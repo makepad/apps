@@ -1,6 +1,7 @@
 //! Range selection, composition, layer clocks, variable axes and unchanged
 //! legacy frames. Rendering/layout is verified separately on the native GPU.
 
+use makepad_motion::plain::{PrimitiveFrame, TextProps};
 use makepad_motion::*;
 
 fn source(text: &str) -> String {
@@ -14,7 +15,7 @@ fn load(text: &str) -> MotionDoc {
 fn units(doc: &MotionDoc, t: f64) -> Vec<TextUnit> {
     let frame = doc.eval(t);
     assert!(frame.errors.is_empty(), "{t}: {:?}", frame.errors);
-    let ItemKind::Text { units, .. } = frame.items.into_iter().next().unwrap().kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = frame.items.into_iter().next().unwrap().kind else { panic!() };
     units
 }
 
@@ -288,8 +289,8 @@ fn documents_without_ranges_keep_plain_text_units() {
         let frame = doc.eval(t);
         assert!(frame.errors.is_empty());
         for (layer, item) in doc.layers.iter().zip(&frame.items) {
-            let LayerKind::Text { source: TextSource::Text(text), by, stagger, color, ranges, .. } = &layer.kind else { continue };
-            let ItemKind::Text { units, .. } = &item.kind else { panic!() };
+            let LayerKind::Text { source: TextSource::Text(text), props: TextProps { by, stagger, color, .. }, ranges, .. } = &layer.kind else { continue };
+            let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &item.kind else { panic!() };
             assert!(ranges.is_empty());
             let spans = unit_ranges(text, *by);
             assert_eq!(units.len(), spans.len());

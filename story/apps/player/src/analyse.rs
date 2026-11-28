@@ -234,7 +234,7 @@ impl Analyser {
     /// Takes what the recorders hold so far.
     fn collect(&mut self, cx: &mut Cx) {
         for r in kernel::take_recorded() {
-            self.kernels.entry(kernel::program_key(r.kernel.program())).or_insert(r);
+            self.kernels.entry(r.kernel.program_key()).or_insert(r);
         }
         let fonts = cx.get_global::<std::rc::Rc<std::cell::RefCell<text::fonts::Fonts>>>().clone();
         self.missing = fonts.borrow().missing_glyphs();
@@ -354,7 +354,7 @@ impl Analyser {
         // Per kernel: the size of its scalar and four wide code (the scalar
         // form of the four wide kernels built here only to compare).
         let sizes = function_sizes(&module);
-        let scalar_module = makepad_script_compute::wasm::module(&refs.iter().map(|k| makepad_script_compute::wasm::Entry { program: k.program(), simd: false }).collect::<Vec<_>>(), target).unwrap_or_default();
+        let scalar_module = kernel::wasm_module_scalar(&refs, target).unwrap_or_default();
         let scalar_sizes = function_sizes(&scalar_module);
         let mut table = String::from("# key scalar_bytes simd_bytes simd/scalar (the film links simd_bytes where present)\n");
         for (i, e) in entries.iter().enumerate() {
@@ -430,9 +430,9 @@ impl Analyser {
                 std::fs::write(src_dir.join(format!("{key:016x}.splash")), &r.source)?;
             }
             std::fs::write(src_dir.join(format!("{key:016x}.layouts.json")), layouts_json(&r.layouts))?;
-            for (path, text) in &r.modules {
-                let name: String = path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '_' }).collect();
-                std::fs::write(src_dir.join(format!("{key:016x}.module.{name}.splash")), text)?;
+            for module in &r.modules {
+                let name: String = module.path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '_' }).collect();
+                std::fs::write(src_dir.join(format!("{key:016x}.module.{name}.splash")), &module.text)?;
             }
         }
         Ok(())

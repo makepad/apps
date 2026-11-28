@@ -49,7 +49,7 @@ pub mod write;
 
 pub use bench_view::{BenchEdit, BenchView, bench_views};
 pub use bench::stimulus_unit;
-pub use catalog::{blocks_alone, catalog, defs_catalog, Catalog, CatalogEntry, CatalogKind, CatalogPin, CatalogSource, Miniature, ProjectDefs};
+pub use catalog::{blocks_alone, catalog, defs_catalog, from_part_docs, Catalog, CatalogEntry, CatalogKind, CatalogPin, CatalogSource, Miniature, ProjectDefs};
 pub use circuit::Phases;
 pub use eval::{
     BenchOut, BenchPanel, BenchProbe, BenchScope, PanelEntry, PanelGroup, EvalError, Evaluated, NO_CANCEL, SysEval, SystemLowered, UnitEval, UnitState, check_system, evaluate,
@@ -60,5 +60,5 @@ pub use map::{BenchKey, BenchSite, Input, Origin, PinSite, SourceMap, SourceRang
 pub use pin_splice::{part_template, part_templates, PartTemplates};
 pub use source::{load_dir, part_assets, Doc, DocKind, Libs, Sources, SYSTEM_DOC};
 pub use splice::{splice, SpanEdit};
-pub use verify::{Verified, splice_verified, text_verified, with_files};
+pub use verify::{Verified, docs_verified, splice_verified, text_verified, with_files};
 pub use write::write;

@@ -2,6 +2,7 @@
 //! `motion_blur:` (makepad-render-graph), and `emit()` colours over 1.
 //! Existing documents are unaffected: every field is new and optional.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -44,7 +45,7 @@ fn kits_expand_into_passes_with_their_own_names() {
     assert!((values[9][tint][0] - 1.0).abs() < 1e-4 && values[9][tint][1] < 0.3, "{:?}", values[9][tint]);
     // emit() keeps components over 1.
     let fill = match &frame.items[0].kind {
-        ItemKind::Rect { fill, .. } => fill.unwrap(),
+        ItemKind::Primitive(PrimitiveFrame::Rect { fill, .. }) => fill.unwrap(),
         _ => panic!(),
     };
     assert!(fill[0] > 3.9 && fill[3] == 1.0, "{fill:?}");

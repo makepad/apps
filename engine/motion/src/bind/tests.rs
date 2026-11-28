@@ -1,3 +1,4 @@
+use crate::plain::PrimitiveFrame;
 use super::run::*;
 
 /// A 10 fps, 100x200 run: a click on `main.save` at frames 10..14, typing
@@ -328,7 +329,7 @@ fn every_overlay_loads_and_evaluates_bound_and_unbound() {
         let alone = MotionDoc::load(o.source).unwrap_or_else(|d| panic!("{}: {d:#?}", o.id));
         let frame = alone.eval(1.0);
         clean(&frame);
-        assert!(frame.items.iter().all(|i| i.opacity == 0.0 || matches!(i.kind, ItemKind::Text { .. } | ItemKind::Shader { .. })), "{}: {:#?}", o.id, frame.items);
+        assert!(frame.items.iter().all(|i| i.opacity == 0.0 || matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. }) | ItemKind::Shader { .. })), "{}: {:#?}", o.id, frame.items);
     }
 }
 
@@ -341,7 +342,7 @@ fn the_highlight_sits_on_the_widget_it_names() {
     let b = item(&doc, &frame, "box");
     let w = r.widget("increment_button", 0.7).unwrap();
     assert!((b.world.e - (w.x - 10.0)).abs() < 1e-6 && (b.world.f - (w.y - 10.0)).abs() < 1e-6, "{:?} {w:?}", b.world);
-    let ItemKind::Rect { size, .. } = b.kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = b.kind else { panic!() };
     assert!((size[0] - (w.w + 20.0)).abs() < 1e-6);
     assert!((b.opacity - 1.0).abs() < 1e-9);
 }
@@ -355,7 +356,7 @@ fn a_ripple_starts_on_each_real_press() {
         let frame = doc.eval(t);
         clean(&frame);
         let ring = item(&doc, &frame, "ring");
-        let ItemKind::Ellipse { size, .. } = ring.kind else { panic!() };
+        let ItemKind::Primitive(PrimitiveFrame::Ellipse { size, .. }) = ring.kind else { panic!() };
         let centre = [ring.world.e + size[0] * 0.5, ring.world.f + size[1] * 0.5];
         assert!((centre[0] - press.at.0).abs() < 1e-6 && (centre[1] - press.at.1).abs() < 1e-6);
         assert!(ring.opacity > 0.3);
@@ -372,14 +373,14 @@ fn keystroke_badges_and_step_counters_show_the_runs_text() {
     let at = 142.0 / 60.0 + 0.3;
     let frame = keys.eval(at);
     clean(&frame);
-    let ItemKind::Text { text, units, .. } = &item(&keys, &frame, "label").kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) = &item(&keys, &frame, "label").kind else { panic!() };
     assert!(text.contains("⌘ S"), "{text:?}");
     assert!(units.iter().any(|u| u.opacity > 0.5));
     assert!(item(&keys, &frame, "cap").opacity > 0.9);
     let steps = bound("steps", r, &[]);
     let frame = steps.eval(1.5);
     clean(&frame);
-    let ItemKind::Text { text, units, .. } = &item(&steps, &frame, "count").kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) = &item(&steps, &frame, "count").kind else { panic!() };
     let shown: String = units.iter().filter(|u| u.opacity > 0.5).map(|u| &text[u.range.clone()]).collect();
     assert_eq!(shown, "2 / 3");
 }
@@ -404,7 +405,7 @@ fn the_overlays_follow_a_moving_crop() {
     assert!((x(0.0) - (w.x - 600.0) * 2.0).abs() < 1e-6);
     assert!((x(1.0) - (w.x - 500.0) * 2.0).abs() < 1e-6);
     let frame = doc.eval(1.0);
-    let ItemKind::Rect { size, .. } = item(&doc, &frame, "box").kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = item(&doc, &frame, "box").kind else { panic!() };
     assert!((size[0] - w.w * 2.0).abs() < 1e-6);
 }
 

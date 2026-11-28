@@ -21,7 +21,7 @@ fn part(name: &str, footprint: &Arc<Footprint>, body: Option<Body3d>) -> Arc<Par
         pins: Vec::new(),
         fields: Fields::default(),
         emitter: None,
-        gpio: None,
+        gpio: None, lifecycle: None, approved: false,
     })
 }
 

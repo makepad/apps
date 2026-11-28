@@ -12,6 +12,7 @@ fab-elec-cam = { path = "../cam" }
 fab-elec-circuit = { path = "../circuit" }
 fab-elec-board = { path = "../board" }
 fab-elec-design = { path = "../design" }
+fab-elec-parts = { path = "../parts" }
 makepad-strict-json = { path = "../../../../../libs/strict_json" }
 
 [dev-dependencies]

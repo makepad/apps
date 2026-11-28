@@ -1210,15 +1210,17 @@ pub fn post_kit_passes(vm: &mut ScriptVm, post: &PostFrame, reflect: Option<(f32
 
 /// Record `world` seen by `state` into an auxiliary pass of the frame (a
 /// reflection, the contact map, the id map), cleared to `clear`, as a
-/// child of `parent`. `scene_world`: the world is the scene's own with items
-/// taken out (the mirror, the frame behind glass), so it names the scene's
-/// environment and resolves it like the scene's draw, and sees what the
-/// scene sees; a map of its own (contact, ids) names none and leaves the
-/// scene's environment alone: resolved like the scene's, its default
-/// environment would drop what the scene's draw prepares on every
-/// recording, and the frame would wait for it for ever.
+/// child of `parent`. `view`: the world is the scene's own with items taken
+/// out (the mirror, the frame behind glass), a view of the scene
+/// (`draw_scene_view`), recorded after the scene's own draw: it sees what the
+/// scene sees, its environment and its sun cascades. A map of its own
+/// (contact, ids) is an aux draw: it names no environment and leaves the
+/// scene's alone (resolved like the scene's, its default environment would
+/// drop what the scene's draw prepares on every recording, and the frame
+/// would wait for it for ever), and binds no cascades. Returns whether the
+/// pass needs recording again and keeps the item pipelines it is waiting for.
 #[allow(clippy::too_many_arguments)]
-fn record_aux(cx: &mut Cx2d, renderer: &mut Renderer, d: &mut Draws, apass: &mut DrawPass, aroot: &mut DrawList2d, alist: &mut DrawList, color: &Texture, depth: &Texture, world: &scene::World, state: SceneState3D, clear: Vec4f, parent: DrawPassId, scene_world: bool) {
+fn record_aux(cx: &mut Cx2d, renderer: &mut Renderer, d: &mut Draws, apass: &mut DrawPass, aroot: &mut DrawList2d, alist: &mut DrawList, color: &Texture, depth: &Texture, world: &scene::World, state: SceneState3D, clear: Vec4f, parent: DrawPassId, view: bool, waiting: &mut Vec<(DrawPassId, DrawShaderId)>) -> bool {
     apass.set_color_texture(cx.cx, color, DrawPassClearColor::ClearWith(clear));
     apass.set_depth_texture(cx.cx, depth, DrawPassClearDepth::ClearWith(1.0));
     cx.begin_pass(apass, Some(1.0));
@@ -1244,8 +1246,8 @@ fn record_aux(cx: &mut Cx2d, renderer: &mut Renderer, d: &mut Draws, apass: &mut
             view_model: None,
         };
         renderer.set_models(Vec::new());
-        if scene_world {
-            renderer.draw_scene_full(cx3d, alist, &mut draws, world, state, None, Some(&mut d.models));
+        if view {
+            renderer.draw_scene_view(cx3d, alist, &mut draws, world, state, Some(&mut d.models));
         } else {
             renderer.draw_scene_aux(cx3d, alist, &mut draws, world, state, Some(&mut d.models));
         }
@@ -1257,6 +1259,7 @@ fn record_aux(cx: &mut Cx2d, renderer: &mut Renderer, d: &mut Draws, apass: &mut
     cx.end_pass(apass);
     cx.cx.attach_child_pass(apass.draw_pass_id(), parent, None);
     cx.cx.repaint_pass(apass.draw_pass_id());
+    renderer.record_item_fallback(cx.cx, waiting)
 }
 
 /// The scene's meshes that `keep` keeps, each drawn unlit in its id (its
@@ -1452,6 +1455,8 @@ pub struct SharedRenderer {
     /// What the last recording drew without: the frame's auxiliary
     /// programs, the items' own lanes, the line shaders.
     recorded_without: [bool; 3],
+    /// Pipelines still warming when a contributing pass or sub-frame was recorded.
+    waiting_item_pipelines: Vec<(DrawPassId, DrawShaderId)>,
     /// The chain's last pass (the host's child) and its output.
     tail: Option<(DrawPassId, Texture)>,
     /// The document's render-graph passes (`post.graph`).
@@ -1545,6 +1550,7 @@ impl SharedRenderer {
             live_programs: HashMap::new(),
             recorded: None,
             recorded_without: [false; 3],
+            waiting_item_pipelines: Vec::new(),
             tail: None,
             graph: Default::default(),
             graph_out: Default::default(),
@@ -1947,6 +1953,24 @@ impl SharedRenderer {
             self.renderer.environment_preparations(),
             self.sub_env.unsettled,
         );
+        // What else a whole paint waits for, and what records the frame again (`reattach`).
+        out.push_str(&format!(
+            ", building {}, sub-frame tail {}, shadows warm {} ({} cascade frames), ao warm {} ({} recordings), environment needs a draw {}, \
+             recorded without aux {} (ready {}), items {} (ready {}), lines {} (ready {})",
+            self.pending.is_some(),
+            self.sub_tail.is_some(),
+            self.shadows_warm,
+            self.csm_frames,
+            self.ao_warm(),
+            self.ao_count,
+            self.renderer.environment_needs_draw(),
+            self.recorded_without[0],
+            self.aux_ready(cx),
+            self.recorded_without[1],
+            self.items_ready(cx),
+            self.recorded_without[2],
+            self.lines.as_ref().is_none_or(|l| l.ready(cx, true)),
+        ));
         for (i, id) in passes.iter().enumerate() {
             let p = &cx.passes[*id];
             out.push_str(&format!("; pass {i} dirty {} painted {}", p.paint_dirty, p.painted_serial));
@@ -1974,7 +1998,8 @@ impl SharedRenderer {
             && self.shadows_warm
             && self.ao_warm()
             && self.aux_ready(cx)
-            && self.renderer.items_ready(cx)
+            && !self.recorded_without[1]
+            && self.items_ready(cx)
             && self.lines.as_ref().is_none_or(|l| l.ready(cx, true))
             && passes.iter().all(|&id| !cx.passes[id].paint_dirty && cx.passes[id].painted_serial >= *serial)
     }
@@ -2007,6 +2032,11 @@ impl SharedRenderer {
         self.pending.is_some()
     }
 
+    /// Sub-frames recorded for the current frame, or None when no frame is in progress.
+    pub fn sub_frames_recorded(&self) -> Option<usize> {
+        self.pending.as_ref().map(|p| p.recorded)
+    }
+
     pub fn reattach(&mut self, cx: &mut Cx2d) {
         // Record a fallback frame again once what it drew without is ready,
         // never while it is still building. A finished environment preparation
@@ -2020,7 +2050,7 @@ impl SharedRenderer {
             self.sub_env.unsettled || !self.shadows_warm || (!self.ao_warm() && self.chain_painted(cx.cx))
                 || self.renderer.environment_needs_draw()
                 || (self.recorded_without[0] && self.aux_ready(cx.cx))
-                || (self.recorded_without[1] && self.renderer.items_ready(cx.cx))
+                || (self.recorded_without[1] && self.items_ready(cx.cx))
                 || (self.recorded_without[2] && self.lines.as_ref().is_none_or(|l| l.ready(cx.cx, true)))
         );
         if stale {
@@ -2074,6 +2104,9 @@ impl SharedRenderer {
         }
         self.grain_seed = grain_seed;
         self.sub_env.begin();
+        // A fallback in any pass or sub-frame counts until the whole frame is recorded again.
+        self.recorded_without[1] = false;
+        self.waiting_item_pipelines.clear();
         let out = self.draw_frame(cx, &f, size, sampling);
         self.last = Some((f, size, sampling));
         out
@@ -2186,6 +2219,10 @@ impl SharedRenderer {
         (!self.contact_live || ready(CONTACT_PROGRAM)) && (!(self.id_live || self.coverage) || ready(ID_PROGRAM))
     }
 
+    fn items_ready(&self, cx: &Cx) -> bool {
+        self.renderer.items_ready(cx) && self.waiting_item_pipelines.iter().all(|&(pass, shader)| cx.draw_shader_ready_in(shader, pass))
+    }
+
     /// The frame has its own depth for SSAO, or needs only one recording.
     fn ao_warm(&self) -> bool {
         let ssao = self.last.as_ref().is_some_and(|(frame, _, _)| frame.post.ssao.is_some_and(|(_, intensity)| intensity.min(1.0) > 0.0));
@@ -2207,11 +2244,8 @@ impl SharedRenderer {
         self.sub_tail = None;
         let out = tail.1.clone();
         self.tail = Some(tail);
-        self.recorded_without = [
-            !self.aux_ready(cx.cx),
-            self.renderer.drew_fallback() || !self.renderer.items_ready(cx.cx),
-            !self.lines.as_ref().is_none_or(|l| l.ready(cx.cx, true)),
-        ];
+        self.recorded_without[0] = !self.aux_ready(cx.cx);
+        self.recorded_without[2] = !self.lines.as_ref().is_none_or(|l| l.ready(cx.cx, true));
         Some(out)
     }
 
@@ -2338,7 +2372,7 @@ impl SharedRenderer {
                 viewport_rect: Rect { pos: dvec2(0.0, 0.0), size: csize },
             };
             let (p, root, list, ccolor, cdepth, _) = self.contact_pass.as_mut().unwrap();
-            record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, ccolor, cdepth, &cworld, cstate, vec4(1.0, 1.0, 1.0, 1.0), scene_id, false);
+            self.recorded_without[1] |= record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, ccolor, cdepth, &cworld, cstate, vec4(1.0, 1.0, 1.0, 1.0), scene_id, false, &mut self.waiting_item_pipelines);
         }
         // The outlined surfaces' ids, each over its own depth (an outline
         // goes round whole shapes, seen through what covers them).
@@ -2361,7 +2395,7 @@ impl SharedRenderer {
             let iworld = id_world(f, &world, |m| m.outline);
             let istate = SceneState3D { time: f.t as f64, camera_pos: v3(f.camera.position), view: f.camera.view, projection: f.camera.proj, viewport_rect: Rect { pos: dvec2(0.0, 0.0), size: dsize } };
             let (p, root, list, ic, idp, _) = self.id_pass.as_mut().unwrap();
-            record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, ic, idp, &iworld, istate, vec4(0.0, 0.0, 0.0, 0.0), scene_id, false);
+            self.recorded_without[1] |= record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, ic, idp, &iworld, istate, vec4(0.0, 0.0, 0.0, 0.0), scene_id, false, &mut self.waiting_item_pipelines);
         }
         // Screen coverage (an inspect asks; an export never does): every
         // mesh's id over one depth, so each pixel names the surface seen
@@ -2384,12 +2418,16 @@ impl SharedRenderer {
             let cworld = id_world(f, &world, |_| true);
             let cstate = SceneState3D { time: f.t as f64, camera_pos: v3(f.camera.position), view: f.camera.view, projection: f.camera.proj, viewport_rect: Rect { pos: dvec2(0.0, 0.0), size: dsize } };
             let (p, root, list, cc, cd, _) = self.cover_pass.as_mut().unwrap();
-            record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, cc, cd, &cworld, cstate, vec4(0.0, 0.0, 0.0, 0.0), scene_id, false);
+            self.recorded_without[1] |= record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, cc, cd, &cworld, cstate, vec4(0.0, 0.0, 0.0, 0.0), scene_id, false, &mut self.waiting_item_pipelines);
         }
         // The planar reflection: the scene without its reflecting floors,
         // mirrored about the floor plane, into its own target (parented
         // under the scene pass, which samples it); every surface two-sided,
-        // as the mirror turns the winding.
+        // as the mirror turns the winding. Its target is made here and it is
+        // recorded after the scene's own draw, as a view of it: the frame's
+        // sun cascades are fitted in that draw. (Paint order is the pass
+        // tree's, not the order of recording.)
+        let mut views: Vec<(bool, scene::World, SceneState3D)> = Vec::new();
         let refl_floors: Vec<usize> = f.meshes.iter().enumerate().filter(|(_, m)| reflects(f, m)).map(|(i, _)| i).collect();
         self.refl_live = f.reflector.is_some() && !refl_floors.is_empty();
         if let (false, Some(r)) = (self.refl_live, &self.refl_pass) {
@@ -2427,12 +2465,11 @@ impl SharedRenderer {
                 projection: f.camera.proj,
                 viewport_rect: Rect { pos: dvec2(0.0, 0.0), size: dsize },
             };
-            let (p, root, list, rcolor, rdepth, _) = self.refl_pass.as_mut().unwrap();
-            record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, rcolor, rdepth, &rworld, rstate, vec4(clear[0], clear[1], clear[2], clear[3]), scene_id, true);
+            views.push((true, rworld, rstate));
         }
         // Glass: the frame without its glass surfaces, from the camera, into
         // its own target the glass programs sample (parented under the
-        // scene pass).
+        // scene pass), recorded after the scene's draw like the reflection.
         let glass_items: Vec<usize> = f.meshes.iter().enumerate().filter(|(_, m)| glass(&m.material)).map(|(i, _)| i).collect();
         if let (true, Some(r)) = (glass_items.is_empty(), &self.behind_pass) {
             release_targets(cx.cx, &[&r.3, &r.4]);
@@ -2456,8 +2493,7 @@ impl SharedRenderer {
                 !glass_items.contains(&(k - 1))
             });
             let bstate = SceneState3D { time: f.t as f64, camera_pos: v3(f.camera.position), view: f.camera.view, projection: f.camera.proj, viewport_rect: Rect { pos: dvec2(0.0, 0.0), size: dsize } };
-            let (p, root, list, bcolor, bdepth, _) = self.behind_pass.as_mut().unwrap();
-            record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, bcolor, bdepth, &bworld, bstate, vec4(clear[0], clear[1], clear[2], clear[3]), scene_id, true);
+            views.push((false, bworld, bstate));
             let behind = self.behind_pass.as_ref().unwrap().3.clone();
             for &i in &glass_items {
                 self.renderer.set_custom_material_texture(&makepad_render::splash_material_name(glass_program_id(&f.meshes[i].material)), Some(behind.clone()));
@@ -2501,11 +2537,16 @@ impl SharedRenderer {
             };
             self.renderer.set_models(Vec::new());
             let st = self.renderer.draw_scene_full(cx3d, scene_list, &mut draws, &world, state, None, Some(&mut d.models));
+            self.recorded_without[1] |= self.renderer.record_item_fallback(cx3d.cx, &mut self.waiting_item_pipelines);
             self.stats.instances = (st.static_instances + st.dyn_instances) as usize;
             // The cascades a frame renders are the ones its receivers read
-            // from the second recording on: whole once two in a row drew.
+            // from the second recording on: whole once two in a row drew. A
+            // recording counts whenever its cascades are whole: drawn with
+            // no caster in view (a title before its letters rise) or kept
+            // from the last drawing (a still frame recorded again), not only
+            // when they drew a caster, or such a frame never warms.
             let casters = world.items.iter().any(|i| i.flags.contains(scene::ItemFlags::CAST_SHADOW));
-            self.csm_frames = if st.csm_draws > 0 { self.csm_frames + 1 } else { 0 };
+            self.csm_frames = if st.csm_whole { self.csm_frames + 1 } else { 0 };
             self.shadows_warm = !(sun_shadow && casters) || self.csm_frames >= 3;
         }
         if let Some(lr) = self.lines.as_mut() {
@@ -2528,13 +2569,18 @@ impl SharedRenderer {
         scene_list.set_view_transform(cx.cx, &Mat4f::identity());
         line_list.set_view_transform(cx.cx, &Mat4f::identity());
         cx.end_pass(scene_pass);
+        for (mirror, vworld, vstate) in views {
+            let target = if mirror { &mut self.refl_pass } else { &mut self.behind_pass };
+            let (p, root, list, vcolor, vdepth, _) = target.as_mut().unwrap();
+            self.recorded_without[1] |= record_aux(cx, &mut self.renderer, self.draws.as_mut().unwrap(), p, root, list, vcolor, vdepth, &vworld, vstate, vec4(clear[0], clear[1], clear[2], clear[3]), scene_id, true, &mut self.waiting_item_pipelines);
+        }
         // A pipeline still compiling drew nothing this recording (a
         // cascade's casters, an item): the frame settles only from two
         // recordings after every pipeline exists.
         if cx.cx.draw_shaders_pending() {
             self.ao_count = 0;
         }
-        scene_pass.draw_pass_id()
+        scene_id
     }
 
     /// Post for frame `center` on the linear image `hdr_in` (made by pass

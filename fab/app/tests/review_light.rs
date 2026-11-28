@@ -13,14 +13,7 @@ use makepad_test::{makepad_test, Role, Selector, TestApp};
 use std::time::Duration;
 
 fn try_call(app: &TestApp, tool: &str, args: &str) -> Result<String, String> {
-    let client = makepad_remote::Client::connect(&app.remote_endpoint()).map_err(|e| format!("connect: {e:?}"))?;
-    let argv = vec!["call".to_string(), format!("fab.{tool}"), args.to_string()];
-    let mut lines = Vec::new();
-    makepad_remote::app::run(&client, &argv, &mut |line| {
-        lines.push(line.to_string());
-        true
-    })
-    .map_err(|e| format!("fab.{tool}: {e:?}"))?;
+    let lines = app.try_call_tool(HANG, &format!("fab.{tool}"), args).map_err(|e| format!("fab.{tool}: {e:?}"))?;
     lines.iter().find(|l| l.contains("\"Result\"")).cloned().ok_or_else(|| format!("fab.{tool} returned no result: {lines:?}"))
 }
 

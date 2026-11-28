@@ -1,6 +1,7 @@
 //! The application's module library: a document loaded without a resolver
 //! of its own (Stage's checks, its Motion editor) imports from it.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use std::sync::Arc;
 
@@ -12,6 +13,6 @@ fn documents_import_from_the_applications_library() {
     library.add_asset("ast_widths", "r1", "{w: 12.0}");
     modules::set_library(Arc::new(library));
     let doc = MotionDoc::load(src).unwrap_or_else(|d| panic!("{d:?}"));
-    let ItemKind::Rect { size, .. } = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
     assert_eq!(size[0], 12.0);
 }

@@ -1,4 +1,4 @@
-//! Document-backed evaluation, adoption and history ordering without a scheduler or clock.
+//! Document-backed evaluation, adoption and history ordering without a scheduler or window.
 
 use fab_elec_board::{Board, BoardKeepout, BoardOp, CarriedKeepout, Factories, Item, Origin, PortRoom};
 use fab_elec_circuit::{CircuitOp, End, QtyUnit, Quantity, Value};
@@ -10,6 +10,7 @@ use fab_elec_lang::{board_doc::{self, Ledger}, evaluate, UnitState, SYSTEM_DOC};
 use fab_elec_view::board::plan::label_ops;
 use fab_elec_view::{StageFlags, StateOf};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 /// A real document-backed controller, matching the board-splice tests' setup.
@@ -101,6 +102,776 @@ fn item_ids(board: &Board) -> Vec<ItemId> {
     (0..board.next_item).map(ItemId).filter(|id| board.item(*id).is_some()).collect()
 }
 
+// The probe fixture's power nets and resistor, reduced to one component.
+const PROBE_CIRCUIT: &str = r#"use mod.elec.*
+use mod.std.*
+let e = mod.elec
+let gnd = e.net({name: "GND" kind: @ground})
+let v33 = e.net({name: "3V3" kind: @power volts: 3.3V})
+let r = e.r(1kohm, v33, gnd, {package: "0402"})
+"#;
+
+const PROBE_BLOCK: &str = r#"let e = mod.elec
+let load = e.block({
+    name: "Load"
+    ports: {top: e.port(@power_in) gnd: e.port(@ground)}
+    params: {r: 1kohm}
+    build: fn(p, o) {
+        let r = e.r(o.r, p.top, p.gnd, {package: "0402"})
+    }
+})
+"#;
+
+fn proposal_fixture() -> (Engine, Mailbox) {
+    let circuit = PROBE_CIRCUIT.replace("use mod.std.*", "use mod.project.*")
+        .replace("e.r(1kohm, v33, gnd, {package: \"0402\"})", "load({top: v33 gnd: gnd}, {r: 1kohm})");
+    let mut sources = fab_elec_lang::Sources::new();
+    sources.add("load.blocks.splash", PROBE_BLOCK).unwrap();
+    sources.add("probe.ckt.splash", circuit).unwrap();
+    let libs = fab_elec_lang::std_libs();
+    let ev = evaluate(&sources, &libs).expect("the one-resistor project block evaluates");
+    let (design, docs) = Docs::from_evaluated(sources, ev);
+    (Engine::new(design, Arc::default(), Arc::default(), Arc::default(), "probe".into()).with_docs(docs), Mailbox::default())
+}
+
+fn proposed_changes(engine: &Engine) -> Vec<DocSet> {
+    let doc = engine.docs().unwrap().view().texts.iter().find(|doc| doc.name == "probe.ckt.splash").unwrap();
+    vec![DocSet::Add { name: "brief.req.splash".into(), text: "require(\"two layers\", board(\"probe\").layers, {max: 2})\n".into() },
+        DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: doc.text.replace("1kohm", "2kohm").into() }]
+}
+
+fn propose_probe(engine: &mut Engine, mail: &Mailbox) -> (fab_elec_host::ProposalId, u64, u64) {
+    mail.push(Cmd::Propose { set: proposed_changes(engine), slot: "schematic".into(), label: "Probe schematic".into(),
+        by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), ticket: Ticket(1) });
+    let sent = step(engine, mail);
+    assert_eq!(sent.evals.len(), 1, "a local proposal runs one independent verification");
+    let verification = sent.evals[0].id;
+    let shown = run(engine, mail, sent);
+    let [(Ticket(1), Outcome::Proposed { id, shown, checks: Some(_), requirements: Some(_) })] = shown.outcomes.as_slice()
+        else { panic!("the proposer gets the checked proposal identity") };
+    (*id, *shown, verification)
+}
+
+#[derive(Debug, PartialEq)]
+enum JournalNotice {
+    Decision(Ticket, String, Vec<(String, String)>),
+    Effect(Option<Ticket>, By),
+    Done(Result<u64, String>),
+}
+
+fn record_decisions(engine: Engine) -> (Engine, mpsc::Receiver<JournalNotice>) {
+    struct Sink(mpsc::Sender<JournalNotice>);
+    type Reply = Box<dyn FnOnce(Result<u64, String>) + Send + Sync>;
+    impl fab_elec_host::JournalSink for Sink {
+        fn gesture(&self, _: Ticket, _: &str, _: &[(String, String)]) -> Option<Reply> {
+            panic!("a proposal press must never bind a gesture");
+        }
+        fn decision(&self, ticket: Ticket, name: &str, args: &[(String, String)]) -> Option<Reply> {
+            self.0.send(JournalNotice::Decision(ticket, name.into(), args.to_vec())).unwrap();
+            let tx = self.0.clone();
+            Some(Box::new(move |result| tx.send(JournalNotice::Done(result)).unwrap()))
+        }
+        fn receive(&self, event: fab_elec_host::JournalEvent<'_>) {
+            if let fab_elec_host::JournalEvent::Effect { ticket, by, .. } = event {
+                self.0.send(JournalNotice::Effect(ticket, by)).unwrap();
+            }
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    (engine.with_journal(Some(Arc::new(Sink(tx)))), rx)
+}
+
+#[test]
+fn held_proposal_accepts_the_shown_design_in_one_step() {
+    let (engine, mail) = proposal_fixture();
+    let (mut engine, journal) = record_decisions(engine);
+    let before = engine.snapshot();
+    let checks = |snap: &fab_elec_view::DesignSnapshot| fab_elec_host::edit_actions::check_list(snap, &[]).unwrap();
+    let (ended, shown, _) = propose_probe(&mut engine, &mail);
+    mail.push(decision(ended, shown, false));
+    let decline = step(&mut engine, &mail);
+    assert!(matches!(decline.outcomes.as_slice(), [(_, Outcome::Declined { .. })]), "the declined press ends the proposal");
+    mail.push(decision(ended, shown, true));
+    let refusal = step(&mut engine, &mail);
+    assert!(matches!(refusal.outcomes.as_slice(), [(_, Outcome::Refused(_))]), "a press on the ended proposal is refused");
+    assert!(journal.try_recv().is_err(), "proposing, declining and a refused press leave the journal empty");
+    let (id, shown, verification) = propose_probe(&mut engine, &mail);
+    let held = engine.snapshot();
+    assert_eq!(held.proposals[0].id, id, "the outcome names the visible proposal");
+    assert_eq!(held.proposals[0].shown, shown, "the outcome names the visible checks");
+    assert_eq!(held.docs.as_ref().unwrap().texts, before.docs.as_ref().unwrap().texts, "a proposal preserves all committed texts and revisions");
+    assert!(engine.log().entries.is_empty(), "the AI proposal creates no history");
+    assert!(Arc::ptr_eq(&held.design, &before.design), "the committed design keeps its identity");
+    assert!(held.preview.is_none(), "a proposal leaves the gesture slot empty");
+    assert_eq!(checks(&held), checks(&before), "elec.check.list keeps reading the live design");
+    let candidate = &held.proposals[0];
+    let accept = |id, shown| Cmd::Decide { id, shown, accept: true, ticket: None };
+    mail.push(decision(id, shown, true));
+    let landed = step(&mut engine, &mail);
+    assert!(landed.rejected.is_empty() && landed.evals.is_empty(), "accept adopts without evaluating again");
+    assert!(Arc::ptr_eq(engine.design(), candidate.design.as_ref().unwrap()), "accept commits the exact design shown");
+    let committed = engine.snapshot();
+    assert!(committed.sheets.iter().all(|s| Arc::ptr_eq(&s.value, &candidate.sheets[&s.unit.unwrap()])),
+        "accept installs the sheet indexes the person saw");
+    let entries = &engine.log().entries;
+    assert_eq!(entries.len(), 1, "the multi-document proposal takes one undo entry");
+    assert_eq!(journal.try_iter().collect::<Vec<_>>(), [
+        JournalNotice::Decision(Ticket(2), "elec.step.accept".into(), vec![("proposal".into(), id.0.to_string()),
+            ("slot".into(), "schematic".into()), ("label".into(), "Probe schematic".into()), ("author".into(), "ai".into())]),
+        JournalNotice::Effect(Some(Ticket(2)), By::Ai { turn: 1, call: 1 }),
+        JournalNotice::Done(Ok(entries[0].seq)),
+    ], "one decision binds the AI-authored effect to the press ticket and completes with its undo step");
+    assert_eq!(entries[0].by, By::Ai { turn: 1, call: 1 }, "the accepted entry credits the local author");
+    assert_eq!((entries[0].text.edits.len(), entries[0].text.present.len(), entries[0].text_inverse.edits.len(),
+        entries[0].text_inverse.present.len()), (1, 1, 1, 1), "both history directions record the replacement and creation");
+    let installed = texts(&engine);
+    let docs = engine.docs().unwrap();
+    for change in candidate.docs.iter() {
+        assert_eq!(docs.sources().find(&change.name).and_then(|id| docs.text(id)), change.after.as_ref(), "accept installs the shown bytes for {}", change.name);
+    }
+    let first_id = docs.sources().find("brief.req.splash").unwrap();
+    for (index, undo) in [true, false, true].into_iter().enumerate() {
+        mail.push(if undo { Cmd::Undo } else { Cmd::Redo });
+        let history = step(&mut engine, &mail);
+        if index == 0 {
+            assert_eq!(history.evals[0].id, verification + 1, "accept left the evaluation counter at the proposal verification");
+        }
+        run(&mut engine, &mail, history);
+        if undo {
+            let expected: Vec<_> = before.docs.as_ref().unwrap().texts.iter().map(|d| (d.doc, d.text.clone())).collect();
+            assert_eq!(texts(&engine), expected, "one undo restores the circuit bytes and removes the requirements");
+        } else {
+            assert_eq!(texts(&engine), installed, "one redo restores both documents");
+        }
+    }
+    let (again, shown, _) = propose_probe(&mut engine, &mail);
+    mail.push(accept(again, shown));
+    let landed = step(&mut engine, &mail);
+    assert!(landed.rejected.is_empty(), "the same creation can be accepted after undo");
+    let current = engine.docs().unwrap().sources();
+    assert!(current.find("brief.req.splash").is_some_and(|id| id != first_id) && current.doc(first_id).is_none(),
+        "reusing the absent name allocates a fresh id and leaves the undone document absent");
+}
+
+fn decision(id: fab_elec_host::ProposalId, shown: u64, accept: bool) -> Cmd {
+    Cmd::Decide { id, shown, accept, ticket: Some(Ticket(2)) }
+}
+
+fn change_doc(engine: &Engine, name: &str, text: String) -> Cmd {
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == name).unwrap();
+    Cmd::Docs { set: vec![DocSet::Replace { name: name.into(), base_rev: doc.rev, text: text.into() }],
+        by: By::Person, label: name.into(), ticket: None }
+}
+
+#[test]
+fn held_proposal_declined_replaced_or_stale_applies_nothing() {
+    use fab_elec_host::ProposalState;
+    let layout = |unit| format!("board(\"{unit}\")\noutline([[[0mm, 0mm], [8mm, 0mm], [8mm, 8mm], [0mm, 8mm], [0mm, 0mm]]])\nzone(\"GND\", [\"F.Cu\"], @board)\n");
+    let mut sources = fab_elec_lang::Sources::new();
+    sources.add("probe.ckt.splash", PROBE_CIRCUIT).unwrap();
+    sources.add("shared.ckt.splash", PROBE_CIRCUIT).unwrap();
+    sources.add("shared.pcb.splash", layout("shared")).unwrap();
+    let (design, docs) = Docs::load(sources, fab_elec_lang::std_libs());
+    let mut engine = Engine::new_held(design, Arc::default(), Arc::default(), Arc::default(), "probe".into()).with_docs(docs).with_app_tools();
+    let mail = Mailbox::default();
+    let start = engine.snapshot().docs.clone().unwrap();
+    let circuit = start.texts.iter().find(|d| d.name == "probe.ckt.splash").unwrap();
+    let set = vec![
+        DocSet::Replace { name: circuit.name.clone(), base_rev: circuit.rev,
+            text: format!("{}let extra = e.r(2kohm, v33, gnd, {{package: \"0402\"}})\n", circuit.text).into() },
+        DocSet::Add { name: "probe.pcb.splash".into(), text: layout("probe").into() },
+    ];
+    mail.push(Cmd::Propose { set, slot: "schematic".into(), label: "Probe layout".into(),
+        by: fab_elec_host::ProposalAuthor::Local(By::Person), ticket: Ticket(1) });
+    let checking = step(&mut engine, &mail);
+    let [fill] = checking.fills.as_slice() else { panic!("only the shared board owes a committed zone refill") };
+    mail.result(checking.evals[0].run());
+    let ready = step(&mut engine, &mail);
+    let [(Ticket(1), Outcome::Proposed { id: first, shown, .. })] = ready.outcomes.as_slice()
+        else { panic!("the checked two-board proposal is ready: {:?}", ready.rejected) };
+    let (first, shown) = (*first, *shown);
+    let snap = engine.snapshot();
+    let view = &snap.proposals[0];
+    let design = view.design.as_ref().unwrap();
+    let probe = design.unit_by_name("probe").unwrap();
+    let shared = fill.task.unit;
+    assert_eq!(view.boards.len(), 2, "both candidate boards publish fills");
+    let pending = &view.checks.as_ref().unwrap().pending_labels;
+    assert!(pending.iter().any(|s| s == "DRC (probe)") && pending.iter().any(|s| s == "DRC (shared)"),
+        "both units awaiting whole-board checks must be named in Review");
+    for unit in &design.units {
+        let zone = unit.board.as_ref().unwrap().zones[0].id;
+        let board = view.boards.iter().find(|b| b.unit == unit.id).unwrap();
+        assert_eq!(board.fills[0].zone, zone, "the published fill belongs to the candidate unit's zone");
+        assert_eq!(&*board.pending_zones, &[zone], "the candidate lists the zone whose fill is still owed");
+    }
+    let shared_board = view.boards.iter().find(|b| b.unit == shared).unwrap();
+    assert!(Arc::ptr_eq(&shared_board.fills, &snap.of(&snap.fills, shared).unwrap().value), "the unchanged board shares its committed fills");
+    assert!(Arc::ptr_eq(&view.sheets[&shared], &snap.of(&snap.sheets, shared).unwrap().value), "the unchanged circuit shares its committed sheet index");
+    let extra = probe.circuit.comp("extra").expect("the candidate circuit has the added resistor");
+    assert!(view.sheets[&probe.id].rows.comp(extra.id.0).is_some(), "the changed sheet has a row for its new resistor");
+
+    // A results-dependent call consumes the fill early in the step, then publishes its refusal.
+    mail.push(Cmd::Invoke { tool: "elec.zone.stitch".into(), args: vec![], preview: false, by: By::Person, ticket: Ticket(3) });
+    mail.result(fill.run());
+    let mut published = None;
+    let settled = engine.step(mail.take(), &mut |snap| published = Some(snap));
+    assert!(matches!(settled.outcomes.as_slice(), [(Ticket(3), Outcome::Refused(_))]), "the incomplete stitch call ends without editing the board");
+    let after = published.expect("the shared fill publishes the updated proposal");
+    let updated = &after.proposals[0];
+    let board = updated.boards.iter().find(|b| b.unit == shared).unwrap();
+    assert!(board.pending_zones.is_empty() && Arc::ptr_eq(&board.fills, &after.of(&after.fills, shared).unwrap().value)
+        && !Arc::ptr_eq(&board.fills, &shared_board.fills), "the shared board republishes the settled fill and clears its debt");
+    assert_eq!((&updated.checks, updated.shown), (&view.checks, shown), "settling geometry alone preserves the shown checks and revision");
+    assert!(Arc::ptr_eq(&updated.sheets, &view.sheets), "a fill settlement shares the published sheets");
+    mail.push(decision(first, shown, false));
+    let declined = step(&mut engine, &mail);
+    assert!(matches!(declined.outcomes.as_slice(), [(_, Outcome::Declined { id })] if *id == first), "decline answers its ticket");
+    assert_eq!(engine.docs().unwrap().view().texts, start.texts, "decline preserves texts and revisions");
+    assert!(engine.log().entries.is_empty(), "decline creates no history");
+    let (second, _, _) = propose_probe(&mut engine, &mail);
+    let (third, shown, _) = propose_probe(&mut engine, &mail);
+    for ended in [first, second] {
+        mail.push(decision(ended, shown, true));
+        let refused = step(&mut engine, &mail);
+        assert!(matches!(refused.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("ended")),
+            "a declined or replaced id refuses as ended");
+    }
+    let other = format!("// person's edit\n{}", circuit.text);
+    mail.push(change_doc(&engine, &circuit.name, other.clone()));
+    let edited = step(&mut engine, &mail);
+    run(&mut engine, &mail, edited);
+    let snap = engine.snapshot();
+    let stale = &snap.proposals[0];
+    assert!(matches!(stale.state, ProposalState::Stale(_)), "a change to the proposed circuit makes it stale");
+    assert!(stale.design.is_none() && stale.boards.is_empty() && stale.sheets.is_empty(), "a stale proposal drops its drawable data");
+    mail.push(decision(third, shown, true));
+    let refused = step(&mut engine, &mail);
+    assert!(matches!(refused.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("changed")), "stale accept names the conflict");
+    let docs = engine.docs().unwrap();
+    assert_eq!(docs.text(circuit.doc).unwrap().as_ref(), other, "stale accept keeps the person's circuit");
+    assert!(docs.sources().find("brief.req.splash").is_none(), "stale accept does not create the other document");
+    assert_eq!(engine.log().entries.len(), 1, "only the person's edit entered history");
+}
+
+#[test]
+fn draft_schematic_rejects_a_part_only_in_the_import_library() {
+    let (mut engine, mail) = proposal_fixture();
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "load.blocks.splash").unwrap();
+    let text = doc.text.replace(r#"e.r(o.r, p.top, p.gnd, {package: "0402"})"#, r#"e.part("cached_regulator", {pins: {VIN: p.top GND: p.gnd}})"#);
+    mail.push(Cmd::Propose { slot: "schematic".into(), label: "Schematic".into(),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: text.into() }],
+        by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), ticket: Ticket(1) });
+    let sent = step(&mut engine, &mail);
+    let [job] = sent.evals.as_slice() else { panic!("the proposed build must reach verification") };
+    mail.result(job.run());
+    let result = step(&mut engine, &mail);
+    let [(_, Outcome::Refused(r))] = result.outcomes.as_slice() else { panic!("a build using an undefined part must be refused") };
+    assert!(r.text.contains("no part named cached_regulator is defined in this project")
+        && r.text.contains("only in the local import library is not in this project yet"),
+        "the schematic refusal must identify the part and explain its availability: {}", r.text);
+}
+
+#[test]
+fn schematic_proposal_exposes_erc_findings_and_allows_accept_with_findings() {
+    use fab_elec_circuit::CheckKind::{PowerNotDriven, SinglePinNet};
+    let (mut engine, mail) = planned_regulator();
+    let before = texts(&engine);
+    let row = propose_regulator(&mut engine, &mail, false);
+    let checks = row.checks.as_ref().unwrap();
+    for kind in [PowerNotDriven, SinglePinNet] {
+        assert!(checks.findings.iter().any(|f| f.kind == kind && f.family == "erc" && f.unit == "device"
+            && f.items == "GND" && f.message.contains("GND") && f.fix.is_some()),
+            "{kind:?} must name the candidate rail and carry its explanation and fix");
+    }
+    assert!(checks.findings.windows(2).all(|pair| pair[0].severity >= pair[1].severity), "the most severe findings must come first");
+    assert!(checks.pending_labels.is_empty(), "a mirrored board with settled checks must not report outstanding DRC");
+    assert!(row.requirements.as_ref().unwrap().failures.iter().any(|(n, _)| n == "ERC clean"), "the undriven regulator must fail ERC clean");
+    mail.push(decision(row.id, row.shown, true));
+    let accepted = step(&mut engine, &mail);
+    assert!(accepted.rejected.is_empty() && engine.log().entries.len() == 1 && Arc::ptr_eq(engine.design(), row.design.as_ref().unwrap()),
+        "Accept with findings must install exactly the shown candidate as one undo step");
+    mail.push(Cmd::Undo);
+    let undo = step(&mut engine, &mail);
+    run(&mut engine, &mail, undo);
+    assert_eq!(texts(&engine), before, "one undo must restore the planned architecture");
+}
+
+fn planned_regulator() -> (Engine, Mailbox) {
+    let mut src = fab_elec_lang::Sources::new();
+    src.add("device.req.splash", r#"require("ERC clean", checks(@erc).errors, {max: 0})"#).unwrap();
+    src.add("device.blocks.splash", r#"let e = mod.elec
+let supply = e.block({name: "Supply" planned: true ports: {vin: e.port(@power_in) gnd: e.port(@ground)}})"#).unwrap();
+    src.add("device.ckt.splash", r#"use mod.project.*
+let e = mod.elec
+let va = e.net({name: "VA" kind: @power})
+let gnd = e.net({name: "GND" kind: @ground})
+let reg = supply({vin: va gnd: gnd})"#).unwrap();
+    let (design, docs) = Docs::load(src, fab_elec_lang::std_libs());
+    (Engine::new_held(design, Arc::default(), Arc::default(), Arc::default(), "device".into()).with_docs(docs), Mailbox::default())
+}
+
+fn propose_regulator(engine: &mut Engine, mail: &Mailbox, supplied: bool) -> Arc<fab_elec_host::ProposalView> {
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "device.blocks.splash").unwrap();
+    let flags = if supplied { "let vin = e.part(mod.std.power_flag(), {pins: [p.vin]}); let g = e.part(mod.std.power_flag(), {pins: [p.gnd]});" } else { "" };
+    let text = format!(r#"let e = mod.elec
+let supply = e.block({{name: "Supply" ports: {{vin: e.port(@power_in) gnd: e.port(@ground)}} build: fn(p, o) {{
+    {flags}
+    let u = e.part(mod.std.ldo_3v3(), {{pins: {{VIN: p.vin EN: p.vin GND: p.gnd}} nc: [@VOUT @NC]}})
+}}}})"#);
+    mail.push(Cmd::Propose { slot: "schematic".into(), label: "Schematic".into(),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: text.into() }],
+        by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), ticket: Ticket(1) });
+    let sent = step(engine, mail);
+    let verified = run(engine, mail, sent);
+    let row = engine.snapshot().proposals[0].clone();
+    assert!(matches!(&verified.outcomes[..], [(_, Outcome::Proposed { id, .. })] if *id == row.id)
+        && row.state == fab_elec_host::ProposalState::Ready, "the filled block must be Ready for the person's decision");
+    row
+}
+
+#[test]
+fn schematic_proposal_repropose_in_same_slot_clears_erc_and_passes_req() {
+    let (mut engine, mail) = planned_regulator();
+    let first = propose_regulator(&mut engine, &mail, false);
+    let circuit = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "device.ckt.splash").unwrap();
+    mail.push(change_doc(&engine, &circuit.name, circuit.text.replace("\"VA\"", "\"VBAT\"")));
+    let rename = step(&mut engine, &mail);
+    run(&mut engine, &mail, rename);
+    let rechecked = engine.snapshot().proposals[0].clone();
+    let checks = rechecked.checks.as_ref().unwrap();
+    assert!(rechecked.id == first.id && checks.counts == first.checks.as_ref().unwrap().counts && rechecked.requirements == first.requirements,
+        "renaming only the undriven rail must preserve identity, counts and requirement verdicts");
+    assert!(checks.findings.iter().any(|f| f.items == "VBAT") && rechecked.shown == first.shown + 1,
+        "changed finding details alone must advance the shown revision");
+    let before = texts(&engine);
+    let history = engine.log().entries.len();
+    let fixed = propose_regulator(&mut engine, &mail, true);
+    assert_ne!(fixed.id, first.id, "replacing the schematic slot must give it a fresh proposal identity");
+    assert!(!fixed.checks.as_ref().unwrap().findings.iter().any(|f| f.family == "erc" && f.severity == fab_elec_core::Severity::Error),
+        "both flagged supplies must clear the candidate's ERC errors");
+    assert_eq!(fixed.requirements.as_ref().unwrap().pass, 1, "the repaired schematic must pass ERC clean");
+    mail.push(decision(rechecked.id, rechecked.shown, true));
+    let stale = step(&mut engine, &mail);
+    assert!(matches!(&stale.outcomes[..], [(_, Outcome::Refused(r))] if r.text.contains("ended")),
+        "Accept bound to the earlier proposal identity and revision must be refused as ended");
+    assert!(engine.log().entries.len() == history && texts(&engine) == before && engine.snapshot().proposals[0].id == fixed.id,
+        "the stale press must leave the documents, history and replacement untouched");
+}
+
+#[test]
+fn architecture_proposal_reports_block_checks_in_check_list_and_req_summary() {
+    use fab_elec_circuit::CheckKind::{OpenPort, RailBudget, VoltageDomain};
+    use fab_elec_core::Severity::{Error, Warning};
+    let mut sources = fab_elec_lang::Sources::new();
+    sources.add("device.req.splash", r#"require("ERC clean", checks(@erc).errors, {max: 0})"#).unwrap();
+    let (design, docs) = Docs::load(sources, fab_elec_lang::std_libs());
+    let mut engine = Engine::new_held(design, Arc::default(), Arc::default(), Arc::default(), "device".into()).with_docs(docs);
+    let mail = Mailbox::default();
+    let definitions = r#"let e = mod.elec
+let reg = e.block({name: "Source" planned: true ports: {out: e.port(@power_out, {volts: 5V current: 20mA})}})
+let load = e.block({name: "Load" planned: true role: "Controller" ports: {
+    v: e.port(@power_in, {volts: 3.3V current: 30mA}) io: e.port(@in)}})
+"#;
+    let circuit = r#"use mod.project.*
+let e = mod.elec
+let rail = e.net({name: "VDD" kind: @power})
+let src = reg({out: rail})
+let controller = load({v: rail})
+"#;
+    for fixed in [false, true] {
+        let defs = "device.blocks.splash";
+        let set = if fixed {
+            let view = engine.docs().unwrap().view();
+            let rev = view.texts.iter().find(|d| d.name == defs).expect("the accepted blocks file must be present").rev;
+            vec![DocSet::Replace { name: defs.into(), base_rev: rev, text: definitions.replace("3.3V", "5V").replace("30mA", "20mA").into() }]
+        } else {
+            vec![DocSet::Add { name: defs.into(), text: definitions.into() },
+                DocSet::Add { name: "device.ckt.splash".into(), text: circuit.into() }]
+        };
+        mail.push(Cmd::Propose { slot: "architecture".into(), label: "Block architecture".into(),
+            by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), set, ticket: Ticket(1) });
+        let sent = step(&mut engine, &mail);
+        let checked = run(&mut engine, &mail, sent);
+        let [(_, Outcome::Proposed { id, shown, checks: Some(c), requirements: Some(r) })] = checked.outcomes.as_slice()
+            else { panic!("verification must return both the block findings and the requirements verdict"); };
+        assert_eq!(c.counts.get(&(OpenPort, Warning)), Some(&1), "the unbound signal must remain a warning");
+        for kind in [RailBudget, VoltageDomain] {
+            assert_eq!(c.counts.get(&(kind.clone(), Error)).copied().unwrap_or(0), usize::from(!fixed),
+                "{kind:?} must follow the rail in the held candidate");
+        }
+        assert_eq!((r.fail,r.pass), (usize::from(!fixed),usize::from(fixed)), "ERC clean must follow the candidate's errors");
+        if !fixed {
+            mail.push(Cmd::Decide { id: *id, shown: *shown, accept: true, ticket: None });
+            let accepted = step(&mut engine, &mail);
+            assert!(accepted.rejected.is_empty(), "a person must be able to accept the reviewed design");
+            let text = fab_elec_host::edit_actions::check_list(&engine.snapshot(), &[("only".into(), "erc".into())]).unwrap();
+            for expected in ["VoltageDomain", "RailBudget", "OpenPort", "controller"] {
+                assert!(text.contains(expected), "the committed check list must name {expected}: {text}");
+            }
+            assert!(!text.contains("Block("), "the check list must use readable block paths: {text}");
+            let read = fab_elec_host::edit_actions::design_read(engine.design(), &[]).unwrap();
+            for expected in ["blocks: [", "planned: true", "Controller", "power_in", "VDD"] {
+                assert!(read.contains(expected), "design.read must expose {expected} for the accepted architecture");
+            }
+        }
+    }
+}
+
+#[test]
+fn held_board_proposal_judges_the_whole_brief_and_binds_its_verdict() {
+    use fab_elec_host::req_actions::{design_facts, report};
+    use fab_elec_req::Status;
+    let brief = r#"brief("Build a probe that fits the opening")
+require("fits the opening", board("probe").size, {max: [10mm 10mm]})
+require("probe routing", board("probe").unrouted, {max: 100})
+require("shared routing", board("shared").unrouted, {max: 100})
+require("shared checks", checks(@drc, {unit: "shared"}).errors, {max: 100})
+require("project DRC", checks(@drc).warnings, {max: 100})
+require("project ERC", checks(@erc).errors, {max: 100})
+require("fits the case", case("probe").fits)
+require("starts up", bench("power"))
+require("voltage", bench("power").expect("rail"))
+require("print time", print.time, {max: 3h})
+require("print mass", print.filament, {max: 40g})
+"#;
+    let layout = |name, edge| format!("board(\"{name}\")\noutline([[[0mm, 0mm], [{edge}mm, 0mm], [{edge}mm, {edge}mm], [0mm, {edge}mm], [0mm, 0mm]]])\n");
+    let mut sources = fab_elec_lang::Sources::new();
+    sources.add("probe.ckt.splash", PROBE_CIRCUIT).unwrap();
+    sources.add("shared.ckt.splash", PROBE_CIRCUIT).unwrap();
+    let board = sources.add("probe.pcb.splash", layout("probe", 8)).unwrap();
+    sources.add("shared.pcb.splash", layout("shared", 8) + "zone(\"GND\", [\"F.Cu\"], @board)\n").unwrap();
+    sources.add("targets.req.splash", brief).unwrap();
+    sources.add("waivers.req.splash", r#"waive("print mass", "prototype")"#).unwrap();
+    let (design, docs) = Docs::load(sources, fab_elec_lang::std_libs());
+    let mut engine = Engine::new_held(design, Arc::default(), Arc::default(), Arc::default(), "probe".into()).with_docs(docs);
+    let mail = Mailbox::default();
+    mail.push(Cmd::Propose { set: vec![DocSet::Replace { name: "probe.pcb.splash".into(),
+        base_rev: revision(&engine, board), text: layout("probe", 12).into() }],
+        slot: "layout".into(), label: "Wider board".into(), by: fab_elec_host::ProposalAuthor::Local(By::Person), ticket: Ticket(1) });
+    let started = step(&mut engine, &mail);
+    mail.result(started.evals[0].run());
+    let ready = step(&mut engine, &mail);
+    let [(Ticket(1), Outcome::Proposed { id, .. })] = ready.outcomes.as_slice() else { panic!("the board-only proposal verifies: {:?}", ready.rejected) };
+    let snap = engine.snapshot();
+    let req = snap.proposals[0].requirements.as_ref().expect("the proposal inherits the complete brief");
+    assert!(req.fail == 1 && req.failures[0].0 == "fits the opening" && req.failures[0].1.contains("12") && req.failures[0].1.contains("max 10"),
+        "the untouched size requirement names the candidate measurement and the bound it breaks");
+    let (live, _) = report(snap.docs.as_ref().unwrap(), &design_facts(&snap));
+    assert_eq!(live.row("fits the opening").unwrap().status, Status::Pass, "the committed board still fits the opening");
+    for name in ["fits the case", "starts up", "voltage", "print time"] {
+        assert!(req.unjudged.iter().any(|(n, reason)| n == name && reason == "not judged for a proposal"),
+            "{name} is unknown because its app producer has not judged the candidate");
+    }
+    assert_eq!(req.waived, 1, "the person's waiver in another candidate document still applies");
+    for name in ["shared routing", "shared checks", "project DRC"] {
+        assert!(req.unjudged.iter().any(|(n, reason)| n == name && reason.contains("pending")), "{name} depends on the outstanding copper work");
+    }
+    assert_eq!(req.pass, 2, "pending copper on the shared board allows current ERC and the probe's routing to pass");
+
+    let [fill] = started.fills.as_slice() else { panic!("only the shared board has a fill in flight") };
+    mail.result(fill.run());
+    let filled = step(&mut engine, &mail);
+    assert_eq!(engine.snapshot().proposals[0].requirements.as_ref(), Some(req), "a refill alone leaves whole-board checks unjudged");
+    let [check] = filled.checks.as_slice() else { panic!("the shared board now runs its whole-board check") };
+    mail.result(check.run());
+    step(&mut engine, &mail);
+    let settled = engine.snapshot();
+    let held = &settled.proposals[0];
+    let judged = held.requirements.as_ref().unwrap();
+    assert_eq!((judged.pass, judged.fail, judged.unknown, judged.waived), (5, 1, 4, 1),
+        "settled copper republishes the scoped and whole-project verdicts, keeping app measures unknown");
+
+    // Keep the same failing row and counts, changing only the bound in its explanation.
+    mail.push(change_doc(&engine, "targets.req.splash", brief.replace("10mm", "9mm")));
+    let edit = step(&mut engine, &mail);
+    run(&mut engine, &mail, edit);
+    let latest = engine.snapshot();
+    let shown = &latest.proposals[0];
+    assert_eq!(shown.checks, held.checks, "a requirement-only edit leaves the candidate check summary identical");
+    assert!(shown.shown == held.shown + 1 && shown.requirements.as_ref().unwrap().failures[0].1.contains("max 9"),
+        "a changed failure reason alone advances the decision revision");
+    mail.push(decision(*id, held.shown, true));
+    let obsolete = step(&mut engine, &mail);
+    assert!(matches!(obsolete.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("requirement results changed")),
+        "Accept on the old revision explains the changed requirements");
+    assert_eq!(engine.docs().unwrap().text(board).unwrap().as_ref(), layout("probe", 8), "the obsolete Accept leaves the committed board untouched");
+
+    let removal = |name: &str| Cmd::Propose { slot: "cleanup".into(), label: "Remove document".into(),
+        set: vec![DocSet::Remove { name: name.into(), base_rev: revision(&engine, engine.docs().unwrap().sources().find(name).unwrap()) }],
+        by: fab_elec_host::ProposalAuthor::Peer { label: "Partner".into() }, ticket: Ticket(2) };
+    let ordinary = removal("waivers.req.splash");
+    mail.push(removal("targets.req.splash"));
+    let refused = step(&mut engine, &mail);
+    assert!(matches!(refused.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("targets.req.splash:1: the brief is the person's own words")),
+        "removing the brief's whole document is refused at the original brief before a peer proposal is held");
+    mail.push(ordinary);
+    let held = step(&mut engine, &mail);
+    assert!(matches!(held.outcomes.as_slice(), [(_, Outcome::Proposed { .. })]),
+        "a peer can still propose removing a requirements document without a brief");
+}
+
+#[test]
+fn held_proposal_rechecks_dependencies_and_parks_the_press() {
+    let (mut engine, mail) = proposal_fixture();
+    let (id, shown, _) = propose_probe(&mut engine, &mail);
+    let first = engine.snapshot();
+    let initial = first.proposals[0].checks.clone().unwrap();
+    let extra = PROBE_BLOCK.replace("let r = e.r", "let parallel = e.r(o.r, p.top, p.gnd, {package: \"0402\"})\n        let r = e.r");
+    mail.push(change_doc(&engine, "load.blocks.splash", extra));
+    let changed = step(&mut engine, &mail);
+    assert_eq!(changed.evals.len(), 1, "the committed block evaluates first");
+    let waiting_clock = engine.snapshot().proposals[0].run.clone();
+    mail.push(decision(id, shown - 1, false));
+    let obsolete = step(&mut engine, &mail);
+    assert!(matches!(obsolete.outcomes.as_slice(), [(_, Outcome::Refused(_))])
+        && waiting_clock.started().is_none() && Arc::ptr_eq(&waiting_clock, &engine.snapshot().proposals[0].run),
+        "republishing while the committed block evaluates preserves the waiting clock");
+    mail.result(changed.evals[0].run());
+    let recheck = step(&mut engine, &mail);
+    assert_eq!(recheck.evals.len(), 1, "the candidate verifies against the new block");
+    let snap = engine.snapshot();
+    let checking = &snap.proposals[0];
+    assert!(checking.design.is_none() && checking.boards.is_empty() && checking.sheets.is_empty(), "a recheck clears the previous candidate geometry");
+    let clock = checking.run.clone();
+    assert!(first.proposals[0].run.started().is_some() && !Arc::ptr_eq(&clock, &first.proposals[0].run)
+        && clock.started().is_none(), "a queued re-verification has its own unstarted clock");
+    mail.push(decision(id, shown, true));
+    let parked = step(&mut engine, &mail);
+    assert!(parked.outcomes.is_empty() && parked.evals.is_empty(), "a press during re-verification waits for the existing job");
+    mail.result(recheck.evals[0].run());
+    let refused = step(&mut engine, &mail);
+    let snap = engine.snapshot();
+    let current = &snap.proposals[0];
+    assert!(clock.started().is_some() && Arc::ptr_eq(&current.run, &clock), "publishing checks preserves that verification's clock");
+    assert_ne!(current.checks.as_ref().unwrap().counts, initial.counts, "the block's second resistor changes the candidate ERC");
+    assert_eq!(current.shown, shown + 1, "changed checks advance the shown revision once");
+    assert!(matches!(refused.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("SinglePinNet")),
+        "the parked press is refused with the changed check");
+    assert!(engine.docs().unwrap().sources().find("brief.req.splash").is_none(), "the obsolete press applies nothing");
+    mail.push(decision(id, current.shown, true));
+    let accepted = step(&mut engine, &mail);
+    assert!(accepted.evals.is_empty() && accepted.rejected.is_empty(), "accepting the new checks adopts directly");
+    let docs = engine.docs().unwrap();
+    let fresh = evaluate(docs.sources(), docs.libs()).unwrap();
+    let expected = Design { generation: engine.design().generation, ..fresh.design };
+    assert_eq!(engine.design().as_ref(), &expected, "the committed design equals a fresh evaluation at the same generation");
+
+    mail.push(Cmd::Undo);
+    let undo = step(&mut engine, &mail);
+    run(&mut engine, &mail, undo);
+    let (id, shown, _) = propose_probe(&mut engine, &mail);
+    mail.push(Cmd::Docs { set: vec![DocSet::Add { name: "other.req.splash".into(), text: "// other brief".into() }],
+        label: "Other requirements".into(), by: By::Person, ticket: None });
+    let changed = step(&mut engine, &mail);
+    run(&mut engine, &mail, changed);
+    assert_eq!(engine.snapshot().proposals[0].shown, shown, "an unrelated document keeps the shown revision");
+    mail.push(decision(id, shown, true));
+    assert!(step(&mut engine, &mail).rejected.is_empty(), "the same press accepts after an unrelated change");
+
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "brief.req.splash").unwrap();
+    mail.push(Cmd::Propose { slot: "requirements".into(), label: "Another requirement".into(), by: fab_elec_host::ProposalAuthor::Local(By::Person),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: "// deferred requirement".into() }], ticket: Ticket(3) });
+    let started = step(&mut engine, &mail);
+    run(&mut engine, &mail, started);
+    let waiting = engine.snapshot().proposals[0].id;
+    let unit = &engine.design().units[0];
+    let ends = unit.circuit.nets.iter().take(2).map(|n| End::Net(n.id)).collect();
+    mail.preview(Sample { seq: 1, tag: 9, place: vec![], label: "resistor".into(), by: By::Person, proposal: None, notes: vec![],
+        circuits: vec![], expect: None, ops: vec![DesignOp::Circuit { unit: unit.id, op: CircuitOp::AddPart {
+            stmt: "let r = e.r(1kohm, _n0, _n1, {package: \"0402\"})".into(), after: None, ends, hint: None } }] });
+    let gesture = step(&mut engine, &mail);
+    run(&mut engine, &mail, gesture);
+    assert!(engine.snapshot().preview.is_some(), "the gesture gets a live preview alongside the held proposal");
+    mail.push(Cmd::CommitPreview { seq: 1, tag: 9 });
+    let gesture = step(&mut engine, &mail);
+    run(&mut engine, &mail, gesture);
+    let snap = engine.snapshot();
+    assert!(snap.preview.is_none() && snap.proposals[0].id == waiting && snap.proposals[0].design.is_some(),
+        "committing the gesture leaves the independent proposal ready on its new base");
+
+    // Only the proposed circuit uses draft_load. Losing its definition keeps the committed
+    // project valid but introduces a mistake into the held proposal.
+    let block_text = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "load.blocks.splash").unwrap().text.clone();
+    mail.push(change_doc(&engine, "load.blocks.splash", format!("{block_text}\nlet draft_load = load\n")));
+    let block = step(&mut engine, &mail);
+    run(&mut engine, &mail, block);
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "probe.ckt.splash").unwrap();
+    mail.push(Cmd::Propose { slot: "draft".into(), label: "Draft block".into(), by: fab_elec_host::ProposalAuthor::Local(By::Person),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: doc.text.replace("= load(", "= draft_load(").into() }],
+        ticket: Ticket(4) });
+    let draft = step(&mut engine, &mail);
+    run(&mut engine, &mail, draft);
+    assert_eq!(engine.snapshot().proposals.len(), 2, "distinct slots keep independent verified candidates");
+    mail.push(change_doc(&engine, "load.blocks.splash", block_text.to_string()));
+    let block = step(&mut engine, &mail);
+    run(&mut engine, &mail, block);
+    let snap = engine.snapshot();
+    assert!(matches!(&snap.proposals[1].state, fab_elec_host::ProposalState::Refused(reason) if reason.contains("draft_load")),
+        "a mistake introduced only on re-verification leaves the refusal and its diagnostic on the row");
+    let refused = &snap.proposals[1];
+    assert!(refused.design.is_none() && refused.boards.is_empty() && refused.sheets.is_empty(), "a refused proposal has no drawable data");
+    assert!(snap.proposals[0].design.is_some(), "failure of one slot leaves the other ready");
+    mail.push(Cmd::Undo);
+    let undo = step(&mut engine, &mail);
+    run(&mut engine, &mail, undo);
+    assert!(Arc::ptr_eq(&snap.proposals[1], &engine.snapshot().proposals[1]),
+        "restoring the dependency leaves the refused proposal untouched");
+    mail.push(Cmd::Propose { slot: "draft".into(), label: "Replacement".into(), set: vec![DocSet::Add {
+        name: "replacement.req.splash".into(), text: "// next draft".into() }],
+        by: fab_elec_host::ProposalAuthor::Local(By::Person), ticket: Ticket(5) });
+    let replaced = step(&mut engine, &mail);
+    let newest = engine.snapshot();
+    assert!(newest.proposals.len() == 2 && newest.proposals[1].id != snap.proposals[1].id
+        && newest.proposals[1].state == fab_elec_host::ProposalState::Checking,
+        "a new proposal replaces the refused row in the same slot on arrival");
+    assert!(matches!(run(&mut engine, &mail, replaced).outcomes.as_slice(), [(Ticket(5), Outcome::Proposed { .. })]),
+        "the replacement ticket receives its own verification result");
+}
+
+#[test]
+fn held_proposal_requires_a_local_press_to_check_peer_text() {
+    use fab_elec_host::{ProposalAuthor, ProposalState};
+    let (engine, mail) = proposal_fixture();
+    let (mut engine, journal) = record_decisions(engine);
+    for name in ["elec.step.accept", "elec.step.decline", "elec.step.check"] {
+        assert!(fab_elec_design::action::find(name).is_none(), "a tool cannot invoke the decision {name}");
+    }
+    let ai = ProposalAuthor::Local(By::Ai { turn: 3, call: 1 });
+    for (name, text, reason) in [("waive.req.splash", "waive(\"test\", \"because\")", "only the person waives"),
+        ("program.fw.splash", "", "firmware")] {
+        mail.push(Cmd::Propose { set: vec![DocSet::Add { name: name.into(), text: text.into() }],
+            slot: "stage".into(), label: "Stage".into(), by: ai.clone(), ticket: Ticket(4) });
+        let result = step(&mut engine, &mail);
+        assert!(matches!(result.outcomes.as_slice(), [(Ticket(4), Outcome::Refused(r))] if r.text.contains(reason)),
+            "proposing {name} returns the specific refusal");
+        assert!(result.evals.is_empty() && engine.snapshot().proposals.is_empty() && engine.log().entries.is_empty(),
+            "a planning refusal starts no job, shows no proposal and logs no edit");
+    }
+
+    let name = "lost.pcb.splash";
+    mail.push(Cmd::Propose { set: vec![DocSet::Add { name: name.into(), text: "".into() }],
+        slot: "stage".into(), label: "Stage".into(), by: ai, ticket: Ticket(4) });
+    let mut published = None;
+    let arrival = engine.step(mail.take(), &mut |s| published = Some(s));
+    let snap = published.expect("arrival publishes the planned text before verification");
+    let [local] = snap.proposals.as_slice() else { panic!("arrival shows exactly one planned proposal") };
+    assert!(local.state == ProposalState::Checking && local.checks.is_none() && local.design.is_none(),
+        "a local arrival shows its checking state before checks or a design exist");
+    assert!(matches!(local.docs.as_slice(), [doc] if doc.name == name && doc.before.is_none() && doc.after.as_deref() == Some("")),
+        "the arrival carries the exact planned document");
+    assert!(arrival.evals.len() == 1 && arrival.outcomes.is_empty() && local.run.started().is_none(),
+        "a queued job has neither a start time nor a verification outcome");
+    let last_eval = arrival.evals[0].id;
+    let done = arrival.evals[0].run();
+    assert!(local.run.started().is_some(), "the pool starts the published clock before its result is delivered");
+    mail.result(done);
+    let result = step(&mut engine, &mail);
+    let failed = engine.snapshot();
+    let reason = match &result.outcomes[..] {
+        [(Ticket(4), Outcome::Refused(r))] if r.text.contains(name) => &r.text,
+        _ => panic!("the proposer's ticket receives the specific verification refusal"),
+    };
+    assert!(matches!(&failed.proposals[..], [v] if v.id == local.id && v.state == ProposalState::Refused(reason.to_string())
+        && v.design.is_none() && v.checks.is_none() && Arc::ptr_eq(&v.docs, &local.docs)), "a refusal keeps the text and ticket reason on the row");
+    mail.push(decision(local.id, local.shown, true));
+    assert!(matches!(step(&mut engine, &mail).outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text == "this proposal is not usable"),
+        "accepting a refused proposal explains why it cannot be used");
+    mail.push(decision(local.id, local.shown, false));
+    assert!(matches!(step(&mut engine, &mail).outcomes.as_slice(), [(_, Outcome::Declined { id })] if *id == local.id)
+        && engine.snapshot().proposals.is_empty() && engine.log().entries.is_empty(), "dismiss ends the refused row without an edit");
+
+    let peer = ProposalAuthor::Peer { label: "Design partner".into() };
+    mail.push(Cmd::Propose { set: vec![DocSet::Add { name: "waive.req.splash".into(), text: "waive(\"test\", \"because\")".into() }],
+        slot: "stage".into(), label: "Stage".into(), by: peer.clone(), ticket: Ticket(4) });
+    let waived = step(&mut engine, &mail);
+    assert!(matches!(waived.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("only the person waives")),
+        "a peer's text may propose a waiver but never grant one");
+    assert!(waived.evals.is_empty() && engine.snapshot().proposals.is_empty(), "a peer's refused waiver starts no evaluation and is never shown");
+    mail.push(Cmd::Propose { slot: "stage".into(), set: proposed_changes(&engine), label: "Probe".into(), by: peer.clone(), ticket: Ticket(4) });
+    let held = step(&mut engine, &mail);
+    let [(Ticket(4), Outcome::Proposed { id, shown, checks: None, requirements: None })] = held.outcomes.as_slice()
+        else { panic!("the peer proposal answers immediately with no checks") };
+    let (id, shown) = (*id, *shown);
+    let snap = engine.snapshot();
+    let v = &snap.proposals[0];
+    assert!(held.evals.is_empty() && v.by == peer && v.state == ProposalState::Unchecked, "receiving peer text starts no evaluation");
+    assert!(v.design.is_none() && v.checks.is_none() && v.docs.len() == 2, "only the peer's document diffs are available");
+    mail.push(decision(id, shown, true));
+    let refused = step(&mut engine, &mail);
+    assert!(matches!(refused.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("check it first")),
+        "the person must check a peer proposal before accepting");
+    assert!(refused.evals.is_empty() && engine.log().entries.is_empty(), "an unchecked accept starts no work and applies nothing");
+    mail.push(Cmd::CheckProposal { id, ticket: None });
+    let check = step(&mut engine, &mail);
+    assert_eq!(check.evals.len(), 1, "the person's check press starts the first evaluation of the peer's text");
+    assert_eq!(check.evals[0].id, last_eval + 1, "the unchecked proposal and its refused accept left the evaluation counter unchanged");
+    mail.push(decision(id, shown, true));
+    let parked = step(&mut engine, &mail);
+    assert!(parked.outcomes.is_empty(), "a press while checking waits for the first peer verification");
+    mail.result(check.evals[0].run());
+    let first = step(&mut engine, &mail);
+    assert!(matches!(first.outcomes.as_slice(), [(_, Outcome::Refused(r))] if r.text.contains("first verified checks")),
+        "a press on unchecked text cannot accept the newly shown checks");
+    let checked = engine.snapshot();
+    let v = &checked.proposals[0];
+    assert!(v.state == ProposalState::Ready && v.design.is_some() && v.checks.is_some(), "the checked peer candidate is ready");
+    assert!(journal.try_recv().is_err(), "checking peer text and refusing the parked press bind no journal call");
+    mail.push(decision(id, v.shown, true));
+    let accepted = step(&mut engine, &mail);
+    assert!(accepted.rejected.is_empty() && engine.log().entries.len() == 1, "the checked peer proposal installs one entry");
+    assert_eq!(engine.log().entries[0].by, By::Person, "the person owns the locally accepted peer edit");
+    assert_eq!(journal.try_iter().collect::<Vec<_>>(), [
+        JournalNotice::Decision(Ticket(2), "elec.step.accept".into(), vec![("proposal".into(), id.0.to_string()),
+            ("slot".into(), "stage".into()), ("label".into(), "Probe".into()), ("author".into(), "peer".into()),
+            ("peer".into(), "Design partner".into())]),
+        JournalNotice::Effect(Some(Ticket(2)), By::Person), JournalNotice::Done(Ok(engine.log().entries[0].seq)),
+    ], "the decision names the peer and its linked effect belongs to the person who accepted");
+}
+
+#[test]
+fn document_set_plans_verify_before_install() {
+    use fab_elec_lang::{docs_verified, NO_CANCEL};
+
+    let mut before = fab_elec_lang::Sources::new();
+    let probe = before.add("probe.ckt.splash", PROBE_CIRCUIT).expect("the probe fixture is a circuit document");
+    let prev = evaluate(&before, &fab_elec_lang::std_libs()).expect("the one-resistor probe evaluates");
+    let (_, mut docs) = Docs::from_evaluated(before.clone(), prev.clone());
+    let view = docs.view().clone();
+    let circuit = &view.texts[0];
+    let replacement: Arc<str> = PROBE_CIRCUIT.replace("1kohm", "2kohm").into();
+    let requirement: Arc<str> = "require(\"two layers\", board(\"probe\").layers, {max: 2})\n".into();
+    let changes = |name: &str, text| [
+        DocSet::Add { name: name.into(), text },
+        DocSet::Replace { name: circuit.name.clone(), base_rev: circuit.rev, text: replacement.clone() },
+    ];
+    let set = changes("brief.req.splash", requirement.clone());
+    let revision = docs.revision();
+    let (planned, edit) = docs.plan_set(&set).expect("the document changes plan together");
+    assert_eq!(docs.sources(), &before, "planning preserves the installed documents and their texts");
+    assert_eq!(docs.revision(), revision, "planning preserves the document revisions");
+    assert_eq!(docs.view().texts, view.texts, "planning preserves each published text and revision");
+    let added = planned.find("brief.req.splash").expect("the new requirements document is present in the plan");
+    assert_eq!(planned.doc(added).unwrap().text, requirement, "the plan contains the full requirements text");
+    assert_eq!(planned.doc(probe).unwrap().text, replacement, "the plan contains the replaced circuit text");
+    let verified = docs_verified(planned, &prev.libs, &prev, edit, &NO_CANCEL)
+        .expect("the valid document set verifies");
+
+    // An unmatched board produces a project error note located only in the new document.
+    let unmatched = "unmatched.pcb.splash";
+    let invalid_set = changes(unmatched, "board(\"unmatched\")\n".into());
+    let (invalid, edit) = docs.plan_set(&invalid_set).expect("the unmatched board can be planned");
+    let board = invalid.find(unmatched).expect("the invalid plan includes the new board");
+    let error = docs_verified(invalid, &prev.libs, &prev, edit, &NO_CANCEL)
+        .expect_err("a new error in a created document refuses the plan");
+    assert!(error.diags().iter().any(|d| d.message.contains(unmatched)
+        && d.sel.iter().any(|s| matches!(s, Sel::Source { doc, .. } if *doc == board))),
+        "the refusal names and locates the created board: {error:?}");
+
+    docs.doc_set(&set).expect("the valid document set installs");
+    assert_eq!(docs.sources(), &verified.sources, "installation preserves every planned document and its exact bytes");
+}
+
 #[test]
 fn whole_documents_from_other_writers_are_atomic_and_undoable() {
     let (mut engine, mailbox, ..) = setup();
@@ -112,14 +883,7 @@ fn whole_documents_from_other_writers_are_atomic_and_undoable() {
         engine.docs().expect("documents remain").view().texts.iter()
             .find(|text| text.doc == doc).expect("the present document has a revision").rev
     };
-    // The probe fixture's power nets and resistor, reduced to one component.
-    let circuit: Arc<str> = r#"use mod.elec.*
-use mod.std.*
-let e = mod.elec
-let gnd = e.net({name: "GND" kind: @ground})
-let v33 = e.net({name: "3V3" kind: @power volts: 3.3V})
-let r = e.r(1kohm, v33, gnd, {package: "0402"})
-"#.into();
+    let circuit: Arc<str> = PROBE_CIRCUIT.into();
     let layout: Arc<str> = "board(\"probe\")\noutline([[[0mm, 0mm], [10mm, 0mm], [10mm, 10mm], [0mm, 10mm], [0mm, 0mm]]])\n".into();
     // Revisions count from the load's first one (each load starts above every earlier one).
     let first = rev(&engine, controller);
@@ -642,6 +1406,7 @@ fn ai_calls_in_a_burst_each_commit_and_answer_with_their_author_and_sites() {
         }
         Outcome::Refused(refusal) => (ticket.0, Err(refusal.text.clone())),
         Outcome::Previewed { .. } => (ticket.0, Err("previewed".into())),
+        Outcome::Proposed { .. } | Outcome::Declined { .. } => panic!("direct edits never return proposal decisions"),
     }).collect();
     assert_eq!(answered, vec![
         (1, Ok(("boot_r to 4.7k".into(), By::Ai { turn: 0, call: 1 }))),
@@ -2452,4 +3217,142 @@ fn body_set_switches_a_parts_body_as_its_card_does_in_one_undo_step() {
         run(&mut engine, &mailbox, undone);
     }
     assert_eq!((models_text(&engine), boot(&engine)), (None, original), "two undos take the document and the overrides back");
+}
+
+#[test]
+fn brief_ledctl_flows_through_proposals_place_and_route_to_met_requirements() {
+    use fab_elec_bom::shortlist::{sourcing_of_part, ShortlistContext};
+    use fab_elec_core::{Contour, Severity};
+    use fab_elec_fixtures::brief_ledctl as fixture;
+    use fab_elec_host::{edit_actions, req_actions, sheet_actions, ProposalAuthor, ProposalState};
+    use fab_elec_route::{route_channel, RouteEvent, RouteRequest, RouteWorker, Spawn};
+    use fab_elec_view::flow::{initial_outline_mm, next_step, FlowStage};
+
+    // One router for both commands, with its pool jobs run synchronously. Only final offers
+    // advance the engine, as on the Board tab; partials and wall-clock cadence are immaterial.
+    struct Inline;
+    impl Spawn for Inline {
+        fn spawn(&self, work: Box<dyn FnOnce() + Send>) { work(); }
+    }
+    let began = std::time::Instant::now();
+    let mut sources = fab_elec_lang::Sources::new();
+    let req_name = fixture::REQUIREMENTS[0].0;
+    let req_id = sources.add(req_name, fixture::BRIEF).unwrap();
+    let (design, docs) = Docs::load(sources, fab_elec_lang::std_libs());
+    edit_actions::register_actions();
+    let mut engine = Engine::new(design, Arc::default(), Arc::default(), Arc::default(), "brief".into())
+        .with_docs(docs).with_app_tools();
+    let mail = Mailbox::default();
+    let book = fab_elec_bom::prices::Library::from_text(fixture::PRICES).expect("the offline fixture price book must read");
+    for (slot, files) in [("requirements", fixture::REQUIREMENTS), ("architecture", fixture::ARCHITECTURE),
+        ("parts", fixture::PARTS), ("schematic", fixture::SCHEMATIC)] {
+        let snap = engine.snapshot();
+        if slot == "parts" {
+            let ctx = ShortlistContext { pinned: &[], used_parts: &Default::default(), imported_ids: &Default::default() };
+            let lists = sheet_actions::parts_shortlist(&snap.design, snap.catalog.as_ref().unwrap(), &[], &ctx, &book.prices, &[]).unwrap();
+            for block in ["usb", "reg", "control", "indicators", "mode"] {
+                assert!(lists.contains(&format!("block: \"{block}\"")), "the offline shortlist must cover planned block {block}");
+            }
+        }
+        let set = files.iter().map(|&(name, text)| {
+            match snap.docs.as_ref().unwrap().texts.iter().find(|d| d.name == name) {
+                Some(d) => DocSet::Replace { name: name.into(), base_rev: d.rev, text: text.into() },
+                None => DocSet::Add { name: name.into(), text: text.into() },
+            }
+        }).collect();
+        let by = if slot == "parts" { By::Person } else { By::Ai { turn: 1, call: 1 } };
+        let history = engine.log().entries.len();
+        mail.push(Cmd::Propose { slot: slot.into(), label: slot.into(), set, by: ProposalAuthor::Local(by), ticket: Ticket(1) });
+        let start = step(&mut engine, &mail);
+        run(&mut engine, &mail, start);
+        let view = engine.snapshot().proposals[0].clone();
+        assert_eq!(view.state, ProposalState::Ready, "{slot} proposal must be ready");
+        assert_eq!(engine.log().entries.len(), history, "{slot} must wait for a person's decision");
+        if slot == "architecture" || slot == "schematic" {
+            let erc: Vec<_> = view.checks.as_ref().unwrap().findings.iter().filter(|f| f.family == "erc").collect();
+            assert!(erc.iter().all(|v| v.severity != Severity::Error) && (slot != "architecture" || erc.is_empty()),
+                "{slot} candidate ERC: {erc:#?}");
+        }
+        mail.push(decision(view.id, view.shown, true));
+        let accepted = step(&mut engine, &mail);
+        assert!(accepted.rejected.is_empty() && engine.log().entries.len() == history + 1, "accepting {slot} must make one undo step: {:?}", accepted.rejected);
+    }
+
+    let snap = engine.snapshot();
+    let docs = snap.docs.as_ref().unwrap();
+    let unit = &snap.design.units[0];
+    let (report, _) = req_actions::report(docs, &req_actions::design_facts(&snap));
+    assert_eq!(report.row("ERC clean").unwrap().status, fab_elec_req::Status::Pass, "the filled schematic must meet ERC clean");
+    assert_eq!(next_step(&snap, Some(&report), Some("schematic")).unwrap().stage, FlowStage::Place, "accepting the filled schematic must offer placement");
+    for comp in &unit.circuit.comps {
+        let (primary, alternates) = sourcing_of_part(&comp.part);
+        assert!(comp.part.approved && comp.part.lifecycle == Some(fab_elec_parts::Lifecycle::Active) && comp.part.footprint.is_some()
+            && book.prices.resolve(&primary).is_some() && !alternates.is_empty(), "{} needs a priced approved active pick with an alternate and a footprint", comp.path);
+    }
+    let pcb = format!("{}.pcb.splash", unit.name);
+    assert!(!docs.texts.iter().any(|d| d.name == pcb), "the schematic must reach Place without a layout document");
+    let (req, diags) = fab_elec_req::read(req_id, fixture::REQUIREMENTS[0].1);
+    assert!(diags.is_empty(), "the accepted targets must read: {diags:?}");
+    let (w,h) = initial_outline_mm(unit, &[req], true);
+    assert_eq!((w,h), (50.0,30.0), "the brief's size bound must determine the initial outline");
+    let mut layout = unit.clone();
+    Arc::make_mut(layout.board.as_mut().unwrap()).apply(&BoardOp::SetOutline(vec![Contour::rect(P::ZERO, P::mm(w,h), 0)])).unwrap();
+    let history = engine.log().entries.len();
+    mail.push(Cmd::Docs { set: vec![DocSet::Add { name: pcb.clone(), text: board_doc::write_unit(&layout).into() }],
+        label: format!("Add {pcb}"), by: By::Person, ticket: Some(Ticket(2)) });
+    let sent = step(&mut engine, &mail);
+    assert!(matches!(&sent.outcomes[..], [(_, Outcome::Done { by: By::Person, .. })]) && engine.log().entries.len() == history + 1,
+        "creating the outlined board must be one person's commit: {:?}", sent.rejected);
+    run(&mut engine, &mail, sent);
+
+    std::thread::scope(|scope| {
+        let (wake, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || { let _ = wake.send(()); });
+        scope.spawn(move || RouteWorker::new(inbox, Arc::new(Inline)).run());
+        for (seq, tool) in [(1, "elec.place"), (2, "elec.route")] {
+            let args = if tool == "elec.place" { tool_args([("mode", "place")]) } else { vec![] };
+            mail.push(Cmd::Invoke { tool: tool.into(), args, by: By::Person, preview: false, ticket: Ticket(3) });
+            let sent = step(&mut engine, &mail);
+            let [start] = sent.routes.as_slice() else { panic!("{tool} must start on the current board: {:?}", sent.rejected) };
+            handle.request(RouteRequest::Base(start.base.clone())).unwrap();
+            handle.request(start.job.request()).unwrap();
+            let answer = 'offers: loop {
+                wakes.recv().expect("the router must publish its completion");
+                while let Some(event) = handle.try_recv() {
+                    match event {
+                        RouteEvent::Proposal(p) if p.last => break 'offers p,
+                        RouteEvent::Refused(r) => panic!("{tool} refused: {r:?}"),
+                        _ => {}
+                    }
+                }
+            };
+            let unit = &engine.design().units[0];
+            if let Some(place) = &answer.metrics.place {
+                let outside: Vec<_> = place.no_room.iter().map(|id| &unit.circuit.comps[id.ix()].path).collect();
+                assert!(outside.is_empty(), "Place left parts outside the board: {outside:?}");
+            }
+            let sample = fab_elec_host::job_sample(Arc::new(answer), By::Person, seq).unwrap();
+            let tag = sample.tag;
+            mail.preview(sample);
+            mail.push(Cmd::CommitPreview { seq, tag });
+            let done = step(&mut engine, &mail);
+            assert!(done.rejected.is_empty(), "{tool} must commit its final offer: {:?}", done.rejected);
+        }
+    });
+
+    let snap = engine.snapshot();
+    let unit = &snap.design.units[0];
+    let board = unit.board.as_ref().unwrap();
+    let facts = req_actions::design_facts(&snap);
+    let (report, _) = req_actions::report(snap.docs.as_ref().unwrap(), &facts);
+    let measured = facts.units[0].board.as_ref().unwrap();
+    let open: Vec<_> = snap.of(&snap.conn, unit.id).unwrap().value.unrouted.iter().map(|net| &board.nets[net.ix()].name).collect();
+    let errors: Vec<_> = snap.violations.value.iter().filter(|v| v.severity == Severity::Error).collect();
+    eprintln!("brief_ledctl: {w} x {h} mm, {} placed components, {} nets, {} unplaced, {} unrouted, {} errors, {:?}",
+        board.placed.len(), board.nets.len(), measured.unplaced, open.len(), errors.len(), began.elapsed());
+    assert_eq!(report.row("fully routed").unwrap().value.as_deref(), Some(open.len().to_string().as_str()), "the Board pane and board.unrouted must agree");
+    assert!(open.is_empty() && errors.is_empty(), "unrouted nets: {open:?}; board and circuit findings: {errors:#?}");
+    let outline = board.outline_bbox();
+    assert_eq!((measured.unplaced, outline.width(), outline.height(), measured.layers), (0, i64::from(mm(50.0)), i64::from(mm(30.0)), 2), "all components must fit the derived two-layer board");
+    assert!(report.met(), "every measured target must pass: {:?}", report.rows);
 }

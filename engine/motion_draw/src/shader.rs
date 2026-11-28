@@ -116,16 +116,22 @@ pub struct DrawMotionShader {
 const INLINE_SCOPE_FILE: &str = "motion://shader_scope";
 const INLINE_PRELUDE: &str = "use mod.std.*\nuse mod.pod.*\nuse mod.math.*\nuse mod.shader.*\nuse mod.draw\nuse mod.shared.*\n";
 
+fn allow_inline_shader() -> Result<(), String> {
+    if super::PLAIN_RECORDING.get() {
+        Err("a shader cannot be compiled while drawing a picture read as data".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// Compile an inline Shader layer's `pixel: fn() {…}` (the document's
 /// function, its `helpers` and its params' names) the way `MotionDraw`
 /// does: `Err` carries the compiler's message. For a publish check (lane
 /// A1) or an editor; needs the widgets' and motion's script modules
 /// registered (`makepad_motion_draw::script_mod`).
 pub fn compile_shader(cx: &mut Cx, source: &PassFn, helpers: &[(String, PassFn)], params: &[String]) -> Result<(), String> {
-    match compile_inline(cx, source, helpers, params, None).1 {
-        None => Ok(()),
-        Some(error) => Err(error),
-    }
+    allow_inline_shader()?;
+    compile_inline(cx, source, helpers, params, None).map(|_| ())
 }
 
 /// The layer's shader as an object of this VM: a `DrawMotionShaderBase`
@@ -133,6 +139,7 @@ pub fn compile_shader(cx: &mut Cx, source: &PassFn, helpers: &[(String, PassFn)]
 /// are its `helpers` (both moved here by their tokens), with one instance
 /// input per param. No shader text is written.
 pub fn inline_shader_object(vm: &mut ScriptVm, source: &PassFn, helpers: &[(String, PassFn)], names: &[String]) -> Result<ScriptObject, String> {
+    allow_inline_shader()?;
     if makepad_script_compute::module::register_shared_std(vm) {
         makepad_tween_script::install_ease(vm);
     }
@@ -182,7 +189,8 @@ fn adopted_file(f: &PassFn) -> String {
     format!("adopted://{:016x}", f.image.hash())
 }
 
-fn compile_inline(cx: &mut Cx, source: &PassFn, helpers: &[(String, PassFn)], names: &[String], origin: Option<&(String, Loc)>) -> (DrawMotionShader, Option<String>) {
+fn compile_inline(cx: &mut Cx, source: &PassFn, helpers: &[(String, PassFn)], names: &[String], origin: Option<&(String, Loc)>) -> Result<DrawMotionShader, String> {
+    allow_inline_shader()?;
     // Edit mode: the pixel function's rows are the document's own, from
     // `origin` on, so its literals compile as slots an editor patches by
     // where they are written (the helpers stay folded).
@@ -194,21 +202,15 @@ fn compile_inline(cx: &mut Cx, source: &PassFn, helpers: &[(String, PassFn)], na
         cx.set_literal_source(&adopted_file(source), origins);
     }
     let mut draw = cx.with_vm(|vm| DrawMotionShader::script_new_with_default(vm));
-    let result = cx.with_vm(|vm| {
+    cx.with_vm(|vm| {
         let shader = inline_shader_object(vm, source, helpers, names)?;
         draw.script_apply(vm, &Apply::Eval, &mut Scope::default(), shader.into());
         Ok::<(), String>(())
-    });
-    let error = match result {
-        Err(error) => Some(error),
-        Ok(()) => makepad_widgets::makepad_platform::shader_error::take(),
-    };
-    (draw, error)
-}
-
-struct Compiled {
-    draw: DrawMotionShader,
-    error: Option<String>,
+    })?;
+    match makepad_widgets::makepad_platform::shader_error::take() {
+        Some(error) => Err(error),
+        None => Ok(draw),
+    }
 }
 
 /// The install half of a prepared effect, kept while its build runs.
@@ -224,7 +226,7 @@ enum Effect {
 
 #[derive(Default)]
 pub(crate) struct Shaders {
-    compiled: HashMap<u64, Compiled>,
+    compiled: HashMap<u64, Result<DrawMotionShader, String>>,
     /// KineticText layers on kinetic kits.
     pub(crate) kinetic: kinetic::Kinetics,
     effects: HashMap<String, Effect>,
@@ -283,7 +285,7 @@ impl Shaders {
             }
         }
         for compiled in self.compiled.values() {
-            if let Some(error) = &compiled.error {
+            if let Err(error) = compiled {
                 if !out.contains(error) {
                     out.push(error.clone());
                 }
@@ -326,7 +328,7 @@ impl Shaders {
     /// (see `kit_effect`); with no pack a preset or library effect is a
     /// problem to report, once.
     fn start(&mut self, cx: &mut Cx, item: &Item) {
-        if self.effects.contains_key(&item.path) {
+        if super::PLAIN_RECORDING.get() || self.effects.contains_key(&item.path) {
             return;
         }
         let ItemKind::Shader { program, .. } = &item.kind else { return };
@@ -389,10 +391,14 @@ impl Shaders {
         }
     }
 
+    pub(super) fn has_source(&self, asset: &AssetRef) -> bool {
+        self.sources.contains_key(asset)
+    }
+
     /// Whether `item`'s effect still needs its library source.
     pub fn needs_source(&self, item: &Item) -> Option<AssetRef> {
         match &item.kind {
-            ItemKind::Shader { program: ShaderProgram::Effect(asset), .. } if !self.sources.contains_key(asset) => Some(asset.clone()),
+            ItemKind::Shader { program: ShaderProgram::Effect(asset), .. } if !self.has_source(asset) => Some(asset.clone()),
             _ => None,
         }
     }
@@ -445,6 +451,10 @@ impl MotionDraw {
     /// Compile (once) and draw an inline shader over its box.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn inline_shader(&mut self, cx: &mut Cx2d, item: &Item, m: &Affine, size: [f64; 2], px: [f64; 2], below: &Texture, opacity: f64) {
+        if self.refuse_plain_item(item) {
+            self.plain_tile(cx, item);
+            return;
+        }
         let ItemKind::Shader { program: ShaderProgram::Inline { source, helpers, origin, .. }, params, local_time, beat, data, .. } = &item.kind else { return };
         let names: Vec<String> = params.iter().map(|(name, _)| name.clone()).collect();
         let mut key = LiveId(source.image.hash()).bytes_append(names.join(",").as_bytes());
@@ -459,22 +469,17 @@ impl MotionDraw {
         }
         let key = key.0;
         if !self.shaders.compiled.contains_key(&key) {
-            let (draw, error) = compile_inline(cx, source, helpers, &names, origin.as_ref());
-            let error = error.map(|e| format!("{}: pixel: {e}", item.path));
-            self.shaders.compiled.insert(key, Compiled { draw, error });
+            let compiled = compile_inline(cx, source, helpers, &names, origin.as_ref())
+                .map_err(|error| format!("{}: pixel: {error}", item.path));
+            self.shaders.compiled.insert(key, compiled);
         }
         self.note_kind(&format!("inline {key:016x}"));
-        let compiled = self.shaders.compiled.get_mut(&key).unwrap();
-        if compiled.error.is_some() {
-            return;
-        }
+        let Ok(d) = self.shaders.compiled.get_mut(&key).unwrap() else { return };
         // The layer's `data` (uploaded once per list), or the empty one.
         let data = match data {
             Some(list) => &self.shaders.data.entry(Arc::as_ptr(&list.0) as *const f32 as usize).or_insert_with(|| (list.0.clone(), data_texture(cx.cx, &list.0))).1,
             None => self.shaders.no_data.get_or_insert_with(|| data_texture(cx.cx, &[])),
         };
-        let compiled = self.shaders.compiled.get_mut(&key).unwrap();
-        let d = &mut compiled.draw;
         d.draw_vars.set_texture(0, below);
         d.draw_vars.set_texture(1, data);
         d.set_affine(coeffs(m), dvec2(size[0], size[1]));
@@ -495,6 +500,9 @@ impl MotionDraw {
     /// `vignette`, … or `kit/<name>`) runs in the kit, p1..p4 setting its
     /// first four number parameters across their ranges.
     pub(super) fn effect(&mut self, cx: &mut Cx2d, item: &Item, input: Texture, px: (u32, u32)) -> Option<Texture> {
+        if self.refuse_plain_item(item) {
+            return None;
+        }
         // A KineticText draws on its kinetic kit.
         if let Some(out) = self.kinetic_effect(cx, item, &input, px) {
             return out;

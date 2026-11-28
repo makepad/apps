@@ -3,6 +3,7 @@
 //! CodeDraw / UI props, escalating numbers, text on another layer's path,
 //! and 2D layers following 3D anchors. Everything is a function of time.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::lyrics::{voice_from_lyrics, voice_words};
 use makepad_motion::*;
 
@@ -41,7 +42,7 @@ fn texts(doc: &MotionDoc, t: f64) -> Vec<Item> {
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
     let mut out = Vec::new();
     leaves(&frame.items, 1.0, &mut out);
-    out.into_iter().filter(|i| matches!(i.kind, ItemKind::Text { .. })).collect()
+    out.into_iter().filter(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. }))).collect()
 }
 
 #[test]
@@ -50,7 +51,7 @@ fn words_lock_to_the_vocal_ghost_current_sung() {
         Text{source: voice(@song) line: 0 by: @word color: #ffffff ghost: #ffffff40 highlight: @active highlight_color: #ff5a1f at: vec2(100, 100)}]}"#);
     let colours = |t: f64| -> Vec<(String, [f64; 4])> {
         match &texts(&doc, t)[0].kind {
-            ItemKind::Text { text, units, .. } => units.iter().map(|u| (text[u.range.clone()].to_string(), u.color)).collect(),
+            ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) => units.iter().map(|u| (text[u.range.clone()].to_string(), u.color)).collect(),
             _ => Vec::new(),
         }
     };
@@ -86,7 +87,7 @@ fn the_new_animators_load_and_are_exact() {
     }
     // sag: the letters end below where they started; mirror ends flipped.
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1920, 1080) duration: 3.0 layers: [Text{text: "go" size: 90 at: vec2(100, 100) animate: @sag start: 0}]}"#);
-    let ItemKind::Text { units, .. } = &texts(&doc, 1.2)[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &texts(&doc, 1.2)[0].kind else { panic!() };
     assert!(units.iter().all(|u| u.offset[1] > 10.0));
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1920, 1080) duration: 3.0 layers: [Text{text: "back" size: 90 at: vec2(100, 100) animate: @mirror start: 0}]}"#);
     assert!((texts(&doc, 1.0)[0].local.scale[0] + 1.0).abs() < 1e-9);
@@ -101,7 +102,7 @@ fn templates_token_stream_form_code_and_props() {
         UiWindow{title: "Auto-reply" lines: ["Harbor gates open at dawn."] start: 1.0 button: "OK"}
         UiButton{label: "Relight" click: 3.0}]}"#);
     let typed = |t: f64| texts(&doc, t).iter().find_map(|i| match &i.kind {
-        ItemKind::Text { text, reveal: Some(n), caret: Some(_), .. } if text.starts_with("Lantern") => Some(*n),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, reveal: Some(n), caret: Some(_), .. }) if text.starts_with("Lantern") => Some(*n),
         _ => None,
     }).unwrap();
     assert_eq!((typed(0.1), typed(0.3), typed(0.8), typed(1.3)), (0, 4, 9, 15), "token by token");
@@ -112,7 +113,7 @@ fn templates_token_stream_form_code_and_props() {
     assert!(wrong.is_err(), "tokens must spell the prompt");
     // Vocal-locked tokens: one per sung word of the line.
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1920, 1080) duration: 4.0 layers: [TokenStream{prompt: "on blue silk" words: voice(@song) line: 1}]}"#);
-    let n = |t: f64| texts(&doc, t).iter().find_map(|i| match &i.kind { ItemKind::Text { reveal: Some(n), caret: Some(_), .. } => Some(*n), _ => None }).unwrap();
+    let n = |t: f64| texts(&doc, t).iter().find_map(|i| match &i.kind { ItemKind::Primitive(PrimitiveFrame::Text { reveal: Some(n), caret: Some(_), .. }) => Some(*n), _ => None }).unwrap();
     assert_eq!((n(2.7), n(3.0), n(3.3)), (3, 8, 12));
 }
 
@@ -130,7 +131,7 @@ fn numbers_escalate_and_overflow() {
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1920, 1080) duration: 2.0 layers: [
         Text{number: tween(0, 1000, 0, 1) log: true format: @escalate size: 60 at: vec2(10, 10)}
         Text{number: 1000 log: true overflow: @wall size: 60 at: vec2(10, 200)}]}"#);
-    let shown: Vec<String> = texts(&doc, 0.3).iter().map(|i| match &i.kind { ItemKind::Text { text, .. } => text.clone(), _ => String::new() }).collect();
+    let shown: Vec<String> = texts(&doc, 0.3).iter().map(|i| match &i.kind { ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => text.clone(), _ => String::new() }).collect();
     assert_eq!(shown[0], "1.0e300");
     assert!(shown[1].starts_with("1000") && shown[1].matches('0').count() == 1000 && shown[1].contains('\n'), "a wall of zeros");
 }
@@ -143,7 +144,7 @@ fn text_rides_another_layers_path() {
         Chart{name: "c" type: @line at: vec2(0, 400) size: vec2(1200, 500) csv: "x,loss\n1,9\n2,5\n3,2"}
         Text{text: "silver road" size: 30 at: vec2(0, 0) path: layer("c")}
         Text{text: "named" size: 30 at: vec2(0, 0) path: layer("c", "Series 1")}]}"#);
-    let paths: Vec<_> = texts(&doc, 1.0).iter().filter_map(|i| match &i.kind { ItemKind::Text { path: Some((path, _)), .. } => Some(path.clone()), _ => None }).collect();
+    let paths: Vec<_> = texts(&doc, 1.0).iter().filter_map(|i| match &i.kind { ItemKind::Primitive(PrimitiveFrame::Text { path: Some((path, _)), .. }) => Some(path.clone()), _ => None }).collect();
     // The Path's world start (110, 70) in the Text's coordinates (at 60, 40).
     assert_eq!(paths[0].cmds.first(), Some(&geometry::PathCmd::MoveTo(50.0, 30.0)), "{:?}", paths[0]);
     assert!(!paths[1].cmds.is_empty() && paths[1] == paths[2], "the chart's (first, or named) series line");
@@ -182,7 +183,7 @@ Motion{size: vec2(1920, 1080) duration: 4.0 layers: [
         font: Font{family: "JetBrains Mono" weight: 400} color: #ff4d12 extra: nil digit: "9"})
 ]}"#);
     let shown = |t: f64| -> Vec<String> {
-        texts(&doc, t).into_iter().filter(|i| i.opacity > 0.5).filter_map(|i| match &i.kind { ItemKind::Text { text, .. } => Some(text.clone()), _ => None }).collect()
+        texts(&doc, t).into_iter().filter(|i| i.opacity > 0.5).filter_map(|i| match &i.kind { ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => Some(text.clone()), _ => None }).collect()
     };
     let at0 = shown(0.0);
     assert_eq!(&at0[..4], ["2.60", "3", "1.30", "0.250"], "{at0:?}");

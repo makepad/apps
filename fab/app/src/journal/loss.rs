@@ -26,12 +26,21 @@ impl Note {
     // A local range has no disk identity. Once reported, keep those rows
     // queued until exit. A writer with a known prefix can still drain.
     pub(super) fn cut(dir: &Path, orders: &mut Orders) -> Option<Vec<Self>> {
+        let notes = Self::outstanding(dir, orders, 0)?;
+        if notes.iter().any(|n| n.range.local) { orders.cut_without_prefix = true; }
+        Some(notes)
+    }
+
+    pub(super) fn outstanding(dir: &Path, orders: &Orders, after: u64) -> Option<Vec<Self>> {
         let plate = dir.parent().and_then(plate_id).map(str::to_owned);
         let &last = orders.outstanding.last()?;
         let mut notes = Vec::new();
         let mut add = |first: u64, end: u64, base: Option<u64>, count: u64| {
+            if count == 0 || end <= after { return }
+            let start = first.max(after + 1);
+            let mut pending = orders.outstanding.range(start..=end);
+            let count = if start == first { count } else { pending.clone().count() as u64 };
             if count == 0 { return }
-            let mut pending = orders.outstanding.range(first..=end);
             let from = *pending.next().expect("a nonempty segment at the cut");
             let to = pending.next_back().copied().unwrap_or(from);
             let absolute = |n| base.map_or(n, |b| b + (n - first));
@@ -55,8 +64,6 @@ impl Note {
         }
         if remaining != 0 {
             add(next, last, None, remaining);
-            // Unclaimed locals have no disk identity. They may never acquire one after the cut.
-            orders.cut_without_prefix = true;
         }
         Some(notes)
     }
@@ -75,6 +82,10 @@ impl Note {
     }
 
     fn write(&self, dir: &Path) -> io::Result<()> {
+        self.publish(dir, |_| ())
+    }
+
+    fn publish(&self, dir: &Path, published: impl FnOnce(PathBuf)) -> io::Result<()> {
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             if !fs::symlink_metadata(parent)?.is_dir() { return Err(invalid()) }
         }
@@ -84,12 +95,15 @@ impl Note {
         let mut fields = self.fields(self.range);
         if let Some(id) = self.journal { fields.push(("journal", s(id.to_string()))); }
         fields.push(("plate", s(self.plate.as_deref().ok_or_else(invalid)?)));
+        #[cfg(test)]
+        tests::probe("publish loss note")?;
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         let result = (|| {
             file.write_all(obj(fields).to_json().as_bytes())?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&tmp, path)?;
+            fs::rename(&tmp, &path)?;
+            published(path);
             sync_dir(dir)
         })();
         if result.is_err() { let _ = fs::remove_file(tmp); }
@@ -151,7 +165,9 @@ pub(super) fn ensure_dir(dir: &Path) -> io::Result<()> {
 }
 
 pub(super) struct Attempt {
-    notes: Vec<(Note, AtomicU8)>,
+    finished: (Mutex<Option<bool>>, std::sync::Condvar),
+    pipe: Mutex<Option<Arc<live::Pipe>>>,
+    notes: Vec<(Note, AtomicU8, AtomicBool)>,
     dirs: Vec<PathBuf>,
 }
 
@@ -161,28 +177,150 @@ impl Attempt {
             (Some(plate), Some(id)) => locations(plate, id, settings).collect(),
             _ => Vec::new(),
         };
-        Self { notes: notes.into_iter().map(|n| (n, 0.into())).collect(), dirs }
+        Self { pipe: Mutex::default(), finished: Default::default(), notes: notes.into_iter().map(|n| (n, 0.into(), false.into())).collect(), dirs }
     }
 
     pub(super) fn write(&self) {
-        for (note, tried) in &self.notes {
+        self.publish(false);
+    }
+
+    fn publish(&self, retry: bool) {
+        let mut complete = true;
+        for (note, tried, published) in &self.notes {
+            if retry && published.load(Ordering::Acquire) { continue }
+            let mut saved = false;
             for (i, dir) in self.dirs.iter().enumerate() {
                 tried.store(i as u8 + 1, Ordering::Release);
                 // Only the settings fallback belongs to the note writer. Plate Delete
                 // may already have moved the primary destination.
                 if i != 0 && ensure_dir(dir).is_err() { continue }
-                if note.write(dir).is_ok() { break }
+                if note.write(dir).is_ok() { saved = true; break }
             }
+            if saved { published.store(true, Ordering::Release); }
+            complete &= saved;
         }
+        self.finish(complete);
     }
 
-    pub(super) fn count(&self) -> u64 { self.notes.iter().map(|(n, _)| n.range.count).sum() }
+    pub(super) fn keep_pipe(&self, pipe: Arc<live::Pipe>) {
+        *self.pipe.lock().unwrap() = Some(pipe);
+    }
+
+    pub(super) fn finish(&self, complete: bool) {
+        self.pipe.lock().unwrap().take();
+        *self.finished.0.lock().unwrap() = Some(complete);
+        self.finished.1.notify_all();
+    }
+
+    pub(super) fn wait(&self) -> io::Result<()> {
+        let saved = self.finished.1.wait_while(self.finished.0.lock().unwrap(), |done| done.is_none()).unwrap();
+        if *saved == Some(true) { return Ok(()) }
+        drop(saved);
+        self.publish(true);
+        if *self.finished.0.lock().unwrap() == Some(true) { Ok(()) } else { Err(io::Error::other("loss note publication failed")) }
+    }
+
+    pub(super) fn count(&self) -> u64 { self.notes.iter().map(|(n, _, _)| n.range.count).sum() }
 
     pub(super) fn summary(&self) -> String {
-        let paths: Vec<_> = self.notes.iter().flat_map(|(n, tried)| self.dirs[..tried.load(Ordering::Acquire) as usize].iter()
+        let paths: Vec<_> = self.notes.iter().flat_map(|(n, tried, _)| self.dirs[..tried.load(Ordering::Acquire) as usize].iter()
             .map(move |dir| dir.join(n.file()).display().to_string().escape_debug().to_string())).collect();
         format!("{} for {} (paths tried: {})", self.count(), self.notes[0].0.plate.as_deref().unwrap_or("unknown plate").escape_debug(),
             if paths.is_empty() { "none".into() } else { paths.join(", ") })
+    }
+}
+
+/// These names belong only to this Delete. If publishing the cut fails, a
+/// resumed writer must not discover a loss for reservations it still owns.
+/// Quit's notes and the notes already transferred are never part of this set.
+#[derive(Default)]
+pub(super) struct DeleteNotes(Vec<PathBuf>);
+
+impl DeleteNotes {
+    pub(super) fn publish(&mut self, plate: &Path, note: Note) -> io::Result<()> {
+        let write = note.publish(plate, |path| self.0.push(path)).and_then(|()| sync_parent(plate));
+        if let Err(mut error) = write {
+            for path in &self.0 {
+                if let Err(e) = fs::remove_file(path) {
+                    if e.kind() != io::ErrorKind::NotFound { error = e; }
+                }
+            }
+            sync_parent(plate)?;
+            return Err(error)
+        }
+        Ok(())
+    }
+}
+
+/// Publish the original bytes beside the plate before removing the fallback
+/// name. The filename is also recovery's deduplication key after a crash.
+pub(super) fn transfer(plate: &Path, settings: &Path) -> io::Result<()> {
+    let root = settings.join(FALLBACK);
+    match fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() => (),
+        Ok(_) => return Err(invalid()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    let fallback = root.join(plate_id(plate).ok_or_else(invalid)?);
+    let Some(files) = entries(&fallback)? else { return Ok(()) };
+    if !fs::symlink_metadata(plate)?.is_dir() { return Err(invalid()) }
+    for entry in files {
+        let entry = entry?;
+        if !is_note(&entry) || !entry.file_type()?.is_file() { continue }
+        let source = entry.path();
+        let mut file = open_regular(&source)?.ok_or(io::ErrorKind::NotFound)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        drop(file);
+        let target = plate.join(entry.file_name());
+        if let Some(mut primary) = open_regular_with(&target, OpenOptions::new().read(true).write(true))? {
+            let mut existing = Vec::new();
+            primary.read_to_end(&mut existing)?;
+            if bytes != existing { return Err(invalid()) }
+            primary.sync_all()?;
+        } else {
+            let tmp = target.with_extension(format!("{}.transfer.tmp", Incarnation::mint()));
+            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+            let result = (|| {
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&tmp, &target)
+            })();
+            if let Err(error) = result {
+                let _ = fs::remove_file(tmp);
+                return Err(error)
+            }
+        }
+        sync_parent(plate)?;
+        fs::remove_file(source)?;
+        sync_parent(&fallback)?;
+        #[cfg(test)]
+        tests::probe("transferred loss note")?;
+    }
+    // Also confirm an unlink whose directory sync failed on an earlier try.
+    sync_parent(&fallback)
+}
+
+/// The plate folder has moved. Only an empty remainder can be removed;
+/// unrelated files and late arrivals in its fallback go to the Trash.
+pub(crate) fn finish_delete(plate: &Path, trash: &dyn Fn(&Path) -> Result<(), String>) -> io::Result<()> {
+    let settings = plate.parent().and_then(Path::parent).ok_or_else(invalid)?;
+    let root = settings.join(FALLBACK);
+    let dir = root.join(plate_id(plate).ok_or_else(invalid)?);
+    for path in [&root, &dir] {
+        match fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() => (),
+            Ok(_) => return Err(invalid()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    match fs::remove_dir(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => trash(&dir).map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 

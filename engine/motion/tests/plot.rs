@@ -1,4 +1,5 @@
 //! Plot lowering and time sampling, exercised through ordinary Motion frames.
+use makepad_motion::plain::{GroupProps, PathProps, PrimitiveFrame};
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -40,7 +41,7 @@ fn frame_item<'a>(items: &'a [Item], path: &str) -> &'a Item {
 fn svg(doc: &MotionDoc, name: &str, t: f64) -> String {
     let frame = doc.eval(t);
     match &frame_item(&frame.items, &named(&doc.layers, name).path).kind {
-        ItemKind::Path { path, .. } => path
+        ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) => path
             .cmds
             .iter()
             .filter_map(|c| match c {
@@ -129,7 +130,7 @@ fn animated_tangent_samples_beats_ease_and_moves() {
     assert!((b[0] - 2.0).abs() < 1e-5 && (slope_b - 4.0).abs() < 1e-4);
     let (mid, slope) = tangent(&doc, 1.0);
     assert!((mid[0] - 0.5).abs() < 1e-4 && (slope - 1.0).abs() < 1e-4);
-    assert!(matches!(named(&doc.layers, "tangent").kind, LayerKind::Path { data: PathShape::Morph { .. }, .. }));
+    assert!(matches!(named(&doc.layers, "tangent").kind, LayerKind::Path(PathProps { data: PathShape::Morph { .. }, .. })));
     let before = svg(&doc, "tangent", 0.5);
     let _later = svg(&doc, "tangent", 2.0);
     assert_eq!(before, svg(&doc, "tangent", 0.5), "scrubbing backwards is stateless");
@@ -143,12 +144,12 @@ fn function_time_changes_one_path_and_unused_time_is_static() {
         Graph{name: "one argument" f: fn(x) { x*x } from: -2 to: 2}
     "#);
     assert_ne!(svg(&doc, "wave", 0.0), svg(&doc, "wave", 1.0));
-    if let LayerKind::Path { data: PathShape::Morph { track, shapes, .. }, .. } = &named(&doc.layers, "wave").kind {
+    if let LayerKind::Path(PathProps { data: PathShape::Morph { track, shapes, .. }, .. }) = &named(&doc.layers, "wave").kind {
         assert_eq!(track.keys.len(), 37);
         assert!(shapes.windows(2).all(|p| p[0].len() == p[1].len()));
     } else { panic!("wave must be one keyed Path"); }
     for name in ["static", "one argument"] {
-        assert!(matches!(named(&doc.layers, name).kind, LayerKind::Path { data: PathShape::Static(_), .. }));
+        assert!(matches!(named(&doc.layers, name).kind, LayerKind::Path(PathProps { data: PathShape::Static(_), .. })));
         assert_eq!(svg(&doc, name, 0.0), svg(&doc, name, 2.0));
         assert!(!named(&doc.layers, name).animated);
     }
@@ -180,7 +181,7 @@ fn plot_and_item_spans_keep_function_time_on_the_plot_clock() {
     // Document 3.5 -> plot 1.5 -> item's clock 0.5, but f sees plot 1.5.
     let lines = contours(&doc, "clock", 3.5);
     assert!((data_point(lines[0].0[0])[1] - 1.5).abs() < 1e-4);
-    if let LayerKind::Path { data: PathShape::Morph { track, .. }, .. } = &named(&doc.layers, "clock").kind {
+    if let LayerKind::Path(PathProps { data: PathShape::Morph { track, .. }, .. }) = &named(&doc.layers, "clock").kind {
         assert_eq!(track.keys.len(), 31);
     } else { panic!("expected geometry keys"); }
 }
@@ -203,7 +204,7 @@ fn path_look_common_fields_and_reveal_survive_lowering() {
     assert_eq!(item.world.apply([0.0, 0.0]), [107.0, 109.0]);
     assert!((item.opacity - 0.6).abs() < 1e-6);
     match &item.kind {
-        ItemKind::Path { width, trim, fill, stroke, cap, join, .. } => {
+        ItemKind::Primitive(PrimitiveFrame::Path { width, trim, fill, stroke, cap, join, .. }) => {
             assert_eq!(*width, 5.0);
             assert!((trim[0] - 0.2).abs() < 1e-6 && (trim[1] - 0.6).abs() < 1e-6);
             assert!(fill.is_some() && stroke.is_some());
@@ -249,9 +250,9 @@ fn default_box_edge_axes_and_decoration_reveal() {
     ]}"#);
     let frame = doc.eval(1.0);
     assert_eq!(frame.items[0].world.apply([0.0, 0.0]), [100.0, 70.0]);
-    assert!(matches!(&doc.layers[0].kind, LayerKind::Group { size: Some(Prop::Const(size)), .. } if *size == [800.0, 560.0]));
+    assert!(matches!(&doc.layers[0].kind, LayerKind::Group { props: GroupProps { size: Some(Prop::Const(size)), .. }, .. } if *size == [800.0, 560.0]));
     let axes = frame_item(&frame.items, &named(&doc.layers, "axes").path);
-    assert!(matches!(&axes.kind, ItemKind::Path { trim, .. } if (trim[1] - 0.5).abs() < 1e-6));
+    assert!(matches!(&axes.kind, ItemKind::Primitive(PrimitiveFrame::Path { trim, .. }) if (trim[1] - 0.5).abs() < 1e-6));
     let lines = contours(&doc, "axes", 1.0);
     assert!(lines.iter().any(|(p, _)| p.first() == Some(&[0.0, 560.0]) && p.last() == Some(&[800.0, 560.0])));
     assert!(lines.iter().any(|(p, _)| p.first() == Some(&[0.0, 560.0]) && p.last() == Some(&[0.0, 0.0])));
@@ -275,7 +276,7 @@ fn native_samplers_are_available_as_data_to_draw2d() {
     let frame = doc.eval(0.0);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
     assert!(frame.items.iter().any(|item| matches!(&item.kind, ItemKind::Draw2d { picture, .. } if !picture.list.ops.is_empty())));
-    assert!(frame.walk().into_iter().any(|(_, item)| matches!(&item.kind, ItemKind::Text { text, .. } if text == "7")));
+    assert!(frame.walk().into_iter().any(|(_, item)| matches!(&item.kind, ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if text == "7")));
 }
 
 #[test]
@@ -341,7 +342,7 @@ fn matrix_maps_every_data_item_grid_axes_and_dot_before_box_conversion() {
     assert_eq!(dot, [472.0, 152.0, 488.0, 168.0]);
     let frame = mapped.eval(0.0);
     assert_eq!(frame_item(&frame.items, &named(&mapped.layers, "pixels").path).world.apply([0.0; 2]), [645.0, 207.0]);
-    assert!(frame.walk().iter().all(|(_, item)| !matches!(&item.kind, ItemKind::Text { .. })), "mapped tick labels default off");
+    assert!(frame.walk().iter().all(|(_, item)| !matches!(&item.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. }))), "mapped tick labels default off");
 }
 
 #[test]
@@ -354,7 +355,7 @@ fn map_tween_uses_plot_fps_and_fixed_svg_commands_for_every_key() {
     for name in ["grid", "minor grid", "axes", "graph", "dot"] {
         assert_eq!(contours(&doc, name, 1.0), contours(&identity, name, 0.0));
         assert_eq!(contours(&doc, name, 3.0), contours(&mapped, name, 0.0));
-        let LayerKind::Path { data: PathShape::Morph { track, shapes, template }, .. } = &named(&doc.layers, name).kind else { panic!("{name} needs SVG keys"); };
+        let LayerKind::Path(PathProps { data: PathShape::Morph { track, shapes, template }, .. }) = &named(&doc.layers, name).kind else { panic!("{name} needs SVG keys"); };
         assert_eq!(track.keys.len(), 25);
         assert_eq!(track.keys.first().unwrap().t.value, 1.0);
         assert_eq!(track.keys.last().unwrap().t.value, 3.0);

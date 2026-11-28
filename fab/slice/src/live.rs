@@ -44,7 +44,7 @@ use crate::live_paths::{Kept, LivePaths};
 use crate::{check_inputs, finish, prepare_job, SliceResult};
 use fab_plate::machine::Machine;
 use fab_plate::{Part, PartMesh, Plate};
-use fab_printability::{Materials, Report};
+use fab_printability::{Materials, Overlaps, Report};
 use makepad_fab_gcode::process::Timeline;
 use makepad_fab_gcode::packed::MovesRef;
 use makepad_fab_gcode::record::MoveRecord;
@@ -64,7 +64,7 @@ use makepad_fab_toolpath::{contours_some, grade, grade_key, is_support_key, par,
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Row-major affine in printer mm (Z up), applied to a part as the plate
 /// has it: `p' = m * p`.
@@ -112,6 +112,15 @@ pub fn fixed_setup(setup: JobSetup) -> SetupFn {
 /// resolving presets never runs on the caller's (the UI's).
 pub type MakeInput = Arc<dyn Fn() -> LiveInput + Send + Sync>;
 
+/// The overlap issues of a [`LiveInput`]'s plate as its evaluation judged them, bound to
+/// that very plate. Made only by [`LiveInput::with_overlaps`].
+#[derive(Clone)]
+pub struct BoundOverlaps {
+    plate: Weak<Plate>,
+    overlaps: Arc<Overlaps>,
+    plate_id: u64,
+}
+
 /// What to slice.
 #[derive(Clone)]
 pub struct LiveInput {
@@ -121,6 +130,8 @@ pub struct LiveInput {
     pub settings_id: u64,
     pub setup: SetupFn,
     pub plate: Arc<Plate>,
+    /// Overlap issues bound by [`Self::with_overlaps`].
+    pub overlaps: Option<BoundOverlaps>,
     /// Per part: its per-triangle paint stream (empty: unpainted).
     pub paint: Arc<Vec<Vec<String>>>,
     /// Per part, when known: the part before its plate translation, and the
@@ -977,6 +988,22 @@ impl ContourSource for WithNp {
 }
 
 impl LiveInput {
+    /// Bind the overlap issues of `plate` as its evaluation judged them to that very plate.
+    /// `plate_id` is the id they were judged on, the evaluated plate's `plate_id(ev)`.
+    /// An input with another id (a swapped field, a moved part) judges its own.
+    /// A plate changed afterwards is another allocation: `Arc::make_mut` moves or clones
+    /// it, and `Arc::get_mut` refuses while the binding lives. Such a plate judges its own.
+    pub fn with_overlaps(mut self, overlaps: Option<Arc<Overlaps>>, plate_id: u64) -> Self {
+        self.overlaps = overlaps.map(|overlaps| BoundOverlaps { plate: Arc::downgrade(&self.plate), overlaps, plate_id });
+        self
+    }
+
+    fn known_overlaps(&self) -> Option<&Arc<Overlaps>> {
+        let bound = self.overlaps.as_ref()?;
+        (self.pieces.is_none() && self.plate_id == bound.plate_id && std::ptr::eq(bound.plate.as_ptr(), Arc::as_ptr(&self.plate)))
+            .then_some(&bound.overlaps)
+    }
+
     /// Place a part in the input itself, so a later settle uses exactly the live plate.
     /// Called while building the input on the engine's thread.
     pub fn place(&mut self, part: usize, xf: Affine) {
@@ -1001,7 +1028,7 @@ impl LiveInput {
 
     /// An input whose setup is already made.
     pub fn ready(plate_id: u64, settings_id: u64, setup: JobSetup, plate: Arc<Plate>, paint: Arc<Vec<Vec<String>>>) -> Self {
-        LiveInput { plate_id, settings_id, setup: fixed_setup(setup), plate, paint, frames: None, machine: Machine::dual_nozzle_350(), np_head: None, pieces: None }
+        LiveInput { plate_id, settings_id, setup: fixed_setup(setup), plate, overlaps: None, paint, frames: None, machine: Machine::dual_nozzle_350(), np_head: None, pieces: None }
     }
     fn key(&self) -> (u64, u64) {
         (self.plate_id, self.settings_id)
@@ -4941,7 +4968,8 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
                 // an object that prints its bodies apart, though it prints them as one, says so
                 contour_issues.extend(apart.iter().map(|(g, why)| fab_printability::bodies_apart(&placed, g, why)));
                 if stale() { return None; }
-                let plate_report = fab_printability::analyse_plate_with(&input.machine, &placed, &materials, &field_of, &stale)?;
+                let known = input.known_overlaps().filter(|_| snap.xf.iter().all(Option::is_none));
+                let (plate_report, _) = fab_printability::analyse_plate_known(&input.machine, &placed, &materials, &field_of, known, &stale)?;
                 if stale() { return None; }
                 let (report, contours) = (Arc::new(plate_report), Arc::new(contour_issues));
                 shared.caches.lock().unwrap().plate_checks = Some((input.key(), placement.clone(), report.clone(), contours.clone()));
@@ -5723,6 +5751,22 @@ mod tests {
 
     fn input(plate: &Plate) -> LiveInput {
         LiveInput::ready(1, 1, (*setup()).clone(), Arc::new(plate.clone()), Arc::new(Vec::new()))
+    }
+
+    #[test]
+    fn overlap_binding_follows_the_unedited_whole_plate() {
+        let input = input(&plate());
+        let id = input.plate_id;
+        let overlaps = Arc::new(fab_printability::overlaps(&input.plate, &|_| None, &|| false).unwrap());
+        let edited = input.with_overlaps(Some(overlaps.clone()), id + 1);
+        assert!(edited.known_overlaps().is_none(), "an input with a different plate id checks its own overlaps");
+        let mut whole = edited.with_overlaps(Some(overlaps), id);
+        assert!(whole.known_overlaps().is_some(), "the evaluated plate reuses its bound overlaps");
+        whole.pieces = Some(Arc::new(crate::piece::Pieces { whole_plate: id, parts: Vec::new() }));
+        assert!(whole.known_overlaps().is_none(), "a pieces input checks its own overlaps");
+        whole.pieces = None;
+        whole.place(0, affine_translate([1.0, 0.0, 0.0]));
+        assert!(whole.known_overlaps().is_none(), "moving a part invalidates the plate allocation binding");
     }
 
     fn checkpoints() -> Next {

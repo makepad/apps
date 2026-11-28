@@ -440,7 +440,7 @@ mod tests {
         state.view.colours = fab_plate::ColourMode::Material;
         assert_eq!(selected(&state), fab_plate::UNMAPPED_RGB, "a saved loadout is offline");
         state.print.links.picked = crate::print::PrinterChoice::Real("Printer".into());
-        state.print.printers.set(&state.print.links.picked, Default::default());
+        state.print.printers.set(&state.print.links.picked, 1, Default::default());
         assert_eq!(selected(&state), spool);
         state.print.colors.rows[0].tray.as_mut().unwrap().colour = None;
         assert_eq!(selected(&state), fab_plate::UNMAPPED_RGB, "mapped tray without ink");

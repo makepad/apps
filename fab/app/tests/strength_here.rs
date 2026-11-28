@@ -4,6 +4,8 @@
 //! before and after; the undo gives the program back byte for byte; and `fab.strengthen` called with
 //! the same picks writes the same program as the button did.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 
 use makepad_strict_json::Value;
@@ -99,8 +101,7 @@ fn the_strength_section_lists_applies_as_one_undo_and_writes_what_the_tool_write
     let h = value.field("head").and_then(|f| f.value.string()).expect("a head").to_string();
     let edits = Value::Str("place(\"figure\", at: [175mm 160mm], name: \"Figure\")\n".to_string()).to_json();
     call(&app, "place", &format!(r#"{{"request_id":"place","expected":"{h}","edits":{edits}}}"#)).expect("place");
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     sliced(&app);
     let (script_before, project_before) = sources(&app);
 

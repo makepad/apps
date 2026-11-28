@@ -2,6 +2,7 @@
 //! into a [`SceneDef`] (building geometry, loading models, fonts, images and
 //! environments once), and keep the VM for the document's closures.
 
+use makepad_core_util::ui_thread::WorkerOnly;
 use makepad_script_compute_sched::kernel::KernelExt;
 use crate::anim::{Anim, ScriptEval};
 use makepad_render_material::ibl::{EnvMap, EnvPreset};
@@ -203,11 +204,30 @@ enum SceneVm {
     Doc(Arc<dyn SceneVmHost>),
 }
 
+thread_local! {
+    static SCENE_VM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+struct SceneVmCall;
+
+#[cfg(debug_assertions)]
+impl Drop for SceneVmCall {
+    fn drop(&mut self) {
+        SCENE_VM_DEPTH.set(SCENE_VM_DEPTH.get() - 1);
+    }
+}
+
 impl SceneVm {
     /// Run `f` with the VM; `audio`: closures read `music(@m)` as these live
     /// levels (while `f` runs).
     fn with<R>(&mut self, audio: Option<AudioNow>, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
         let run = move |vm: &mut ScriptVm| {
+            #[cfg(debug_assertions)]
+            let _call = {
+                SCENE_VM_DEPTH.set(SCENE_VM_DEPTH.get() + 1);
+                SceneVmCall
+            };
             if let Some(h) = crate::script::host_mut(vm) {
                 h.evaluating = audio.is_some();
                 if let Some(now) = audio {
@@ -442,6 +462,7 @@ impl Scene3dDoc {
     /// Read `object` (a `Scene3D{..}`) in `vm`; the shared half of the loads.
     fn read_from(mut vm: SceneVm, object: Option<ScriptObject>, o: ReadOptions) -> Result<Scene3dDoc, Vec<Diagnostic>> {
         let ReadOptions { source, resolver, bpm, origin_file, host_fields, line_offset, col_shift, shift, read_at_load } = o;
+        let mut cx = LoadCx { resolver, source, glbs: HashMap::new(), node_names: Vec::new(), models: Vec::new(), budget: Default::default(), hdri_site: None };
         // Reading runs document code too (builders, parametric functions):
         // bounded like the evaluation.
         let (result, report) = vm.with(None, |vm| vm.eval_bounded(&EvalLimits::DOC_LOAD, |vm| {
@@ -460,33 +481,44 @@ impl Scene3dDoc {
                 return Err(r.diagnostics);
             }
             let root = r.vm.bx.heap_mut().new_object_ref(obj);
-            let mut cx = LoadCx { resolver, source, glbs: HashMap::new(), node_names: Vec::new(), models: Vec::new(), budget: Default::default() };
             let def = parse_scene(&mut r, &mut cx, obj);
             let closures = std::mem::take(&mut r.closures);
-            Ok((def, r.diagnostics, closures, root, cx.models))
+            // Collect this parse's model messages before another scene uses the VM.
+            let said = crate::script::host(r.vm).map(|h| std::mem::take(&mut *h.model_messages.borrow_mut())).unwrap_or_default();
+            Ok((def, r.diagnostics, closures, root, said))
         }));
         if let Some(limit) = report.limit() {
+            vm.with(None, |_| drop(result));
             return Err(vec![script_error(&limit, line_offset, shift)]);
         }
-        let mut result = result?;
-        for d in &mut result.1 {
+        let (def, warnings, closures, root, said) = result?;
+        // The document owns its VM roots during map resolution, including on a
+        // failed file read or an unwind (its Drop releases them under the lock).
+        let mut doc = Scene3dDoc { def, warnings, vm, closures, _root: Some(root), eval_errors: Vec::new(), exact_t: None, audio: None, physics: None, models: std::mem::take(&mut cx.models), read_at_load };
+        if let Some(env) = &mut doc.def.environment {
+            match environment_map(&env.source, &mut cx) {
+                Ok(map) => {
+                    env.key = env_key(&env.source, &map);
+                    env.map = map;
+                }
+                Err(diagnostic) => doc.warnings.push(diagnostic),
+            }
+        }
+        for d in &mut doc.warnings {
             d.loc.line += shift;
         }
-        let (def, mut diagnostics, closures, root, models) = result;
-        // What the model builders said (an unknown option, a spec warning).
-        let said: Vec<String> = vm.with(None, |vm| crate::script::host(vm).map(|h| std::mem::take(&mut *h.model_messages.borrow_mut())).unwrap_or_default());
-        diagnostics.extend(said.into_iter().map(|m| Diagnostic::warning(Loc { line: 1, col: 1 }, "mod.model", m)));
-        if diagnostics.iter().any(|d| d.is_error()) {
-            return Err(diagnostics);
+        doc.warnings.extend(said.into_iter().map(|m| Diagnostic::warning(Loc { line: 1, col: 1 }, "mod.model", m)));
+        if doc.warnings.iter().any(|d| d.is_error()) {
+            return Err(std::mem::take(&mut doc.warnings));
         }
         // A standalone VM is frozen from here on: a frame's closures read the
         // document but cannot keep state in it, so frames are pure functions
         // of their arguments and can be evaluated in any order. (A Motion
         // document's VM was frozen as it loaded: the scene's closures are
         // among what it holds.)
-        if let SceneVm::Own(_) = &vm {
-            let roots: Vec<ScriptValue> = std::iter::once(root.as_object().into()).chain(closures.iter().map(|c| c.as_object().into())).collect();
-            vm.with(None, |vm| {
+        if let SceneVm::Own(_) = &doc.vm {
+            let roots: Vec<ScriptValue> = doc._root.iter().chain(&doc.closures).map(|r| r.as_object().into()).collect();
+            doc.vm.with(None, |vm| {
                 vm.freeze_document(&roots);
                 // What `memo()` kept while it loaded refers into this VM: it
                 // goes now, under the VM's lock (a worker loads, the UI thread
@@ -494,8 +526,8 @@ impl Scene3dDoc {
                 crate::script::memo_clear();
             });
         }
-        let physics = def.physics.clone().map(crate::physics::PhysicsRuntime::new);
-        Ok(Scene3dDoc { def, warnings: diagnostics, vm, closures, _root: Some(root), eval_errors: Vec::new(), exact_t: None, audio: None, physics, models, read_at_load })
+        doc.physics = doc.def.physics.clone().map(crate::physics::PhysicsRuntime::new);
+        Ok(doc)
     }
 
     /// Whether this document, loaded with `old` inputs, shows `new` by
@@ -570,12 +602,16 @@ impl Scene3dDoc {
         self.audio = Some(now);
     }
 
-    /// Whether a shader material's hooks sample the 2D layer `name` with
-    /// gradients or at a level (`self.name.sample_grad(` / `.sample_lod(`):
-    /// the layer's picture then carries a mip chain.
+    /// Whether a shader material's hooks, or a post pass that reads it,
+    /// sample the 2D layer `name` with gradients or at a level
+    /// (`self.name.sample_grad(` / `.sample_lod(`): the layer's picture then
+    /// carries a mip chain.
     pub fn samples_minified(&self, name: &str) -> bool {
+        fn calls(text: &str, name: &str) -> bool {
+            [".sample_grad(", ".sample_lod("].iter().any(|call| text.contains(&format!("self.{name}{call}")))
+        }
         fn hooks_sample(m: &MaterialDef, name: &str) -> bool {
-            m.shader.as_ref().is_some_and(|h| h.fields.iter().any(|(_, text)| [".sample_grad(", ".sample_lod("].iter().any(|call| text.contains(&format!("self.{name}{call}")))))
+            m.shader.as_ref().is_some_and(|h| h.fields.iter().any(|(_, text)| calls(text, name)))
         }
         fn node_samples(n: &NodeDef, name: &str) -> bool {
             let own = match &n.kind {
@@ -586,7 +622,11 @@ impl Scene3dDoc {
             };
             own || n.children.iter().any(|c| node_samples(c, name))
         }
-        node_samples(&self.def.root, name)
+        // `post: [Pass{reads: ["name"] pixel: fn() -> vec4 {..}}]`, its pixel fn or a helper.
+        let in_post = self.def.post.graph.iter().any(|p| {
+            p.decl.reads.iter().any(|r| r == name) && (calls(p.decl.pixel.text(), name) || p.decl.helpers.iter().any(|h| calls(h.code.text(), name)))
+        });
+        node_samples(&self.def.root, name) || in_post
     }
 
     /// A new evaluation (frame or sub-frame) begins: what `memo()` kept for
@@ -660,6 +700,8 @@ pub(crate) struct LoadCx<'a> {
     /// Decoded bytes of this load, charged by the decoders before they
     /// allocate.
     budget: makepad_platform::resource_resolver::DecodeBudget,
+    /// Source of a file environment's diagnostic after the VM has been released.
+    hdri_site: Option<(Loc, String)>,
 }
 
 /// Number `node` and the nodes below it depth first, from `next`.
@@ -793,11 +835,7 @@ fn parse_scene(r: &mut Reader, cx: &mut LoadCx, obj: ScriptObject) -> SceneDef {
             background = Some(Anim::Const(lin(bg)));
         }
         if environment.is_none() {
-            if let Some(p) = env {
-                let map = Arc::new(EnvMap::procedural(&p, 512, 1.0, 0.0));
-                let source = EnvSource::Preset(p);
-                environment = Some(EnvironmentDef { key: env_key(&source, &map), source, map, intensity: Anim::Const([1.0]), rotation: Anim::Const([0.0]), background: false, blur: 0.5, background_intensity: Anim::Const([1.0]) });
-            }
+            environment = env.map(|p| pending_environment(EnvSource::Preset(p)));
         }
         if !contains_light(&root) {
             let v = r.vm.eval(ScriptMod::new("", "", &(format!("motion3d://look/{l:?}")), 0, 0, &(format!("{SCENE_PRELUDE}{rig}")), &[]));
@@ -820,8 +858,7 @@ fn parse_scene(r: &mut Reader, cx: &mut LoadCx, obj: ScriptObject) -> SceneDef {
         // studio environment and say so.
         let loc = r.loc(obj);
         r.warn(loc, "Scene3D", "no lights and no environment: using Environment{preset: @studio}", Some("add `environment: Environment{preset: @studio}` or lights: [DirectionalLight{...}]".into()));
-        let map = Arc::new(EnvMap::procedural(&EnvPreset::Studio, 512, 1.0, 0.0));
-        def.environment = Some(EnvironmentDef { source: EnvSource::Preset(EnvPreset::Studio), key: env_key(&EnvSource::Preset(EnvPreset::Studio), &map), map, intensity: Anim::Const([1.0]), rotation: Anim::Const([0.0]), background: false, blur: 0.5, background_intensity: Anim::Const([1.0]) });
+        def.environment = Some(pending_environment(EnvSource::Preset(EnvPreset::Studio)));
     }
     def
 }
@@ -839,34 +876,65 @@ fn env_key(source: &EnvSource, map: &EnvMap) -> u64 {
     makepad_geom3d::math::hash64(tag.bytes().fold(map.width as u64, |h, b| h.wrapping_mul(0x100_0000_01b3) ^ b as u64))
 }
 
-/// The environment a Scene3D `@name` stands for, with its map: one of
-/// render-material's looks (`@studio` .. `@gradient`, as always), else an
-/// HDRI generator preset by its Scene3D name (`@hdri_golden_hour`,
-/// `makepad_hdri_engine::PRESET_ENVIRONMENTS`).
-fn named_environment(name: &str) -> Option<(EnvSource, Arc<EnvMap>)> {
+/// The environment a Scene3D `@name` stands for: one of render-material's
+/// looks (`@studio` .. `@gradient`, as always), else an HDRI generator
+/// preset by its Scene3D name (`@hdri_golden_hour`,
+/// `makepad_hdri_engine::PRESET_ENVIRONMENTS`). Nothing is made here: its
+/// map is resolved by [`environment_map`] after parsing.
+fn environment_source(name: &str) -> Option<EnvSource> {
     if let Some(p) = EnvPreset::by_name(name) {
-        let map = Arc::new(EnvMap::procedural(&p, 512, 1.0, 0.0));
-        return Some((EnvSource::Preset(p), map));
+        return Some(EnvSource::Preset(p));
     }
     let name = makepad_hdri_engine::PRESET_ENVIRONMENTS.iter().copied().find(|n| *n == name)?;
-    let params = makepad_hdri_engine::presets::preset(name.strip_prefix(makepad_hdri_engine::HDRI_PREFIX)?)?;
-    Some((EnvSource::HdriPreset(name), hdri_preset_map(name, &params)))
+    generator_preset(name).map(|_| EnvSource::HdriPreset(name))
+}
+
+/// A generator preset's params by its Scene3D name (`hdri_golden_hour`).
+fn generator_preset(name: &str) -> Option<makepad_hdri_engine::HdriParams> {
+    makepad_hdri_engine::presets::preset(name.strip_prefix(makepad_hdri_engine::HDRI_PREFIX)?)
+}
+
+/// The parser records the source. Only `read_from` sees this empty map.
+fn pending_environment(source: EnvSource) -> EnvironmentDef {
+    static EMPTY: std::sync::OnceLock<Arc<EnvMap>> = std::sync::OnceLock::new();
+    let map = EMPTY.get_or_init(|| Arc::new(EnvMap { width: 0, height: 0, data: Vec::new() })).clone();
+    EnvironmentDef { source, map, key: 0, intensity: Anim::Const([1.0]), rotation: Anim::Const([0.0]), background: false, blur: 0.5, background_intensity: Anim::Const([1.0]) }
+}
+
+fn environment_map(source: &EnvSource, cx: &mut LoadCx) -> Result<Arc<EnvMap>, Diagnostic> {
+    debug_assert!(SCENE_VM_DEPTH.get() == 0, "an environment map made under the document's VM lock");
+    match source {
+        EnvSource::Preset(preset) => Ok(Arc::new(EnvMap::procedural(preset, 512, 1.0, 0.0))),
+        EnvSource::HdriPreset(name) => Ok(hdri_preset_map(name, &generator_preset(name).expect("a resolved generator preset"))),
+        EnvSource::Hdri(media) => cx.resolver.load(media).and_then(|bytes| load_hdr_engine(&bytes, &mut cx.budget)).map(Arc::new).map_err(|e| {
+            let (loc, path) = cx.hdri_site.take().expect("a parsed HDRI file has a source location");
+            Diagnostic::error(loc, path, format!("the HDRI did not load: {e}")).hint("give a Radiance .hdr file (file(\"studio.hdr\") or asset(id, rev)), or use `preset: @studio`")
+        }),
+    }
 }
 
 /// A generator preset's map, baked once per process at
-/// `PROCEDURAL_HDRI_WIDTH`: a document loads again
-/// on every edit, and a bake takes up to half a second (a sky in release, one
-/// thread; a document loads on its caller's thread, so the rows run in a
-/// plain loop). The twelve presets hold at most 96 MiB. The whole map, key
+/// `PROCEDURAL_HDRI_WIDTH`: a document loads again on every edit and a
+/// weather preset can take minutes to bake. The whole map, key
 /// and all, as the generator exports it: Scene3D lights through its
 /// environment and its own lights and declares no `Environment.sun`, so the
 /// renderer lights with all of it, as it does a `.hdr`.
 fn hdri_preset_map(name: &'static str, params: &makepad_hdri_engine::HdriParams) -> Arc<EnvMap> {
     static BAKED: std::sync::Mutex<Option<HashMap<&'static str, Arc<EnvMap>>>> = std::sync::Mutex::new(None);
+    static PRESET_BAKE: WorkerOnly = WorkerOnly::new("a generator preset's environment bake");
     if let Some(map) = BAKED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|baked| baked.get(name)) {
         return map.clone();
     }
-    let (map, _key) = makepad_hdri_engine::envmap::bake_env_map(params, makepad_hdri_engine::PROCEDURAL_HDRI_WIDTH, |n, f| (0..n).for_each(f));
+    PRESET_BAKE.check();
+    // Spread over the pool whose worker loads the document (a scene's load
+    // job): a weather preset bakes for minutes on one core. Elsewhere (a
+    // test, a tool) the bake runs on the caller.
+    let pool = makepad_widgets::makepad_platform::thread::TaskPool::of_current_worker();
+    let spread = |n: usize, f: &(dyn Fn(usize) + Sync)| match &pool {
+        Some(pool) => pool.fan_out(n, f),
+        None => (0..n).for_each(f),
+    };
+    let (map, _key) = makepad_hdri_engine::envmap::bake_env_map(params, makepad_hdri_engine::PROCEDURAL_HDRI_WIDTH, spread);
     // Two loads that baked at once keep the first map, so every document
     // hands the renderer the same one.
     BAKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(name).or_insert_with(|| Arc::new(map)).clone()
@@ -898,8 +966,8 @@ fn parse_environment(r: &mut Reader, cx: &mut LoadCx, v: ScriptValue, path: &str
     let Some(o) = v.as_object().filter(|_| r.kind(v).as_deref() == Some("environment")) else {
         // `environment: @studio` shorthand.
         if let Some(id) = v.as_id() {
-            if let Some((source, map)) = named_environment(&id.to_string()) {
-                return Some(EnvironmentDef { key: env_key(&source, &map), source, map, intensity: Anim::Const([1.0]), rotation: Anim::Const([0.0]), background: false, blur: 0.5, background_intensity: Anim::Const([1.0]) });
+            if let Some(source) = environment_source(&id.to_string()) {
+                return Some(pending_environment(source));
             }
         }
         let loc = v.as_object().map(|o| r.loc(o)).unwrap_or_default();
@@ -913,15 +981,9 @@ fn parse_environment(r: &mut Reader, cx: &mut LoadCx, v: ScriptValue, path: &str
     let blur = r.f32(o, path, "blur", 0.0).clamp(0.0, 1.0);
     let background_intensity = r.anim::<1>(o, path, "background_intensity", [1.0], Semantic::Plain);
     let hdri = r.media(o, path, "hdri").or_else(|| r.media(o, path, "src"));
-    let (source, map) = if let Some(m) = hdri {
-        match cx.resolver.load(&m).and_then(|b| load_hdr_engine(&b, &mut cx.budget)) {
-            Ok(map) => (EnvSource::Hdri(m), Arc::new(map)),
-            Err(e) => {
-                let loc = r.loc(o);
-                r.error(loc, &format!("{path}.hdri"), format!("the HDRI did not load: {e}"), Some("give a Radiance .hdr file (file(\"studio.hdr\") or asset(id, rev)), or use `preset: @studio`".into()));
-                return None;
-            }
-        }
+    let source = if let Some(m) = hdri {
+        cx.hdri_site = Some((r.loc(o), format!("{path}.hdri")));
+        EnvSource::Hdri(m)
     } else {
         let name = r.id(o, "preset").unwrap_or_else(|| "studio".into());
         if r.has(o, "top") || name == "gradient" {
@@ -930,21 +992,20 @@ fn parse_environment(r: &mut Reader, cx: &mut LoadCx, v: ScriptValue, path: &str
             let horizon = c(r, "horizon", [0.8, 0.8, 0.9, 1.0]);
             let bottom = c(r, "bottom", [0.1, 0.1, 0.1, 1.0]);
             let preset = EnvPreset::Gradient { top: [top[0], top[1], top[2]], horizon: [horizon[0], horizon[1], horizon[2]], bottom: [bottom[0], bottom[1], bottom[2]] };
-            let map = Arc::new(EnvMap::procedural(&preset, 512, 1.0, 0.0));
-            (EnvSource::Preset(preset), map)
+            EnvSource::Preset(preset)
         } else {
-            match named_environment(&name) {
+            match environment_source(&name) {
                 Some(found) => found,
                 None => {
                     let loc = r.loc(o);
                     let names: Vec<String> = makepad_render::PROCEDURAL_ENVIRONMENTS.iter().chain(makepad_hdri_engine::PRESET_ENVIRONMENTS).map(|n| format!("@{n}")).collect();
                     r.error(loc, &format!("{path}.preset"), format!("no environment preset `@{name}`"), Some(format!("one of {}", names.join(" "))));
-                    named_environment("studio").expect("studio is a look")
+                    EnvSource::Preset(EnvPreset::Studio)
                 }
             }
         }
     };
-    Some(EnvironmentDef { key: env_key(&source, &map), source, map, intensity, rotation, background, blur, background_intensity })
+    Some(EnvironmentDef { intensity, rotation, background, blur, background_intensity, ..pending_environment(source) })
 }
 
 fn parse_fog(r: &mut Reader, v: ScriptValue, path: &str) -> Option<FogDef> {
@@ -3952,46 +4013,46 @@ mod environment_tests {
     }
 
     #[test]
-    fn every_procedural_environment_name_resolves() {
-        // Each name on its own thread: a generator preset bakes at the
-        // engine's width (up to about 1.5 s in a debug build).
-        let keys: Vec<u64> = std::thread::scope(|s| {
-            let names: Vec<_> = PROCEDURAL_ENVIRONMENTS.iter().chain(PRESET_ENVIRONMENTS).map(|&name| s.spawn(move || {
-                let reference = name.strip_prefix(HDRI_PREFIX).map(|preset| {
-                    let params = presets::preset(preset).unwrap_or_else(|| panic!("{name}: not a generator preset"));
-                    hdri::envmap::bake_env_map(&params, PROCEDURAL_HDRI_WIDTH, serial).0
-                });
-                let mut seen: Vec<EnvironmentDef> = Vec::new();
-                for src in spellings(name) {
-                    let doc = load_in(PathBuf::new(), &src).unwrap_or_else(|e| panic!("{src}: {e}"));
-                    assert!(doc.warnings.is_empty(), "{src}: {:?}", doc.warnings);
-                    let env = doc.def.environment.clone().unwrap_or_else(|| panic!("{src}: no environment"));
-                    match (&env.source, &reference) {
-                        // A look (render_materials_looks_keep_their_names_and_maps).
-                        (EnvSource::Preset(_), None) => {}
-                        // A generator preset is the generator's map at
-                        // `PROCEDURAL_HDRI_WIDTH`.
-                        (EnvSource::HdriPreset(n), Some(reference)) => {
-                            assert_eq!(*n, name, "{src}");
-                            assert!(*env.map == *reference, "{src}: not the preset's {PROCEDURAL_HDRI_WIDTH}-wide bake");
-                        }
-                        (source, _) => panic!("{src}: {source:?}"),
-                    }
-                    seen.push(env);
-                }
-                // Both spellings are one environment, and a document loaded
-                // again bakes nothing: the map is the one baked before.
-                if reference.is_some() {
-                    assert_eq!(seen[0].key, seen[1].key, "{name}: two keys");
-                    assert!(Arc::ptr_eq(&seen[0].map, &seen[1].map), "{name}: baked twice");
-                }
-                seen[0].key
-            })).collect();
-            names.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
-        });
-        // The renderer holds each map under its key: no two names share one.
-        let unique: std::collections::HashSet<u64> = keys.iter().copied().collect();
-        assert_eq!(unique.len(), PROCEDURAL_ENVIRONMENTS.len() + PRESET_ENVIRONMENTS.len(), "keys {keys:?}");
+    fn every_environment_name_resolves() {
+        // Each name stands for its own environment, by the load's own lookup:
+        // a look, or the generator preset of that name. Nothing is baked: a
+        // generator preset's map is checked once, for one preset, in
+        // a_generator_preset_loads_as_the_generators_map (a document's two
+        // spellings read every name the same way).
+        let mut sources = std::collections::HashSet::new();
+        for &name in PROCEDURAL_ENVIRONMENTS.iter().chain(PRESET_ENVIRONMENTS) {
+            let source = environment_source(name).unwrap_or_else(|| panic!("@{name} does not resolve"));
+            match (&source, name.strip_prefix(HDRI_PREFIX)) {
+                // A look (render_materials_looks_keep_their_names_and_maps).
+                (EnvSource::Preset(_), None) => {}
+                (EnvSource::HdriPreset(n), Some(_)) => assert_eq!(*n, name),
+                (source, _) => panic!("@{name}: {source:?}"),
+            }
+            // The renderer holds each map under a key made from its source:
+            // no two names share one.
+            assert!(sources.insert(format!("{source:?}")), "@{name} is another name's environment: {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_generator_preset_loads_as_the_generators_map() {
+        // One preset for all of them (every_environment_name_resolves): a
+        // studio, whose bake is the quickest.
+        let name = "hdri_three_point";
+        let reference = hdri::envmap::bake_env_map(&presets::preset(name.strip_prefix(HDRI_PREFIX).unwrap()).unwrap(), PROCEDURAL_HDRI_WIDTH, serial).0;
+        let seen: Vec<EnvironmentDef> = spellings(name).iter().map(|src| {
+            let doc = load_in(PathBuf::new(), src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert!(doc.warnings.is_empty(), "{src}: {:?}", doc.warnings);
+            let env = doc.def.environment.clone().unwrap_or_else(|| panic!("{src}: no environment"));
+            assert!(matches!(env.source, EnvSource::HdriPreset(n) if n == name), "{src}: {:?}", env.source);
+            // The generator's map at `PROCEDURAL_HDRI_WIDTH`.
+            assert!(*env.map == reference, "{src}: not the preset's {PROCEDURAL_HDRI_WIDTH}-wide bake");
+            env
+        }).collect();
+        // Both spellings are one environment, and a document loaded again
+        // bakes nothing: the map is the one baked before.
+        assert_eq!(seen[0].key, seen[1].key, "two keys");
+        assert!(Arc::ptr_eq(&seen[0].map, &seen[1].map), "baked twice");
     }
 
     #[test]

@@ -34,6 +34,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, KeyCode, KeyModifiers, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
@@ -257,28 +259,41 @@ type Slab = ((usize, usize), (usize, usize));
 /// The window, in logical pixels, at device scale 2.
 const WINDOW: (f64, f64, f64) = (1600.0, 1000.0, 2.0);
 
-/// The finished picture (with the screen AO `ao`, None: either), the slab's square in it.
-fn look(app: &TestApp, ao: Option<bool>) -> (std::path::PathBuf, Grab, f64, Option<Slab>) {
+/// The finished picture (with the screen AO `ao`, None: either), the slab's square in it: looked
+/// for `near` the square found before, else in the view's middle.
+fn look(app: &TestApp, ao: Option<bool>, near: Option<Slab>) -> (std::path::PathBuf, Grab, f64, Option<Slab>) {
     let (path, grab) = finished_grab(app, ao);
     let b = app.locator(Selector::id("viewport")).snapshot().bounds;
     let scale = grab.width as f64 / WINDOW.0;
     let (x0, y0) = ((b.x as f64 * scale) as usize, (b.y as f64 * scale) as usize);
     let (x1, y1) = (((b.x + b.w) as f64 * scale) as usize, ((b.y + b.h) as f64 * scale) as usize);
-    // the view's middle, where the wheel keeps the slab: not the toolbar, the gizmo or the
-    // view's buttons over its edges
-    let (w, h) = ((x1 - x0) / 5, (y1 - y0) / 5);
-    let slab = grab.slab(x0 + w, y0 + h, x1 - w, y1 - h);
+    let slab = match near {
+        // The wheel keeps the slab where it is, not in the view's middle: a window fixed there
+        // cut the foot off a slab below it, and the strips measured from that square fell on the
+        // block's top. Around the slab, with room to grow, inside the view.
+        Some(((sx0, sx1), (sy0, sy1))) => {
+            let (cx, cy) = ((sx0 + sx1) / 2, (sy0 + sy1) / 2);
+            let half = (sx1 - sx0).max(sy1 - sy0) * 3 / 4;
+            grab.slab(cx.saturating_sub(half).max(x0), cy.saturating_sub(half).max(y0), (cx + half).min(x1), (cy + half).min(y1))
+        }
+        // the view's middle: not the toolbar, the gizmo or the view's buttons over its edges
+        None => {
+            let (w, h) = ((x1 - x0) / 5, (y1 - y0) / 5);
+            grab.slab(x0 + w, y0 + h, x1 - w, y1 - h)
+        }
+    };
     (path, grab, scale, slab)
 }
 
-/// One view's readings with the AO on and off, and their checks; the slab found in its pictures.
-/// `normal`: the slab the Normal view found, which this view must find too (same zoom).
-fn check(app: &TestApp, view: &str, normal: Option<Slab>) -> Slab {
+/// One view's readings with the AO on and off, and their checks; the slab found in its pictures,
+/// looked for `near` the zoom's last. `normal`: the slab the Normal view found, which this view
+/// must find too (same zoom).
+fn check(app: &TestApp, view: &str, near: Slab, normal: Option<Slab>) -> Slab {
     let mut readings = Vec::new();
     let mut found = None;
     for on in [true, false] {
         screen_ao(app, on);
-        let (path, grab, _, slab) = look(app, Some(on));
+        let (path, grab, _, slab) = look(app, Some(on), Some(near));
         let Some(slab) = slab else { panic!("{view}: the slab not found; see {path:?}") };
         // The strips are measured from the slab's square: another square (the skirt round the
         // slab) puts them on other pixels, the far one over the slab's edge onto the bed.
@@ -356,14 +371,15 @@ fn an_inside_corner_reads_darker_than_the_open_face_in_both_views() {
         let (eye, target) = (at("eye"), at("target"));
         assert!(eye.len() == 3 && target.len() == 3 && (eye[0] - target[0]).hypot(eye[1] - target[1]) < 1e-3 * (eye[2] - target[2]), "the Top view: {}", camera.to_json());
         // Zoomed in by the wheel at the slab's middle till it is 560 px across.
-        let mut step = 0;
-        loop {
-            let (path, _, scale, slab) = look(&app, None);
+        let (mut step, mut near) = (0, None);
+        let near = loop {
+            let (path, _, scale, slab) = look(&app, None, near);
             let Some(((x0, x1), (y0, y1))) = slab else {
                 panic!("step {step}: the slab not found; the viewport reports {}; see {path:?}", app.locator(Selector::id("viewport")).snapshot().description)
             };
+            near = slab;
             if x1 - x0 >= 560 {
-                break;
+                break ((x0, x1), (y0, y1));
             }
             assert!(step < 24, "the wheel did not zoom in to the slab");
             let at = ((x0 + x1) as f64 * 0.5 / scale, (y0 + y1) as f64 * 0.5 / scale);
@@ -371,13 +387,12 @@ fn an_inside_corner_reads_darker_than_the_open_face_in_both_views() {
             app.scroll_at(at.0, at.1, 0.0, -80.0, None);
             wait_until(&app, "the wheel's zoom", || recording(&app).get("camera").map(Value::to_json) != camera);
             step += 1;
-        }
-        let normal = check(&app, "Normal", None);
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        };
+        let normal = check(&app, "Normal", near, None);
+        render_mode::pick(&app, "Sliced");
         // the whole slice, not its live tiles before it (they have no skirt yet)
         wait_until(&app, "the slice", || call(&app, "slice", "{}").is_ok_and(|t| whole_slice(&t)));
-        check(&app, "Sliced", Some(normal));
+        check(&app, "Sliced", normal, Some(normal));
     });
     let _ = std::fs::remove_file(&prefs);
     result.unwrap();

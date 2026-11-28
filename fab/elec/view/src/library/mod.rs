@@ -8,10 +8,16 @@ pub mod symbol;
 mod tests;
 
 use crate::ElecLive;
+use crate::req_list::ReqDraft;
+use fab_elec_bom::prices::{Library as PriceBook, Prices};
+use fab_elec_bom::shortlist::{PriceCoverage, ShortlistContext, ShortlistEntry};
+use fab_elec_design::Design;
+use makepad_widgets_core::tip::TipWidgetExt;
 use fab_elec_circuit::Circuit;
 use fab_elec_lang::{Catalog, CatalogEntry, CatalogKind};
+use fab_elec_parts::Lifecycle;
 use makepad_widgets_core::{view::ViewAction as RowAction, *};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use symbol::{Mark, SymbolIcon, SymbolIconWidgetRefExt};
 
@@ -30,6 +36,7 @@ pub struct EntryKey {
 /// The Library and the sheet asking each other, as plain actions.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LibraryAction {
+    ChooseParts,
     /// A click on an entry: the sheet carries it from the pointer's next move and places it where
     /// the next click lands.
     Arm(EntryKey),
@@ -93,6 +100,11 @@ script_mod! {
                     text_style: theme.font_bold{font_size: 9}
                 }
             }
+        }
+
+        lib_choose_parts_tip := Tip{
+            width: Fit height: Fit
+            lib_choose_parts := Button{text: "Choose parts" enabled: false}
         }
 
         // Fab's density: the property kit's row height and body type (`fab.font_size_ui`), a
@@ -209,7 +221,7 @@ script_mod! {
             // Transparent on the float; hover is a rounded wash (v10: no square surfaces).
             Row := View{
                 width: Fill
-                height: theme.prop_row_height
+                height: 34
                 flow: Right
                 align: Align{y: 0.5}
                 padding: Inset{left: 19 right: 2}
@@ -239,34 +251,29 @@ script_mod! {
                         }
                     }
                 }
-                symbol := mod.widgets.SymbolIcon{}
                 labels := View{
-                    width: Fill
-                    height: Fill
-                    flow: Right
-                    align: Align{y: 0.5}
-                    spacing: 4
-                    title := Label{
-                        width: Fit{max: FitBound.Rel{base: Base.Full factor: 0.68}}
-                        height: Fit padding: 0 max_lines: 1 text_overflow: Ellipsis
-                        draw_text +: {
-                            color: theme.color_text
-                            text_style: theme.font_regular{font_size: theme.prop_font_size}
+                    width: Fill height: Fill flow: Down align: Align{y: 0.5}
+                    first := View{
+                        width: Fill height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                        symbol := mod.widgets.SymbolIcon{}
+                        title := Label{
+                            width: Fill height: Fit padding: 0 max_lines: 1 text_overflow: Ellipsis
+                            draw_text +: {color: theme.color_text text_style: theme.font_regular{font_size: theme.prop_font_size}}
+                        }
+                        status := Label{
+                            width: Fit height: Fit padding: 0 max_lines: 1
+                            draw_text +: {color: theme.color_text text_style: theme.font_regular{font_size: 7.5}}
+                        }
+                        star := View{
+                            width: 14 height: 14 flow: Overlay
+                            outline := mod.widgets.SymbolIcon{width: Fill height: Fill draw_svg +: {color: theme.color_on_surface_variant}}
+                            filled := mod.widgets.SymbolIcon{width: Fill height: Fill draw_svg +: {color: theme.color_warning}}
                         }
                     }
                     meta := Label{
-                        width: Fill
-                        height: Fit padding: 0 max_lines: 1 text_overflow: Ellipsis
-                        draw_text +: {
-                            color: theme.color_on_surface_variant
-                            text_style: theme.font_regular{font_size: 7.5}
-                        }
+                        width: Fill height: Fit padding: 0 max_lines: 1 text_overflow: Ellipsis
+                        draw_text +: {color: theme.color_on_surface_variant text_style: theme.font_regular{font_size: 7.5}}
                     }
-                }
-                star := View{
-                    width: 14 height: 14 flow: Overlay
-                    outline := mod.widgets.SymbolIcon{width: Fill height: Fill draw_svg +: {color: theme.color_on_surface_variant}}
-                    filled := mod.widgets.SymbolIcon{width: Fill height: Fill draw_svg +: {color: theme.color_warning}}
                 }
             }
             Detail := View{
@@ -309,13 +316,13 @@ script_mod! {
         // it; the hint while no part is hovered.
         preview := View{
             width: Fill
-            height: 68
+            height: Fit
             flow: Right
             spacing: 8
             padding: Inset{top: 4 bottom: 4}
             well := View{
                 width: 72
-                height: Fill
+                height: 60
                 padding: 6
                 show_bg: true
                 draw_bg +: {
@@ -374,28 +381,30 @@ pub const RECENT_COUNT: usize = 8;
 
 /// Rows in display order. One pass over ranked matches and remembered keys. A remembered key is
 /// resolved only against offered entries, so a missing library can reappear on the next rebuild.
-fn build_rows(
-    entries: &[CatalogEntry], query: &str, pinned: &[EntryKey], recent: &[EntryKey],
+fn rows_from_matches(
+    entries: &[CatalogEntry], ranked: &[ShortlistEntry], query: &str, pinned: &[EntryKey], recent: &[EntryKey],
     used: &HashSet<String>, folded: &HashSet<Section>,
 ) -> (Vec<Row>, [String; Section::ALL.len()]) {
     let mut counts: [String; Section::ALL.len()] = Default::default();
-    let ranked = rank::rank(entries, query);
     let pins: HashSet<_> = pinned.iter().map(|key| (key.lib.as_str(), key.name.as_str())).collect();
     let row = |index: usize, section| {
         let entry = &entries[index];
         Row::Entry { index, section, pinned: pins.contains(&(entry.lib.as_str(), entry.name.as_str())) }
     };
     if !query.trim().is_empty() {
-        return (ranked.into_iter().map(|index| row(index, None)).collect(), counts);
+        return (ranked.iter().map(|r| row(r.index, None)).collect(), counts);
     }
     if ranked.is_empty() {
         return (vec![Row::Empty], counts);
     }
     let mut by_key = HashMap::new();
     let mut sections: [Vec<usize>; Section::ALL.len()] = Default::default();
-    for index in ranked {
+    for matched in ranked {
+        let index = matched.index;
         let entry = &entries[index];
-        by_key.insert((entry.lib.as_str(), entry.name.as_str()), index);
+        let key = (entry.lib.as_str(), entry.name.as_str());
+        by_key.insert(key, index);
+        if pins.contains(&key) { sections[Section::Pinned as usize].push(index); }
         if entry.part.as_ref().is_some_and(|part| used.contains(&part.name)) {
             sections[Section::Board as usize].push(index);
         }
@@ -407,7 +416,6 @@ fn build_rows(
         sections[section as usize].push(index);
     }
     let lookup = |key: &EntryKey| by_key.get(&(key.lib.as_str(), key.name.as_str())).copied();
-    sections[Section::Pinned as usize].extend(pinned.iter().filter_map(lookup));
     sections[Section::Recent as usize].extend(recent.iter().take(RECENT_COUNT).filter_map(lookup));
     let mut rows = Vec::new();
     for (section, indices) in Section::ALL.into_iter().zip(sections) {
@@ -446,6 +454,65 @@ fn entry_detail(entry: &CatalogEntry) -> String {
         None => fact,
     }
 }
+
+/// The person's badges for an entry's part: `approved`, then `NRND` or `obsolete`. Empty for a
+/// block and for a part that states neither. O(1).
+fn entry_status_badges(entry: &CatalogEntry) -> String {
+    let Some(part) = &entry.part else { return String::new() };
+    let mut out = Vec::new();
+    if part.approved {
+        out.push("approved");
+    }
+    match part.lifecycle {
+        Some(Lifecycle::Nrnd) => out.push("NRND"),
+        Some(Lifecycle::Obsolete) => out.push("obsolete"),
+        _ => {}
+    }
+    out.join(" · ")
+}
+
+#[derive(Default)]
+struct RowText {
+    badges: String,
+    meta: String,
+    detail: String,
+}
+
+const IMPORT_NOTE: &str = "This part is in the local import library but not in this project, so it cannot be placed yet. Choose parts can still pick it.";
+
+fn row_text(entry: &CatalogEntry, row: &ShortlistEntry, placeable: bool) -> RowText {
+    let badges = entry_status_badges(entry);
+    let base = entry_detail(entry);
+    let tier = row.tier.ui_label();
+    let (meta, full) = if entry.kind == CatalogKind::Block {
+        let label = format!("{tier} · {base}");
+        (label.clone(), label)
+    } else {
+        let (price, dated) = match &row.price {
+            PriceCoverage::Unpriced => ("unpriced".into(), "unpriced".into()),
+            PriceCoverage::Priced { unit_micros, qty_break, currency, source, date } => {
+                let amount = fab_elec_bom::Figure { micros: i128::from(*unit_micros), currency: currency.clone(),
+                    source: source.clone(), date: date.clone() }.display();
+                let short = format!("{amount} @{qty_break}");
+                (short.clone(), format!("{short} · {source} · {date}"))
+            }
+        };
+        let alts = row.alternates.len();
+        let mut full = format!("{tier} · {dated} · {base}");
+        if let Some(fp) = &row.footprint { full.push_str(&format!(" · {fp}")); }
+        full.push_str(&format!(" · +{alts} alt"));
+        (format!("{tier} · {price} · {base} · +{alts} alt"), full)
+    };
+    let mut lines = Vec::new();
+    if !badges.is_empty() { lines.push(badges.as_str()); }
+    lines.push(&full);
+    if !entry.summary.is_empty() { lines.push(&entry.summary); }
+    if !placeable { lines.push(IMPORT_NOTE); }
+    RowText { detail: lines.join("\n"), badges, meta }
+}
+
+/// A cache-only entry has no placement template in the project's circuit VM.
+fn can_place(index: usize, base_count: usize) -> bool { index < base_count }
 
 /// The first four-digit package token, borrowed from the footprint name.
 fn package_code(footprint: &str) -> Option<&str> {
@@ -500,6 +567,20 @@ pub struct LibraryPanel {
     #[rust]
     host_catalog: bool,
     #[rust]
+    base_catalog: Option<Arc<Catalog>>,
+    #[rust]
+    imported: Arc<Vec<CatalogEntry>>,
+    #[rust]
+    imported_ids: BTreeSet<String>,
+    #[rust]
+    price_book: Option<Arc<PriceBook>>,
+    #[rust]
+    design: Option<Arc<Design>>,
+    #[rust]
+    used_parts: BTreeSet<String>,
+    #[rust]
+    draft: Option<ReqDraft>,
+    #[rust]
     circuit: Option<Arc<Circuit>>,
     #[rust]
     used: HashSet<String>,
@@ -516,7 +597,7 @@ pub struct LibraryPanel {
     #[rust]
     section_counts: [String; Section::ALL.len()],
     #[rust]
-    row_details: Vec<String>,
+    row_details: Vec<RowText>,
     #[rust]
     selected: Option<usize>,
     #[rust]
@@ -554,7 +635,7 @@ impl LibraryPanel {
         }
         let text = match (entry, self.hovered) {
             (Some(entry), Some(index)) => {
-                let about = if entry.summary.is_empty() { self.row_details.get(index).cloned().unwrap_or_default() } else { entry.summary.clone() };
+                let about = &self.row_details[index].detail;
                 format!("{}\n{about}", entry.title)
             }
             _ => "Hover a part to see its symbol. Drag it onto the sheet, or click it and then click the sheet.".to_string(),
@@ -564,8 +645,9 @@ impl LibraryPanel {
 
     /// Feeds the catalog from a host and stops following `ElecLive`, including for `None`.
     pub fn set_catalog(&mut self, cx: &mut Cx, catalog: Option<Arc<Catalog>>) {
+        let imported = if self.host_catalog { self.imported.clone() } else { Arc::default() };
         self.host_catalog = true;
-        self.update_source(cx, catalog, None);
+        self.update_source(cx, catalog, imported, None, None, None);
     }
 
     /// Restores both shortcut lists and rebuilds the rows once, keeping keys for absent libraries;
@@ -589,22 +671,38 @@ impl LibraryPanel {
         self.catalog.as_ref()?.entries.get(self.selected?).map(entry_key)
     }
 
-    /// The catalog and the shown circuit from `ElecLive`, unless a host feeds the catalog. On each
-    /// snapshot signal and each draw: O(units) to find the circuit and two pointer compares; the
-    /// rows are rebuilt only when either changed.
+    fn sync_choose(&mut self, cx: &mut Cx) {
+        let state = cx.get_global_ref::<ReqDraft>();
+        if state.is_some() && self.draft.as_ref() == state { return }
+        let draft = state.cloned().unwrap_or_default();
+        if self.draft.as_ref() == Some(&draft) { return }
+        let working = draft.view.as_ref().is_some_and(|v| !v.done);
+        let note = if draft.slot == Some("parts") { draft.view.as_ref().map(|v| v.text.as_str()) }
+            else if working { Some("Another stage is being drafted") } else { None };
+        self.view.button(cx, ids!(lib_choose_parts_tip.lib_choose_parts)).set_enabled(cx, !working && draft.admit.is_ok());
+        self.view.tip(cx, ids!(lib_choose_parts_tip)).set_text(note.or(draft.admit.err()).unwrap_or("Choose parts"));
+        self.draft = Some(draft);
+    }
+
     fn follow_live(&mut self, cx: &mut Cx) {
-        if self.host_catalog {
-            return;
-        }
+        self.sync_choose(cx);
+        if self.host_catalog { return }
         if let Some(live) = cx.get_global_ref::<ElecLive>() {
             let catalog = live.snap.catalog.clone();
+            let imported = live.imported_catalog.clone();
+            let price_book = live.price_book.clone();
+            let design = Some(live.snap.design.clone());
             let circuit = shown_circuit(live, self.circuit.as_deref()).cloned();
-            self.update_source(cx, catalog, circuit);
+            self.update_source(cx, catalog, imported, price_book, design, circuit);
         }
     }
 
-    fn update_source(&mut self, cx: &mut Cx, catalog: Option<Arc<Catalog>>, circuit: Option<Arc<Circuit>>) {
-        let catalog_changed = self.catalog.as_ref().map(Arc::as_ptr) != catalog.as_ref().map(Arc::as_ptr);
+    fn update_source(&mut self, cx: &mut Cx, catalog: Option<Arc<Catalog>>, imported: Arc<Vec<CatalogEntry>>,
+        price_book: Option<Arc<PriceBook>>, design: Option<Arc<Design>>, circuit: Option<Arc<Circuit>>) {
+        let catalog_changed = self.base_catalog.as_ref().map(Arc::as_ptr) != catalog.as_ref().map(Arc::as_ptr)
+            || !Arc::ptr_eq(&self.imported, &imported);
+        let prices_changed = self.price_book.as_ref().map(Arc::as_ptr) != price_book.as_ref().map(Arc::as_ptr);
+        self.price_book = price_book;
         let mut used_changed = false;
         if self.circuit.as_ref().map(Arc::as_ptr) != circuit.as_ref().map(Arc::as_ptr) {
             // e.define registers parts by unique name. Component and catalog VMs can construct
@@ -621,24 +719,48 @@ impl LibraryPanel {
             used_changed = self.used != used;
             self.used = used;
         }
+        if self.design.as_ref().map(Arc::as_ptr) != design.as_ref().map(Arc::as_ptr) {
+            let used = design.iter().flat_map(|d| &d.units).flat_map(|u| &u.circuit.comps).map(|c| c.part.name.clone()).collect();
+            used_changed |= self.used_parts != used;
+            self.used_parts = used;
+            self.design = design;
+        }
         if catalog_changed {
             let selected = self.selected();
-            self.catalog = catalog;
-            self.row_details = self.catalog.iter().flat_map(|cat| cat.entries.iter().map(entry_detail)).collect();
-            self.selected = selected.and_then(|key| {
-                self.catalog.as_ref()?.entries.iter()
-                    .position(|entry| entry.lib == key.lib && entry.name == key.name)
-            });
-            self.update_detail();
+            self.base_catalog = catalog;
+            self.imported = imported;
+            self.imported_ids = self.imported.iter().map(|e| e.name.clone()).collect();
+            self.catalog = if self.imported.is_empty() { self.base_catalog.clone() } else {
+                let mut entries = self.base_catalog.as_ref().map(|c| c.entries.clone()).unwrap_or_default();
+                let present: HashSet<_> = entries.iter().filter(|e| e.lib.is_empty() || e.lib == "imported").map(|e| e.name.clone()).collect();
+                entries.extend(self.imported.iter().filter(|e| !present.contains(&e.name)).cloned());
+                Some(Arc::new(Catalog { entries }))
+            };
+            self.hovered = None;
+            self.selected = selected.and_then(|key| self.catalog.as_ref()?.entries.iter().position(|e| e.lib == key.lib && e.name == key.name));
         }
-        if catalog_changed || used_changed {
-            self.rebuild(cx);
-        }
+        if catalog_changed || used_changed || prices_changed { self.rebuild(cx); }
+    }
+
+    fn placeable(&self, index: usize) -> bool {
+        can_place(index, self.base_catalog.as_ref().map_or(0, |c| c.entries.len()))
     }
 
     fn rebuild(&mut self, cx: &mut Cx) {
         let entries = self.catalog.as_ref().map_or(&[][..], |catalog| catalog.entries.as_slice());
-        (self.rows, self.section_counts) = build_rows(entries, &self.query, &self.pinned, &self.recent, &self.used, &self.folded);
+        let pinned = self.pinned.iter().map(|k| (k.lib.clone(), k.name.clone())).collect::<Vec<_>>();
+        let ctx = ShortlistContext { pinned: &pinned, used_parts: &self.used_parts, imported_ids: &self.imported_ids };
+        let empty = Prices::default();
+        let prices = self.price_book.as_ref().map_or(&empty, |p| &p.prices);
+        let matches = rank::rank_with_context(entries, &self.query, &ctx, prices);
+        (self.rows, self.section_counts) = rows_from_matches(entries, &matches, &self.query, &self.pinned, &self.recent, &self.used, &self.folded);
+        self.row_details.clear();
+        self.row_details.resize_with(entries.len(), RowText::default);
+        for row in matches {
+            self.row_details[row.index] = row_text(&entries[row.index], &row, self.placeable(row.index));
+        }
+        self.previewed = None;
+        self.update_detail();
         self.place_detail();
         self.press = None;
         self.visible_rows.clear();
@@ -669,8 +791,9 @@ impl LibraryPanel {
     fn update_detail(&mut self) {
         self.detail.clear();
         self.pins.clear();
-        if let Some(entry) = self.catalog.as_ref().and_then(|catalog| catalog.entries.get(self.selected?)) {
-            self.detail.clone_from(&entry.summary);
+        let Some(index) = self.selected else { return };
+        if let Some(entry) = self.catalog.as_ref().and_then(|catalog| catalog.entries.get(index)) {
+            self.detail.clone_from(&self.row_details[index].detail);
             // Named, so a two-pin part does not read as a stray "1, 2".
             let names = entry.pins.iter().map(|pin| pin.name.as_str()).collect::<Vec<_>>().join(", ");
             self.pins = if names.is_empty() { names } else { format!("pins {names}") };
@@ -696,7 +819,7 @@ impl LibraryPanel {
                     self.shortcuts_changed(cx);
                     return;
                 }
-                cx.action(LibraryAction::Arm(key.clone()));
+                if self.placeable(index) { cx.action(LibraryAction::Arm(key.clone())); }
                 let selection_changed = self.selected != Some(index) || self.selected_in != section;
                 self.selected = Some(index);
                 self.selected_in = section;
@@ -717,6 +840,7 @@ impl LibraryPanel {
     }
 
     fn begin_drag(&mut self, cx: &mut Cx, index: usize) {
+        if !self.placeable(index) { return }
         let Some(entry) = self.catalog.as_ref().and_then(|catalog| catalog.entries.get(index)) else {
             return;
         };
@@ -744,9 +868,13 @@ impl Widget for LibraryPanel {
             self.press = None;
         }
         let actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
+        if self.view.button(cx, ids!(lib_choose_parts_tip.lib_choose_parts)).clicked(&actions) {
+            cx.action(LibraryAction::ChooseParts);
+        }
         if let Some(query) = self.view.text_input(cx, ids!(search)).changed(&actions) {
             if self.query != query {
                 self.query = query;
+                self.hovered = None;
                 self.view.portal_list(cx, ids!(entries)).set_first_id_and_scroll(0, 0.0);
                 self.rebuild(cx);
             }
@@ -785,6 +913,7 @@ impl Widget for LibraryPanel {
                 _ => {}
             }
         }
+        cx.extend_actions(actions);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -813,16 +942,20 @@ impl Widget for LibraryPanel {
                     Row::Entry { index, pinned, .. } => {
                         let entry = &self.catalog.as_ref().unwrap().entries[index];
                         let item = list.item(cx, row_id, id!(Row));
-                        if let Some(mut icon) = item.symbol_icon(cx, ids!(symbol)).borrow_mut() {
+                        if let Some(mut icon) = item.symbol_icon(cx, ids!(labels.first.symbol)).borrow_mut() {
                             if let Some(part) = &entry.part {
                                 icon.set_part(part, entry.hash);
                             } else {
                                 icon.set_mark(Mark::Section(Section::Blocks), entry.kind == CatalogKind::Block);
                             }
                         }
-                        item.label(cx, ids!(labels.title)).set_text(cx, &entry.title);
-                        item.label(cx, ids!(labels.meta)).set_text(cx, &self.row_details[index]);
-                        let star = item.widget(cx, ids!(star));
+                        if let Some(mut view) = item.borrow_mut::<View>() {
+                            view.cursor = Some(if self.placeable(index) { MouseCursor::Hand } else { MouseCursor::Default });
+                        }
+                        item.label(cx, ids!(labels.first.status)).set_text(cx, &self.row_details[index].badges);
+                        item.label(cx, ids!(labels.first.title)).set_text(cx, &entry.title);
+                        item.label(cx, ids!(labels.meta)).set_text(cx, &self.row_details[index].meta);
+                        let star = item.widget(cx, ids!(labels.first.star));
                         if let Some(mut icon) = star.symbol_icon(cx, ids!(outline)).borrow_mut() {
                             icon.set_mark(Mark::Star { pinned: false }, !pinned && cx.fingers.is_area_hovered(item.area()));
                         }

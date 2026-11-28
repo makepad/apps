@@ -9,6 +9,8 @@
 mod picture;
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, Role, Selector, TestApp};
@@ -126,7 +128,7 @@ fn place_block(app: &TestApp, body: &str) {
 place("block", name: "Block", color: "Orange")"#;
     let batch = format!(r#"{{"request_id":"eye-1-place","expected":{head:?},"edits":{}}}"#, Value::Str(edits.to_string()).to_json());
     call(app, "place", &batch).expect("place");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible();
 }
 
@@ -151,9 +153,9 @@ fn the_eye_is_an_icon_that_ghosts_the_part_and_undoes(app: TestApp) {
     wait_until(&app, "the closed eye", || eyes(&app, "Show part") == 1 && eyes(&app, "Hide part") == 0);
     let ghosted = look_until(&app, "the part's colour is gone and a ghost left", |l| l.solid * 20 < shown.solid && l.ghosted());
     assert!(ghosted.ghosted());
-    // the title counts it, and says it is hidden
-    let text = |id: &str| app.widget_snapshot().nodes().into_iter().find(|n| n.visible() && n.node.path.rsplit('.').next() == Some(id)).map(|n| n.node.name).unwrap_or_default();
-    wait_until(&app, "the counts to say the part is hidden", || text("doc_state").starts_with("1 part (1 hidden) · "));
+    // the status bar counts it, and says it is hidden
+    let text = |path: &str| app.widget_snapshot().nodes().into_iter().find(|n| n.visible() && n.node.path.ends_with(path)).map(|n| n.node.name).unwrap_or_default();
+    wait_until(&app, "the counts to say the part is hidden", || text("status_bar.info").starts_with("1 part (1 hidden) · "));
 
     // one undo step brings it back, one redo ghosts it again
     app.locator(Selector::id("undo").nth(0)).press();

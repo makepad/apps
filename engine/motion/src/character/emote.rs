@@ -3,6 +3,7 @@
 //! sparkles, an anger mark, hearts. They ride the head (a nod carries
 //! them) and are drawn over the character.
 
+use crate::plain::PrimitiveFrame;
 use crate::frame::{Affine, Item, ItemKind, Local};
 use crate::geometry::{parse_path, VectorPath};
 use crate::model::{Blend, Cap, Color, Join};
@@ -80,7 +81,7 @@ pub fn items(name: &str, geometry: &Arc<VectorPath>, u: f64, length: f64, head: 
             effects: Vec::new(),
             blend: Blend::Normal,
             is_static: false,
-            kind: ItemKind::Path { path: geometry.clone(), fill, stroke, width: width / size, trim: [0.0, 1.0], cap: Cap::Round, join: Join::Round },
+            kind: ItemKind::Primitive(PrimitiveFrame::Path { path: geometry.clone(), fill, stroke, width: width / size, trim: [0.0, 1.0], cap: Cap::Round, join: Join::Round }),
         });
     };
     let line = 0.018 * w;

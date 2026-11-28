@@ -194,13 +194,15 @@ pub struct FabColorLink {
     /// the widgets under the popover take no hovers or presses through it.
     #[rust]
     lock_area: Area,
-    /// The colour whose tray menu is up.
+    /// The target and colour whose tray menu is up.
     #[rust]
-    menu_for: Option<String>,
+    menu_for: Option<(EditOwner, String)>,
     /// The tray whose contents menu is up (a right-click on the slot while the printer does
     /// not report).
     #[rust]
-    tray_editing: Option<super::colours::Position>,
+    tray_editing: Option<(EditOwner, super::colours::Position)>,
+    #[rust]
+    owner: EditOwner,
     /// Each drawn spot: its rect, row (colour name) and kind.
     #[rust]
     spots: Vec<(Rect, String, Spot)>,
@@ -382,6 +384,11 @@ fn tip(state: &AppState, row: &Row, spot: Spot) -> String {
     }
 }
 
+/// Capture the plate destination when its colour map is drawn. Open tray menus retain a copy.
+pub fn capture_tray_owner(owner: &mut EditOwner, state: &PrintState) {
+    owner.capture(PrinterScope::Target, state);
+}
+
 impl FabColorLink {
     fn menu_id(&self) -> LiveId {
         LiveId::from_str(&format!("fab_color_tray:{:?}", self.uid))
@@ -491,8 +498,9 @@ impl FabColorLink {
                 }
             }
             Spot::Mapping | Spot::Tray | Spot::Differs | Spot::Warn => {
+                if !self.owner.matches(&state.print) { return; }
                 self.close_editor(cx, true);
-                self.menu_for = Some(row.name.clone());
+                self.menu_for = Some((self.owner.clone(), row.name.clone()));
                 open_menu(cx, self.menu_id(), tray_menu(m, row.pos), rect, MenuPlace::Below);
             }
         }
@@ -603,10 +611,11 @@ impl Widget for FabColorLink {
                     return;
                 }
                 let Some(state) = scope.data.get::<AppState>() else { return };
+                if !self.owner.matches(&state.print) { return; }
                 let m = &state.print.colors;
                 let tray = self.spots.iter().find(|(r, _, spot)| *spot == Spot::Mapping && r.contains(fe.abs)).and_then(|(_, name, _)| m.row(name)).and_then(|row| row.pos).filter(|_| !m.layout.live || state.print.target_printer().is_some_and(|p| p.virtual_printer)).and_then(|pos| m.layout.tray(pos));
                 if let Some(t) = tray {
-                    self.tray_editing = Some(t.pos);
+                    self.tray_editing = Some((self.owner.clone(), t.pos));
                     self.hint.clear(cx, uid);
                     open_menu(cx, self.tray_edit_id(), super::colours::tray_edit_menu(t, &m.layout.heads), Rect { pos: fe.abs, size: dvec2(0.0, 0.0) }, MenuPlace::At);
                 }
@@ -624,12 +633,13 @@ impl Widget for FabColorLink {
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
         if let Some(pick) = menu_picked(actions, self.tray_edit_id()) {
-            if let (Some(pos), Some(edit)) = (self.tray_editing.take(), super::colours::tray_edit_pick(pick)) {
-                cx.action(super::PrintAction::EditTray(pos, edit));
+            if let (Some((owner, pos)), Some(edit)) = (self.tray_editing.take(), super::colours::tray_edit_pick(pick)) {
+                cx.action(super::PrintAction::EditTray(owner, pos, edit));
             }
         }
         if let Some(pick) = menu_picked(actions, self.menu_id()) {
-            if let (Some(name), Some(pos)) = (self.menu_for.take(), tray_pick(&state.print.colors, pick)) {
+            let menu = self.menu_for.take().filter(|(owner, _)| owner.matches(&state.print));
+            if let (Some((_, name)), Some(pos)) = (menu, tray_pick(&state.print.colors, pick)) {
                 cx.action(match &self.part {
                     Some(part) => crate::ui::parts::assign_tray(state, part.objects.clone(), pos, part.paint.clone()),
                     None => PartAction::MapColor { color: name, printer: state.print.colors.layout.printer.clone(), at: Some((super::colours::head_word(&state.print.colors.layout.heads, pos.head), pos.tray_text())) },
@@ -657,6 +667,7 @@ impl Widget for FabColorLink {
         self.spots.clear();
         self.text.clear();
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
+        capture_tray_owner(&mut self.owner, &state.print);
         let heads = &state.print.colors.layout.heads;
         let row = self.row.clone();
         if self.editing.as_ref().is_some_and(|n| row.as_ref().is_none_or(|r| r.name != *n)) {

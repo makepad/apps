@@ -153,13 +153,7 @@ fn all_names(vm: &ScriptVm, exports: ScriptObject) -> Vec<String> {
     out
 }
 
-/// A character of a script written without spaces between words (Han,
-/// kana, Hangul syllables and CJK punctuation): each is its own word.
-pub fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
-        | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
-}
+pub use makepad_motion_plain::is_cjk;
 
 /// Whether `text` has any [`is_cjk`] character.
 pub fn has_cjk(text: &str) -> bool {

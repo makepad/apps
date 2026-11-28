@@ -45,6 +45,7 @@
 //! declarations; Splash sources are copied unchanged and absent media has no
 //! payload entry. The player reconstructs one shared tree draft from it.
 
+use makepad_motion::plain::TextProps;
 use makepad_motion::{AudioFeatures, InputValue, LayerKind, MotionContext, MotionDoc};
 use makepad_story_cut::{Animated, CutDoc, CutEval, CutNodeKind, GraphicSrc, MediaRef};
 use makepad_strict_json::{self as json, Value};
@@ -652,7 +653,7 @@ fn build(edit: &Path, media: Media, tree: Option<(std::sync::Arc<makepad_asset_d
                                     .all_layers()
                                     .iter()
                                     .filter_map(|layer| match &layer.kind {
-                                        LayerKind::Text { font, .. } => Some(font.clone()),
+                                        LayerKind::Text { props: TextProps { font, .. }, .. } => Some(font.clone()),
                                         _ => None,
                                     })
                                     .collect();

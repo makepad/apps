@@ -159,6 +159,8 @@ pub fn strip_presses(cx: &mut Cx, tools: &WidgetRef, actions: &Actions) -> Vec<C
 /// Between the strip's view and its host, which draws the menus.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StripAction {
+    DraftArchitecture,
+    DraftSchematic,
     /// Open the Power flyout beside the button with (net name, note) rows, ground first,
     /// followed by the power flag when the catalog offers one.
     PowerMenu { rails: Vec<(String, String)>, has_power_flag: bool, anchor: Rect },

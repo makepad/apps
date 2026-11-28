@@ -1,5 +1,6 @@
 //! Pure deform-stage contracts. The lane lead runs these; pixel proof uses
 //! motion_draw on the native GPU separately.
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::{character, geometry, rig, *};
 
 fn load(layer: &str) -> MotionDoc {
@@ -127,7 +128,7 @@ fn first_key_defines_rest_and_rigid_child_obeys_container_transform() {
     assert_eq!(bones(&doc).bones[0].rest, 0.0); // t=0 would be 45 degrees.
     let frame = doc.eval(1.0);
     let ItemKind::Group { children, .. } = &frame.items[0].kind else { panic!() };
-    assert!(matches!(children[0].kind, ItemKind::Rect { .. }));
+    assert!(matches!(children[0].kind, ItemKind::Primitive(PrimitiveFrame::Rect { .. })));
     near(children[0].transform([30.0, 10.0]).apply([0.0, 0.0]), [300.0, 300.0]);
 }
 
@@ -143,8 +144,8 @@ fn paths_rects_ellipses_and_image_meshes_deform_deterministically() {
     assert_eq!(a, doc.eval(2.0));
     assert!(a.errors.is_empty());
     let ItemKind::Group { children, .. } = &a.items[0].kind else { panic!() };
-    for item in &children[..3] { assert!(matches!(item.kind, ItemKind::Path { .. })); }
-    let ItemKind::Path { path, .. } = &children[0].kind else { panic!() };
+    for item in &children[..3] { assert!(matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Path { .. }))); }
+    let ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) = &children[0].kind else { panic!() };
     assert!(path.cmds.len() > 2, "straight edges gain vertices to bend near joints");
     let bounds = geometry::bounds(path).unwrap();
     near([bounds[2], bounds[3]], [0.0, 100.0]);

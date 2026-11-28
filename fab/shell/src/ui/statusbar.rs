@@ -13,7 +13,7 @@
 //! what it says changes.
 
 use crate::api::*;
-use crate::print::panel::slice_status;
+use crate::print::panel::{export_failure, slice_status};
 use crate::print::SliceStatus;
 use crate::ui::job_strip::JOB_LINE_CHARS;
 use makepad_widgets_core::*;
@@ -77,7 +77,8 @@ script_mod! {
                 strip := mod.widgets.FabJobStrip{max_chars: #(JOB_LINE_CHARS)}
             }
         }
-        info := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_muted } }
+        // what is on the plate: words read, in the second voice
+        info := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_dim } }
     }
 }
 
@@ -179,6 +180,10 @@ fn tool_hint(state: &AppState) -> String {
 /// (nothing to slice, waiting, checking printability, a part too big) while the slice shows.
 pub fn slice_line(state: &AppState) -> Option<(String, Option<f32>)> {
     let p = &state.print;
+    // an export that failed, in any view and mode
+    if let Some(why) = export_failure(p) {
+        return Some((why, None));
+    }
     // a printer's job held in view (Monitor): the plate's slice is not what shows
     if p.monitor_holds() {
         return None;
@@ -193,7 +198,7 @@ pub fn slice_line(state: &AppState) -> Option<(String, Option<f32>)> {
         };
         return Some((text, progress));
     }
-    if matches!(p.status, SliceStatus::Failed(_)) {
+    if p.calibration_error.is_some() || matches!(p.status, SliceStatus::Failed(_)) {
         return Some((status, None));
     }
     if !p.play.active {

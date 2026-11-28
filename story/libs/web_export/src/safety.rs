@@ -49,9 +49,9 @@
 use crate::shader_loops::{self, Cost, PackLoops};
 use crate::{Phase, Progress};
 use makepad_strict_json::{obj, s, Value};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -936,7 +936,8 @@ struct Browser {
     gpu_lines: Arc<Mutex<Vec<String>>>,
 }
 
-/// Lines of Chrome's log that say its GPU process died.
+/// Lines of Chrome's log that say its GPU process died (read by the Unix launch's log thread).
+#[cfg(unix)]
 const GPU_DEATH: [&str; 5] = ["GPU process exited unexpectedly", "GPU process isn't usable", "GPU process crashed", "Lost UI shared context", "GPU process launch failed"];
 
 #[cfg(unix)]
@@ -954,8 +955,10 @@ mod fds {
 impl Browser {
     #[cfg(unix)]
     fn launch(chrome: &Path, profile: &Path, size: (u32, u32)) -> Result<Browser, String> {
+        use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
         std::fs::create_dir_all(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
         // Chrome reads commands on fd 3 and writes answers on fd 4.
         let (cmd_read, cmd_write) = std::io::pipe().map_err(|e| e.to_string())?;

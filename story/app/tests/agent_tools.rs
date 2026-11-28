@@ -63,7 +63,7 @@ const SKIP: &[(&str, &str)] = &[
 
 /// Tools this test's Story cannot serve, with the error they answer and why.
 const ABSENT: &[(&str, &str, &str)] = &[
-    ("cut_panel_make", "is not installed here", "no model command line"),
+    ("cut_panel_make", "uses no model", "the launch says no model (MAKEPAD_AI_PROVIDER=none), even where `claude` is installed"),
     ("editor_deep", "no deep make has run", "reads what editor_make (a model) made"),
     ("write_effect", "needs the VJ effect pack", "Story carries no effect pack"),
     ("read_effect", "no preset", "no effect pack: list_effects is empty"),
@@ -167,7 +167,7 @@ const ARGS: &[(&str, &str)] = &[
     ("doc_patch", r#"{"path": "slides/guard_plate.splash", "edits": [{"old": "Text{text: \"Guard\" size: 48 at: vec2(40, 40) color: #ffffff}", "new": "Text{text: \"Guarded\" size: 48 at: vec2(40, 40) color: #ffffff}"}]}"#),
     ("doc_rename", r#"{"from": "slides/guard_plate.splash", "to": "slides/guarded_plate.splash"}"#),
     ("add_slide", r#"{"kind": "blank"}"#),
-    ("add_layer", r#"{"index": 0, "kind": "camera", "device": 0}"#),
+    ("add_layer", r#"{"index": 0, "kind": "camera", "device": "@test_pattern"}"#),
     ("set_slide", r#"{"index": 0, "target_seconds": 30}"#),
     ("set_deck_target", r#"{"seconds": 60}"#),
     ("doc_delete", r#"{"path": "slides/guarded_plate.splash"}"#),

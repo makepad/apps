@@ -154,6 +154,17 @@ pub enum NetStyle {
     Label,
 }
 
+/// Electrical accounting for one rail, supplied by the circuit adapter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GRailSummary {
+    pub volts: Option<(f64, f64)>,
+    pub volts_conflict: bool,
+    pub demand: f64,
+    pub has_demand: bool,
+    pub budget: Option<f64>,
+    pub source_conflict: bool,
+}
+
 /// A net: a hyper-edge over part ports and block ports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GNet {
@@ -163,6 +174,7 @@ pub struct GNet {
     pub kind: NetKind,
     /// The nominal potential in volts when known (orders rails top to bottom).
     pub volts: Option<f64>,
+    pub rail: Option<GRailSummary>,
     /// The part ports on it: (node index, port index).
     pub pins: Vec<(u32, u32)>,
     /// The bus it is a member of, if any (an index into `LayoutGraph::buses`).
@@ -177,6 +189,10 @@ pub struct GBlockPort {
     /// The side its definition asks for, if any.
     pub side: Option<Side>,
     pub kind: PortKind,
+    pub ground: bool,
+    pub volts: Option<(f64, f64)>,
+    pub current: Option<f64>,
+    pub open: bool,
     /// The nets bound to it (a bus port binds several), as indices into `LayoutGraph::nets`.
     pub nets: Vec<u32>,
 }
@@ -201,6 +217,8 @@ pub struct GBlock {
     pub path: String,
     /// The definition's title (`LED driver`), if any.
     pub title: Option<String>,
+    pub planned: bool,
+    pub role: Option<String>,
     pub flow: Flow,
     pub ports: Vec<GBlockPort>,
     /// Source order among its siblings.

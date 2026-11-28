@@ -253,7 +253,9 @@ pub fn pump(page: &mut VideoCut, cx: &mut Cx, ui: &WidgetRef) {
         controls.push(format!("PanelRow{{{}}}", row.join(" ")));
     }
     let body = if controls.is_empty() { String::new() } else { format!("flow: Down width: Fill spacing: 2\n{}", controls.join("\n")) };
-    pane.widget(cx, ids!(t_style)).as_splash().set_text(cx, &body);
+    let splash = pane.widget(cx, ids!(t_style)).as_splash();
+    splash.set_grants(HostGrants::CLIPBOARD);
+    splash.set_text(cx, &body);
     pane.set_visible(cx, true);
 }
 

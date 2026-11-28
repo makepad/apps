@@ -13,6 +13,10 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_script::syntax::{self, Node};
 use makepad_strict_json::Value;
@@ -121,7 +125,7 @@ fn settle_after_commit(app: &TestApp, part: &str, key: &str, before: f64) -> Str
 }
 
 fn pick_part(app: &TestApp, name: &str) {
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name(name)).wait_visible().click();
     app.locator(Selector::id("t_shape")).wait_visible().click();
 }
@@ -274,6 +278,7 @@ fn a_dragged_value_stays_where_it_was_let_go_on_the_demo_plate(app: TestApp) {
     place_parts(&app, &[BRACKET, VASE]);
     let mut snapped = Vec::new();
     pick_part(&app, "Shelf bracket");
+    part_editor::open(&app);
     let mut geo = settle(&app, "Shelf bracket", quiet());
     drag_holds(&app, "Shelf bracket", "Screw hole", "bracket/hole", &[false, true], &mut geo, &mut snapped);
     drag_holds(&app, "Shelf bracket", "Width", "bracket/width", &[false], &mut geo, &mut snapped);
@@ -287,6 +292,7 @@ fn a_dragged_value_stays_where_it_was_let_go_on_the_demo_plate(app: TestApp) {
     assert!((number(&shown(&app, "Width")) - undone).abs() < 0.06, "Width: the control does not show the undone value {undone}");
     drag_away_and_back(&app, "Shelf bracket", "Screw hole", "bracket/hole");
     pick_part(&app, "Bud vase");
+    part_editor::open(&app);
     let mut geo = settle(&app, "Bud vase", quiet());
     drag_holds(&app, "Bud vase", "Height", "vase/vase_height", &[false], &mut geo, &mut snapped);
     if !snapped.is_empty() {
@@ -302,6 +308,7 @@ fn a_dragged_value_stays_where_it_was_let_go_on_the_demo_plate(app: TestApp) {
 fn a_field_part_follows_a_panel_drag_on_the_glass(app: TestApp) {
     place_parts(&app, &[VASE]);
     pick_part(&app, "Bud vase");
+    part_editor::open(&app);
     settle(&app, "Bud vase", quiet());
     let drawn = || app.log_since(0).map_or(0, |log| log.lines.iter().filter(|l| l.contains("fab vp sdf live:")).count());
     let mut drag = app.locator(Selector::role(Role::SpinButton).name("Belly")).wait_visible().press_and_drag();
@@ -331,6 +338,7 @@ fn a_field_part_follows_a_panel_drag_on_the_glass(app: TestApp) {
 fn a_dragged_value_stays_where_it_was_let_go_on_an_exact_part(app: TestApp) {
     place_parts(&app, &[EXACT_PART]);
     pick_part(&app, "Housing");
+    part_editor::open(&app);
     let mut snapped = Vec::new();
     let mut geo = settle(&app, "Housing", quiet());
     drag_holds(&app, "Housing", "Housing size", "housing/size", &[false, true], &mut geo, &mut snapped);
@@ -378,6 +386,7 @@ fn an_exact_part_shows_its_shapes_while_it_is_dragged() {
         const FRAME: Duration = Duration::from_millis(16);
         place_parts(&app, &[EXACT_PART]);
         pick_part(&app, "Housing");
+        part_editor::open(&app);
         settle(&app, "Housing", quiet());
         let before = shown_previews(&app, KEY).len();
         let mut drag = app.locator(Selector::role(Role::SpinButton).name(LABEL)).wait_visible().press_and_drag();
@@ -429,6 +438,7 @@ fn an_exact_part_dragged_back_shows_the_shape_it_built_at_once() {
         };
         place_parts(&app, &[EXACT_PART]);
         pick_part(&app, "Housing");
+        part_editor::open(&app);
         settle(&app, "Housing", quiet());
         let mut drag = app.locator(Selector::role(Role::SpinButton).name(LABEL)).wait_visible().press_and_drag();
         // The value counts from where the drag engages (3 px in); 20 px on is ten millimetres.
@@ -463,6 +473,7 @@ fn an_exact_part_dragged_back_shows_the_shape_it_built_at_once() {
 fn a_refused_drag_goes_back_and_says_why(app: TestApp) {
     place_parts(&app, &[POST_PART]);
     pick_part(&app, "Post");
+    part_editor::open(&app);
     let control = Selector::role(Role::SpinButton).name("Post radius");
     let before = settle(&app, "Post", quiet());
     for hold in ["at once", "after more moves"] {

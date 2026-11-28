@@ -11,7 +11,8 @@
 //! The view shows the live design with the rows the host published for it, including a circuit
 //! preview's own index (`StateOf::Preview`). While an edit this view committed is landing it
 //! applies nothing, so the sheet never flashes back to the committed layout during evaluation.
-//! Only a new circuit or rows needs a layout; a board edit swaps the design in place.
+//! Only a new circuit or rows needs a layout; a board edit swaps the design in place. A
+//! proposal borrows the camera and uses its own published rows and a separate layout slot.
 //!
 //! Cost: per signal one global read and `Arc` compares; per new circuit or rows one row-index
 //! clone (O(rows)) and the layout request a feeding host would make; nothing more per board
@@ -20,7 +21,7 @@
 
 use super::ExplorerView;
 use crate::{ElecLive, SheetIndex, StatesOf, ViewAction};
-use crate::snapshot::{DesignSnapshot, Tagged};
+use crate::snapshot::{DesignSnapshot, ProposalView, Tagged};
 use fab_elec_circuit::Circuit;
 use fab_elec_core::BoardId;
 use fab_elec_design::{Design, Unit};
@@ -36,6 +37,11 @@ pub(super) struct Followed {
 }
 
 impl Followed {
+    pub(super) fn matches(&self, s: &SheetSource) -> bool {
+        let u = &s.design.units[s.unit];
+        self.is(u) && step(self, &u.circuit, &s.rows) == Step::Swap
+    }
+
     /// Whether `unit` is the unit followed: the same id and name (another plate's unit may have
     /// this one's id).
     fn is(&self, unit: &Unit) -> bool {
@@ -64,45 +70,104 @@ fn shown<'a>(snap: &'a DesignSnapshot, id: BoardId) -> Option<(&'a Arc<Design>, 
     Some((design, snap.of(&snap.sheets, id)?))
 }
 
+/// The design, unit position in that design, and matching stable rows to display.
+pub(super) struct SheetSource {
+    pub design: Arc<Design>,
+    pub unit: usize,
+    pub rows: Arc<SheetIndex>,
+}
+
+impl SheetSource {
+    pub(super) fn same_sheet(&self, other: &Self) -> bool {
+        let (a, b) = (&self.design.units[self.unit], &other.design.units[other.unit]);
+        a.id == b.id && Arc::ptr_eq(&a.circuit, &b.circuit) && Arc::ptr_eq(&self.rows, &other.rows)
+    }
+}
+
+/// A held picture keeps the displayed unit by id, including its absence. Only an
+/// unassigned pane chooses a first sheet. Ordinary following keeps the live bench rule.
+pub(super) fn source(host: &ElecLive, proposal: Option<&ProposalView>, previous: Option<(BoardId, &str)>) -> Option<SheetSource> {
+    if let Some(view) = proposal {
+        let design = view.design.as_ref()?;
+        let unit = match previous {
+            Some((id, _)) => design.units.iter().position(|u| u.id == id)?,
+            None => design.units.iter().position(|u| view.sheets.contains_key(&u.id))?,
+        };
+        return Some(SheetSource { design: design.clone(), rows: view.sheets.get(&design.units[unit].id)?.clone(), unit });
+    }
+    let unit = host.sheet_unit(previous)?;
+    let (design, sheet) = shown(&host.snap, host.snap.live().units[unit].id)?;
+    Some(SheetSource { design: design.clone(), unit, rows: sheet.value.clone() })
+}
+
 impl ExplorerView {
     /// Show the host's newest design when it is not the one shown: in place for a board edit,
     /// laid out again for a new circuit or rows.
     pub(super) fn follow(&mut self, cx: &mut Cx) {
-        // Keep the released display through the host's preview-to-commit gap.
-        if self.holding() { return; }
-        if self.pinned || !cx.has_global::<ElecLive>() {
+        if self.pinned || !cx.has_global::<ElecLive>() { return; }
+        let host = cx.get_global::<ElecLive>();
+        let previous = self.followed.as_ref().map(|f| (f.unit, f.name.as_str()));
+        if let Some(view) = host.previewed() {
+            if self.review.as_ref().is_some_and(|r| Arc::ptr_eq(&r.view, view)) { return; }
+            let displayed = self.sheet_design.as_ref().and_then(|d| d.units.get(self.unit)).map(|u| (u.id, u.name.as_str()));
+            let candidate = source(host, Some(view), displayed);
+            let view = view.clone();
+            self.follow_comparison(cx, view, candidate, displayed.is_some());
             return;
         }
-        let host = cx.get_global::<ElecLive>();
-        let unit = host.sheet_unit(self.followed.as_ref().map(|f| (f.unit, f.name.as_str())));
-        let snap = host.snap.clone();
-        let Some(unit) = unit else {
-            // No unit with parts (a plate with no circuit): the sheet empties, never keeping the
-            // circuit of the plate before.
-            if self.design.is_some() { self.unload(cx); }
+        let next = source(host, None, previous);
+        let no_unit = next.is_none() && host.sheet_unit(previous).is_none();
+        let returning = self.review.is_some() || self.return_picture.is_some();
+        if self.review.is_none() {
+            self.follow_live(cx, next, no_unit, returning, None);
+            return;
+        }
+
+        // Finish live work against the live source. A newer snapshot or an adopted sheet
+        // advances gen before deferred results are considered, so an older result cannot land.
+        let deferred = std::mem::take(&mut self.review.as_mut().unwrap().deferred);
+        let completing_live = self.layout_jobs.busy();
+        self.wire_snapshot(cx);
+        self.keep_snapshot(cx);
+        let prepared = self.leave_comparison(cx, next.as_ref());
+        self.follow_live(cx, next, no_unit, returning, prepared);
+        for result in deferred { self.layout_result(cx, result); }
+        if completing_live {
+            if let Some(result) = self.layout_jobs.poll(cx) { self.layout_result(cx, result); }
+        }
+        self.pane.nav.stop();
+        if self.assemble_pending { self.request_frame(cx); }
+    }
+
+    fn follow_live(&mut self, cx: &mut Cx, next: Option<SheetSource>, no_unit: bool, returning: bool, prepared: Option<super::Laid>) {
+        if self.holding() { return; }
+        let Some(SheetSource { design, unit, rows }) = next else {
+            if no_unit {
+                self.return_picture = None;
+                if self.design.is_some() { self.unload(cx); }
+            }
             return;
         };
-        let live = snap.live();
-        let id = live.units[unit].id;
-        let Some((design, sheet)) = shown(&snap, id) else { return };
-        if self.unit == unit && self.design.as_ref().is_some_and(|shown| Arc::ptr_eq(shown, design)) {
+        let id = design.units[unit].id;
+        if self.unit == unit && self.design.as_ref().is_some_and(|shown| Arc::ptr_eq(shown, &design))
+            && self.followed.as_ref().is_some_and(|f| Arc::ptr_eq(&f.rows, &rows)) {
             return;
         }
         let circuit = design.units[unit].circuit.clone();
         let name = design.units[unit].name.clone();
         let same_unit = self.design.is_some() && self.unit == unit && self.followed.as_ref().is_some_and(|f| f.is(&design.units[unit]));
-        match self.followed.as_ref().filter(|_| same_unit).map(|shown| step(shown, &circuit, &sheet.value)) {
+        match self.followed.as_ref().filter(|_| same_unit).map(|shown| step(shown, &circuit, &rows)) {
             Some(Step::Swap) => {
                 self.design = Some(design.clone());
                 self.draw_bg.redraw(cx);
             }
             Some(Step::Relayout) => {
-                self.followed = Some(Followed { unit: id, name, circuit, rows: sheet.value.clone() });
-                self.update_design(cx, design.clone(), sheet.value.rows.clone());
+                self.followed = Some(Followed { unit: id, name, circuit, rows: rows.clone() });
+                self.change_design(cx, design, rows.rows.clone(), returning, prepared);
             }
             None => {
-                self.followed = Some(Followed { unit: id, name, circuit, rows: sheet.value.clone() });
-                self.load(cx, design.clone(), unit, sheet.value.rows.clone());
+                self.followed = Some(Followed { unit: id, name, circuit, rows: rows.clone() });
+                self.load(cx, design, unit, rows.rows.clone(), returning, prepared);
             }
         }
     }

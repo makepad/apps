@@ -56,7 +56,8 @@ impl Reader<'_, '_> {
             self.blend_kind(at, &path, value, &mut kind)?;
             values.push(read(self, at, &path, value)?);
         }
-        Some(BlendForm { x, y, cols, rows, values, value_kind: kind, ease })
+        BlendForm::new(x, y, cols, rows, values, kind, ease)
+            .map_err(|message| self.err(at, field, message, None)).ok()
     }
 
     fn blend_control(&mut self, at: &At, field: &str, value: &Look) -> Option<Prop<1>> {

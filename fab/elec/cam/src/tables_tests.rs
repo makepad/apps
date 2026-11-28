@@ -20,7 +20,7 @@ fn generic_tables_group_sort_transform_and_validate() {
         pins: Vec::new(),
         fields: Fields::default(),
         emitter: None,
-        gpio: None,
+        gpio: None, lifecycle: None, approved: false,
     });
     let mut circuit = Circuit::default();
     for (id, refdes, value, mpn, dnp) in [

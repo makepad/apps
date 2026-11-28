@@ -380,7 +380,7 @@ script_mod! {
     let ToolIcon = mod.widgets.FabIconButton{
         width: 24
         height: 22
-        draw_icon +: {color: fab.color_text_dim}
+        draw_icon +: {color: fab.color_flat_ink_dim}
     }
 
     let EyeIcon = ToolIcon{}
@@ -505,7 +505,7 @@ script_mod! {
                     }
                     // the dimensions, quieter than the name
                     size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                        draw_text +: { color: fab.color_text_dim row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
                     }
                 }
                 // The engine that builds the part (Exact, Field, Mesh) as a pill; its tip says what
@@ -525,11 +525,11 @@ script_mod! {
                                 let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
                                 let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
                                 sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
-                                sdf.fill(theme.prop_field)
+                                sdf.fill(fab.color_field)
                                 return sdf.result
                             }
                         }
-                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_muted } }
+                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_dim } }
                     }
                 }
                 // The part's colour, its edges on device pixels, with its nozzle's letter, left of the eye;
@@ -607,7 +607,7 @@ script_mod! {
         width: Fill height: 44
         draw_chip: mod.draw.DrawFabChip{}
         draw_text: mod.draw.DrawText{
-            color: fab.color_text_muted
+            color: fab.color_text_dim
             text_style: theme.font_regular{ font_size: fab.font_size_small - 1.0 }
         }
     }
@@ -617,7 +617,7 @@ script_mod! {
         width: Fill height: 44
         draw_chip: mod.draw.DrawFabChip{}
         draw_text: mod.draw.DrawText{
-            color: fab.color_text_muted
+            color: fab.color_text_dim
             text_style: theme.font_regular{ font_size: fab.font_size_small - 1.0 }
         }
     }
@@ -2132,9 +2132,8 @@ impl Widget for FabPatternDial {
 pub struct FabPartPanel {
     #[deref]
     view: View,
-    /// What the position fields measure from: the part's origin, its footprint's centre or corner.
-    #[rust]
-    anchor: PositionAnchor,
+    #[live]
+    is_sidebar: bool,
     #[rust]
     position_shown: Option<(usize, u64, PositionAnchor, Pose)>,
     #[rust]
@@ -2146,7 +2145,7 @@ pub struct FabPartPanel {
     rest_shown: Option<(String, u64, crate::print::colours::Mapping)>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PositionAnchor {
     #[default]
     Origin,
@@ -2193,6 +2192,14 @@ impl Widget for FabPartPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let active = scope.data.get::<AppState>().is_none_or(|state| {
+            if self.is_sidebar {
+                !held_events::in_hidden_subtree(cx) && state.ui.part_side_shown
+            } else {
+                state.ui.on_screen(crate::ui::editors::Editor::Part)
+            }
+        });
+        if !active { return; }
         if let Event::Actions(actions) = event {
             if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
                 self.view.redraw(cx);
@@ -2213,10 +2220,6 @@ impl Widget for FabPartPanel {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        if !state.ui.on_screen(crate::ui::editors::Editor::Part) && !state.ui.part_side_shown {
-            // off screen: none of its controls can be pressed
-            return;
-        }
         let Some(index) = active_part(state) else { return };
         let p = &state.plate.parts[index];
         let object = &p.object;
@@ -2241,9 +2244,9 @@ impl Widget for FabPartPanel {
         let about = mm_to_world([o[0], o[1], p.min_mm[2]]);
         let zero = vec3(0.0, 0.0, 0.0);
         let pose = if let Some(nx) = x.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - self.anchor.xy(p)[0], 0.0, 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - state.ui.part_anchor.xy(p)[0], 0.0, 0.0])))
         } else if let Some(ny) = y.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - self.anchor.xy(p)[1], 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - state.ui.part_anchor.xy(p)[1], 0.0])))
         } else if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).changed(actions) {
             Some(pose_turn_shift(about, (r - p.rotate) as f32, zero))
         } else {
@@ -2260,20 +2263,13 @@ impl Widget for FabPartPanel {
         }
         let p = &state.plate.parts[index];
         if let Some(nx) = x.ended(actions) {
-            cx.action(self.anchor.place_field(p, 0, nx));
+            cx.action(state.ui.part_anchor.place_field(p, 0, nx));
         }
         if let Some(ny) = y.ended(actions) {
-            cx.action(self.anchor.place_field(p, 1, ny));
+            cx.action(state.ui.part_anchor.place_field(p, 1, ny));
         }
         if let Some(choice) = v.drop_down(cx, ids!(body.transform.anchor)).changed(actions) {
-            self.anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
-            // A footprint may extend beyond the origin field's range. Equal limits give
-            // ValueInput an unbounded coordinate with the same scrub step and snap.
-            for field in [x, y] {
-                if let Some(mut f) = field.borrow_mut() {
-                    f.max = if self.anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
-                }
-            }
+            state.ui.part_anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
             crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
         if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).ended(actions) {
@@ -2306,9 +2302,19 @@ impl Widget for FabPartPanel {
                 for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
                     v.widget(cx, id).set_visible(cx, can_edit);
                 }
-                let position = (index, state.plate.revision, self.anchor, state.scene_state.nudge_of(p.element));
+                let position = (index, state.plate.revision, state.ui.part_anchor, state.scene_state.nudge_of(p.element));
+                if self.position_shown.is_none_or(|(_, _, anchor, _)| anchor != state.ui.part_anchor) {
+                    v.drop_down(cx, ids!(body.transform.anchor)).set_selected_item(cx, state.ui.part_anchor as usize);
+                    // A footprint may extend beyond the origin field's range. Equal limits give
+                    // ValueInput an unbounded coordinate with the same scrub step and snap.
+                    for field in [ids!(body.transform.xy.value.num), ids!(body.transform.xy.value.num_y)] {
+                        if let Some(mut f) = v.value_input(cx, field).borrow_mut() {
+                            f.max = if state.ui.part_anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
+                        }
+                    }
+                }
                 if self.position_shown != Some(position) {
-                    self.shown_xy = self.anchor.xy(&p);
+                    self.shown_xy = state.ui.part_anchor.xy(&p);
                     self.position_shown = Some(position);
                 }
                 // Each setter leaves a field being edited alone and takes the value on release.
@@ -2338,7 +2344,7 @@ impl Widget for FabPartPanel {
         // the toolbar's search filters the sections' rows (`filter_sections`)
         let query = self.view.text_input(cx, ids!(editor_bar.search.row.input)).text();
         let sections = [ids!(transform), ids!(params), ids!(colours), ids!(issues)].map(|path| self.view.widget(cx, path));
-        crate::ui::widgets::filter_sections(cx, live_id!(part_sections), &query, &sections);
+        crate::ui::widgets::filter_sections(cx, LiveId(self.view.widget_uid().0), &query, &sections);
         self.view.draw_walk(cx, scope, walk)
     }
 }

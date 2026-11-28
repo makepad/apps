@@ -5,8 +5,8 @@
 # shadows and image-based lighting, GLB skeletal and morph animation — and
 # drawn frame-exact on Makepad's GPU pipeline with its post chain (bloom,
 # SSAO, depth of field, temporal motion blur, outline, tone mapping). A
-# library the Motion Scene3D layer drives, plus `makepad-motion3d`: pixel
-# tests, benchmarks and the showcase strips.
+# library the Motion Scene3D layer drives, plus `makepad-motion3d` for
+# benchmarks and the showcase strips.
 [package]
 name = "makepad-stage-motion3d"
 version = "0.1.0"
@@ -21,6 +21,11 @@ name = "makepad_stage_motion3d"
 name = "makepad-motion3d"
 path = "src/main.rs"
 
+# The GPU pixel tests run as one frame-tool batch in a hidden window.
+[[test]]
+name = "pixels"
+harness = false
+
 [features]
 default = ["models"]
 # Modelled props and characters (`mod.model`, `Model{src: crate("c")}`)
@@ -30,6 +35,7 @@ default = ["models"]
 models = ["dep:makepad-stage-model-host"]
 
 [dependencies]
+makepad-core-util = { path = "../../../../libs/core_util" }
 # The VM (the forms module names it directly; the widget library re-exports it).
 makepad-script = { path = "../../../../platform/script" }
 makepad-script-compute-sched = { path = "../../../../platform/script/compute_sched" }
@@ -72,7 +78,7 @@ makepad-text-mesh = { path = "../../../../libs/text_mesh" }
 # use, and Stage's model host builds and caches its programs in Stage's store.
 makepad-model-script = { path = "../../../apps/engine/model_script" }
 makepad-stage-model-host = { path = "../model_host", optional = true }
-# Strips and pixel-test failures are written as PNG.
+# Rendered frames, strips and the screen-fit fixture are written as PNG.
 makepad-zune-png = { path = "../../../../libs/zune/zune-png", version = "0.5.2" }
 
 [dev-dependencies]

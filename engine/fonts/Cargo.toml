@@ -19,4 +19,5 @@ name = "makepad_doc_fonts"
 dev-roots = []
 
 [dependencies]
+makepad-doc-font-names = { path = "../font_names" }
 makepad-asset-data = { path = "../../../apps/engine/asset/data" }

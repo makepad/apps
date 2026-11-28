@@ -907,6 +907,10 @@ fn to_request(files: ResultFiles) -> Result<PublishRequest, String> {
     request.artist = files.artist;
     request.generator = files.generator;
     request.model = files.model;
+    // The hub node that ran the job (`node 42`): the annotation's backend.
+    if !files.hub.is_empty() {
+        request.backend = files.hub;
+    }
     request.prompt = files.prompt;
     request.manifest_provenance = files.seed.map(|seed| PublishProvenance {
         generator: request.generator.clone(),
@@ -1150,10 +1154,9 @@ mod tests {
     }
 
 
-    #[test]
-    fn a_result_becomes_the_stores_publish_request() {
+    fn audio_files() -> ResultFiles {
         use makepad_flow::engine::results::{ResultFile, ResultThumb};
-        let files = ResultFiles {
+        ResultFiles {
             kind: ResultKind::Audio,
             namespace: "flows".into(),
             title: "Beat".into(),
@@ -1168,6 +1171,7 @@ mod tests {
             artist: String::new(),
             generator: "makepad-flow".into(),
             model: "m".into(),
+            hub: String::new(),
             prompt: "p".into(),
             seed: Some(5),
             digest: Some([4u8; 32]),
@@ -1175,12 +1179,26 @@ mod tests {
             provenance: Vec::new(),
             value_digest: [1u8; 32],
             sources: Vec::new(),
-        };
-        let request = to_request(files).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_result_becomes_the_stores_publish_request() {
+        let request = to_request(audio_files()).unwrap();
+        assert_eq!(request.backend, "");
         assert_eq!((request.kind, request.artifact.media, request.artifact.role), (AssetKind::Audio, MediaType::Wav, FileRole::Audio));
         assert_eq!(request.alias.as_ref().map(ToString::to_string).as_deref(), Some("flows/beat"));
         assert_eq!(request.categories, ["music"]);
         let provenance = request.manifest_provenance.unwrap();
         assert_eq!((provenance.model.as_str(), provenance.seed, provenance.params_digest), ("m", 5, Some([4u8; 32])));
+    }
+
+    #[test]
+    fn publish_files_carries_hub_into_asset_worker_backend() {
+        let files = ResultFiles { hub: "node 42".into(), model: "fasth3-4step-q4-24g".into(), ..audio_files() };
+        let request = to_request(files).unwrap();
+        assert_eq!(request.backend, "node 42");
+        assert_eq!(request.model, "fasth3-4step-q4-24g");
+        assert_eq!(request.generator, "makepad-flow");
     }
 }

@@ -45,13 +45,13 @@ script_mod! {
                 return sdf.result
             }
         }
-        phase := mod.widgets.FabTitleLabel{ width: Fill text: "" }
-        times := mod.widgets.FabTitleLabel{ width: Fill text: "" }
+        phase := mod.widgets.FabTitleLabel{ width: Fill text: "" draw_text +: { color: fab.color_text_well } }
+        times := mod.widgets.FabTitleLabel{ width: Fill text: "" draw_text +: { color: fab.color_text_well } }
         bar := mod.widgets.FabProgress{ width: Fill height: 8 }
-        detail := mod.widgets.FabLabelDim{ width: Fill text: "" }
-        accepted := mod.widgets.FabLabelDim{ width: Fill text: "" visible: false }
-        steps := mod.widgets.FabLabel{ width: Fill text: "" visible: false }
-        heat := mod.widgets.FabLabelDim{ width: Fill text: "" }
+        detail := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
+        accepted := mod.widgets.FabLabelDim{ width: Fill text: "" visible: false draw_text +: { color: fab.color_text_well_dim } }
+        steps := mod.widgets.FabLabel{ width: Fill text: "" visible: false draw_text +: { color: fab.color_text_well } }
+        heat := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
         note := mod.widgets.FabLabel{ width: Fill text: "" draw_text +: { color: fab.color_error } }
         actions := View{
             width: Fill height: Fit flow: Right spacing: 6
@@ -70,10 +70,10 @@ script_mod! {
                 remove := mod.widgets.FabButton{ text: "Remove" }
             }
         }
-        virtual_row := mod.widgets.FabVirtualSpeed{}
+        virtual_row := mod.widgets.FabVirtualSpeed{ virtual_note +: { draw_text +: { color: fab.color_text_well_dim } } }
         start_confirm := View{
             width: Fill height: Fit flow: Down spacing: 6 visible: false
-            question := mod.widgets.FabLabel{ width: Fill text: "Is the plate clear? The job starts at once." }
+            question := mod.widgets.FabLabel{ width: Fill text: "Is the plate clear? The job starts at once." draw_text +: { color: fab.color_text_well } }
             buttons := View{
                 width: Fill height: Fit flow: Right spacing: 6
                 go := mod.widgets.FabButtonAccent{ text: "Start print" }
@@ -82,7 +82,7 @@ script_mod! {
         }
         stop_confirm := View{
             width: Fill height: Fit flow: Down spacing: 6 visible: false
-            question := mod.widgets.FabLabel{ width: Fill text: "Stop the print? A stopped print cannot be resumed." }
+            question := mod.widgets.FabLabel{ width: Fill text: "Stop the print? A stopped print cannot be resumed." draw_text +: { color: fab.color_text_well } }
             buttons := View{
                 width: Fill height: Fit flow: Right spacing: 6
                 go := mod.widgets.FabButtonAccent{ text: "Stop print" }
@@ -114,6 +114,8 @@ pub struct JobView {
     /// The connection when it is not up, printer errors, the last command's answer.
     pub note: String,
     pub cancel: bool,
+    /// A preparing row cancels this admission. Upload and resin cancellation use their link.
+    pub cancel_job: Option<String>,
     /// Pause offered (false) or Resume (true).
     pub pause: Option<bool>,
     pub stop: bool,
@@ -131,8 +133,24 @@ pub struct JobView {
 const SPEEDS: [Speed; 4] = [Speed::Times(1.0), Speed::Times(10.0), Speed::Times(60.0), Speed::ToEnd];
 const SPEED_BUTTONS: &[&[LiveId]] = ids_array!(speed_1, speed_10, speed_60, speed_end);
 
-pub(super) fn speed_before_start(p: &PrintState, printer: &fab_printer_link::Snapshot) -> Option<Speed> {
-    (printer.virtual_printer && !p.printer_busy()).then_some(printer.virtual_speed)
+fn speed_before_start(p: &PrintState, choice: &PrinterChoice) -> Option<Speed> {
+    let printer = p.printer_of(choice)?;
+    (printer.virtual_printer && !p.printer_busy_for(choice)).then_some(printer.virtual_speed)
+}
+
+pub fn confirm_speed(p: &PrintState) -> Option<(ControlDestination, Speed)> {
+    let PrintConfirm::Filament(ticket) = p.confirm_print.as_ref()? else { return None };
+    let dest = ControlDestination::from_ticket(ticket);
+    if !dest.matches(p) { return None; }
+    Some((dest, speed_before_start(p, &ticket.printer)?))
+}
+
+impl JobView {
+    /// The owner of the live controls and speed row on this rendered job card.
+    pub fn control_destination(&self, p: &PrintState) -> Option<ControlDestination> {
+        if !self.cancel && !self.stop && self.pause.is_none() && self.virtual_speed.is_none() { return None; }
+        p.resin_job.as_ref().map(ControlDestination::resin).or_else(|| ControlDestination::filament(PrinterScope::Shown, p))
+    }
 }
 
 pub(super) fn sync_speed_row(cx: &mut Cx, row: &ViewRef, speed: Option<Speed>) {
@@ -218,18 +236,20 @@ pub fn job_view(p: &PrintState, now: f64) -> Option<JobView> {
     let s = &*printer.state;
     let tracked = printer.job.as_ref().filter(|_| shown.is_none_or(|j| printer.job_sends >= j.link_send));
     // The job this report is about: its own times, never another's.
-    let sent = shown.filter(|j| p.sending.as_ref().is_none_or(|name| *name == j.meta.name));
+    let preparing = p.sending_for(p.shown_choice()).and_then(|send| p.follow.job_of(&send.job));
+    let sent = preparing.or(shown);
     let mut v = JobView::default();
-    let mut name = p.sending.clone();
+    let mut name = preparing.map(|job| job.meta.name.clone());
     let printer_percent = |v: &mut JobView| {
         v.fraction = s.progress.map(|pc| (pc / 100.0).clamp(0.0, 1.0) as f32);
     };
-    if p.sending.is_some() {
+    if let Some(job) = preparing {
+        v.cancel_job = Some(job.meta.id.clone());
         v.phase = "Preparing the package for the printer".to_string();
         v.cancel = true;
         v.running = true;
-    } else if let Some(why) = &p.print_blocked {
-        v.phase = why.clone();
+    } else if let Some(why) = p.print_blocked.get(p.shown_choice()) {
+        v.phase = why.to_owned();
         v.attention = true;
         v.close = true;
     } else {
@@ -282,7 +302,7 @@ pub fn job_view(p: &PrintState, now: f64) -> Option<JobView> {
     let name = name.or_else(|| sent.map(|j| j.meta.name.clone()));
 
     let planned = sent.map(|j| j.meta.planned);
-    let elapsed = sent.filter(|_| p.print_blocked.is_none()).map(|j| j.ended_at.unwrap_or(now) - j.sent_at);
+    let elapsed = sent.filter(|_| p.print_blocked.get(p.shown_choice()).is_none()).map(|j| j.ended_at.unwrap_or(now) - j.sent_at);
     let mut times = Vec::new();
     if let Some(e) = elapsed {
         times.push(format!("Elapsed {}", format_time(e)));
@@ -356,13 +376,17 @@ fn saved_view(job: &CommittedJob, p: &PrintState, now: f64) -> JobView {
         JobState::EndedUnseen => "It ended while Fab was closed: how isn't known.".into(),
     };
     v.attention = matches!(job.state, JobState::Failed(_));
+    if job.state == JobState::Preparing && p.sending.iter().any(|sending| sending.job == m.id) {
+        v.cancel = true;
+        v.cancel_job = Some(m.id.clone());
+    }
     v.start = job.state == JobState::Queued;
     v.remove = job.state == JobState::Queued;
-    if let Some(printer) = p.shown_printer().filter(|printer| p.job_destination_matches(m, printer)) {
+    if let Some(printer) = p.shown_printer().filter(|printer| p.job_destination_matches_for(p.shown_choice(), m, printer)) {
         v.virtual_speed = match job.state {
             // Fab marks the job sent before the link worker publishes its first report.
             JobState::Sent if printer.virtual_printer => Some(printer.virtual_speed),
-            JobState::Preparing | JobState::Queued => speed_before_start(p, printer),
+            JobState::Preparing | JobState::Queued => speed_before_start(p, p.shown_choice()),
             _ => None,
         };
     }
@@ -390,7 +414,9 @@ pub struct FabJobCard {
     #[rust]
     pause: Option<bool>,
     #[rust]
-    preparing: bool,
+    preparing: Option<String>,
+    #[rust]
+    queued_start: Option<PrintAction>,
     #[deref]
     view: View,
     #[rust]
@@ -401,12 +427,11 @@ impl FabJobCard {
     fn sync(&mut self, cx: &mut Cx, state: &AppState) {
         let p = &state.print;
         let job = job_view(p, Cx::time_now());
-        self.control_destination = job.as_ref().filter(|j| j.cancel || j.stop || j.pause.is_some()).and_then(|_| {
-            p.resin_job.as_ref().map(ControlDestination::resin).or_else(|| ControlDestination::filament(p))
-        });
+        self.control_destination = job.as_ref().and_then(|j| j.control_destination(p));
+        self.preparing = job.as_ref().and_then(|j| j.cancel_job.clone());
+        self.queued_start = None;
         let Some(job) = job else { return };
         self.pause = job.pause;
-        self.preparing = p.resin_job.is_none() && p.sending.is_some();
         // the resin printer's link is plain TCP: everywhere
         let supported = p.resin_job.is_some() || fab_printer_link::printing_supported();
         let v = &self.view;
@@ -435,7 +460,16 @@ impl FabJobCard {
         v.button(cx, ids!(actions.start)).set_visible(cx, supported && job.start);
         v.button(cx, ids!(actions.remove)).set_visible(cx, job.remove);
         let asking = p.follow.confirm_start.is_some() && p.follow.confirm_start == p.follow.picked;
-        v.view(cx, ids!(start_confirm)).set_visible(cx, supported && job.start && asking);
+        let confirm = v.view(cx, ids!(start_confirm));
+        confirm.set_visible(cx, supported && job.start && asking);
+        if supported && job.start && asking {
+            self.queued_start = p.follow.shown().and_then(|row| Some(PrintAction::StartJob {
+                id: row.meta.id.clone(), ticket: p.queued_ticket(&row.meta)?,
+            }));
+            let ready = self.queued_start.is_some();
+            confirm.label(cx, ids!(question)).set_text(cx, if ready { "Is the plate clear? The job starts at once." } else { "Link the printer this job was prepared for before starting it." });
+            confirm.button(cx, ids!(buttons.go)).set_visible(cx, ready);
+        }
         let row = v.view(cx, ids!(virtual_row));
         sync_speed_row(cx, &row, job.virtual_speed);
         if job.running && self.tick.is_empty() {
@@ -459,14 +493,14 @@ impl Widget for FabJobCard {
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
         let v = &self.view;
-        if let Some(dest) = &self.control_destination {
-            if v.button(cx, ids!(actions.cancel)).clicked(actions) {
-                if self.preparing {
-                    if state.print.sending.is_some() && dest.matches(&state.print) { cx.action(PrintAction::CancelSend); }
-                } else {
-                    cx.action(PrintAction::PrinterControl(dest.clone(), PrinterControl::Stop));
-                }
+        if v.button(cx, ids!(actions.cancel)).clicked(actions) {
+            if let Some(id) = &self.preparing {
+                cx.action(PrintAction::CancelSend(id.clone()));
+            } else if let Some(dest) = &self.control_destination {
+                cx.action(PrintAction::PrinterControl(dest.clone(), PrinterControl::Stop));
             }
+        }
+        if let Some(dest) = &self.control_destination {
             if v.button(cx, ids!(actions.stop)).clicked(actions) {
                 cx.action(PrintAction::AskStop(dest.clone(), state.print.confirm_stop.as_ref() != Some(dest)));
             }
@@ -478,7 +512,7 @@ impl Widget for FabJobCard {
             }
             if v.button(cx, ids!(actions.pause)).clicked(actions) {
                 if let Some(paused) = self.pause {
-                    cx.action(PrintAction::PrinterControl(dest.clone(), if paused { PrinterControl::Resume } else { PrinterControl::Pause }));
+                    cx.action(dest.pause_or_resume(paused));
                 }
             }
         }
@@ -493,14 +527,14 @@ impl Widget for FabJobCard {
             cx.action(PrintAction::AskStartJob(None));
         }
         if v.button(cx, ids!(start_confirm.buttons.go)).clicked(actions) {
-            if let Some(id) = picked() { cx.action(PrintAction::StartJob(id)); }
+            if let Some(press) = &self.queued_start { cx.action(press.clone()); }
         }
         if v.button(cx, ids!(actions.remove)).clicked(actions) {
             if let Some(id) = picked() { cx.action(PrintAction::RemoveJob(id)); }
         }
         let row = v.view(cx, ids!(virtual_row));
-        if let Some(speed) = picked_speed(cx, &row, actions) {
-            cx.action(PrintAction::SetVirtualSpeed(speed));
+        if let (Some(dest), Some(speed)) = (&self.control_destination, picked_speed(cx, &row, actions)) {
+            cx.action(PrintAction::SetVirtualSpeed(dest.clone(), speed));
         }
         if actions.iter().any(|a| a.downcast_ref::<PrintAction>().is_some()) {
             self.view.redraw(cx);
@@ -528,7 +562,7 @@ mod tests {
         }
         let mut p = PrintState::default();
         p.links.picked = PrinterChoice::Real("Sim".into());
-        p.printers.set(&p.links.picked, Arc::new(Snapshot {
+        p.printers.set(&p.links.picked, 1, Arc::new(Snapshot {
             name: "Sim".into(), status: ConnectionStatus::Connected, state: Arc::new(s.unwrap()),
             job: job.map(|stage| JobStatus { name: "block".into(), file: "block.gcode.3mf".into(), stage }),
             ..Default::default()
@@ -553,8 +587,8 @@ mod tests {
         });
         let mut p = PrintState::default();
         p.links.picked = b.clone();
-        p.printers.set(&b, busy.clone());
-        p.printers.set(&a, idle.clone());
+        p.printers.set(&b, 1, busy.clone());
+        p.printers.set(&a, 1, idle.clone());
         assert!(p.printer_busy(), "B's own job must make B busy when targeted");
 
         p.links.picked = a.clone();
@@ -584,17 +618,17 @@ mod tests {
         let speeds = |p: &PrintState| {
             let queued = job_view(p, 0.0).unwrap();
             assert!(queued.start, "the selected job is queued");
-            (queued.virtual_speed, speed_before_start(p, p.target_printer().unwrap()))
+            (queued.virtual_speed, speed_before_start(p, &p.links.picked))
         };
         assert_eq!(speeds(&p), (None, None), "a real link hides speed on both pre-start cards");
         let printer = Arc::make_mut(p.target_printer_mut().unwrap());
         printer.virtual_printer = true;
         printer.virtual_speed = speed;
-        Arc::make_mut(&mut p.follow.jobs[0].meta).virtual_printer = true;
+        Arc::make_mut(&mut p.follow.jobs.at_mut(0).meta).virtual_printer = true;
         assert_eq!(speeds(&p), (Some(speed), Some(speed)), "both cards show the idle virtual link's speed");
         let other_report = p.target_printer().unwrap().clone();
         p.links.picked = PrinterChoice::Real("Other".into());
-        p.printers.set(&p.links.picked, other_report);
+        p.printers.set(&p.links.picked, 1, other_report);
         assert_eq!(speeds(&p), (None, Some(speed)), "a job queued for another destination has no speed row");
         p.links.picked = PrinterChoice::Real("Sim".into());
         Arc::make_mut(p.target_printer_mut().unwrap()).job = Some(JobStatus { name: "other".into(), file: "other.3mf".into(), stage: JobStage::Starting });
@@ -602,17 +636,17 @@ mod tests {
 
         Arc::make_mut(p.target_printer_mut().unwrap()).job = None;
         p.follow.picked = None;
-        p.follow.jobs[0].state = JobState::Preparing;
-        p.sending = Some("block".into());
+        p.follow.jobs.at_mut(0).state = JobState::Preparing;
+        p.sending.push(Sending { job: p.follow.jobs[0].meta.id.clone(), printer: p.links.picked.clone() });
         let card = |p: &PrintState| job_view(p, 0.0).unwrap();
         let saved_speed = |p: &PrintState| saved_view(&p.follow.jobs[0], p, 0.0).virtual_speed;
         assert_eq!(card(&p).virtual_speed, Some(speed), "the virtual job keeps its speed while packaging");
         assert_eq!(saved_speed(&p), Some(speed), "the same job picked while packaging offers the same speed");
 
         // The send was queued on the link worker. The UI still has its previous idle report.
-        p.sending = None;
-        p.follow.jobs[0].state = JobState::Sent;
-        p.follow.jobs[0].link_send = 1;
+        p.sending.clear();
+        p.follow.jobs.at_mut(0).state = JobState::Sent;
+        p.follow.jobs.at_mut(0).link_send = 1;
         let sent = card(&p);
         assert_eq!(sent.phase, "On its way to the printer");
         assert_eq!(sent.virtual_speed, Some(speed), "the sent virtual job keeps its speed before the first printer report");
@@ -635,10 +669,10 @@ mod tests {
         assert_eq!(saved_speed(&p), Some(speed), "a sent job in the list can control its busy virtual link");
         let other_report = p.target_printer().unwrap().clone();
         p.links.picked = PrinterChoice::Real("Other".into());
-        p.printers.set(&p.links.picked, other_report);
+        p.printers.set(&p.links.picked, 1, other_report);
         assert_eq!(saved_speed(&p), None, "a sent job for another destination cannot control this link");
         p.links.picked = PrinterChoice::Real("Sim".into());
-        p.follow.jobs[0].state = JobState::Finished;
+        p.follow.jobs.at_mut(0).state = JobState::Finished;
         assert_eq!(saved_speed(&p), None, "a finished job in the list cannot control this link");
     }
 
@@ -648,7 +682,9 @@ mod tests {
         assert_eq!(job_view(&state(&[IDLE], None), 0.0), None);
         // The package.
         let mut p = state(&[IDLE], None);
-        p.sending = Some("block".into());
+        let meta = jobs::JobMeta { id: "preparing".into(), name: "block".into(), ..Default::default() };
+        p.sending.push(Sending { job: meta.id.clone(), printer: p.links.picked.clone() });
+        p.follow.jobs.push(jobs::CommittedJob { meta: Arc::new(meta), ..Default::default() });
         let v = job_view(&p, 0.0).unwrap();
         assert!(v.phase.starts_with("Preparing the package") && v.cancel && !v.stop && v.detail == "block");
         // The upload.

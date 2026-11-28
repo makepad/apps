@@ -1,3 +1,4 @@
+use crate::plain::PathProps;
 use super::bounce::Bouncer;
 use super::ease_graph::parse_curve;
 use super::particles::{particle, Flow};
@@ -332,7 +333,7 @@ fn math_paths(doc: &MotionDoc) -> Vec<(String, [f64; 2], bool)> {
     doc.all_layers()
         .into_iter()
         .filter_map(|l| match &l.kind {
-            LayerKind::Path { fill, .. } => Some((l.name.clone().unwrap_or_default(), l.transform.at.constant().unwrap_or([f64::NAN; 2]), fill.as_ref().is_some_and(|f| f.is_animated()))),
+            LayerKind::Path(PathProps { fill, .. }) => Some((l.name.clone().unwrap_or_default(), l.transform.at.constant().unwrap_or([f64::NAN; 2]), fill.as_ref().is_some_and(|f| f.is_animated()))),
             _ => None,
         })
         .collect()

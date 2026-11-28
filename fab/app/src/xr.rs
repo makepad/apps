@@ -42,7 +42,7 @@ use crate::xr_edit::{self, Affine, Command, EditOut, SliceAxis, XrEdit};
 use crate::xr_mech::{MechOut, SceneBodies, XrMech};
 use fab::api::{ArmAction, ForceAction, ForceField, MechAction, MechLight, MechScene, MechTool, Family, PlateMode, Workspace};
 use fab::model::ElementId;
-use fab::print::{ControlDestination, PrintAction, PrinterControl, PrintState};
+use fab::print::{ControlDestination, PrintAction, PrinterControl, PrinterScope, PrintState};
 use fab::viewport::print::{draw_overlay_placed, draw_print_placed, DrawFabFar, DrawFabHead, DrawFabPath, DrawFabStrip, FarTiers, PrintFrame, PrintPalette, PrintPlacement};
 use fab::fab_sdf_tiles::draw::TileLight;
 use fab_model::eval::Evaluated;
@@ -1300,10 +1300,10 @@ impl FabXr {
         }
         let monitor = state.filter(|_| mode == Some(PlateMode::Monitor)).map(|s| &s.print);
         let confirm_stop = monitor.is_some_and(|p| p.confirm_stop.as_ref().is_some_and(|dest|
-            matches!(dest, ControlDestination::Filament { .. }) && dest.matches(p)));
+            MonitorControls::shown(p).is_some_and(|controls| controls.destination == *dest)));
         if let Some(p) = monitor {
             // a new snapshot of the printer is a new Arc
-            for v in [p.shown_printer().map_or(0, |s| Arc::as_ptr(s) as u64), confirm_stop as u64, p.follow.on as u64] {
+            for v in [p.shown_printer().map_or(0, |s| Arc::as_ptr(s) as u64), p.printers.epoch_of(p.shown_choice()).unwrap_or(0), confirm_stop as u64, p.follow.on as u64] {
                 key = (key ^ v).wrapping_mul(0x100_0000_01b3);
             }
         }
@@ -2637,19 +2637,24 @@ impl MonitorControls {
         let report = &p.shown_printer()?.state;
         let paused = report.gcode_state.as_deref() == Some("PAUSE");
         if !report.busy() { return None; }
-        Some(Self { destination: ControlDestination::filament(p)?, paused })
+        Some(Self { destination: ControlDestination::filament(PrinterScope::Shown, p)?, paused })
     }
 
     fn action(&self, id: u32) -> Option<PrintAction> {
         let dest = &self.destination;
         Some(match id {
-            item::PRINTER_PAUSE => PrintAction::PrinterControl(dest.clone(), if self.paused { PrinterControl::Resume } else { PrinterControl::Pause }),
+            item::PRINTER_PAUSE => dest.pause_or_resume(self.paused),
             item::PRINTER_STOP => PrintAction::AskStop(dest.clone(), true),
             item::PRINTER_STOP_NO => PrintAction::AskStop(dest.clone(), false),
             item::PRINTER_STOP_YES => PrintAction::PrinterControl(dest.clone(), PrinterControl::Stop),
             _ => return None,
         })
     }
+}
+
+#[cfg(test)]
+pub(super) fn monitor_pause_press(p: &PrintState) -> Option<PrintAction> {
+    MonitorControls::shown(p)?.action(item::PRINTER_PAUSE)
 }
 
 /// The printer panel's job and status: what the printer reports, Pause and Stop while a job runs
@@ -3747,7 +3752,7 @@ mod tests {
 
         let mut p = PrintState::default();
         p.links.picked = PrinterChoice::Real("fixture".into());
-        p.printers.set(&p.links.picked, Arc::new(Snapshot {
+        p.printers.set(&p.links.picked, 1, Arc::new(Snapshot {
             status: ConnectionStatus::Connected,
             state: Arc::new(PrinterState { gcode_state: Some("RUNNING".into()), ..Default::default() }),
             ..Default::default()
@@ -3786,7 +3791,7 @@ mod tests {
         let shown = MonitorControls::shown(&p).unwrap();
         let other_report = p.target_printer().unwrap().clone();
         p.links.picked = PrinterChoice::Real("other fixture".into());
-        p.printers.set(&p.links.picked, other_report);
+        p.printers.set(&p.links.picked, 1, other_report);
         let (resin, filament) = dispatch(&mut p, shown.action(item::PRINTER_PAUSE).unwrap());
         assert!(resin.is_empty() && filament.is_empty(), "a different configured printer received XR Pause");
     }

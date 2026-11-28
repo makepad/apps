@@ -1,0 +1,36 @@
+let e = mod.elec
+
+let usb_power = e.block({
+    name: "USB-C power"
+    role: "USB-C power input"
+    planned: true
+    ports: {vbus: e.port(@power_out, {volts: 5V current: 500mA}) gnd: e.port(@ground)}
+})
+
+let reg_3v3 = e.block({
+    name: "3.3 V regulator"
+    role: "3.3 V LDO"
+    planned: true
+    ports: {vin: e.port(@power_in, {volts: [4.5V 5.5V] current: 150mA}) vout: e.port(@power_out, {volts: 3.3V current: 600mA}) gnd: e.port(@ground)}
+})
+
+let mcu = e.block({
+    name: "20-pin controller"
+    role: "MCU with SWD header"
+    planned: true
+    ports: {vdd: e.port(@power_in, {volts: [2.0V 3.6V] current: 30mA}) gnd: e.port(@ground) led: e.port(@out, {width: 8}) key: e.port(@in)}
+})
+
+let led_bank = e.block({
+    name: "Indicator bank"
+    role: "8 green status LEDs"
+    planned: true
+    ports: {vdd: e.port(@power_in, {volts: 3.3V current: 40mA}) ctl: e.port(@in, {width: 8})}
+})
+
+let button = e.block({
+    name: "Mode button"
+    role: "Tactile pushbutton"
+    planned: true
+    ports: {vdd: e.port(@power_in, {volts: 3.3V current: 0.33mA}) out: e.port(@out) gnd: e.port(@ground)}
+})

@@ -1,11 +1,14 @@
 use super::index::{Rect, RectIndex};
 use super::tree::{board_kind, live, parent, BoardTree};
-use makepad_work_core::entity::{field, kind, Entity};
-use makepad_work_core::event::{self, Content, Event, Id, Key, Value};
-use makepad_work_core::fold::State;
+pub use super::tree::{Step, Target};
+use makepad_town_core::entity::{field, kind, Entity};
+use makepad_town_core::event::{self, Content, Event, Id, Key, Value};
+use makepad_town_core::fold::State;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Resolve UNDO (including redo) through the event log, e.g. `|id| log.get(id)`.
 pub fn touched_by<'a>(mut event: &'a Event, lookup: impl Fn(&Id) -> Option<&'a Event>) -> Vec<Id> {
@@ -33,6 +36,60 @@ pub fn touched_by<'a>(mut event: &'a Event, lookup: impl Fn(&Id) -> Option<&'a E
 }
 
 #[derive(Debug, PartialEq)]
+pub(super) struct BoardImage {
+    pub blob: Option<(Id, u64)>,
+    pub poster: Option<(Id, u64)>,
+    pub media: String,
+    pub duration_ms: u64,
+    pub duration_label: String,
+}
+
+impl BoardImage {
+    fn read(e: &Entity) -> Self {
+        let file = |key| match e.value(key) {
+            Some(Value::Blob { size, root }) => Some((makepad_town_core::blob::id(*size, root), *size)),
+            _ => None,
+        };
+        let duration_ms = match e.value(field::DURATION) {
+            Some(Value::Int(n)) => u64::try_from(*n).unwrap_or(0),
+            _ => 0,
+        };
+        let secs = duration_ms / 1000;
+        Self { blob: file(field::BLOB), poster: file(field::POSTER), media: e.text(field::MEDIA).into(), duration_ms,
+            duration_label: if duration_ms > 0 { format!("{}:{:02}", secs / 60, secs % 60) } else { String::new() } }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct BoardDesign {
+    /// The event that last wrote SRC: the same revision has the same text.
+    pub revision: Option<Id>,
+    pub src: Arc<str>,
+    pub src_hash: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Design sources copied and hashed on this thread.
+    pub(super) static DESIGN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl BoardDesign {
+    /// A rebuild copies and hashes a design's source once per revision: `previous`, the same
+    /// item in the view being replaced, gives its text back while SRC is unchanged.
+    fn read(entity: &Entity, previous: Option<&BoardDesign>) -> Self {
+        let revision = entity.fields.get(&field::SRC).map(|f| f.writer);
+        if let Some(previous) = previous.filter(|p| p.revision == revision) { return previous.clone() }
+        #[cfg(test)]
+        DESIGN_READS.with(|reads| reads.set(reads.get() + 1));
+        let src = entity.text(field::SRC);
+        let mut hash = DefaultHasher::new();
+        src.hash(&mut hash);
+        Self { revision, src: Arc::from(src), src_hash: hash.finish() }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct BoardItem {
     pub id: Id,
     pub kind: Key,
@@ -45,6 +102,8 @@ pub struct BoardItem {
     pub selectable: bool,
     pub parent_section: Option<Id>,
     pub colour: Option<u32>,
+    pub(super) image: Option<Box<BoardImage>>,
+    pub(super) design: Option<Box<BoardDesign>>,
     pub z_key: Option<Box<[u8]>>,
     z_writer: Option<Id>,
 }
@@ -54,7 +113,7 @@ impl BoardItem {
         self.id
     }
 
-    fn read(entity: &Entity, parent_section: Option<Id>) -> Self {
+    fn read(entity: &Entity, parent_section: Option<Id>, previous: Option<&BoardItem>) -> Self {
         let coord = |field| match entity.value(field) {
             Some(Value::Int(value)) => i128::from(*value),
             _ => 0,
@@ -70,6 +129,9 @@ impl BoardItem {
         let z_key = entity.z_key().map(|(bytes, _)| Box::from(bytes));
         Self {
             id: entity.id,
+            design: (entity.kind == kind::DESIGN)
+                .then(|| Box::new(BoardDesign::read(entity, previous.and_then(|p| p.design.as_deref())))),
+            image: (entity.kind == kind::IMAGE).then(|| Box::new(BoardImage::read(entity))),
             kind: entity.kind.clone(),
             rect: Rect::new(world(x), world(y), world(x + w), world(y + h)),
             x: x as i64,
@@ -118,6 +180,11 @@ pub struct BoardView {
 
 impl BoardView {
     pub fn build(state: &State, board: Id) -> Self {
+        Self::rebuild(state, board, None)
+    }
+
+    /// [`Self::build`], taking each design's text from `previous` while its SRC is unchanged.
+    pub fn rebuild(state: &State, board: Id, previous: Option<&BoardView>) -> Self {
         let mut view = Self {
             board, board_live: state.entities.get(&board).is_some_and(|e| e.kind == kind::BOARD && live(e)),
             by_id: HashMap::new(), items: Vec::new(), free: Vec::new(),
@@ -132,7 +199,7 @@ impl BoardView {
             }
             if view.board_live && live(entity) {
                 if let Some(p) = tree.placement(entity).filter(|p| p.board == board) {
-                    let handle = view.insert(BoardItem::read(entity, p.section));
+                    let handle = view.insert(BoardItem::read(entity, p.section, previous.and_then(|v| v.get(&entity.id))));
                     view.order.push(handle);
                 }
             }
@@ -191,7 +258,8 @@ impl BoardView {
                 let board_live = state.entities.get(&id).is_some_and(|e| e.kind == kind::BOARD && live(e));
                 if self.board_live != board_live {
                     // Looped items can belong here without a parent path to the board.
-                    let old = std::mem::replace(self, Self::build(state, id));
+                    let next = Self::rebuild(state, id, Some(self));
+                    let old = std::mem::replace(self, next);
                     // Only the live side of this transition has records.
                     return old.by_id.into_keys().chain(self.by_id.keys().copied()).collect();
                 }
@@ -223,7 +291,7 @@ impl BoardView {
         affected.retain(|&id| {
             let item = state.entities.get(&id).filter(|e| self.board_live && board_kind(&e.kind) && live(e))
                 .and_then(|e| tree.placement(e).filter(|p| p.board == self.board)
-                    .map(|p| BoardItem::read(e, p.section)));
+                    .map(|p| BoardItem::read(e, p.section, self.get(&id))));
             match (self.by_id.get(&id).copied(), item) {
                 (Some(h), Some(item)) => {
                     let old = self.item(h);
@@ -296,6 +364,32 @@ impl BoardView {
         hits.into_iter().map(|h| self.item(h).id).collect()
     }
 
+    /// Top-left in board ticks for a new card. Search beyond the viewport too when
+    /// placing beside a visible item, since its neighbour may be just off screen.
+    pub fn next_free_spot(&self, viewport: Option<Rect>, size: (f64, f64)) -> (i64, i64) {
+        let by_right = |a: &&BoardItem, b: &&BoardItem| a.rect.x1.total_cmp(&b.rect.x1).then(a.id.cmp(&b.id));
+        let ticks = |v: f64| (v * 64.).round() as i64;
+        let beside = |item: &BoardItem| (item.rect.x1 + 32., item.rect.y0);
+        let Some(vp) = viewport else {
+            return self.items.iter().flatten().max_by(by_right)
+                .map_or((0, 0), |item| { let (x, y) = beside(item); (ticks(x), ticks(y)) });
+        };
+        let overlaps = |x, y| {
+            let candidate = Rect::new(x, y, x + size.0, y + size.1);
+            self.visible(candidate).into_iter().filter_map(|id| self.get(&id))
+                .filter(|item| item.rect.overlaps(candidate)).max_by(by_right)
+        };
+        let (mut x, mut y) = ((vp.x0 + vp.x1) * 0.5, (vp.y0 + vp.y1) * 0.5);
+        x = ticks(x) as f64 / 64.;
+        y = ticks(y) as f64 / 64.;
+        if let Some(obstacle) = overlaps(x, y) {
+            let rightmost = self.visible(vp).into_iter().filter_map(|id| self.get(&id)).max_by(by_right);
+            (x, y) = beside(rightmost.unwrap_or(obstacle));
+            while let Some(item) = overlaps(x, y) { x = item.rect.x1 + 32.; }
+        }
+        (ticks(x), ticks(y))
+    }
+
     /// Contiguous ranges of the supplied z-ordered visible set. Only the current layer can
     /// conflict, so even a stack of identical rects compares against just its last member.
     pub fn layers(&self, visible: &[Id]) -> Vec<Range<usize>> {
@@ -317,4 +411,149 @@ impl BoardView {
         if start < visible.len() { ranges.push(start..visible.len()); }
         ranges
     }
+}
+
+impl BoardView {
+    /// This board's presenting path, in order. A deleted board has none.
+    pub fn path(&self, state: &State) -> Vec<Step> {
+        if self.board_live { super::tree::path(state, self.board) } else { Vec::new() }
+    }
+
+    /// Each step of `path` with the world rect it brings into view, in path order; `None` for a
+    /// step with nothing to show. The board step shows every item; an empty board shows nothing.
+    pub fn present_targets(&self, path: &[Step]) -> Vec<(Id, Option<Rect>)> {
+        let mut board = None;
+        path.iter().map(|step| (step.id, match step.target {
+            Target::Item(id) => self.get(&id).map(|item| item.rect),
+            Target::Board => *board.get_or_insert_with(|| {
+                self.order.iter().map(|&h| self.item(h).rect)
+                    .reduce(|a, b| Rect::new(a.x0.min(b.x0), a.y0.min(b.y0), a.x1.max(b.x1), a.y1.max(b.y1)))
+            }),
+            Target::Gone(_) | Target::Unknown(_) => None,
+        })).collect()
+    }
+}
+
+/// Presenting a board along its path, for one view: which step shows, the glide toward it,
+/// and the camera to go back to. None of it is in the fold. Steps whose target can't be shown
+/// (deleted, unknown) are skipped; a path with nothing to show stays where it is. The path can
+/// change while presenting: the step is kept by id, and if a peer deletes it, Next and
+/// Previous go on from where it was.
+#[derive(Clone)]
+pub struct Present {
+    at: Option<(usize, Id)>,
+    before: makepad_canvas::Camera,
+    glide: Option<(makepad_canvas::GlidePath, f64, f64)>,
+    shown: makepad_canvas::Camera,
+}
+
+/// The margin a presented target keeps from the window's edges, in pixels.
+const PRESENT_MARGIN: f64 = 24.0;
+
+impl Present {
+    /// Start presenting from `camera`, which Esc restores.
+    pub fn start(camera: makepad_canvas::Camera) -> Self {
+        Self { at: None, before: camera, glide: None, shown: camera }
+    }
+
+    /// The step shown (or being glided to); `None` before the first.
+    pub fn step(&self) -> Option<Id> {
+        self.at.map(|(_, id)| id)
+    }
+
+    /// The camera at `now`: along the glide while one runs, else the last arrival.
+    pub fn camera(&self, now: f64) -> makepad_canvas::Camera {
+        match &self.glide {
+            Some((path, start, seconds)) if *seconds > 0.0 => path.at((now - start) / seconds),
+            _ => self.shown,
+        }
+    }
+
+    /// Whether a glide is still under way at `now` (the canvas keeps drawing while it is).
+    pub fn gliding(&self, now: f64) -> bool {
+        self.glide.as_ref().is_some_and(|(_, start, seconds)| now < start + seconds)
+    }
+
+    // Where the current step is in `targets`: its index, or where it was if it is gone.
+    fn place(&self, targets: &[(Id, Option<Rect>)]) -> Option<(usize, bool)> {
+        let (at, id) = self.at?;
+        Some(match targets.iter().position(|(step, _)| *step == id) {
+            Some(i) => (i, true),
+            None => (at.min(targets.len()), false),
+        })
+    }
+
+    /// Glide to the next step that has something to show, from `present_targets`. Returns
+    /// whether it moved; at the end it holds.
+    pub fn next(&mut self, targets: &[(Id, Option<Rect>)], now: f64) -> bool {
+        let from = match self.place(targets) { None => 0, Some((i, here)) => i + usize::from(here) };
+        let found = (from..targets.len()).find(|&i| targets[i].1.is_some());
+        self.go(found, targets, now)
+    }
+
+    /// Glide to the previous step that has something to show.
+    pub fn previous(&mut self, targets: &[(Id, Option<Rect>)], now: f64) -> bool {
+        let Some((before, _)) = self.place(targets) else { return false };
+        let found = (0..before).rev().find(|&i| targets[i].1.is_some());
+        self.go(found, targets, now)
+    }
+
+    fn go(&mut self, found: Option<usize>, targets: &[(Id, Option<Rect>)], now: f64) -> bool {
+        let Some((step, Some(rect))) = found.map(|i| targets[i]) else { return false };
+        let from = self.camera(now);
+        let Some(to) = fit_to(from.view, rect) else { return false };
+        let path = makepad_canvas::GlidePath::new(from, to);
+        self.glide = Some((path, now, path.seconds()));
+        self.shown = to;
+        self.at = Some((found.unwrap(), step));
+        true
+    }
+
+    /// Keep the shown step framed in `view` after the window resized or its target moved or
+    /// changed size. A resize lands at once; a moved target is glided to if a glide is under
+    /// way. Returns whether the camera changed.
+    pub fn refit(&mut self, targets: &[(Id, Option<Rect>)], view: makepad_widgets::Rect, now: f64) -> bool {
+        let resized = self.shown.view != view;
+        self.before.view = view;
+        let here = self.place(targets).filter(|&(_, here)| here).and_then(|(i, _)| targets[i].1);
+        let to = match here.and_then(|rect| fit_to(view, rect)) {
+            Some(to) => to,
+            None if resized => {
+                let mut kept = self.shown;
+                kept.view = view;
+                kept
+            }
+            None => return false,
+        };
+        if !resized && to.scale == self.shown.scale && to.pan == self.shown.pan {
+            return false;
+        }
+        self.glide = if !resized && self.gliding(now) {
+            let path = makepad_canvas::GlidePath::new(self.camera(now), to);
+            Some((path, now, path.seconds()))
+        } else {
+            None
+        };
+        self.shown = to;
+        true
+    }
+
+    /// Stop presenting: the camera that was there before it started.
+    pub fn end(self) -> makepad_canvas::Camera {
+        self.before
+    }
+}
+
+/// The camera that frames `rect` in `view` with the presenting margin, at a zoom the canvas can
+/// show.
+fn fit_to(view: makepad_widgets::Rect, rect: Rect) -> Option<makepad_canvas::Camera> {
+    let world = makepad_widgets::Rect {
+        pos: makepad_widgets::dvec2(rect.x0, rect.y0),
+        size: makepad_widgets::dvec2((rect.x1 - rect.x0).max(1.0), (rect.y1 - rect.y0).max(1.0)),
+    };
+    let m = PRESENT_MARGIN;
+    let insets = makepad_widgets::Inset { left: m, right: m, top: m, bottom: m };
+    let fitted = makepad_canvas::Camera::fit(view, world, insets)?;
+    let centre = fitted.local_to_screen(fitted.world_to_local(world.center()));
+    fitted.zoom_about(centre, fitted.scale.clamp(makepad_canvas::MIN_ZOOM, makepad_canvas::MAX_ZOOM))
 }

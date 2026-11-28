@@ -51,6 +51,7 @@
 
 pub mod flags;
 mod settings_panel;
+mod review;
 
 use super::batch::Templates;
 use super::checks::{check_marks, wave_may_clear, CheckMark};
@@ -95,6 +96,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 script_mod! {
+    #(crate::canvas::pane::review_chip::script_mod(vm))
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
 
@@ -121,6 +123,8 @@ script_mod! {
         tools: View{width: Fit height: Fit visible: false}
         settings: View{visible: false}
         status: View{visible: false}
+        review_bar: mod.draw.DrawColor{}
+        review_chip: mod.widgets.ProposalChip{}
         draw_line: mod.draw.DrawCanvasLine{}
         draw_box: mod.draw.DrawCanvasBox{}
         draw_polygon: mod.draw.DrawVector{}
@@ -323,6 +327,11 @@ pub struct BoardPane {
     #[find]
     #[live]
     settings: WidgetRef,
+    #[find]
+    #[live]
+    review_chip: WidgetRef,
+    #[live]
+    review_bar: DrawColor,
     /// The theme's panel ground: a light one gives the light board look (unless `set_light`).
     #[live]
     ground: Vec4f,
@@ -787,6 +796,7 @@ struct BoardMarquee {
 #[derive(Default)]
 struct PaneState {
     unit: Option<BoardId>,
+    review: Option<review::Comparison>,
     stitch_target: Option<(NetId, Option<ItemId>)>,
     stitch: Option<PendingStitch>,
     settings: settings_panel::SettingsPanel,
@@ -1190,6 +1200,7 @@ impl BoardPane {
     /// Calling it twice is harmless. Host inputs and display settings stay; the empty
     /// picture and canvas rebuild on the next draw as on first use.
     pub fn release(&mut self, cx: &mut Cx) {
+        self.leave_comparison(cx);
         self.end_drag(Some(&mut *cx));
         self.cancel_placing(cx);
         self.flags.release();
@@ -1334,6 +1345,7 @@ impl BoardPane {
     /// sight. Own / foreign focuses update the selection summary but never move this camera.
     /// O(board items) once for a net, O(1) per glide frame.
     pub fn answer_focus(&mut self, cx: &mut Cx, focus: &Focus) {
+        if self.comparison_paused(cx) { return; }
         self.select_focus(cx, focus);
         if focus.origin == FocusOrigin::Board {
             return;
@@ -1608,7 +1620,12 @@ impl BoardPane {
         self.follow(cx);
         let Some(unit) = self.st.unit else { return };
         let Some(draw) = BoardDraws::current(cx, unit) else { return };
-        if self.st.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(d, &draw)) {
+        if self.st.review.is_some() {
+            let live = cx.get_global::<ElecLive>();
+            let board = live.snap.live().unit(unit).and_then(|u| u.board.as_ref());
+            if !board.is_some_and(|b| Arc::ptr_eq(b, &draw.board) && Arc::ptr_eq(b, &draw.geom.board))
+                || live.snap.of(&live.snap.fills, unit).is_some_and(|f| !Arc::ptr_eq(&f.value, &draw.fills)) { return; }
+        } else if self.st.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(d, &draw)) {
             return;
         }
         // An already superseded picture may finish building. Keep the displayed round until
@@ -1634,7 +1651,17 @@ impl BoardPane {
         if self.st.drawn.is_some() && !self.takes_picture(cx, &draw.board) {
             return;
         }
-        let new_picture = self.st.drawn.as_ref().map_or(true, |d| d.gen != draw.gen || d.unit != draw.unit);
+        let new_picture = self.st.review.is_some() || self.st.drawn.as_ref().is_none_or(|d| d.gen != draw.gen || d.unit != draw.unit);
+        self.leave_comparison(cx);
+        self.install_picture(cx, &draw, new_picture);
+        if let Some(old) = self.st.drawn.replace(draw) {
+            BoardDraws::retire(cx, old);
+        }
+        self.selection_summary();
+        self.sync_stitch_target(cx);
+    }
+
+    fn install_picture(&mut self, cx: &mut Cx, draw: &BoardDraw, new_picture: bool) {
         let mut old = std::mem::take(&mut self.st.layers);
         let mut slots = Vec::with_capacity(draw.pubs.layers.len());
         for lp in &draw.pubs.layers {
@@ -1673,11 +1700,6 @@ impl BoardPane {
                 draw.timing.picture_ms
             );
         }
-        if let Some(old) = self.st.drawn.replace(draw) {
-            BoardDraws::retire(cx, old);
-        }
-        self.selection_summary();
-        self.sync_stitch_target(cx);
     }
 
     fn layer_shown(&self, l: LayerId) -> bool {
@@ -3248,6 +3270,9 @@ impl BoardPane {
         Some(LineKey::Idle { unrouted: conn.unrouted.len(), selected, left })
     }
 
+    /// Route all open nets with this pane's selected routing method.
+    pub fn route_all(&mut self, cx: &mut Cx) { self.route_pressed(cx, LineButton::RouteAll); }
+
     /// A press on the route line: route the board's unrouted nets, or the selection's, or re-route
     /// the nets the last route left open.
     fn route_pressed(&mut self, cx: &mut Cx, button: LineButton) {
@@ -3678,24 +3703,7 @@ impl BoardPane {
         cam.center = [(x0 + x1) * 0.5 + (x1 - x0) * 0.3 * a.cos() * z, (y0 + y1) * 0.5 + (y1 - y0) * 0.3 * a.sin() * z];
     }
 
-    fn draw_board(&mut self, cx: &mut Cx2d, rect: Rect) {
-        // A drop settles before the layers read the dim rows, so the frame that retires the held
-        // copy also shows the picture's copy undimmed: the item is never missing for a frame.
-        if self.drag_over(cx) {
-            if let Some(landing) = self.st.landing() {
-                log!("fab.board: release on screen {:.1} ms after it", (Cx::monotonic_now() - landing.since) * 1e3);
-            }
-            let refused = self.landing_refusal(cx);
-            self.end_drag(None);
-            if let Some(text) = refused {
-                self.note(cx, ChipKind::Refused, text, Vec::new());
-            }
-        }
-        let theme = self.theme();
-        let dpi = cx.current_dpi_factor();
-        let cam = self.pane.cam;
-        let main = cam.uniforms();
-        let active = self.st.active.unwrap_or(LayerId::F_CU);
+    fn live_inputs(&mut self, cx: &mut Cx2d, base: BoardUniforms) -> (BoardUniforms, BoardTextures) {
         let hover_item = match self.st.hover {
             Some(item) if item.0 < (1 << 24) => item.0 as f32,
             _ => -1.0,
@@ -3744,8 +3752,6 @@ impl BoardPane {
         };
         let lit = lit.filter(|net| net.0 < (1 << 24));
         let mut base = BoardUniforms {
-            cam: main,
-            live_light: if self.light() { 1.0 } else { 0.0 },
             hover_item,
             hover_mix: self.pane.hover_mix(),
             hover_at: pour_light(self.pane.pointer(), dvec2(0.0, 0.0), 1.0),
@@ -3754,9 +3760,7 @@ impl BoardPane {
             fresh_pending: if pending { 1.0 } else { 0.0 },
             lit_net: lit.map_or(-1.0, |net| net.0 as f32),
             lit_mix: if lit.is_some() { lit_mix } else { 0.0 },
-            thin_alpha: theme.thin_alpha,
-            clip: [rect.pos.x as f32, rect.pos.y as f32, (rect.pos.x + rect.size.x) as f32, (rect.pos.y + rect.size.y) as f32],
-            ..BoardUniforms::default()
+            ..base
         };
         let mut tex = if cx.has_global::<ElecLive>() {
             let live = cx.get_global::<ElecLive>();
@@ -3780,6 +3784,38 @@ impl BoardPane {
             tex.slots[4] = Some(dims.texture(cx));
             base.pane_states_on = 1.0;
         }
+        (base, tex)
+    }
+
+    fn draw_board(&mut self, cx: &mut Cx2d, rect: Rect) {
+        // A drop settles before the layers read the dim rows, so the frame that retires the held
+        // copy also shows the picture's copy undimmed: the item is never missing for a frame.
+        if self.st.review.is_none() && self.drag_over(cx) {
+            if let Some(landing) = self.st.landing() {
+                log!("fab.board: release on screen {:.1} ms after it", (Cx::monotonic_now() - landing.since) * 1e3);
+            }
+            let refused = self.landing_refusal(cx);
+            self.end_drag(None);
+            if let Some(text) = refused {
+                self.note(cx, ChipKind::Refused, text, Vec::new());
+            }
+        }
+        let theme = self.theme();
+        let dpi = cx.current_dpi_factor();
+        let cam = self.pane.cam;
+        let main = cam.uniforms();
+        let active = self.st.active.unwrap_or(LayerId::F_CU);
+        let base = BoardUniforms { cam: main, live_light: self.light() as u8 as f32, thin_alpha: theme.thin_alpha,
+            clip: [rect.pos.x as f32, rect.pos.y as f32, (rect.pos.x + rect.size.x) as f32, (rect.pos.y + rect.size.y) as f32],
+            ..Default::default() };
+        let comparison = self.st.review.is_some();
+        let (base, tex) = if let Some(review) = &mut self.st.review {
+            let mut tex = BoardTextures::default();
+            tex.slots[4] = review.shown_emphasis().map(|states| states.texture(cx));
+            (BoardUniforms { pane_states_on: tex.slots[4].is_some() as u8 as f32, ..base }, tex)
+        } else {
+            self.live_inputs(cx, base)
+        };
         let size = ((rect.size.x * dpi).ceil().max(1.0) as u32, (rect.size.y * dpi).ceil().max(1.0) as u32);
         let target_cam = [((main[0] as f64 - rect.pos.x) * dpi) as f32, ((main[1] as f64 - rect.pos.y) * dpi) as f32, main[2] * dpi as f32, 1.0];
         let order = BoardTheme::stack(self.st.layers.iter().map(|s| s.layer));
@@ -3790,7 +3826,7 @@ impl BoardPane {
         if let Some(substrate) = self.st.substrate.as_mut() {
             let mut u = BoardUniforms { layer_ink: theme.substrate, hover_item: -1.0, ..base };
             let mut tex = tex.clone();
-            if let Some(slot) = &self.st.heat {
+            if let Some(slot) = self.st.heat.as_ref().filter(|_| !comparison) {
                 tex.slots[5] = Some(slot.texture.clone());
                 u.heat_on = 1.0;
                 u.heat_box = slot.field.bounds_mm.map(|v| v as f32);
@@ -3852,7 +3888,7 @@ impl BoardPane {
             target.begin(cx, vec4(0.0, 0.0, 0.0, 0.0));
             let u = BoardUniforms {
                 cam: target_cam, layer_ink: ink, clip: [0.0, 0.0, size.0 as f32, size.1 as f32],
-                hover_at: pour_light(self.pane.pointer(), rect.pos, dpi), ..base
+                hover_at: if comparison { base.hover_at } else { pour_light(self.pane.pointer(), rect.pos, dpi) }, ..base
             };
             if let Some(l) = slot.tris.as_mut() {
                 l.draw(cx, &mut self.draw_tri_max.draw_vars, &tex, &u);
@@ -3876,6 +3912,9 @@ impl BoardPane {
             holes.draw(cx, &mut self.draw_pad.draw_vars, &tex, &u);
             lists += 1;
         }
+        self.st.stats.lists = lists;
+        self.st.stats.layers = shown;
+        if comparison { return; }
         self.sync_marks(cx);
         let mut pending_ink = theme.label;
         pending_ink[3] *= 0.55;
@@ -3905,8 +3944,6 @@ impl BoardPane {
         self.draw_drag(cx, &theme, active, &base);
         self.draw_keys(cx, &theme, active, &base, rect);
         self.draw_tool_marks(cx, rect);
-        self.st.stats.lists = lists;
-        self.st.stats.layers = shown;
         if timing {
             let pass = cx.current_pass_id();
             cx.passes[pass].set_gpu_timing_enabled(true);
@@ -3922,6 +3959,12 @@ impl Widget for BoardPane {
     fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Group;
         makepad_platform::a11y::set_string(&mut node.role_description, "board");
+        if self.comparison_paused(cx) {
+            makepad_platform::a11y::set_string(&mut node.name, "Board");
+            let caption = self.st.review.as_ref().map_or("", |r| r.caption.as_str());
+            makepad_platform::a11y::set_string(&mut node.value, caption);
+            return;
+        }
         let board = self.st.drawn.as_ref().map(|draw| &draw.geom.board);
         let design = cx.get_global_ref::<ElecLive>().map(|live| &live.snap.design).or(self.st.design.as_ref());
         let name = board.and_then(|board| design.and_then(|design| design.unit(board.unit)))
@@ -3935,6 +3978,7 @@ impl Widget for BoardPane {
 
     /// Item nodes exist only for this lookup; the frame publishes no semantic parts.
     fn semantics_lookup(&self, cx: &Cx, lookup: &SemanticLookup, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        if self.comparison_paused(cx) { return; }
         let Some(draw) = &self.st.drawn else { return };
         let order = self.pick_order();
         let geom = &draw.geom;
@@ -3958,10 +4002,15 @@ impl Widget for BoardPane {
 
     /// Actions on this pane's lookup answers; the widget layer routes them here by owner.
     fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, _scope: &mut Scope) -> a11y_tree::ActionResult {
+        if self.comparison_paused(cx) { return a11y_tree::ActionResult::Unhandled; }
         self.semantic_action(cx, request)
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.comparison_paused(cx) {
+            self.comparison_event(cx, event, scope);
+            return;
+        }
         if !matches!(self.st.shape, ShapeGesture::Idle)
             && (matches!(event, Event::KeyFocus(f) if f.prev == self.draw_bg.area() && f.focus != f.prev)
                 || matches!(event, Event::MouseDown(e) if !self.st.rect.contains(e.abs))
@@ -4243,7 +4292,8 @@ impl Widget for BoardPane {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let started = Cx::monotonic_now();
-        if self.st.heat_want && cx.has_global::<ElecLive>() {
+        let preview = cx.get_global_ref::<ElecLive>().and_then(ElecLive::previewed).cloned();
+        if preview.is_none() && self.st.heat_want && cx.has_global::<ElecLive>() {
             let c = cx.get_global::<ElecLive>().sim.index.generation;
             if let Some(slot) = self.st.heat.as_ref().filter(|slot| slot.field.generation != c) {
                 let g = slot.field.generation;
@@ -4268,12 +4318,29 @@ impl Widget for BoardPane {
                 BoardDraws::set_templates(cx, Templates { stroke, pad, tri });
             }
         }
+        if let Some(view) = preview {
+            self.draw_comparison(cx, scope, rect, &view);
+            return DrawStep::done();
+        }
+        let keep_camera = self.st.review.is_some() && self.pane.placed;
         self.sync(cx);
+        if self.st.review.is_some() {
+            // A landing or an in-flight build may postpone the next picture. Restore the
+            // last Live streams now and let the normal sync rules take its successor.
+            self.leave_comparison(cx);
+            let present = self.st.unit.and_then(|id| cx.get_global_ref::<ElecLive>()?.snap.live().unit(id)?.board.as_ref()).is_some();
+            if present {
+                if let Some(last) = self.st.drawn.clone() { self.install_picture(cx, &last, true); }
+            } else {
+                if let Some(old) = self.st.drawn.take() { BoardDraws::retire(cx, old); }
+                self.install_empty(cx);
+            }
+        }
         let Some(draw) = self.st.drawn.as_ref() else { return DrawStep::done() };
         let b = draw.geom.scene.bbox;
         let bounds = [b.min.x as f64 / 1e6, b.min.y as f64 / 1e6, b.max.x as f64 / 1e6, b.max.y as f64 / 1e6];
         if self.st.refit {
-            self.pane.placed = false;
+            if !keep_camera { self.pane.placed = false; }
             self.st.refit = false;
         }
         self.pane.set_covered_inset(self.st.drawn_inset);
@@ -4281,7 +4348,7 @@ impl Widget for BoardPane {
             self.opening_view = None;
             self.st.glide = None;
         }
-        self.pane.place(cx, rect, Some(bounds));
+        self.pane.place(cx, rect, (!keep_camera).then_some(bounds));
         if self.status.visible() {
             let active = self.st.active.unwrap_or(LayerId::F_CU);
             let supplied = self.st.conn.as_ref().filter(|_| self.st.unit == Some(draw.unit));
@@ -4347,21 +4414,12 @@ impl Widget for BoardPane {
 #[cfg(test)]
 mod tests {
     use super::{arrange_fate, heat_texels, landed, outcome, shows_drop, ArrangeFate, HeatField, Outcome};
-    use crate::snapshot::{Committed, DesignSnapshot, Refusal, StageFlags, StateOf, Tagged};
+    use crate::snapshot::{Committed, Refusal, StateOf, Tagged};
     use fab_elec_design::{By, Design};
     use fab_elec_core::{BoardId, P};
     use std::sync::Arc;
 
-    fn snapshot(design: Arc<fab_elec_design::Design>) -> DesignSnapshot {
-        DesignSnapshot {
-            profiles: Arc::default(), profile_diags: Arc::default(),
-            design, preview: None, preview_tag: None, preview_by: None, created: vec![], last_commit: None,
-            sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![], sysnets: None, export: vec![], benches: Arc::default(),
-            violations: Tagged { unit: None, of: StateOf::Committed, generation: 0, value: Arc::new(vec![]) },
-            awaiting: Arc::new(vec![]), cases: Arc::default(), checking: vec![], last_refusal: None, stale: StageFlags::default(), head: String::new(),
-            source_map: None, docs: None, catalog: None,
-        }
-    }
+    use crate::snapshot::tests::snapshot;
 
     #[test]
     fn tune_readout_keeps_the_reported_lengths_and_measurement_qualifiers() {

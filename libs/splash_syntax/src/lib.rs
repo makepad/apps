@@ -34,12 +34,22 @@ pub enum Kind {
     Nil,
     /// The complete original text of a value whose nesting exceeded the reader's limit.
     TooDeep(String),
+    /// An opaque function literal, with its original spelling.
+    Fn(String),
+    /// A computed item in an array or argument list, with its original spelling.
+    Expr { op: ExprOp, text: String },
     /// A bare name: a reference to a `let`.
     Name(String),
     Arr(Vec<Node>),
     /// `Type{…}` or `{…}`: `open` and `close` are the braces.
     Obj { ty: Option<String>, open: usize, close: usize, fields: Vec<Field> },
     Call { name: String, args: Vec<Node> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExprOp {
+    Subtract,
+    Index,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,8 +71,17 @@ pub struct Stmt {
     pub value: Node,
 }
 
+/// An import, from the start of `use` through its path and optional semicolon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Use {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Parsed {
+    pub uses: Vec<Use>,
     pub stmts: Vec<Stmt>,
     /// `(byte offset, message)`.
     pub errors: Vec<(usize, String)>,
@@ -140,6 +159,9 @@ impl Node {
             Kind::Bool(b) => format!("{b}"),
             Kind::Nil => "nil".into(),
             Kind::TooDeep(_) => "a value nested too deeply".into(),
+            Kind::Fn(_) => "a function".into(),
+            Kind::Expr { op: ExprOp::Subtract, .. } => "a subtraction".into(),
+            Kind::Expr { op: ExprOp::Index, .. } => "an index expression".into(),
             Kind::Name(s) => format!("the name `{s}`"),
             Kind::Arr(items) => format!("an array of {}", items.len()),
             Kind::Obj { ty: Some(ty), .. } => format!("a {ty}{{…}}"),
@@ -189,6 +211,7 @@ pub fn parse_with(src: &str, limits: Limits) -> Parsed {
 fn parse_with_budget(src: &str, limits: Limits, origin: usize, budget: usize) -> Parsed {
     let mut parser = Parser::new(src, limits, false, origin, budget);
     let mut stmts = Vec::new();
+    let mut uses = Vec::new();
     loop {
         parser.skip_space();
         if parser.at >= parser.bytes.len() {
@@ -197,8 +220,10 @@ fn parse_with_budget(src: &str, limits: Limits, origin: usize, budget: usize) ->
         let start = parser.at;
         let word = parser.peek_word();
         if word == "use" {
-            // Skip the import up to the end of the line.
-            parser.at = src[start..].find('\n').map_or(src.len(), |n| start + n);
+            match parser.import(start) {
+                Some(import) => uses.push(import),
+                None => parser.recover(),
+            }
             continue;
         }
         let name = if word == "let" {
@@ -240,10 +265,11 @@ fn parse_with_budget(src: &str, limits: Limits, origin: usize, budget: usize) ->
             parser.errors.push((at, format!("cycle in let reference to `{name}`")));
         });
     }
-    Parsed { stmts, errors: parser.errors }
+    Parsed { uses, stmts, errors: parser.errors }
 }
 
-/// Read exactly one value, allowing only comments and whitespace around it.
+/// Read exactly one data value, allowing only comments and whitespace around it.
+/// Opaque code is available in document syntax trees, but is not a literal.
 pub fn read_value(src: &str) -> Result<Node, Vec<(usize, String)>> {
     let marker = 0u8;
     let origin = std::hint::black_box(&marker) as *const u8 as usize;
@@ -280,7 +306,9 @@ impl<'a> Parser<'a> {
         self.skip(true);
     }
 
-    fn skip(&mut self, commas: bool) {
+    /// The VM records whitespace even inside comments between two tokens.
+    fn skip(&mut self, commas: bool) -> bool {
+        let start = self.at;
         loop {
             while self.at < self.bytes.len() && (self.bytes[self.at].is_ascii_whitespace() || (commas && self.bytes[self.at] == b',')) {
                 self.at += 1;
@@ -295,14 +323,46 @@ impl<'a> Parser<'a> {
                 if let Some(n) = self.src[self.at + 2..].find("*/") {
                     self.at += 2 + n + 2;
                 } else {
-                    if self.single_value {
-                        self.error("a block comment is not closed with `*/`");
-                    }
+                    self.error("a block comment is not closed with `*/`");
                     self.at = self.src.len();
                 }
                 continue;
             }
             break;
+        }
+        self.src[start..self.at].chars().any(char::is_whitespace)
+    }
+
+    fn import(&mut self, start: usize) -> Option<Use> {
+        self.at += "use".len();
+        let mut path = String::new();
+        loop {
+            self.skip(false);
+            let wildcard = !path.is_empty() && self.bytes.get(self.at) == Some(&b'*');
+            if wildcard {
+                path.push('*');
+                self.at += 1;
+            } else {
+                let word = self.peek_word();
+                if word.is_empty() {
+                    self.error("an import needs a module or item name");
+                    return None;
+                }
+                path.push_str(word);
+                self.at += word.len();
+            }
+            let end = self.at;
+            self.skip(false);
+            if !wildcard && self.bytes.get(self.at) == Some(&b'.') {
+                path.push('.');
+                self.at += 1;
+                continue;
+            }
+            let end = if self.bytes.get(self.at) == Some(&b';') {
+                self.at += 1;
+                self.at
+            } else { end };
+            return Some(Use { path, start, end });
         }
     }
 
@@ -354,25 +414,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            b'[' => {
-                self.at += 1;
-                let mut items = Vec::new();
-                loop {
-                    self.skip_space();
-                    match self.bytes.get(self.at) {
-                        Some(b']') => {
-                            self.at += 1;
-                            break;
-                        }
-                        None => {
-                            self.errors.push((start, "an array is not closed with `]`".into()));
-                            return None;
-                        }
-                        _ => items.push(self.value(depth + 1)?),
-                    }
-                }
-                Kind::Arr(items)
-            }
+            b'[' => Kind::Arr(self.items(b']', depth + 1, start, "an array")?),
             b'{' => self.object(None, depth)?,
             b'-' | b'0'..=b'9' | b'.' => Kind::Num(self.number()?),
             byte if ident_start(byte) => {
@@ -396,25 +438,24 @@ impl<'a> Parser<'a> {
                         self.at = after;
                         Kind::Nil
                     }
+                    ("fn", Some(b'(')) => {
+                        self.balanced()?;
+                        self.skip(false);
+                        if self.bytes.get(self.at) != Some(&b'{') {
+                            self.error("a function needs a body in braces");
+                            return None;
+                        }
+                        self.balanced()?;
+                        if too_deep { return Some(self.placeholder(start)); }
+                        if self.single_value {
+                            self.errors.push((start, "a function is not a data literal".into()));
+                        }
+                        Kind::Fn(self.src[start..self.at].into())
+                    }
                     (_, Some(b'{' | b'(')) if too_deep => return self.skip_group(start),
                     (_, Some(b'{')) => self.object(Some(word), depth)?,
                     (_, Some(b'(')) => {
-                        self.at += 1;
-                        let mut args = Vec::new();
-                        loop {
-                            self.skip_space();
-                            match self.bytes.get(self.at) {
-                                Some(b')') => {
-                                    self.at += 1;
-                                    break;
-                                }
-                                None => {
-                                    self.errors.push((start, format!("`{word}(` is not closed with `)`")));
-                                    return None;
-                                }
-                                _ => args.push(self.value(depth + 1)?),
-                            }
-                        }
+                        let args = self.items(b')', depth + 1, start, &word)?;
                         Kind::Call { name: word, args }
                     }
                     _ => {
@@ -444,12 +485,73 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn items(&mut self, close: u8, depth: usize, start: usize, owner: &str) -> Option<Vec<Node>> {
+        self.at += 1;
+        let mut items = Vec::new();
+        loop {
+            self.skip_space();
+            match self.bytes.get(self.at) {
+                Some(&c) if c == close => {
+                    self.at += 1;
+                    return Some(items);
+                }
+                None => {
+                    let msg = if close == b']' { "an array is not closed with `]`".into() }
+                              else { format!("`{owner}(` is not closed with `)`") };
+                    self.errors.push((start, msg));
+                    return None;
+                }
+                _ => {}
+            }
+            let mut item = self.value(depth)?;
+            let mut first_op = None;
+            let mut end = self.at;
+            loop {
+                let space = self.skip(false);
+                let op = match self.bytes.get(self.at) {
+                    Some(b'-') => {
+                        self.at += 1;
+                        self.skip(false);
+                        if self.bytes.get(self.at) == Some(&b'(') {
+                            self.balanced()?;
+                        } else {
+                            self.value(depth)?;
+                        }
+                        ExprOp::Subtract
+                    }
+                    // Only an array literal admits another row after whitespace.
+                    // In call arguments a bracket after a value always indexes it.
+                    Some(b'[') if close != b']' || !space => {
+                        self.balanced()?;
+                        ExprOp::Index
+                    }
+                    _ => break,
+                };
+                first_op.get_or_insert(op);
+                end = self.at;
+            }
+            if let Some(op) = first_op {
+                if self.single_value {
+                    self.errors.push((item.start, "an expression is not a data literal".into()));
+                }
+                item.end = end;
+                item.kind = Kind::Expr { op, text: self.src[item.start..end].into() };
+            }
+            items.push(item);
+        }
+    }
+
     fn placeholder(&self, start: usize) -> Node {
         Node { start, end: self.at, kind: Kind::TooDeep(self.src[start..self.at].into()) }
     }
 
     /// Consume the balanced group at the cursor without building its nodes.
     fn skip_group(&mut self, start: usize) -> Option<Node> {
+        self.balanced()?;
+        Some(self.placeholder(start))
+    }
+
+    fn balanced(&mut self) -> Option<()> {
         let open = self.at;
         let mut closers = Vec::new();
         while let Some(&byte) = self.bytes.get(self.at) {
@@ -464,12 +566,31 @@ impl<'a> Parser<'a> {
                     }
                     if closers.is_empty() {
                         self.at += 1;
-                        return Some(self.placeholder(start));
+                        return Some(());
                     }
                 }
-                b'"' => {
-                    self.string()?;
+                b'"' | b'\'' => {
+                    self.skip_quoted(byte)?;
                     continue;
+                }
+                b'r' if !self.src[..self.at].ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$') => {
+                    let hashes = self.bytes[self.at + 1..].iter().take_while(|&&b| b == b'#').count();
+                    if self.bytes.get(self.at + 1 + hashes) == Some(&b'"') {
+                        let start = self.at;
+                        self.at += 2 + hashes;
+                        loop {
+                            let Some(quote) = self.src[self.at..].find('"') else {
+                                self.errors.push((start, "a raw string is not closed".into()));
+                                return None;
+                            };
+                            self.at += quote + 1;
+                            if self.bytes[self.at..].starts_with(&self.bytes[start + 1..start + 1 + hashes]) {
+                                self.at += hashes;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                 }
                 b'/' if matches!(self.bytes.get(self.at + 1), Some(b'/' | b'*')) => {
                     self.skip_space();
@@ -480,6 +601,20 @@ impl<'a> Parser<'a> {
             self.at += 1;
         }
         self.errors.push((open, "a nested value is not closed".into()));
+        None
+    }
+
+    // In opaque code only the closing quote matters. Escapes and arbitrary
+    // code between the delimiters do not become syntax-tree children.
+    fn skip_quoted(&mut self, quote: u8) -> Option<()> {
+        let start = self.at;
+        self.at += 1;
+        while let Some(&b) = self.bytes.get(self.at) {
+            self.at += 1;
+            if b == quote { return Some(()); }
+            if b == b'\\' && self.at < self.bytes.len() { self.at += 1; }
+        }
+        self.errors.push((start, "a string is not closed".into()));
         None
     }
 
@@ -525,28 +660,63 @@ impl<'a> Parser<'a> {
         let start = self.at;
         self.at += 1;
         let mut out = String::new();
-        loop {
-            let Some(ch) = self.src[self.at..].chars().next() else {
-                self.errors.push((start, "a string is not closed with `\"`".into()));
-                return None;
-            };
+        while let Some(ch) = self.src[self.at..].chars().next() {
             self.at += ch.len_utf8();
             match ch {
                 '"' => return Some(out),
                 '\\' => {
-                    let Some(next) = self.src[self.at..].chars().next() else { continue };
+                    let escape = self.at - 1;
+                    let Some(next) = self.src[self.at..].chars().next() else {
+                        self.errors.push((escape, "unfinished string escape".into()));
+                        return None;
+                    };
                     self.at += next.len_utf8();
-                    out.push(match next {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        '0' => '\0',
-                        other => other,
-                    });
+                    match next {
+                        '\\' | '\'' | '"' => out.push(next),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        '0' => out.push('\0'),
+                        '\n' => {
+                            while let Some(space) = self.src[self.at..].chars().next().filter(|c| c.is_whitespace()) {
+                                self.at += space.len_utf8();
+                            }
+                        }
+                        'x' | 'u' => match self.hex_escape(next) {
+                            Ok(ch) => out.push(ch),
+                            Err(msg) => {
+                                self.errors.push((escape, msg.into()));
+                                return None;
+                            }
+                        },
+                        other => { out.push('\\'); out.push(other); }
+                    }
                 }
                 ch => out.push(ch),
             }
         }
+        self.errors.push((start, "a string is not closed with `\"`".into()));
+        None
+    }
+
+    fn hex_escape(&mut self, kind: char) -> Result<char, &'static str> {
+        let braced = kind == 'u' && self.bytes.get(self.at) == Some(&b'{');
+        if braced { self.at += 1; }
+        let mut value = 0u32;
+        let start = self.at;
+        let width = if kind == 'u' { 4 } else { 2 };
+        loop {
+            let byte = *self.bytes.get(self.at).ok_or("unfinished hexadecimal string escape")?;
+            if braced && byte == b'}' && self.at > start {
+                self.at += 1;
+                break;
+            }
+            let digit = (byte as char).to_digit(16).ok_or("invalid hexadecimal string escape")?;
+            value = value.checked_mul(16).and_then(|v| v.checked_add(digit)).ok_or("invalid Unicode character")?;
+            self.at += 1;
+            if !braced && self.at - start == width { break; }
+        }
+        char::from_u32(value).ok_or("invalid Unicode character")
     }
 
     fn number(&mut self) -> Option<f64> {
@@ -621,7 +791,7 @@ pub fn write_value(node: &Node) -> String {
             Kind::Color(rgba) => out.push_str(&color_literal(*rgba)),
             Kind::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Kind::Nil => out.push_str("nil"),
-            Kind::TooDeep(text) | Kind::Name(text) => out.push_str(text),
+            Kind::TooDeep(text) | Kind::Name(text) | Kind::Fn(text) | Kind::Expr { text, .. } => out.push_str(text),
             Kind::Arr(items) => list(out, '[', items, ']'),
             Kind::Call { name, args } => {
                 out.push_str(name);
@@ -830,6 +1000,89 @@ pub fn fnv64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_have_ranges_and_leave_the_next_statement() {
+        let src = "use mod.a.*; let x = 1\nuse mod /*c*/ . b x";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(parsed.uses.iter().map(|u| (u.path.as_str(), &src[u.start..u.end])).collect::<Vec<_>>(),
+                   [("mod.a.*", "use mod.a.*;"), ("mod.b", "use mod /*c*/ . b")]);
+        assert_eq!(parsed.stmts.iter().map(|s| &src[s.start..s.end]).collect::<Vec<_>>(), ["let x = 1", "x"]);
+        for bad in ["use", "use .name", "use mod.", "use mod..x", "use mod.*.x"] {
+            assert!(!parse(bad).errors.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn functions_are_opaque_and_keep_their_spelling() {
+        let function = r##"fn( x /* ) */ ) { ['}', "\"]", r#""}"#]; // }
+            { x } }"##;
+        let src = format!("Box{{f: {function} y: 2}}");
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let obj = &parsed.stmts[0].value;
+        let f = obj.field("f").unwrap();
+        assert_eq!(&src[f.start..f.end], function);
+        assert_eq!(f.kind, Kind::Fn(function.into()));
+        assert_eq!(write_value(f), function);
+        assert_eq!(obj.field("y").and_then(Node::num), Some(2.0));
+        for bad in ["fn(", "fn(x)", "fn(x) {]", "fn(x) {\"}\""] {
+            assert!(!parse(bad).errors.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn juxtaposed_items_follow_the_vm() {
+        use ExprOp::{Index, Subtract};
+        for (src, op, expected) in [
+            ("[8-2]", Subtract, "8-2"),
+            ("[8 -2]", Subtract, "8 -2"),
+            ("[8\n- 2]", Subtract, "8\n- 2"),
+            ("f(8 -2)", Subtract, "8 -2"),
+            ("[a[0][1]]", Index, "a[0][1]"),
+            ("[a/**/[0]]", Index, "a/**/[0]"),
+            ("f(a [0])", Index, "a [0]"),
+            ("[f(1) -a[0]]", Subtract, "f(1) -a[0]"),
+        ] {
+            let parsed = parse(src);
+            assert!(parsed.errors.is_empty(), "{src}: {:?}", parsed.errors);
+            let (Kind::Arr(items) | Kind::Call { args: items, .. }) = &parsed.stmts[0].value.kind else { panic!("{src}") };
+            let [item] = items.as_slice() else { panic!("{src}: expected one item") };
+            assert_eq!(item.kind, Kind::Expr { op, text: expected.into() }, "{src}");
+            assert_eq!(&src[item.start..item.end], expected);
+            assert_eq!(write_value(item), expected);
+            assert_eq!(write_value(&parsed.stmts[0].value), src);
+        }
+        for src in ["[a [0]]", "[[1 2] [3 4]]", "[a/* */[0]]", "[a, [0]]", "f(a, [0])", "[8, -2]", "f(8, -2)"] {
+            let parsed = parse(src);
+            assert!(parsed.errors.is_empty(), "{src}: {:?}", parsed.errors);
+            let (Kind::Arr(items) | Kind::Call { args: items, .. }) = &parsed.stmts[0].value.kind else { panic!("{src}") };
+            assert_eq!(items.len(), 2, "{src}");
+            assert!(!items.iter().any(|v| matches!(v.kind, Kind::Expr { .. })), "{src}");
+        }
+    }
+
+    #[test]
+    fn strings_decode_splash_escapes_and_locate_bad_escapes() {
+        let src = "\"\\u{1f31f}\\u2605\\x41\\q\\'\\0\\\n \ttext\"";
+        assert_eq!(read_value(src).unwrap().str(), Some("🌟★A\\q'\0text"));
+        for bad in [r"\x4", r"\xZZ", r"\u123", r"\u{}", r"\uD800", r"\u{110000}", r"\u{ffffffffff}"] {
+            let src = format!("Title{{text: \"é{bad}\"}}");
+            let parsed = parse(&src);
+            assert_eq!(parsed.errors.first().map(|e| e.0), src.find('\\'), "{bad}: {:?}", parsed.errors);
+        }
+    }
+
+    #[test]
+    fn unclosed_comments_are_errors_in_document_and_literal_mode() {
+        for src in ["/*", "x /*", "[x /*", "fn() {/*"] {
+            let offset = src.find("/*").unwrap();
+            let has_comment_error = |errors: &[(usize, String)]| errors.iter().any(|(at, msg)| *at == offset && msg.contains("block comment"));
+            assert!(has_comment_error(&parse(src).errors), "{src}");
+            assert!(has_comment_error(&read_value(src).unwrap_err()), "{src}");
+        }
+    }
 
     #[test]
     fn overdeep_subtree_keeps_its_range_and_the_reader_continues() {

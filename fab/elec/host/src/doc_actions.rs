@@ -19,7 +19,7 @@ pub const DOC_LIST: ActionDef = ActionDef {
     help: "The project's electronics documents as the code panes hold them: each one's name, kind, revision and line count. elec.doc.read reads one; fab.elec_text changes its text.",
     returns: "docs: [{..}]
   name: text  the file name, relative to the project
-  kind: choice circuit|board|sheets|system|cable|part|blocks|bench|profile|view|firmware
+  kind: choice circuit|board|sheets|system|cable|part|blocks|bench|profile|view|firmware|requirements
   rev: int  one more with each change of its text
   lines: int",
     fields: &[],
@@ -32,7 +32,7 @@ pub const DOC_READ: ActionDef = ActionDef {
     group: "Documents",
     help: "A document's text as its code pane shows it, each line after its number and a tab (the numbers are not part of the text), and its revision: the rev a fab.elec_text edit of it names.",
     returns: "doc: text
-kind: choice circuit|board|sheets|system|cable|part|blocks|bench|profile|view|firmware
+kind: choice circuit|board|sheets|system|cable|part|blocks|bench|profile|view|firmware|requirements
 rev: int
 lines: int  the document's line count
 from: int  the first line shown
@@ -95,6 +95,9 @@ pub fn kind_word(name: &str) -> &'static str {
 /// O(documents).
 pub fn find_doc<'a>(docs: &'a DocsView, name: &str) -> Result<&'a DocText, String> {
     let name = name.trim();
+    if docs.texts.is_empty() {
+        return Err(format!("doc: no document {name}: the plate has no electronics documents"));
+    }
     if let Some(text) = docs.texts.iter().find(|text| text.name == name) {
         return Ok(text);
     }
@@ -248,4 +251,17 @@ pub fn find_edits(text: &str, change: &TextChange) -> Result<FoundEdits, String>
         lines.push(line..line + body.matches('\n').count() + 1);
     }
     Ok(FoundEdits { text: out, lines })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doc_read_on_empty_plate_reports_no_electronics_documents() {
+        let err = doc_read(&DocsView::default(), &[("doc".into(), "device.req.splash".into())]).unwrap_err();
+        assert_eq!(err.message, "doc: no document device.req.splash: the plate has no electronics documents",
+            "the missing document must explain the empty plate without listing nonexistent documents");
+    }
 }

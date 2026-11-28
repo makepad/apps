@@ -9,6 +9,7 @@
 //! changed modules into the CUT tree draft, then uses the shared tree save.
 //! A standalone library graphic publishes a Motion revision.
 
+use makepad_motion::plain::PrimitiveFrame;
 use super::super::ops::CutOp;
 use super::super::patch::Value;
 use super::super::VideoCut;
@@ -1007,7 +1008,7 @@ const SCRUB_TOUCH: f64 = 0.12;
 /// with the playhead, and a scrub sounds a short touch at each new place.
 /// The edit's own mix (`engine::sound_mix`, played as the edit's viewer
 /// plays it); silent when the graphic is not placed in the edit or the
-/// page is not shown, and on a hidden or muted instance (`sound::muted`).
+/// page is not shown.
 fn play_sound(page: &mut VideoCut, cx: &mut Cx, shown: bool) {
     let start = page.motion.desk.session.as_ref().filter(|_| shown)
         .and_then(|session| session.node.as_deref())
@@ -3056,7 +3057,7 @@ fn view_items(session: &MotionSession, frame: &MotionFrame) -> Vec<ViewItem> {
         let path = owner.to_string();
         let outline = session.outline.layer(&path);
         let (size, text) = match &item.kind {
-            ItemKind::Text { text, size, line_height, tracking, weight, .. } => {
+            ItemKind::Primitive(PrimitiveFrame::Text { text, size, line_height, tracking, weight, .. }) => {
                 // An estimate of the laid-out box (heavier faces run wider).
                 let lines: Vec<&str> = text.lines().collect();
                 let longest = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0) as f64;
@@ -3065,7 +3066,7 @@ fn view_items(session: &MotionSession, frame: &MotionFrame) -> Vec<ViewItem> {
                 let h = lines.len().max(1) as f64 * size * line_height.max(1.0);
                 ([w.max(*size), h], Some(text.clone()))
             }
-            ItemKind::Path { path, width, .. } => (path_bounds(path, *width), None),
+            ItemKind::Primitive(PrimitiveFrame::Path { path, width, .. }) => (path_bounds(path, *width), None),
             _ => match item.box_size() {
                 Some(size) if size[0] > 0.0 && size[1] > 0.0 => (size, None),
                 _ => continue,
@@ -3074,20 +3075,20 @@ fn view_items(session: &MotionSession, frame: &MotionFrame) -> Vec<ViewItem> {
         // Text animated per unit keeps its offsets in its units: the box
         // follows the first.
         let unit_offset = match &item.kind {
-            ItemKind::Text { units, .. } if units.len() > 1 || units.first().is_some_and(|unit| unit.offset != [0.0, 0.0]) => units.first().map_or([0.0, 0.0], |unit| unit.offset),
+            ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) if units.len() > 1 || units.first().is_some_and(|unit| unit.offset != [0.0, 0.0]) => units.first().map_or([0.0, 0.0], |unit| unit.offset),
             _ => [0.0, 0.0],
         };
         let transform = makepad_motion::Affine::translate(unit_offset[0], unit_offset[1]).then(&item.transform(size));
         let quad = [[0.0, 0.0], [size[0], 0.0], [size[0], size[1]], [0.0, size[1]]].map(|p| transform.apply(p));
         let (ink, round, text_size) = match &item.kind {
-            ItemKind::Rect { fill, stroke, .. } => (fill.or(*stroke), false, 0.0),
-            ItemKind::Ellipse { fill, stroke, .. } => (fill.or(*stroke), true, 0.0),
-            ItemKind::Path { stroke, fill, .. } => (stroke.or(*fill), false, 0.0),
-            ItemKind::Text { units, size, .. } => (units.first().map(|unit| unit.color), false, *size),
+            ItemKind::Primitive(PrimitiveFrame::Rect { fill, stroke, .. }) => (fill.or(*stroke), false, 0.0),
+            ItemKind::Primitive(PrimitiveFrame::Ellipse { fill, stroke, .. }) => (fill.or(*stroke), true, 0.0),
+            ItemKind::Primitive(PrimitiveFrame::Path { stroke, fill, .. }) => (stroke.or(*fill), false, 0.0),
+            ItemKind::Primitive(PrimitiveFrame::Text { units, size, .. }) => (units.first().map(|unit| unit.color), false, *size),
             _ => (None, false, 0.0),
         };
         let opacity = match &item.kind {
-            ItemKind::Text { units, .. } => item.opacity * units.first().map_or(1.0, |unit| unit.opacity),
+            ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) => item.opacity * units.first().map_or(1.0, |unit| unit.opacity),
             _ => item.opacity,
         };
         let placed = session.selection.layer.as_deref().filter(|selected| *selected == path)
@@ -3581,9 +3582,9 @@ fn sketch_thumbnail(session: &MotionSession) -> (usize, usize, Vec<u32>) {
     let scale = (w as f64 / doc.size[0].max(1.0)).min(h as f64 / doc.size[1].max(1.0));
     for item in view_items(session, &frame) {
         let fill = frame.walk().into_iter().find(|(_, i)| i.path == item.path).and_then(|(_, i)| match &i.kind {
-            ItemKind::Rect { fill, stroke, .. } | ItemKind::Ellipse { fill, stroke, .. } => fill.or(*stroke),
-            ItemKind::Path { stroke, fill, .. } => stroke.or(*fill),
-            ItemKind::Text { units, .. } => units.first().map(|unit| unit.color),
+            ItemKind::Primitive(PrimitiveFrame::Rect { fill, stroke, .. }) | ItemKind::Primitive(PrimitiveFrame::Ellipse { fill, stroke, .. }) => fill.or(*stroke),
+            ItemKind::Primitive(PrimitiveFrame::Path { stroke, fill, .. }) => stroke.or(*fill),
+            ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) => units.first().map(|unit| unit.color),
             _ => None,
         });
         let Some(fill) = fill else { continue };

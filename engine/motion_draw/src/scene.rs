@@ -102,6 +102,9 @@ fn camera_matrices(camera: &CameraFrame, aspect: f64) -> (Mat4f, Mat4f) {
 
 /// Draw a Scene3D item into its own target at `scale` pixels per unit.
 pub(super) fn render(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, scale: f64) -> Option<Texture> {
+    if md.refuse_plain_item(item) {
+        return None;
+    }
     let ItemKind::Scene3D { model: media, size, camera, lights, nodes, materials, background, exposure, .. } = &item.kind else { return None };
     let px = ((size[0] * scale).ceil().max(1.0) as u32, (size[1] * scale).ceil().max(1.0) as u32);
     if md.scenes.draw.is_none() {

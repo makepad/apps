@@ -74,6 +74,71 @@ macro_rules! gen_job_out {
     };
 }
 
+/// Accepted transport state of one or both VJ video decks (`vj_deck_transport`, `vj_deck_status`).
+const VJ_DECK_TRANSPORT_OUT: &str = r#"{"type":"object","additionalProperties":true,"properties":{
+    "note":{"type":"string","description":"Short summary of the decks' accepted transport state."},
+    "decks":{"type":"array","description":"Accepted transport state of each targeted deck, in A then B order.","items":{
+        "type":"object","additionalProperties":true,"properties":{
+            "deck":{"type":"string","enum":["a","b"],"description":"Deck identifier."},
+            "loaded":{"type":"boolean","description":"True while an active clip or recording is adopted on this deck."},
+            "clip":{"type":["string","null"],"description":"Title of the active clip, or null when empty."},
+            "linked_dj":{"type":["string","null"],"description":"DJ deck letter (a or b) when a linked recording follows a DJ deck, else null."},
+            "play":{"type":"boolean","description":"Accepted play toggle (true playing, false paused)."},
+            "mode":{"type":"string","enum":["forward","reverse","bounce","single"],"description":"Accepted playback loop mode."},
+            "loop_enabled":{"type":"boolean","description":"Accepted loop enable flag."},
+            "reverse":{"type":"boolean","description":"Accepted reverse travel flag."},
+            "bounce":{"type":"boolean","description":"Accepted bounce reflection flag."},
+            "speed":{"type":"number","description":"Accepted free-running playback speed (0.25 to 4)."},
+            "beats":{"type":"number","description":"Accepted beats per loop sweep (0 means Free/speed)."},
+            "loop_in":{"type":"number","description":"Accepted loop IN point in seconds."},
+            "loop_out":{"type":"number","description":"Accepted loop OUT point in seconds (0 means clip end)."},
+            "position":{"type":["number","null"],"description":"Last published playhead position in seconds, or null when unavailable."},
+            "duration":{"type":["number","null"],"description":"Clip length in seconds, or null when unknown."},
+            "pending":{"type":"array","items":{"type":"string","enum":["mode","range","seek","beats","play","speed"]},"description":"Transport intent kinds still queued for owner admission."},
+            "applied":{"type":"boolean","description":"On vj_deck_transport: true if commands were submitted to this deck, false if skipped."},
+            "skipped_reason":{"type":"string","description":"When applied is false, why this deck was skipped."},
+            "preference":{"type":"object","additionalProperties":true,"description":"Per-deck transport preferences held in memory for future show clips (mode, reverse, beats, speed)."}
+        },"required":["deck","loaded","play","mode","loop_enabled","reverse","bounce","speed","beats","loop_in","loop_out","pending"]
+    }}
+},"required":["decks","note"]}"#;
+
+/// The batch returned by both VJ video generation and status.
+const VJ_VIDEO_BATCH: &str = r#"{"type":"object","additionalProperties":true,"properties":{
+    "batch_id":{"type":"string","description":"Identifier of the video batch, such as vj-1."},
+    "running":{"type":"boolean","description":"True while any clip is queued, preparing or running."},
+    "total":{"type":"integer","description":"Number of clips requested in the batch."},
+    "done":{"type":"integer","description":"Number of clips published to the library."},
+    "failed":{"type":"integer","description":"Number of clips that failed."},
+    "cancelled":{"type":"integer","description":"Number of cancelled clips."},
+    "active_nodes":{"type":"array","items":{"type":"string"},"description":"Hub nodes currently working on this batch."},
+    "video_nodes":{"type":"integer","description":"Number of AI Hub nodes with a video model installed right now."},
+    "available_models":{"type":"array","description":"Installed video models on the AI Hub and the nodes offering each.","items":{
+        "type":"object","properties":{
+            "model":{"type":"string","description":"Video model identifier."},
+            "nodes":{"type":"array","items":{"type":"string"},"description":"Hub nodes that have this model installed."}
+        },"required":["model","nodes"]
+    }},
+    "clips":{"type":"array","description":"The clips in request order, with the latest reported state of each.","items":{
+        "type":"object","properties":{
+            "index":{"type":"integer","description":"One-based position in the batch."},
+            "job_id":{"type":"integer","description":"FlowStudio run id once dispatched."},
+            "prompt":{"type":"string","description":"Generation prompt for this clip."},
+            "title":{"type":"string","description":"Library title for this clip."},
+            "state":{"type":"string","enum":["queued","preparing","running","done","failed","cancelled"],"description":"Current generation state."},
+            "stage":{"type":"string","description":"Latest stage reported by the hub or flow engine."},
+            "progress":{"type":"number","minimum":0,"maximum":1,"description":"Fraction complete as reported by the hub. Omitted while unknown."},
+            "model":{"type":"string","description":"Video model generating this clip."},
+            "hub":{"type":"string","description":"Label of the hub node generating this clip."},
+            "asset":{"type":"string","description":"Exact library reference (asset_id@revision) once published."},
+            "seconds":{"type":"number","description":"Elapsed generation time in seconds."},
+            "width":{"type":"integer","description":"Clip width in pixels."},
+            "height":{"type":"integer","description":"Clip height in pixels."},
+            "frames":{"type":"integer","description":"Number of frames in the clip."},
+            "error":{"type":"string","description":"Reason the clip failed."}
+        },"required":["index","prompt","title","state"]
+    }}
+},"required":["batch_id","running","total","done","failed","cancelled","clips"]}"#;
+
 /// The result of every storyboard change.
 macro_rules! board_out {
     () => {
@@ -217,7 +282,7 @@ pub static TOOLS: &[ToolSpec] = &[
         r#"{"type": "object", "additionalProperties": true, "properties": {"title": {"type": "string", "description": "the deck's title"}, "slides": {"type": "array", "items": {"type": "string", "description": "slide name"}, "description": "its slides in order"}, "revision": {"type": "integer", "description": "the document revision"}}, "required": ["revision"]}"#),
     tool("add_slide", Cut, true, false, "Stage document trees",
         "Add a slide after the given index, or append it. sketch writes a compact Slide of the person's text (`sketch`: first line the title, a line per bullet), shown in the deck's default layout until a graphic is attached with set_slide. graphic references an existing slide file. title/text/blank/image/video/camera create a named slides/ file and a compact graphic Slide. app writes a compact app Slide with its default title band and fitted frame. The tree reloads as one undoable change.",
-        r#"{"type": "object", "properties": {"kind": {"type": "string", "enum": ["sketch", "graphic", "blank", "title", "text", "image", "video", "app", "camera"], "description": "sketch, graphic and app write compact Slides; defaults to graphic with path, otherwise blank"}, "sketch": {"type": "string", "description": "a sketch slide's text: first line the title, then one line per bullet"}, "path": {"type": "string", "description": "logical tree file path, including extension (tree_list)"}, "name": {"type": "string", "description": "unique slide name"}, "after": {"type": "integer", "minimum": 0, "description": "insert after this slide index; omit to append"}, "title": {"type": "string", "description": "headline"}, "subtitle": {"type": "string", "description": "subtitle"}, "bullets": {"type": "array", "items": {"type": "string", "description": "bullet"}, "description": "bullet texts"}, "fit": {"type": "string", "enum": ["fill", "contain"], "description": "image fit"}, "seconds": {"type": "number", "minimum": 0, "description": "video duration"}, "audio": {"type": "boolean", "description": "play video sound"}, "app": {"type": "string", "description": "shared app registry id"}, "notes": {"type": "string", "description": "presenter notes"}, "size": {"type": "array", "items": {"type": "number", "description": "points"}, "minItems": 2, "description": "app size"}, "base_revision": {"type": "integer", "minimum": 0, "description": "revision returned by doc_read; refuse a stale edit"}, "play": {"type": "array", "minItems": 2, "items": {"type": "number", "description": "seconds"}, "description": "video source range [start, end]"}, "device": {"type": ["string", "integer"], "description": "camera name or index"}, "width": {"type": "integer", "minimum": 1, "description": "camera width"}, "height": {"type": "integer", "minimum": 1, "description": "camera height"}, "fps": {"type": "number", "minimum": 1, "description": "camera rate"}, "rotate": {"type": "integer", "enum": [0, 90, 180, 270], "description": "camera rotation in degrees"}, "mirror": {"type": "boolean", "description": "mirror the camera"}, "crop": {"type": "array", "items": {"type": "number", "description": "fraction"}, "minItems": 4, "description": "camera crop [x,y,width,height]"}, "adjust": {"type": "object", "properties": {"brightness": {"type": "number", "description": "brightness"}, "contrast": {"type": "number", "description": "contrast"}, "saturation": {"type": "number", "description": "saturation"}}, "description": "camera adjustment"}, "duration": {"type": "number", "exclusiveMinimum": 0, "description": "Compact slide duration in seconds; omit to inherit its graphic duration (app: 6 seconds)"}}}"#,
+        r#"{"type": "object", "properties": {"kind": {"type": "string", "enum": ["sketch", "graphic", "blank", "title", "text", "image", "video", "app", "camera"], "description": "sketch, graphic and app write compact Slides; defaults to graphic with path, otherwise blank"}, "sketch": {"type": "string", "description": "a sketch slide's text: first line the title, then one line per bullet"}, "path": {"type": "string", "description": "logical tree file path, including extension (tree_list)"}, "name": {"type": "string", "description": "unique slide name"}, "after": {"type": "integer", "minimum": 0, "description": "insert after this slide index; omit to append"}, "title": {"type": "string", "description": "headline"}, "subtitle": {"type": "string", "description": "subtitle"}, "bullets": {"type": "array", "items": {"type": "string", "description": "bullet"}, "description": "bullet texts"}, "fit": {"type": "string", "enum": ["fill", "contain"], "description": "image fit"}, "seconds": {"type": "number", "minimum": 0, "description": "video duration"}, "audio": {"type": "boolean", "description": "play video sound"}, "app": {"type": "string", "description": "shared app registry id"}, "notes": {"type": "string", "description": "presenter notes"}, "size": {"type": "array", "items": {"type": "number", "description": "points"}, "minItems": 2, "description": "app size"}, "base_revision": {"type": "integer", "minimum": 0, "description": "revision returned by doc_read; refuse a stale edit"}, "play": {"type": "array", "minItems": 2, "items": {"type": "number", "description": "seconds"}, "description": "video source range [start, end]"}, "device": {"type": ["string", "integer"], "description": "part of a camera name, its index, or @test_pattern for generated colour bars. Omit for the first camera."}, "width": {"type": "integer", "minimum": 1, "description": "camera width"}, "height": {"type": "integer", "minimum": 1, "description": "camera height"}, "fps": {"type": "number", "minimum": 1, "description": "camera rate"}, "rotate": {"type": "integer", "enum": [0, 90, 180, 270], "description": "camera rotation in degrees"}, "mirror": {"type": "boolean", "description": "mirror the camera"}, "crop": {"type": "array", "items": {"type": "number", "description": "fraction"}, "minItems": 4, "description": "camera crop [x,y,width,height]"}, "adjust": {"type": "object", "properties": {"brightness": {"type": "number", "description": "brightness"}, "contrast": {"type": "number", "description": "contrast"}, "saturation": {"type": "number", "description": "saturation"}}, "description": "camera adjustment"}, "duration": {"type": "number", "exclusiveMinimum": 0, "description": "Compact slide duration in seconds; omit to inherit its graphic duration (app: 6 seconds)"}}}"#,
         open_out!()),
     tool("move_slide", Cut, true, false, "Stage DECK page",
         "Move slide `from` to position `to` in the open deck. One undoable step.",
@@ -245,7 +310,7 @@ pub static TOOLS: &[ToolSpec] = &[
         mutation_out!()),
     tool("add_layer", Cut, true, false, "Stage document trees",
         "Add an image, video, Motion graphic or camera above an inline slide's picture. Media and Motion layers take paths within the deck tree.",
-        r#"{"type": "object", "properties": {"index": {"type": ["string", "integer"], "description": "slide index or name"}, "kind": {"type": "string", "enum": ["graphic", "image", "video", "camera"], "description": "kind of layer"}, "path": {"type": "string", "description": "Motion graphic or media path in the tree"}, "fit": {"type": "string", "enum": ["fill", "contain", "fit", "none"], "description": "picture fit"}, "base_revision": {"type": "integer", "minimum": 0, "description": "working revision"}, "play": {"type": "array", "minItems": 2, "items": {"type": "number", "description": "seconds"}, "description": "video source range [start, end]"}, "device": {"type": ["string", "integer"], "description": "camera name or index"}, "width": {"type": "integer", "minimum": 1, "description": "camera width"}, "height": {"type": "integer", "minimum": 1, "description": "camera height"}, "fps": {"type": "number", "minimum": 1, "description": "camera rate"}, "rotate": {"type": "integer", "enum": [0, 90, 180, 270], "description": "camera rotation in degrees"}, "mirror": {"type": "boolean", "description": "mirror the camera"}, "crop": {"type": "array", "items": {"type": "number", "description": "fraction"}, "minItems": 4, "description": "camera crop [x,y,width,height]"}, "adjust": {"type": "object", "properties": {"brightness": {"type": "number", "description": "brightness"}, "contrast": {"type": "number", "description": "contrast"}, "saturation": {"type": "number", "description": "saturation"}}, "description": "camera adjustment"}}, "required": ["index", "kind"]}"#,
+        r#"{"type": "object", "properties": {"index": {"type": ["string", "integer"], "description": "slide index or name"}, "kind": {"type": "string", "enum": ["graphic", "image", "video", "camera"], "description": "kind of layer"}, "path": {"type": "string", "description": "Motion graphic or media path in the tree"}, "fit": {"type": "string", "enum": ["fill", "contain", "fit", "none"], "description": "picture fit"}, "base_revision": {"type": "integer", "minimum": 0, "description": "working revision"}, "play": {"type": "array", "minItems": 2, "items": {"type": "number", "description": "seconds"}, "description": "video source range [start, end]"}, "device": {"type": ["string", "integer"], "description": "part of a camera name, its index, or @test_pattern for generated colour bars. Omit for the first camera."}, "width": {"type": "integer", "minimum": 1, "description": "camera width"}, "height": {"type": "integer", "minimum": 1, "description": "camera height"}, "fps": {"type": "number", "minimum": 1, "description": "camera rate"}, "rotate": {"type": "integer", "enum": [0, 90, 180, 270], "description": "camera rotation in degrees"}, "mirror": {"type": "boolean", "description": "mirror the camera"}, "crop": {"type": "array", "items": {"type": "number", "description": "fraction"}, "minItems": 4, "description": "camera crop [x,y,width,height]"}, "adjust": {"type": "object", "properties": {"brightness": {"type": "number", "description": "brightness"}, "contrast": {"type": "number", "description": "contrast"}, "saturation": {"type": "number", "description": "saturation"}}, "description": "camera adjustment"}}, "required": ["index", "kind"]}"#,
         open_out!()),
     tool("set_deck", Cut, true, false, "Stage DECK page",
         "Change the open deck's own fields: its title, the transition between slides unless a slide names its own, and the output size.",
@@ -600,6 +665,102 @@ pub static TOOLS: &[ToolSpec] = &[
         r#"{"type": "object", "properties": {"preset": {"type": "string", "minLength": 1, "description": "the preset to start from, an id from gen_presets"}, "name": {"type": "string", "description": "the saved preset's name"}, "prompt": {"type": "string", "description": "the prompt it starts with"}, "params": {"type": "object", "additionalProperties": true, "properties": {}, "description": "parameters by name, as gen_run takes them, e.g. {\"seconds\": 8}"}, "seed": {"type": "integer", "minimum": 0, "description": "a fixed seed"}}, "required": ["preset"]}"#,
         r#"{"type": "object", "additionalProperties": true, "properties": {"saving": {"type": "string", "description": "the name it is saved under"}}, "required": ["saving"]}"#),
     tool(gen::ESTIMATE.api_name, Assets, false, false, "makepad-gen", gen::ESTIMATE.description, gen::ESTIMATE.input, open_out!()),
+
+    request("vj_video_generate", Assets, false, false, "Stage VJ video (vj_video.rs)", Layout {
+        title: "Generate video clips", confirm: "Generate",
+        order: &[("prompt", "Prompt"), ("count", "Clips"), ("duration", "Duration (s)"), ("resolution", "Resolution"), ("orientation", "Orientation"), ("model", "Model"), ("audio", "Audio")],
+        hide: &["seed", "wait"],
+    },
+        "Generate one clip or a batch on the AI Hub and add each finished clip to the VJ library. Confirm the batch on one settings card. Follow individual clips with vj_video_status.",
+        r#"{"type":"object","properties":{
+            "prompt":{"type":"string","description":"What happens in the clip. Give a non-empty prompt, or leave it empty when prompts is given. A repeated prompt gets distinct seeds."},
+            "prompts":{"type":"array","minItems":1,"description":"Distinct clips in request order. Each inherits the shared settings unless overridden.","items":{
+                "type":"object","properties":{
+                    "prompt":{"type":"string","minLength":1,"description":"What happens in this clip."},
+                    "title":{"type":"string","description":"Optional library title. Defaults to an excerpt of this prompt."},
+                    "seed":{"type":"integer","minimum":0,"description":"Optional deterministic seed for this clip."}
+                },"required":["prompt"]
+            }},
+            "count":{"type":"integer","minimum":1,"description":"How many clips to queue. Defaults to one for prompt, or the length of prompts. A smaller count takes the first entries and a larger count cycles through them."},
+            "duration":{"type":"number","minimum":0.5,"maximum":20,"description":"Target length in seconds at 24 fps (default 5), snapped to the model's frame grid (17n+5)."},
+            "resolution":{"type":"string","enum":["draft","standard","hd"],"description":"Sizes in landscape, portrait and square order. Draft is 640x352, 352x640 or 480x480. Standard (default) is 864x480, 480x864 or 640x640. HD is 1280x704, 704x1280 or 960x960 and needs a 32 GB or larger GPU."},
+            "orientation":{"type":"string","enum":["landscape","portrait","square"],"description":"Clip orientation. Defaults to landscape."},
+            "model":{"type":"string","enum":["auto","fasth3-4step","fasth3-4step-q4-24g","minimax-h3-nvfp4-32g","minimax-h3-q4-24g","minimax-h3-bf16-96g","minimax-h3"],"description":"Video model (default `auto`: fans out across all installed video GPUs by ETA)."},
+            "audio":{"type":"boolean","description":"Generate and mux an audio track. VJ clips are silent by default."},
+            "seed":{"type":"integer","minimum":0,"description":"Optional starting seed. Each clip adds its zero-based position unless it has its own seed. Omit to use fresh, distinct seeds."},
+            "wait":{"type":"boolean","description":"Wait with live progress for the batch (default true in chat). False returns its batch_id immediately."}
+        }}"#,
+        VJ_VIDEO_BATCH),
+    tool("vj_video_status", Assets, false, false, "Stage VJ video (vj_video.rs)",
+        "Show a VJ video batch with each clip's state, reported progress, hub node, library result or failure, and the video models and node count currently installed on the AI Hub.",
+        r#"{"type":"object","properties":{"batch_id":{"type":"string","description":"Batch id from vj_video_generate. Omit to inspect the newest batch or get a batch summary."}}}"#,
+        VJ_VIDEO_BATCH),
+    tool("vj_video_cancel", Assets, true, false, "Stage VJ video (vj_video.rs)",
+        "Cancel one clip or all queued and running clips in a VJ video batch.",
+        r#"{"type":"object","properties":{
+            "batch_id":{"type":"string","description":"Batch to cancel. Defaults to the active or newest batch."},
+            "clip":{"type":"integer","minimum":1,"description":"One-based clip index. Omit to cancel all unfinished clips in the batch."}
+        }}"#,
+        r#"{"type":"object","properties":{
+            "batch_id":{"type":"string","description":"Identifier of the affected batch."},
+            "cancelled":{"type":"integer","description":"Number of clips cancelled."},
+            "running":{"type":"boolean","description":"True while work remains queued or running in the batch."}
+        },"required":["batch_id","cancelled","running"]}"#),
+
+    request("vj_show_start", Assets, false, false, "Stage VJ show", Layout {
+        title: "Start VJ Show", confirm: "Start Show", order: &[("theme", "Theme"), ("style", "Style"),
+            ("energy", "Energy"), ("duration", "Clip length (s)"), ("model", "Video model")], hide: &[],
+    }, "Start a continuous, beat-driven VJ show. Stage generates themed clips on the LAN video nodes and mixes them until stopped. Starting a show replaces the previous show.",
+        r#"{"type":"object","properties":{
+            "theme":{"type":"string","minLength":1,"description":"Subject of the show."},
+            "style":{"type":"string","description":"Visual style for generated clips."},
+            "energy":{"type":"string","enum":["auto","calm","groove","intense","wild"],"description":"Mixing energy. Auto follows the music."},
+            "cut_rate":{"type":"string","enum":["auto","slow","fast"],"description":"Cut cadence relative to the energy setting."},
+            "fx_intensity":{"type":"number","minimum":0,"maximum":1,"description":"Effect intensity (default 0.75)."},
+            "duration":{"type":"number","minimum":2,"maximum":10,"description":"Generated clip length in seconds (default 3)."},
+            "model":{"type":"string","description":"Video model. Empty or auto uses any installed video model."},
+            "include_existing":{"type":"boolean","description":"Use published library clips immediately during warmup."}
+        },"required":["theme"]}"#, open_out!()),
+    tool("vj_show_steer", Assets, true, false, "Stage VJ show",
+        "Change the running show's direction, pause or resume automation, or hand manual controls back to the show.",
+        r#"{"type":"object","properties":{
+            "theme":{"type":"string","minLength":1,"description":"New subject for future clips."},
+            "style":{"type":"string","description":"New visual style."},
+            "energy":{"type":"string","enum":["auto","calm","groove","intense","wild"],"description":"Mixing energy."},
+            "cut_rate":{"type":"string","enum":["auto","slow","fast"],"description":"Cut cadence."},
+            "fx_intensity":{"type":"number","minimum":0,"maximum":1,"description":"Effect intensity."},
+            "paused":{"type":"boolean","description":"Pause new generation and cuts, or resume them."},
+            "reclaim_manual":{"type":"boolean","description":"Return fader and deck ownership to the show."},
+            "hard_reset":{"type":"boolean","description":"On a theme or style change, cancel generation still running for the old theme."}
+        }}"#, open_out!()),
+    tool("vj_show_stop", Assets, true, false, "Stage VJ show",
+        "Stop the automated show and its unfinished jobs. Published clips stay in the library.", no_args!(), open_out!()),
+    tool("vj_show_status", Assets, false, false, "Stage VJ show",
+        "Read the show's clock, generation progress, manual holds, newest event sequence (`last_event_seq`) and recent beat-aligned transitions. Omit `since_seq` for the latest 16 events; pass `last_event_seq` to poll only newer events, or `0` for all retained events.",
+        r#"{"type":"object","properties":{"since_seq":{"type":"integer","minimum":0,"description":"Return only events with seq > since_seq. Omit for the latest 16 events; pass 0 for all retained events."}}}"#,
+        open_out!()),
+
+    tool("vj_deck_transport", Assets, true, false, "Stage VJ deck transport (video_transport.rs)",
+        "Control playback transport on VJ deck A, deck B, or both (default both): loop mode (forward, reverse, bounce, single), reverse direction, play/pause, speed (0.25..4), beat-locked loop length (beats 0..64, 0 = Free), IN/OUT loop range in seconds (loop_out 0 = clip end), restart from IN, or seek. Only supplied fields change. Returns each deck's currently accepted state and any intent kinds still pending owner admission (check settled state with vj_deck_status).",
+        r#"{"type":"object","properties":{
+            "deck":{"type":"string","enum":["a","b","both"],"description":"Which VJ deck to control: a, b, or both (default both)."},
+            "mode":{"type":"string","enum":["forward","reverse","bounce","single"],"description":"Loop mode: forward (loop forward), reverse (loop backward), bounce (reflect at IN and OUT), single (play IN to OUT once). Bounce and single keep the current travel direction unless reverse is also given."},
+            "reverse":{"type":"boolean","description":"Set reverse travel direction without moving the playhead (keeps loop shape). Cannot contradict mode."},
+            "play":{"type":"boolean","description":"Play (true) or pause (false) the deck."},
+            "speed":{"type":"number","minimum":0.25,"maximum":4,"description":"Free-running playback speed multiplier from 0.25 to 4 (used when beats is 0)."},
+            "beats":{"type":"number","minimum":0,"maximum":64,"description":"Beats per loop sweep locked to the audio clock (0 for Free/speed; presets are 1, 2, 4, 8, 16; up to 64)."},
+            "loop_in":{"type":"number","minimum":0,"maximum":36000,"description":"Loop IN point in seconds (0 to 36000; must stay before loop_out unless loop_out is 0)."},
+            "loop_out":{"type":"number","minimum":0,"maximum":36000,"description":"Loop OUT point in seconds (0 to 36000; 0 means the clip's end; otherwise must be after loop_in)."},
+            "restart":{"type":"boolean","description":"When true, restart the clip from its loop IN point. Cannot be combined with seek."},
+            "seek":{"type":"number","minimum":0,"maximum":36000,"description":"Jump the playhead to this position in seconds (0 to 36000). Cannot be combined with restart: true."}
+        }}"#,
+        VJ_DECK_TRANSPORT_OUT),
+    tool("vj_deck_status", Assets, false, false, "Stage VJ deck transport (video_transport.rs)",
+        "Read the accepted transport state of VJ deck A, deck B, or both (default both): loaded clip, play/pause, loop mode, reverse, bounce, speed, beat-lock beats, loop IN/OUT, last published playhead position, duration, any transport intents still pending admission, and active show preferences.",
+        r#"{"type":"object","properties":{
+            "deck":{"type":"string","enum":["a","b","both"],"description":"Which VJ deck to inspect: a, b, or both (default both)."}
+        }}"#,
+        VJ_DECK_TRANSPORT_OUT),
 
     // ------------------------------------------------------------- App runs
     tool("list_apps", AppRuns, false, false, "shared app registry (libs/app_registry)",
@@ -995,6 +1156,25 @@ mod tests {
             assert_eq!(input.get("type").and_then(|value| value.as_str()), Some("object"), "{}", tool.name);
             check_schema(&tool.output_schema()).unwrap_or_else(|error| panic!("{} output: {error}", tool.name));
             assert!(tool.description.len() > 20, "{}", tool.name);
+        }
+    }
+
+    #[test]
+    fn vj_deck_transport_schema_rejects_bad_mode_speed_and_range() {
+        let schema = find("vj_deck_transport").unwrap().input_schema();
+        let validate = |text: &str| crate::schema::validate(&schema, &makepad_strict_json::parse(text.as_bytes()).unwrap());
+        for args in [
+            r#"{"mode":"bounce"}"#,
+            r#"{"deck":"both","mode":"single","reverse":true,"play":false,"speed":4,"beats":64,"loop_in":1,"loop_out":5,"restart":true}"#,
+            r#"{"deck":"b","seek":2.5}"#,
+        ] {
+            assert_eq!(validate(args), Ok(()), "{args}");
+        }
+        for args in [
+            r#"{"mode":"pingpong"}"#, r#"{"speed":0.1}"#, r#"{"speed":5}"#, r#"{"loop_in":-1}"#,
+            r#"{"loop_out":40000}"#, r#"{"beats":65}"#, r#"{"deck":"c","mode":"bounce"}"#, r#"{"play":"true"}"#,
+        ] {
+            assert!(validate(args).is_err(), "{args}");
         }
     }
 

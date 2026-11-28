@@ -10,6 +10,8 @@
 //! first plan until the edit's own, the test reads only the log and the window, as the person
 //! only edits; one call would let the report in before the edit.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use makepad_script::syntax;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, KeyCode, KeyModifiers, Role, Selector, TestApp};
@@ -137,8 +139,7 @@ fn edits_in_sliced_commit_and_plan_again_once_a_plan_is_out(app: TestApp) {
     // The head before any plan, while nothing waits on the model worker.
     let was = head(&app);
     let from = seq(&app);
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     let first = planned(&app, from, "the first plan");
 
     // At once, while what the first plan's supports tell is still measured (the sliced checks,

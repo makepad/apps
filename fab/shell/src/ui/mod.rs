@@ -25,6 +25,7 @@ pub mod requirements_panel;
 pub mod bom_panel;
 pub mod board_controls;
 pub mod journal_panel;
+pub mod review_strip;
 pub mod area_notch;
 pub mod areas;
 pub mod mech_actions;
@@ -105,6 +106,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     bom_panel::script_mod(vm);
     board_controls::script_mod(vm);
     journal_panel::script_mod(vm);
+    review_strip::script_mod(vm);
     area_notch::script_mod(vm);
     shell::script_mod(vm);
 }

@@ -69,8 +69,6 @@ struct Shared {
     /// The transport's locates as of the last pass (stored after the rest,
     /// so a change seen means the clock above is of the new run).
     located: AtomicU64,
-    /// Output muted (a hidden instance): it renders, the device hears 0.
-    muted: AtomicBool,
 }
 
 impl Shared {
@@ -117,10 +115,6 @@ impl Shared {
             root.taken += k;
             at += k;
         }
-        if self.muted.load(Ordering::Relaxed) {
-            left.fill(0.0);
-            right.fill(0.0);
-        }
     }
 }
 
@@ -160,15 +154,12 @@ impl Output {
         // Previews (the instrument switch, the keys) ride the audition bus:
         // on the main pair, or on channels 3-4 when the device has them.
         bus::set_channels(channels);
-        let muted = self.shared.muted.load(Ordering::Relaxed);
         let mut done = 0;
         while done < frames {
             let n = (frames - done).min(self.left.len());
             let (l, r) = (&mut self.left[..n], &mut self.right[..n]);
             self.shared.render(l, r);
-            if !muted {
-                bus::mix_main(rate as f64, l, r);
-            }
+            bus::mix_main(rate as f64, l, r);
             for channel in 0..channels.min(2) {
                 let out = &mut buffer.channel_mut(channel)[done..done + n];
                 for (i, sample) in out.iter_mut().enumerate() {
@@ -182,9 +173,7 @@ impl Output {
             if channels >= 4 {
                 l.fill(0.0);
                 r.fill(0.0);
-                if !muted {
-                    bus::mix_cue(rate as f64, l, r);
-                }
+                bus::mix_cue(rate as f64, l, r);
                 buffer.channel_mut(2)[done..done + n].copy_from_slice(l);
                 buffer.channel_mut(3)[done..done + n].copy_from_slice(r);
             }
@@ -334,10 +323,6 @@ impl Engine {
     /// The composer's clock.
     pub fn clock(&self) -> Arc<dyn ClockSource> {
         Arc::new(EngineClock(self.shared.clone()))
-    }
-
-    pub fn set_muted(&self, muted: bool) {
-        self.shared.muted.store(muted, Ordering::Relaxed);
     }
 
     /// The device's rate, once one asked.

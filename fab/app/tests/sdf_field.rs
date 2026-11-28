@@ -12,11 +12,15 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
 mod common;
 #[path = "common/wait.rs"]
 mod idle_wait;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 
 use makepad_script::syntax::{self, Node};
@@ -140,7 +144,7 @@ fn rebuilding(app: &TestApp) -> bool {
 }
 
 fn pick_part(app: &TestApp, name: &str) {
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name(name)).wait_visible().click();
     workspace_row::press(app, "3D modeling");
     app.locator(Selector::id("t_shape")).wait_visible().click();
@@ -179,6 +183,7 @@ fn field_parts_are_never_meshed_in_normal_use(app: TestApp) {
 
     // ---- a field part moves ----
     pick_part(&app, "Field part");
+    part_editor::open(&app);
     let (x0, _) = part_x(&app, "Field part");
     app.locator(Selector::role(Role::SpinButton).name("X")).wait_visible().set_value(x0.round() + 15.0);
     wait_until(&app, "the part to move", || (part_x(&app, "Field part").0 - (x0.round() + 15.0)).abs() < 0.5);
@@ -187,7 +192,7 @@ fn field_parts_are_never_meshed_in_normal_use(app: TestApp) {
 
     // ---- select, switch the workspaces, slice: nothing evaluates (the count only grows, so
     // one reading at the end covers every step) ----
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Field part")).wait_visible().click();
     for ws in ["Monitor", "Mechanics", "3D modeling"] {
         workspace_row::press(&app, ws);

@@ -5,7 +5,7 @@
 //! view the one the camera commands act on (`ViewportState::camera_pane`).
 //!
 //! Its owner passes it the events first (`FabViewPie::take_event`): a press while it is open
-//! is its alone.
+//! is its alone. Each pill is a button by its name in the semantic tree while the pie is open.
 
 use crate::api::{AppState, PaneId, PresetView, ShellAction};
 use crate::ui::stage::StageAction;
@@ -73,14 +73,14 @@ script_mod! {
                 }
             }
         }
-        pie0 := PiePill{ visible: false label +: { text: "Top" } }
-        pie1 := PiePill{ visible: false label +: { text: "Back" } }
-        pie2 := PiePill{ visible: false label +: { text: "Right" } }
-        pie3 := PiePill{ visible: false label +: { text: "Frame selected" } }
-        pie4 := PiePill{ visible: false label +: { text: "Bottom" } }
-        pie5 := PiePill{ visible: false label +: { text: "Frame all" } }
-        pie6 := PiePill{ visible: false label +: { text: "Left" } }
-        pie7 := PiePill{ visible: false label +: { text: "Front" } }
+        pie0 := PiePill{ visible: false a11y: {role: "button" label: "Top"} label +: { text: "Top" } }
+        pie1 := PiePill{ visible: false a11y: {role: "button" label: "Back"} label +: { text: "Back" } }
+        pie2 := PiePill{ visible: false a11y: {role: "button" label: "Right"} label +: { text: "Right" } }
+        pie3 := PiePill{ visible: false a11y: {role: "button" label: "Frame selected"} label +: { text: "Frame selected" } }
+        pie4 := PiePill{ visible: false a11y: {role: "button" label: "Bottom"} label +: { text: "Bottom" } }
+        pie5 := PiePill{ visible: false a11y: {role: "button" label: "Frame all"} label +: { text: "Frame all" } }
+        pie6 := PiePill{ visible: false a11y: {role: "button" label: "Left"} label +: { text: "Left" } }
+        pie7 := PiePill{ visible: false a11y: {role: "button" label: "Front"} label +: { text: "Front" } }
     }
 }
 

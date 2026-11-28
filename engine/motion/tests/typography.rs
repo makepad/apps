@@ -1,6 +1,7 @@
 //! Named typography animators (`Text{animate: @…}`): each one loads, and
 //! the ones that are the Text's own fields leave what the author set.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::typography::animators;
 use makepad_motion::*;
 
@@ -30,10 +31,10 @@ fn every_animator_loads_and_evaluates() {
 #[test]
 fn animators_set_only_what_the_author_left_open() {
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1280, 720) duration: 3.0 layers: [Text{text: "Hello world" animate: @fade_up by: @letter start: 1.0}]}"#);
-    let ItemKind::Text { units, .. } = &doc.eval(0.5).items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &doc.eval(0.5).items[0].kind else { panic!() };
     assert_eq!(units.len(), 10, "the author's `by: @letter` wins over the look's @word");
     assert!(units.iter().all(|u| u.opacity < 0.01), "nothing before `start`");
-    let ItemKind::Text { units, .. } = &doc.eval(2.9).items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &doc.eval(2.9).items[0].kind else { panic!() };
     assert!(units.iter().all(|u| u.opacity > 0.99));
 }
 
@@ -49,13 +50,13 @@ fn looks_become_the_layers_that_draw_them() {
     let frame = doc.eval(1.5);
     assert!(matches!(&frame.items[0].kind, ItemKind::Shader { text: Some(_), .. }), "a scramble is vj_fx's decode preset");
     let ItemKind::Group { children, .. } = &frame.items[1].kind else { panic!() };
-    let shown: Vec<String> = children.iter().filter(|c| c.opacity > 0.5).filter_map(|c| match &c.kind { ItemKind::Text { text, .. } => Some(text.clone()), _ => None }).collect();
+    let shown: Vec<String> = children.iter().filter(|c| c.opacity > 0.5).filter_map(|c| match &c.kind { ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => Some(text.clone()), _ => None }).collect();
     assert_eq!(shown, vec!["simple"], "the second word holds at 1.5 s");
     let ItemKind::Group { children, .. } = &frame.items[2].kind else { panic!() };
     assert_eq!(children.len(), 4, "one big word a line");
-    let ItemKind::Text { caret, reveal, .. } = &doc.eval(0.3).items[3].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { caret, reveal, .. }) = &doc.eval(0.3).items[3].kind else { panic!() };
     assert!(caret.is_some() && reveal.is_some_and(|r| r < 5));
-    let ItemKind::Text { plate: Some(plate), .. } = &doc.eval(2.0).items[4].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { plate: Some(plate), .. }) = &doc.eval(2.0).items[4].kind else { panic!() };
     assert!(plate.underline && plate.reveal > 0.99);
     let diags = MotionDoc::load(r#"use mod.motion.*; Motion{size: vec2(1280, 720) duration: 1.0 layers: [Text{text: "x" animate: @fade_upp}]}"#).unwrap_err();
     assert!(diags.iter().any(|d| d.message.contains("@fade_up") || d.hint.as_deref().is_some_and(|h| h.contains("fade_up"))), "{diags:?}");
@@ -78,12 +79,12 @@ fn mattes_line_masks_outlines_and_text_as_a_matte() {
     // The whole text, laid out once, showing only its second line; the
     // matte is that line's own plate.
     let shown = |item: &Item| match &item.kind {
-        ItemKind::Text { text, units, .. } => units.iter().filter(|u| u.opacity > 0.0).map(|u| text[u.range.clone()].to_string()).collect::<Vec<_>>(),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) => units.iter().filter(|u| u.opacity > 0.0).map(|u| text[u.range.clone()].to_string()).collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    assert!(matches!(&children[0].kind, ItemKind::Text { text, .. } if text == "Ideas\ndon't wait"));
+    assert!(matches!(&children[0].kind, ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if text == "Ideas\ndon't wait"));
     assert_eq!(shown(&children[0]), vec!["don't wait".to_string()]);
-    assert!(matches!(&mask.kind, ItemKind::Text { plate: Some(p), .. } if p.each), "the matte is the line's own box");
+    assert!(matches!(&mask.kind, ItemKind::Primitive(PrimitiveFrame::Text { plate: Some(p), .. }) if p.each), "the matte is the line's own box");
     assert_eq!(shown(mask), vec!["don't wait".to_string()]);
     // An outline: nudged copies with the text cut out, then the fill.
     let ItemKind::Group { children, .. } = &frame.items[1].kind else { panic!() };
@@ -91,11 +92,11 @@ fn mattes_line_masks_outlines_and_text_as_a_matte() {
     assert_eq!((ring.len(), *mask_mode), (12, MaskMode::Inverse));
     // Footage inside type.
     let ItemKind::Group { children, mask: Some(mask), .. } = &frame.items[2].kind else { panic!() };
-    assert!(matches!(&children[0].kind, ItemKind::Shader { .. }) && matches!(&mask.kind, ItemKind::Text { .. }));
+    assert!(matches!(&children[0].kind, ItemKind::Shader { .. }) && matches!(&mask.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. })));
     // A luma matte of a feathered shape: the feather is the mask's blur, and
     // a mask Path without a fill shows its whole area.
     let ItemKind::Group { mask: Some(mask), mask_mode, .. } = &frame.items[3].kind else { panic!() };
     assert_eq!(*mask_mode, MaskMode::LumaInverse);
     assert_eq!(mask.blur, 12.0);
-    assert!(matches!(&mask.kind, ItemKind::Path { fill: Some(_), .. }));
+    assert!(matches!(&mask.kind, ItemKind::Primitive(PrimitiveFrame::Path { fill: Some(_), .. })));
 }

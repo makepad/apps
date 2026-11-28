@@ -4,10 +4,227 @@ use super::*;
 use fab_elec_design::By;
 use fab_elec_host::{JournalStep, JournalEvent, Ticket};
 use makepad_widgets::makepad_platform::thread::{Class, TaskPool, ThreadOptions, ThreadSpawner};
-use std::sync::{OnceLock, Weak};
+use std::sync::{Condvar, OnceLock, Weak};
 use std::time::Instant;
 
-struct Pipe {
+#[derive(Default)]
+struct State {
+    paused: bool,
+    retired: bool,
+    active: bool,
+    recovery_writers: usize,
+    thread: Option<std::thread::Thread>,
+    discarded: u64,
+    reported: bool,
+}
+
+pub(super) struct Gate {
+    dir: PathBuf,
+    state: Mutex<State>,
+    changed: Condvar,
+    committing: AtomicBool,
+}
+
+static GATES: Mutex<BTreeMap<PathBuf, Weak<Gate>>> = Mutex::new(BTreeMap::new());
+
+impl State {
+    fn report(&mut self, log: &mut impl FnMut(String)) {
+        if self.discarded != 0 && !self.reported {
+            self.reported = true;
+            log(format!("journal: {} records for a deleted plate were not kept", self.discarded));
+        }
+    }
+}
+
+impl Gate {
+    fn for_dir(dir: PathBuf) -> Arc<Self> {
+        let mut gates = GATES.lock().unwrap();
+        if let Some(gate) = gates.get(&dir).and_then(Weak::upgrade) { return gate }
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let gate = Arc::new(Self { dir: dir.clone(), state: Mutex::default(), changed: Condvar::new(), committing: false.into() });
+        gates.insert(dir, Arc::downgrade(&gate));
+        gate
+    }
+
+    pub(super) fn paused(&self) -> bool { self.state.lock().unwrap().paused }
+
+    fn pipe(self: &Arc<Self>) -> Option<Arc<Pipe>> {
+        pipes().lock().unwrap().get(&self.dir).and_then(Weak::upgrade).filter(|p| Arc::ptr_eq(&p.gate, self))
+    }
+}
+
+// Remove runs a short synchronous recovery writer without a producer pipe.
+pub(super) struct RecoveryWriter(pub(super) Arc<Gate>);
+
+impl RecoveryWriter {
+    pub(super) fn enter(dir: &Path) -> io::Result<Self> {
+        let gate = Gate::for_dir(dir.to_owned());
+        let mut state = gate.state.lock().unwrap();
+        if state.paused || state.retired { return Err(io::ErrorKind::WouldBlock.into()) }
+        state.recovery_writers += 1;
+        drop(state);
+        Ok(Self(gate))
+    }
+}
+
+impl Drop for RecoveryWriter {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().recovery_writers -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+impl Gate {
+    // A contended kernel lock has no cancellation primitive. Only live
+    // writers use this interruptible wait before retrying the row lock.
+    pub(super) fn wait_for_row(&self) -> io::Result<()> {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self.changed.wait_timeout_while(state, Duration::from_millis(10), |s| !s.paused && !s.retired).unwrap();
+        if state.paused || state.retired { Err(io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.state.get_mut().unwrap().report(&mut |line| makepad_widgets::log!("{}", line));
+    }
+}
+
+pub struct Pause { gate: Arc<Gate> }
+
+/// Called on the model worker. A lazy opening and discovery both register at
+/// the same in-memory gate before they can start their first filesystem access.
+pub fn pause_plate(plate: &Path) -> io::Result<Pause> {
+    let gate = Gate::for_dir(plate.join("journal"));
+    let mut state = gate.state.lock().unwrap();
+    if state.paused || state.retired { return Err(io::ErrorKind::WouldBlock.into()) }
+    state.paused = true;
+    if let Some(thread) = &state.thread { thread.unpark(); }
+    gate.changed.notify_all();
+    drop(gate.changed.wait_while(state, |s| s.active || s.recovery_writers != 0).unwrap());
+    Ok(Pause { gate })
+}
+
+impl Pause {
+    pub fn resume(self) { drop(self); }
+
+    /// Transfer existing notes while the model can still refuse Delete and resume.
+    pub fn prepare(self) -> io::Result<PreparedPause> {
+        self.prepare_notes().map_err(prepare_error)?;
+        Ok(PreparedPause(self))
+    }
+
+    fn prepare_notes(&self) -> io::Result<()> {
+        let gate = &self.gate;
+        let plate = gate.dir.parent().ok_or_else(invalid)?;
+        let settings = plate.parent().and_then(Path::parent).ok_or_else(invalid)?;
+        gate.committing.store(true, Ordering::Release);
+        // Quit publishes its dispatch under the same orders lock that we
+        // sample here. The IO and this wait are both outside producer locks.
+        if let Some(pipe) = gate.pipe() {
+            let quit = pipe.journal.progress.orders.lock().unwrap().quit_cut.clone();
+            if let Some((_, attempt)) = quit {
+                #[cfg(test)]
+                tests::probe("waiting for quit note")?;
+                attempt.wait()?;
+            }
+        }
+        #[cfg(test)]
+        tests::probe("before fallback transfer")?;
+        loss::transfer(plate, settings)
+    }
+}
+
+fn prepare_error(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), "Fab couldn't prepare this plate's journal for the Trash. It is kept.")
+}
+
+/// Dropping this guard resumes the writers even after their fallback notes moved.
+pub struct PreparedPause(Pause);
+
+impl PreparedPause {
+    pub fn commit(self) -> io::Result<RetiredPlate> {
+        self.retire().map_err(prepare_error)?;
+        Ok(RetiredPlate { gate: self.0.gate.clone(), pipe: self.0.gate.pipe().as_ref().map(Arc::downgrade) })
+    }
+
+    fn retire(&self) -> io::Result<()> {
+        let gate = &self.0.gate;
+        let plate = gate.dir.parent().ok_or_else(invalid)?;
+        let mut published = loss::DeleteNotes::default();
+        let mut through = None;
+        let (outstanding, waiters) = loop {
+            let mut state = gate.state.lock().unwrap();
+            let Some(pipe) = gate.pipe() else {
+                state.retired = true;
+                break Default::default()
+            };
+            let mut orders = pipe.journal.progress.orders.lock().unwrap();
+            let after = *through.get_or_insert_with(|| orders.quit_cut.as_ref().map_or(0, |(cut, _)| *cut));
+            if orders.outstanding.last().is_none_or(|n| *n <= after) {
+                // The last cut and retirement share the producer's lock. A row
+                // arriving during note I/O therefore gets either a note or a
+                // discarded count, exactly once.
+                state.retired = true;
+                pipe.journal.progress.pending.store(0, Ordering::Release);
+                break (std::mem::take(&mut orders.outstanding), std::mem::take(&mut orders.waiters))
+            }
+            let notes = loss::Note::outstanding(&gate.dir, &orders, after).unwrap_or_default();
+            through = orders.outstanding.last().copied();
+            drop(orders);
+            drop(state);
+            // Publish Delete's own notes directly in the primary location.
+            for note in notes { published.publish(plate, note)?; }
+        };
+        drop(outstanding);
+        if let Some(pipe) = gate.pipe() {
+            // A failed spawn may have left an unstarted writer and its receiver
+            // here. Claim it exactly as start() does. Retired producers can no
+            // longer enqueue, so payloads can be freed off their threads.
+            if !pipe.started.swap(true, Ordering::AcqRel) { pipe.writer.lock().unwrap().take(); }
+            let backlog = std::mem::take(&mut pipe.journal.sender.backlog.lock().unwrap().records);
+            drop(backlog);
+        }
+        for waiter in waiters {
+            if let Some(notify) = waiter.notify.upgrade() { notify(0); }
+        }
+        Ok(())
+    }
+}
+
+/// Keep discovery on the retired gate through the last filesystem operation of Delete.
+pub struct RetiredPlate {
+    gate: Arc<Gate>,
+    pipe: Option<Weak<Pipe>>,
+}
+
+impl Drop for RetiredPlate {
+    fn drop(&mut self) {
+        // Publish both removals together. A new lookup can now start a fresh
+        // writer while old calls still own (and discard through) their old gate.
+        let mut gates = GATES.lock().unwrap();
+        let mut entries = pipes().lock().unwrap();
+        let dir = &self.gate.dir;
+        if let Some(old) = &self.pipe {
+            if entries.get(dir).is_some_and(|entry| entry.ptr_eq(old)) { entries.remove(dir); }
+        }
+        if gates.get(dir).is_some_and(|entry| entry.ptr_eq(&Arc::downgrade(&self.gate))) {
+            gates.remove(dir);
+        }
+    }
+}
+
+impl Drop for Pause {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap();
+        state.paused = false;
+        self.gate.committing.store(false, Ordering::Release);
+        self.gate.changed.notify_all();
+    }
+}
+
+pub(super) struct Pipe {
+    gate: Arc<Gate>,
     journal: Journal,
     writer: Mutex<Option<Writer>>,
     started: std::sync::atomic::AtomicBool,
@@ -117,15 +334,17 @@ pub(super) fn read_boundary(dir: &Path, file: &File, known: Option<u64>) -> io::
 impl Pipe {
     /// All openings of the same directory share its writer, even if a previously
     /// unnamed plate was adopted while an old engine still had a commit in flight.
-    fn open(dir: PathBuf, settings: Option<&Path>, create_plate: bool) -> Arc<Self> {
+    fn open(gate: &Arc<Gate>, settings: Option<&Path>, create_plate: bool) -> Arc<Self> {
+        let dir = gate.dir.clone();
         let mut entries = pipes().lock().unwrap();
         if let Some(pipe) = entries.get(&dir).and_then(Weak::upgrade) { return pipe }
         let (journal, mut writer) = Journal::channel(dir.clone(), Arc::default(), 1,
             Arc::new(|n| makepad_widgets::log!("journal: {} records queued", n)));
         let settings = settings.map(Path::to_owned);
         writer.settings = settings.clone();
+        writer.gate = Some(gate.clone());
         writer.create_plate = create_plate;
-        let pipe = Arc::new(Self { settings, journal, writer: Mutex::new(Some(writer)), started: Default::default(), dir: dir.clone() });
+        let pipe = Arc::new(Self { gate: gate.clone(), settings, journal, writer: Mutex::new(Some(writer)), started: Default::default(), dir: dir.clone() });
         entries.insert(dir, Arc::downgrade(&pipe));
         pipe
     }
@@ -134,33 +353,94 @@ impl Pipe {
         if self.started.swap(true, Ordering::AcqRel) { return }
         let owner = self.clone();
         match spawner.spawn_worker(ThreadOptions { name: Some("Fab plate journal".into()), ..Default::default() }, move || {
-            let writer = owner.writer.lock().unwrap().take().unwrap();
-            // Also run for a recovery-only plate, which has no producers.
-            let prepare = || {
-                let mut log = |line| makepad_widgets::log!("{}", line);
-                if writer.progress.pending() != 0 { writer.prepare(&mut log).map(|_| ()) }
-                else { writer.recover_notes(&mut log) }
-            };
-            let mut prepared = prepare().is_ok();
-            loop {
-                match writer.rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(first) => { writer.batch(first); prepared = true; }
-                    Err(_) => {
-                        let mut entries = pipes().lock().unwrap();
-                        if Arc::strong_count(&owner) == 1 {
-                            entries.remove(&owner.dir);
-                            break;
-                        }
-                        drop(entries);
-                        if !prepared { prepared = prepare().is_ok(); }
-                    }
-                }
-            }
+            owner.run();
         }) {
             Ok(task) => task.detach(),
             Err(_) => { self.started.store(false, Ordering::Release); }
         }
     }
+    fn stop_if_idle(self: &Arc<Self>, writer: &mut Writer) -> bool {
+        if Arc::strong_count(self) != 1 { return false }
+        writer.close_handles();
+        let mut state = self.gate.state.lock().unwrap();
+        let mut entries = pipes().lock().unwrap();
+        if Arc::strong_count(self) != 1 { return false }
+        if entries.get(&self.dir).is_some_and(|p| p.ptr_eq(&Arc::downgrade(self))) { entries.remove(&self.dir); }
+        state.active = false;
+        state.thread = None;
+        self.gate.changed.notify_all();
+        true
+    }
+
+    fn run(self: Arc<Self>) {
+        let mut writer = self.writer.lock().unwrap().take().unwrap();
+        let gate = &self.gate;
+        let mut state = gate.state.lock().unwrap();
+        state.thread = Some(std::thread::current());
+        let mut batch = VecDeque::new();
+        let mut prepare = true;
+        let mut retry = false;
+        let mut log = |line| makepad_widgets::log!("{}", line);
+        loop {
+            if state.paused || state.retired {
+                drop(state);
+                writer.close_handles();
+                state = gate.state.lock().unwrap();
+                state.active = false;
+                gate.changed.notify_all();
+                state = gate.changed.wait_while(state, |s| s.paused && !s.retired).unwrap();
+                if state.retired { break }
+                retry = false;
+            }
+            if retry {
+                #[cfg(test)]
+                let _ = tests::probe("writer retry wait");
+                let (next, _) = gate.changed.wait_timeout_while(state, Duration::from_secs(1), |s| !s.paused && !s.retired).unwrap();
+                state = next;
+                if !state.paused && !state.retired && batch.is_empty() {
+                    drop(state);
+                    if self.stop_if_idle(&mut writer) { return }
+                    state = gate.state.lock().unwrap();
+                }
+                retry = false;
+                continue
+            }
+            state.active = true;
+            drop(state);
+            if batch.is_empty() {
+                if let Ok(row) = writer.rx.try_recv() {
+                    let mut backlog = writer.backlog.lock().unwrap();
+                    batch = std::mem::take(&mut backlog.records);
+                    batch.push_front(row);
+                }
+            }
+            if let Some(row) = batch.front() {
+                if writer.try_write(row, &mut log) {
+                    batch.pop_front();
+                    if batch.is_empty() {
+                        let mut backlog = writer.backlog.lock().unwrap();
+                        if backlog.records.is_empty() { backlog.reported = false; }
+                    }
+                } else { retry = true; }
+                prepare = false;
+            } else if prepare {
+                let result = if writer.progress.pending() != 0 { writer.prepare(&mut log).map(|_| ()) }
+                    else { writer.recover_unpaused(&mut log) };
+                retry = result.is_err();
+                prepare = retry;
+            } else {
+                if self.stop_if_idle(&mut writer) { return }
+                #[cfg(test)]
+                let _ = tests::probe("writer idle");
+                std::thread::park_timeout(Duration::from_secs(1));
+            }
+            state = gate.state.lock().unwrap();
+        }
+        state.active = false;
+        state.thread = None;
+        gate.changed.notify_all();
+    }
+
 }
 
 /// Discover unopened plates on the pool. Concurrent plate opens share the
@@ -169,7 +449,9 @@ pub(crate) fn recover_loss_notes(store: fab_ai::plates::PlateStore, spawner: Thr
     let discover = move || {
         let settings = store.root.parent();
         loss::discover_for_recovery(&store, &mut |line| makepad_widgets::log!("{}", line), |dir, create_plate| {
-            Pipe::open(dir, settings, create_plate).start(&spawner);
+            let gate = Gate::for_dir(dir);
+            let state = gate.state.lock().unwrap();
+            if !state.retired { Pipe::open(&gate, settings, create_plate).start(&spawner); }
         });
     };
     match pool.submit_named(Class::Background, "Fab journal loss discovery", discover) {
@@ -185,9 +467,11 @@ struct Disk {
 }
 
 struct Opening {
+    gate: Arc<Gate>,
     dir: Option<PathBuf>,
     pipe: OnceLock<Arc<Pipe>>,
     spawner: OnceLock<ThreadSpawner>,
+    saved_plate: AtomicBool,
     presence: OnceLock<Option<super::presence::Watch>>,
     manifest: String,
     checkpoint: Mutex<Option<Arc<Files>>>,
@@ -196,6 +480,14 @@ struct Opening {
     /// Electronics files at the last publication. Only the strand compares contents.
     disk: Mutex<Disk>,
     mechanical: Mutex<super::mechanical::Saved>,
+}
+
+impl Opening {
+    fn watch_presence(&self, spawner: &ThreadSpawner) {
+        if let Some(plate) = self.gate.dir.parent() {
+            self.presence.get_or_init(|| super::presence::Watch::start(plate.to_owned(), spawner));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -221,7 +513,7 @@ fn beds() -> &'static Mutex<Beds> {
 pub(crate) fn release_presence(plate: &Path) {
     let openings: Vec<_> = beds().lock().unwrap().iter().map(|(_, o)| o.clone()).collect();
     for opening in openings {
-        if opening.dir.as_deref().and_then(Path::parent) == Some(plate) {
+        if opening.gate.dir.parent() == Some(plate) {
             // an opening not yet attached takes no watch after this
             if let Some(watch) = opening.presence.get_or_init(|| None) { watch.release(); }
         }
@@ -239,6 +531,10 @@ impl Plate {
             let mut beds = beds.lock().unwrap();
             beds.retain(|(k, _)| k.strong_count() != 0);
             if let Some((_, opening)) = beds.iter().find(|(k, _)| k.ptr_eq(&key)) {
+                if session.plate.is_some() {
+                    opening.saved_plate.store(true, Ordering::Release);
+                    if let Some(spawner) = opening.spawner.get() { opening.watch_presence(spawner); }
+                }
                 return Some(Self { opening: opening.clone(), store, identity })
             }
         }
@@ -247,7 +543,12 @@ impl Plate {
         let prefix = fab_model::project::elec_dir(Path::new(manifest)).to_string_lossy().into_owned();
         let dir = session.plate.as_ref().map(|id| store.dir(id).join("journal"));
         let mechanical = super::mechanical::Saved::opened(manifest, &loaded.files, session.model.state());
-        let opening = Arc::new(Opening { manifest: manifest.to_owned(), mechanical: Mutex::new(mechanical), dir, pipe: OnceLock::new(), spawner: OnceLock::new(), presence: OnceLock::new(), checkpoint_order: OnceLock::new(), checkpoint: Mutex::new(Some(Arc::new(loaded.files))), prefix,
+        let gate = Gate::for_dir(dir.clone().unwrap_or_else(|| {
+            let id = identity.id();
+            debug_assert_eq!(reader::sessions::working_id(id).map(|(_, pid)| pid), Some(std::process::id()));
+            store.dir(id).join("journal")
+        }));
+        let opening = Arc::new(Opening { saved_plate: session.plate.is_some().into(), gate, manifest: manifest.to_owned(), mechanical: Mutex::new(mechanical), dir, pipe: OnceLock::new(), spawner: OnceLock::new(), presence: OnceLock::new(), checkpoint_order: OnceLock::new(), checkpoint: Mutex::new(Some(Arc::new(loaded.files))), prefix,
             disk: Mutex::new(Disk { docs: crate::elec_host::electronics(session.model.docs()), assets: (**session.model.elec_assets()).clone() }) });
         beds.lock().unwrap().push((key, opening.clone()));
         Some(Self { opening, store, identity })
@@ -255,22 +556,12 @@ impl Plate {
 
     pub(crate) fn attach(&self, spawner: &ThreadSpawner) {
         self.opening.spawner.get_or_init(|| spawner.clone());
-        // a saved plate's folder, beside journal/; a plate-less session takes no presence
-        if let Some(plate) = self.opening.dir.as_deref().and_then(Path::parent) {
-            self.opening.presence.get_or_init(|| super::presence::Watch::start(plate.to_owned(), spawner));
-        }
+        if self.opening.saved_plate.load(Ordering::Acquire) { self.opening.watch_presence(spawner); }
         self.retry_worker();
     }
 
     fn pipe(&self) -> &Arc<Pipe> {
-        self.opening.pipe.get_or_init(|| {
-            let dir = self.opening.dir.clone().unwrap_or_else(|| {
-                let id = self.identity.id();
-                debug_assert_eq!(reader::sessions::working_id(id).map(|(_, pid)| pid), Some(std::process::id()));
-                self.store.dir(id).join("journal")
-            });
-            Pipe::open(dir, self.store.root.parent(), self.opening.dir.is_none())
-        })
+        self.opening.pipe.get_or_init(|| Pipe::open(&self.opening.gate, self.store.root.parent(), self.opening.dir.is_none()))
     }
 
     /// Another Fab process has this plate open. One atomic read.
@@ -287,6 +578,12 @@ impl Plate {
     }
 
     pub(crate) fn checkpoint(&self) -> u64 {
+        let mut state = self.opening.gate.state.lock().unwrap();
+        if state.retired { state.discarded += 1; return 0 }
+        self.checkpoint_locked()
+    }
+
+    fn checkpoint_locked(&self) -> u64 {
         let pipe = self.pipe();
         let order = *self.opening.checkpoint_order.get_or_init(|| {
             let files = self.opening.checkpoint.lock().unwrap().take().expect("first record of this opening");
@@ -297,13 +594,21 @@ impl Plate {
     }
 
     fn reserve(&self) -> Reservation {
-        self.checkpoint();
+        let mut state = self.opening.gate.state.lock().unwrap();
+        if state.retired {
+            state.discarded += 1;
+            return Reservation { order: 0, time_ms: 0 }
+        }
+        self.checkpoint_locked();
         self.pipe().journal.reserve()
     }
 
     fn publish(&self, reservation: Reservation, record: Record) {
+        let state = self.opening.gate.state.lock().unwrap();
+        if state.retired { return }
         let checkpoint = self.opening.checkpoint_order.get().copied();
         self.pipe().journal.sender.push(Ordered { reservation, checkpoint, record });
+        if let Some(thread) = &state.thread { thread.unpark(); }
     }
 
     pub(super) fn send(&self, record: Record) -> u64 {
@@ -327,7 +632,7 @@ impl Plate {
 
     pub(super) fn folder(&self) -> String {
         // Production directories are always <plate id>/journal.
-        self.pipe().dir.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy().into_owned()
+        self.opening.gate.dir.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy().into_owned()
     }
 
     pub(super) fn effect(&self, call: Option<&Call>, seq: u64, by: By, label: &str, changes: Vec<Change>) {
@@ -336,7 +641,7 @@ impl Plate {
         let mut action = None;
         if let Some(call) = call {
             let mut state = call.state.lock().unwrap();
-            let seqs = if Arc::ptr_eq(self.pipe(), call.plate.pipe()) {
+            let seqs = if Arc::ptr_eq(&self.opening.gate, &call.plate.opening.gate) {
                 local = Some(call.id);
                 action = Some(call.action.clone());
                 &mut state.seqs
@@ -429,18 +734,22 @@ impl Call {
     pub(crate) fn refused(plate: &Plate, by: By, name: &str, wire_id: &str, raw: &str, reason: &str) {
         let mut who = actor(by);
         if let Value::Obj(fields) = &mut who { fields.push(("wire_id".into(), s(wire_id))); }
-        Self::begin_as(plate, who, name, s(raw)).done("refused", reason.into());
+        Self::begin_as(plate, who, name, s(raw), true).done("refused", reason.into());
     }
 
     pub(crate) fn begin(plate: &Plate, by: By, name: &str, args: Value) -> Arc<Self> {
-        Self::begin_as(plate, actor(by), name, args)
+        Self::begin_as(plate, actor(by), name, args, true)
     }
 
-    fn begin_as(plate: &Plate, actor: Value, name: &str, args: Value) -> Arc<Self> {
+    pub(super) fn decision(plate: &Plate, name: &str, args: &[(String, String)]) -> Arc<Self> {
+        Self::begin_as(plate, actor(By::Person), name, arguments(args), false)
+    }
+
+    fn begin_as(plate: &Plate, actor: Value, name: &str, args: Value, replay: bool) -> Arc<Self> {
         static SERIAL: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let reference = format!("call-{nanos:x}-{:x}-{:x}", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed));
-        let id = plate.send(Record::Call { reference: reference.clone(), actor, action: name.to_owned(), args: args.clone() });
+        let id = plate.send(Record::Call { reference: reference.clone(), actor, action: name.to_owned(), args: args.clone(), replay });
         Arc::new(Self { plate: plate.clone(), id, reference, action: obj(vec![("name", s(name)), ("args", args)]), state: Default::default() })
     }
 
@@ -565,18 +874,27 @@ impl Drop for GestureBinding {
     }
 }
 
-impl fab_elec_host::JournalSink for Electronics {
-    fn gesture(&self, ticket: Ticket, name: &str, args: &[(String, String)]) -> Option<Box<dyn FnOnce(Result<u64, String>) + Send + Sync>> {
-        let call = Call::begin(&self.plate, By::Person, name, arguments(args));
+impl Electronics {
+    fn bind_press(&self, ticket: Ticket, call: Arc<Call>) -> Box<dyn FnOnce(Result<u64, String>) + Send + Sync> {
         self.bind(ticket, &call);
         let guard = GestureBinding(self.clone(), ticket, call);
-        Some(Box::new(move |result| {
+        Box::new(move |result| {
             match result {
                 Ok(seq) => guard.2.done("ok", format!("{{seq: {seq}}}")),
                 Err(reason) => guard.2.done("refused", reason),
             }
             drop(guard);
-        }))
+        })
+    }
+}
+
+impl fab_elec_host::JournalSink for Electronics {
+    fn gesture(&self, ticket: Ticket, name: &str, args: &[(String, String)]) -> Option<Box<dyn FnOnce(Result<u64, String>) + Send + Sync>> {
+        Some(self.bind_press(ticket, Call::begin(&self.plate, By::Person, name, arguments(args))))
+    }
+
+    fn decision(&self, ticket: Ticket, name: &str, args: &[(String, String)]) -> Option<Box<dyn FnOnce(Result<u64, String>) + Send + Sync>> {
+        Some(self.bind_press(ticket, Call::decision(&self.plate, name, args)))
     }
 
     fn receive(&self, event: JournalEvent<'_>) {
@@ -610,7 +928,7 @@ pub(crate) struct Quit {
     save: Save,
     asked: Option<Instant>,
     shown_seconds: Option<u64>,
-    writing: Option<(Arc<[loss::Attempt]>, Receiver<()>)>,
+    writing: Option<(Arc<[Arc<loss::Attempt>]>, Receiver<()>)>,
     exited: bool,
 }
 
@@ -639,18 +957,26 @@ impl Quit {
 
     pub(crate) fn ready(&mut self, cx: &makepad_widgets::Cx, now: Instant) -> bool {
         let writers = || pipes().lock().unwrap().values().filter_map(Weak::upgrade).collect();
-        self.poll(now, writers, |attempts, done| {
+        let ready = self.poll(now, writers, |attempts, done| {
             // The model's pool may itself have dropped the quit. This last
             // file operation has an independent worker, just like each pipe.
             let options = ThreadOptions { name: Some("Fab journal loss note".into()), ..Default::default() };
+            let queued = attempts.clone();
             if let Ok(task) = cx.spawn_worker_with(options, move || {
                 for attempt in attempts.iter() { attempt.write(); }
                 let _ = done.send(());
-            }) { task.detach(); }
-        }, |msg| makepad_widgets::log!("{}", msg))
+            }) { task.detach(); } else { for attempt in queued.iter() { attempt.finish(false); } }
+        }, |msg| makepad_widgets::log!("{}", msg));
+        if ready {
+            // Beds can retain an opening until process exit, when statics have
+            // no destructor. Report its final discarded count at graceful Quit.
+            let gates: Vec<_> = beds().lock().unwrap().iter().map(|(_, o)| o.gate.clone()).collect();
+            for gate in gates { gate.state.lock().unwrap().report(&mut |line| makepad_widgets::log!("{}", line)); }
+        }
+        ready
     }
 
-    fn poll(&mut self, now: Instant, writers: impl FnOnce() -> Vec<Arc<Pipe>>, start: impl FnOnce(Arc<[loss::Attempt]>, mpsc::Sender<()>),
+    fn poll(&mut self, now: Instant, writers: impl FnOnce() -> Vec<Arc<Pipe>>, start: impl FnOnce(Arc<[Arc<loss::Attempt>]>, mpsc::Sender<()>),
         mut log: impl FnMut(String)) -> bool {
         let gone = matches!(self.save, Save::HostGone { .. });
         let waiting = matches!(self.save, Save::Waiting);
@@ -666,8 +992,16 @@ impl Quit {
                 let mut all: Vec<_> = writers.iter().map(|p| p.journal.progress.orders.lock().unwrap()).collect();
                 if !gone && self.repeats == 1 && writers.iter().zip(&all).any(|(p, orders)|
                     !orders.outstanding.is_empty() && !p.journal.progress.write_error()) { return false }
-                let notes: Arc<[_]> = writers.iter().zip(&mut all).filter_map(|(p, orders)|
-                    loss::Note::cut(&p.dir, orders).map(|n| loss::Attempt::new(n, &p.dir, p.settings.as_deref()))).collect();
+                if writers.iter().any(|p| p.gate.committing.load(Ordering::Acquire)) { return false }
+                let notes: Arc<[_]> = writers.iter().zip(&mut all).filter_map(|(p, orders)| {
+                    let notes = loss::Note::cut(&p.dir, orders)?;
+                    let attempt = Arc::new(loss::Attempt::new(notes, &p.dir, p.settings.as_deref()));
+                    if gone || self.repeats == 1 {
+                        attempt.keep_pipe(p.clone());
+                        orders.quit_cut = Some((p.journal.counter.load(Ordering::Relaxed), attempt.clone()));
+                    }
+                    Some(attempt)
+                }).collect();
                 drop(all);
                 if gone || !notes.is_empty() {
                     let (done, receipt) = mpsc::channel();
@@ -683,7 +1017,7 @@ impl Quit {
         if let Some((notes, done)) = &self.writing {
             if let Save::HostGone { since, reported } = &mut self.save {
                 if !*reported {
-                    let count: u64 = notes.iter().map(loss::Attempt::count).sum();
+                    let count: u64 = notes.iter().map(|a| a.count()).sum();
                     log(format!("journal: model host stopped before save; journals={}, outstanding={count}", notes.len()));
                     *reported = true;
                 }
@@ -691,7 +1025,7 @@ impl Quit {
             }
             if queued || (self.repeats < 2 && matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty))) { return false }
             if !gone {
-                log(format!("journal: unwritten records: {}", notes.iter().map(loss::Attempt::summary).collect::<Vec<_>>().join("; ")));
+                log(format!("journal: unwritten records: {}", notes.iter().map(|a| a.summary()).collect::<Vec<_>>().join("; ")));
             }
         }
         self.exited = true;
@@ -707,10 +1041,18 @@ impl Plate {
         let prefix = fab_model::project::elec_dir(Path::new(manifest)).to_str().unwrap().to_owned();
         let mut files: Files = docs.iter().map(|(name, text)| (format!("{prefix}/{name}"), Arc::from(text.as_bytes()))).collect();
         files.insert(manifest.into(), Arc::from(b"// fixture\nuse mod.fab.*\n".as_slice()));
-        let opening = Opening { manifest: manifest.to_owned(), mechanical: Default::default(), dir: Some(dir.to_owned()), pipe: OnceLock::new(), spawner: OnceLock::new(), presence: OnceLock::new(), checkpoint_order: OnceLock::new(), checkpoint: Mutex::new(Some(Arc::new(files))), prefix,
+        let opening = Opening { saved_plate: true.into(), gate: Gate::for_dir(dir.to_owned()), manifest: manifest.to_owned(), mechanical: Default::default(), dir: Some(dir.to_owned()), pipe: OnceLock::new(), spawner: OnceLock::new(), presence: OnceLock::new(), checkpoint_order: OnceLock::new(), checkpoint: Mutex::new(Some(Arc::new(files))), prefix,
             disk: Mutex::new(Disk { docs: docs.clone(), assets: Default::default() }) };
         Self { opening: Arc::new(opening), store: fab_ai::plates::PlateStore::under(dir, dir), identity: Default::default() }
     }
+
+    pub(super) fn worker(&self) -> impl FnOnce() + Send + use<> {
+        let pipe = self.pipe().clone();
+        assert!(!pipe.started.swap(true, Ordering::AcqRel));
+        move || pipe.run()
+    }
+
+    pub(super) fn discarded(&self) -> u64 { self.opening.gate.state.lock().unwrap().discarded }
 
     pub(super) fn take_writer(&self) -> Writer {
         let pipe = self.pipe();
@@ -718,19 +1060,19 @@ impl Plate {
         pipe.writer.lock().unwrap().take().unwrap()
     }
 
-    pub(crate) fn pending(&self) -> u64 { self.pipe().journal.progress.pending.load(Ordering::Acquire) }
+    pub(crate) fn pending(&self) -> u64 { self.opening.pipe.get().map_or(0, |p| p.journal.progress.pending()) }
 }
 
 #[cfg(test)]
-pub(super) fn quit_for(quit: &mut Quit, plate: &Plate, start: impl FnOnce(Arc<[loss::Attempt]>, mpsc::Sender<()>),
+pub(super) fn quit_for(quit: &mut Quit, plate: &Plate, start: impl FnOnce(Arc<[Arc<loss::Attempt>]>, mpsc::Sender<()>),
     log: impl FnMut(String)) -> bool {
     quit_for_at(quit, plate, Instant::now(), start, log)
 }
 
 #[cfg(test)]
 pub(super) fn quit_for_at(quit: &mut Quit, plate: &Plate, now: Instant,
-    start: impl FnOnce(Arc<[loss::Attempt]>, mpsc::Sender<()>), log: impl FnMut(String)) -> bool {
-    quit.poll(now, || vec![plate.pipe().clone()], start, log)
+    start: impl FnOnce(Arc<[Arc<loss::Attempt>]>, mpsc::Sender<()>), log: impl FnMut(String)) -> bool {
+    quit.poll(now, || plate.opening.pipe.get().cloned().into_iter().collect(), start, log)
 }
 
 #[cfg(test)]

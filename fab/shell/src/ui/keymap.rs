@@ -722,10 +722,16 @@ mod tests {
 
     #[test]
     fn every_entry_has_a_section() {
+        let mut section = None;
         for row in help_rows() {
-            if let HelpRow::Entry(id) = row {
-                let e = entry(id);
-                assert!(!e.chord.is_empty() && !e.action.is_empty() && !e.context.is_empty());
+            match row {
+                HelpRow::Section(title) => section = Some(title),
+                HelpRow::Entry(id) => {
+                    let e = entry(id);
+                    assert!(!e.chord.is_empty() && !e.action.is_empty() && !e.context.is_empty());
+                    let title = section.as_deref().unwrap_or_else(|| panic!("{} comes before any section header", e.action));
+                    assert!(title.starts_with(e.context), "{} sits under {title:?}, not its own context {}", e.action, e.context);
+                }
             }
         }
     }

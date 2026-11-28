@@ -445,6 +445,9 @@ fn a_camera_node_reads_its_fields_and_plans_a_camera_op() {
     assert_eq!(camera.size, (640, 360));
     assert!(matches!(&camera.kind, DrawKind::Camera { spec: planned } if planned == spec));
     assert!(eval.frame_plan(5.0).ops.iter().all(|op| op.node != "cam"), "outside its span there is no layer");
+
+    let pattern = load(&CAMERA_CUT.replace(r#""OBSBOT""#, "@test_pattern"));
+    assert!(matches!(&pattern.node("cam").unwrap().kind, CutNodeKind::Camera(spec) if spec.device == makepad_story_cut::CameraDevice::TestPattern));
 }
 
 #[test]
@@ -478,6 +481,7 @@ fn a_camera_device_picks_by_name_or_number() {
     use makepad_story_cut::CameraDevice::*;
     let names = ["ASUS FHD webcam", "OBSBOT Meet 2"];
     assert_eq!(First.pick(names), Some(0));
+    assert_eq!(TestPattern.pick(names), None, "a pattern never selects a system camera");
     assert_eq!(Index(1).pick(names), Some(1));
     assert_eq!(Index(2).pick(names), None);
     assert_eq!(Name("obsbot".into()).pick(names), Some(1), "any case, part of the name");

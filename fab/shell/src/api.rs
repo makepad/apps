@@ -660,10 +660,10 @@ impl Default for ViewportState {
             colours: Default::default(),
             missing_spool_colours: 0,
             look: crate::view_prefs::default_look(),
-            drag_detail: crate::view_prefs::load_drag_detail(),
-            sliced_detail: crate::view_prefs::load_sliced_detail(),
-            traced_detail: crate::view_prefs::load_traced_detail(),
-            soldered: crate::view_prefs::load_soldered(),
+            drag_detail: fab_sdf_tiles::trace::DragDetail::Realtime,
+            sliced_detail: SlicedDetail::Fast,
+            traced_detail: TracedDetail::Fast,
+            soldered: true,
             lighting: Lighting::default(),
             board_lighting: Lighting::BrightStudio,
             overlays: Overlays::default(),
@@ -1570,6 +1570,11 @@ pub struct UiState {
     pub tests_sidebar: bool,
     /// Design's Part sidebar in the Plate view (the plate toolbar's Part): on until put away.
     pub part_sidebar: bool,
+    /// Whether the lead Plate view hosts the Part sidebar. Each frame `FabShell::draw_walk`
+    /// decides from that view's width before `FabStage::draw_walk` reads the result.
+    pub part_side_offered: bool,
+    /// The reference point used by the position fields in either editor placement.
+    pub part_anchor: crate::ui::parts::PositionAnchor,
     /// A marquee being dragged in a Plate view: the view, and its corners (window points). The
     /// navigator sets it, the tool overlay draws it.
     pub marquee: Option<(PaneId, DVec2, DVec2)>,
@@ -1732,8 +1737,8 @@ impl UiState {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
-            nav: crate::view_prefs::load_nav(),
-            invert_wheel: crate::view_prefs::load_invert_wheel(),
+            nav: NavScheme::default(),
+            invert_wheel: false,
             undo_turn: None,
             workspaces: crate::workspaces::Workspaces::default(),
             plate_mode: PlateMode::Design,
@@ -1765,9 +1770,11 @@ impl Default for UiState {
             camera_pip: false,
             tests_sidebar: false,
             part_sidebar: true,
+            part_side_offered: false,
+            part_anchor: Default::default(),
             part_side_shown: false,
             marquee: None,
-            part_side_w: crate::view_prefs::load_part_side_w().unwrap_or(crate::ui::stage::PART_SIDE_W).clamp(crate::ui::stage::PART_SIDE_MIN_W, crate::ui::stage::PART_SIDE_MAX_W),
+            part_side_w: crate::ui::stage::PART_SIDE_W,
             gizmo: GizmoMode::Off,
             paint_radius: 3.0,
             paint_color: [0.8, 0.05, 0.05],
@@ -2231,6 +2238,8 @@ pub struct PlateInfo {
     /// The Test prints view shows: `parts` are the ticked pieces, where they print, and these are
     /// the plate's own parts, what its lists and overrides read. Nothing under it edits.
     pub whole: Option<Arc<Vec<PlatePart>>>,
+    /// The active whole-plate object before the test pieces replaced the plate.
+    pub whole_active: Option<String>,
 }
 
 /// Plate-to-scene links used by glass classification. Rebuilt with `sync_plate_elements`,
@@ -3847,6 +3856,29 @@ pub enum ForceAction {
     StartHub,
 }
 
+/// Machine preferences and non-secret firmware-token metadata loaded once on the app's
+/// startup path before the first draw.
+#[derive(Clone, Debug)]
+pub struct StartupPrefs {
+    pub view: Option<crate::view_prefs::ViewPrefs>,
+    pub model_sources: crate::model_sources::ModelSources,
+    pub firmware_net: crate::firmware_net::FirmwareNet,
+    pub firmware_tokens: Result<Vec<crate::firmware_net::TokenEntry>, String>,
+}
+
+impl StartupPrefs {
+    /// Reads this machine's startup preferences and firmware-token metadata (names and hosts
+    /// only; token bytes stay inside a `Secret` wiped before returning).
+    pub fn load(load_view: bool) -> Self {
+        Self {
+            view: load_view.then(crate::view_prefs::ViewPrefs::load),
+            model_sources: crate::model_sources::load(),
+            firmware_net: crate::firmware_net::load(),
+            firmware_tokens: crate::firmware_net::tokens(),
+        }
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         let scene = crate::viewport::scene_gpu::SceneGpu::default();
@@ -3900,9 +3932,9 @@ impl Default for AppState {
             scene_gpu: Rc::new(RefCell::new(scene)),
             pose_sets: vec![PoseSet::default()],
             device: DeviceView::default(),
-            model_sources: crate::model_sources::load(),
-            firmware_net: crate::firmware_net::load(),
-            firmware_tokens: crate::firmware_net::tokens(),
+            model_sources: crate::model_sources::ModelSources::default(),
+            firmware_net: crate::firmware_net::FirmwareNet::default(),
+            firmware_tokens: Ok(Vec::new()),
             picks: Default::default(),
         }
     }
@@ -4143,44 +4175,79 @@ impl AppState {
         self.view.panes.get(pane.0 as usize).and_then(Option::as_ref).is_some_and(|p| p.case_hidden && self.device.case.contains(&id))
     }
 
-    /// The view as this machine's preferences have it (the look chosen last).
-    pub fn apply_view_prefs(&mut self) {
-        if let Some(look) = crate::view_prefs::load_look() {
+    /// Apply startup preferences loaded on the app's real startup path before the first draw.
+    /// `apply_ortho`: pass `false` when `restore_state` already restored camera state on relaunch.
+    pub fn apply_startup_prefs(&mut self, prefs: StartupPrefs, apply_ortho: bool) {
+        if let Some(view) = prefs.view {
+            self.apply_loaded_view_prefs(view, apply_ortho);
+        }
+        self.model_sources = prefs.model_sources;
+        self.firmware_net = prefs.firmware_net;
+        self.firmware_tokens = prefs.firmware_tokens;
+    }
+
+    /// Apply view preferences and invalidate workspace layouts built from the previous state.
+    /// `apply_ortho`: pass `false` when `restore_state` already restored camera state on relaunch.
+    pub fn apply_loaded_view_prefs(&mut self, prefs: crate::view_prefs::ViewPrefs, apply_ortho: bool) {
+        if let Some(look) = prefs.look {
             self.view.look = look;
         }
-        if let Some(lighting) = crate::view_prefs::load_lighting() {
+        self.view.drag_detail = prefs.drag_detail;
+        self.view.sliced_detail = prefs.sliced_detail;
+        self.view.traced_detail = prefs.traced_detail;
+        self.view.soldered = prefs.soldered;
+        if let Some(lighting) = prefs.lighting {
             self.view.lighting = lighting;
         }
-        if let Some(lighting) = crate::view_prefs::load_board_lighting() {
+        if let Some(lighting) = prefs.board_lighting {
             self.view.board_lighting = lighting;
         }
-        if let Some(mode) = crate::view_prefs::load_colours() {
+        if let Some(mode) = prefs.colours {
             self.view.colours = mode;
         }
-        if let Some(shading) = crate::view_prefs::load_shading() {
+        if let Some(shading) = prefs.shading {
             self.view.shading = shading;
         }
-        if let Some(overlays) = crate::view_prefs::load_overlays() {
+        if let Some(overlays) = prefs.overlays {
             self.view.overlays = overlays;
         }
-        self.print.play.active = crate::view_prefs::load_slice();
-        self.print.finish = crate::view_prefs::load_surface();
-        self.ui.arm_shown = crate::view_prefs::load_arm();
-        self.ui.scan_shown = crate::view_prefs::load_scan();
-        self.ui.workspaces = crate::workspaces::Workspaces::load();
-        // a workspace that is not offered now (its family switched off) does not come back
+        self.print.play.active = prefs.slice;
+        self.print.finish = prefs.surface;
+        self.ui.nav = prefs.nav;
+        self.ui.invert_wheel = prefs.invert_wheel;
+        self.ui.part_side_w = prefs
+            .part_side_w
+            .unwrap_or(crate::ui::stage::PART_SIDE_W)
+            .clamp(crate::ui::stage::PART_SIDE_MIN_W, crate::ui::stage::PART_SIDE_MAX_W);
+        self.ui.arm_shown = prefs.arm;
+        self.ui.scan_shown = prefs.scan;
+        let next_rev = self.ui.workspaces.rev.wrapping_add(1);
+        let next_instance_rev = self.ui.workspaces.instance_rev.wrapping_add(1);
+        let next_shape = self.ui.workspaces.current().shape.wrapping_add(1);
+        self.ui.workspaces = prefs.workspaces;
+        self.ui.workspaces.rev = next_rev;
+        self.ui.workspaces.instance_rev = next_instance_rev;
+        for def in &mut self.ui.workspaces.list {
+            def.shape = next_shape;
+        }
         if !self.ui.offered(self.ui.workspaces.current()) {
             self.ui.enter(Workspace::Design);
         }
         if let Some(mode) = self.ui.workspaces.current().mode {
             self.ui.plate_mode = mode;
         }
-        self.ui.scan_colour = crate::view_prefs::load_scan_colour();
-        self.ui.scan_cameras = crate::view_prefs::load_scan_cameras();
-        let ortho = crate::view_prefs::load_ortho();
-        for pane in self.view.plate_panes() {
-            crate::nav::orbit::set_ortho(self.view.camera_mut(pane), ortho);
+        self.ui.scan_colour = prefs.scan_colour;
+        self.ui.scan_cameras = prefs.scan_cameras;
+        if apply_ortho {
+            for pane in self.view.plate_panes() {
+                crate::nav::orbit::set_ortho(self.view.camera_mut(pane), prefs.ortho);
+            }
         }
+    }
+
+    /// The view as this machine's preferences have it (the look chosen last).
+    pub fn apply_view_prefs(&mut self) {
+        self.apply_loaded_view_prefs(crate::view_prefs::ViewPrefs::load(), true);
     }
 
     /// Whether the workspace is offered now: an experimental one only while View › Experimental

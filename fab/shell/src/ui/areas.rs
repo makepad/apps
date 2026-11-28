@@ -7,8 +7,9 @@
 //! moved by hand ([`WorkspaceOp::Resize`]) and a tab pressed ([`WorkspaceOp::Select`]).
 //!
 //! Costs: an op is O(areas + tabs), on a click, a key, a drop or a tool call; deriving a map is
-//! O(areas + tabs), per load (a drag's preview loads one each time its target changes). Nothing
-//! here runs per frame.
+//! O(areas + tabs), per load. Each frame the shell finds the lead Plate with
+//! [`AreaTree::lead_plate_area`] and measures it with [`AreaTree::area_width`] when deciding
+//! whether to offer the Part sidebar. Both walks are O(nodes) and allocate nothing.
 
 use crate::ui::editors::Editor;
 use makepad_widgets_core::makepad_micro_serde::*;
@@ -142,7 +143,8 @@ pub enum WorkspaceOp {
     /// came from); never an area a view fronts ([`Editor::keeps_corner`]), which it would cover.
     /// With neither, a panel opens as a side column ([`PANEL_W`] wide) at the right of `from` when
     /// a view fronts it, else of the workspace's first view; a view, or a workspace with no view,
-    /// splits the last area (the bottom or right one) down, the new half holding it.
+    /// splits the last area (the bottom or right one) down, the new half holding it. This skips
+    /// the Transport recorder's area unless it is the only area.
     Reveal { editor: Editor, from: Option<AreaId> },
     /// A drag dropped: `what` leaves its place (an area it empties closes) and lands `at` node
     /// `to`. A tab no area holds (a mode's tab the shell shows) lands as a new tab.
@@ -273,6 +275,54 @@ impl AreaTree {
         match self {
             AreaTree::Area { id, .. } | AreaTree::Split { id, .. } => *id,
         }
+    }
+
+    /// The visible Plate with the lowest instance number.
+    pub fn lead_plate_area(&self, maximized: Option<AreaId>) -> Option<AreaId> {
+        let tree = match maximized { Some(id) => self.node(id)?, None => self };
+        let mut lead: Option<(u32, AreaId)> = None;
+        tree.visit(&mut |node| {
+            if let AreaTree::Area { id, tabs, selected } = node {
+                if let Some(i) = tabs.get(*selected) {
+                    if i.editor == Editor::Viewport && lead.is_none_or(|(n, _)| i.n < n) {
+                        lead = Some((i.n, *id));
+                    }
+                }
+            }
+        });
+        lead.map(|(_, area)| area)
+    }
+
+    /// The width Dock gives a visible area. Narrowing resolves the stored align against
+    /// the nominal width. The actual width also accounts for the sash and the pane floors.
+    pub fn area_width(&self, target: AreaId, room: f64, narrow: bool, maximized: Option<AreaId>,
+                      splitter_w: f64, floors: (f64, f64)) -> Option<f64> {
+        fn width(tree: &AreaTree, target: AreaId, room: f64, narrow_room: Option<f64>,
+                 splitter_w: f64, floors: (f64, f64)) -> Option<f64> {
+            match tree {
+                AreaTree::Area { id, .. } => (*id == target).then_some(room),
+                AreaTree::Split { axis, align, a, b, .. } => {
+                    let (align, narrow_a, narrow_b) = narrowed(*axis, *align, narrow_room);
+                    let (ra, rb) = if *axis == SplitterAxis::Horizontal {
+                        let asked = match align {
+                            SplitterAlign::FromA(x) => x,
+                            SplitterAlign::FromB(x) => room - x,
+                            SplitterAlign::Weighted(w) => room * w,
+                        };
+                        let hi = room - floors.1;
+                        let pos = if floors.0 <= hi { asked.clamp(floors.0, hi) } else { room * 0.5 };
+                        (pos, (room - pos - splitter_w).max(0.0))
+                    } else {
+                        (room, room)
+                    };
+                    width(a, target, ra, narrow_a, splitter_w, floors)
+                        .or_else(|| width(b, target, rb, narrow_b, splitter_w, floors))
+                }
+            }
+        }
+        if room <= 0.0 { return None; }
+        let tree = match maximized { Some(id) => self.node(id)?, None => self };
+        width(tree, target, room, narrow.then_some(room), splitter_w, floors)
     }
 
     /// Every area and its stack with the front tab's index, in order: left before right, top
@@ -449,6 +499,14 @@ impl AreaTree {
         match self {
             AreaTree::Area { id, .. } => *id,
             AreaTree::Split { b, .. } => b.last_area(),
+        }
+    }
+
+    fn last_area_without_transport(&self) -> Option<AreaId> {
+        match self {
+            AreaTree::Area { id, tabs, .. } =>
+                (!tabs.iter().any(|tab| tab.editor == Editor::Transport)).then_some(*id),
+            AreaTree::Split { a, b, .. } => b.last_area_without_transport().or_else(|| a.last_area_without_transport()),
         }
     }
 
@@ -715,7 +773,7 @@ impl AreaTree {
                     None => {
                         let (at, side, align) = match view {
                             Some(area) => (area, Side::Right, Side::Right.panel()),
-                            None => (self.last_area(), Side::Down, SplitterAlign::Weighted(0.5)),
+                            None => (self.last_area_without_transport().unwrap_or_else(|| self.last_area()), Side::Down, SplitterAlign::Weighted(0.5)),
                         };
                         self.split_with(at, side, vec![instance], align);
                     }
@@ -803,7 +861,7 @@ impl AreaTree {
 
     /// The tree's tabs, tab sets and splits into `map` as `how` shows them ([`present`]); the
     /// root's dock id. `room`: the width this node has, when the window is narrow.
-    fn put(&self, map: &mut DockMap, how: &Present, extra: &[(Editor, Editor, bool)], room: Option<f64>) -> LiveId {
+    fn put(&self, map: &mut DockMap, how: &Present, extra: &[(Editor, Editor, bool)], area_extra: Option<(AreaId, Editor, bool)>, room: Option<f64>) -> LiveId {
         match self {
             AreaTree::Area { id, tabs, selected } => {
                 let mut out: Vec<LiveId> = Vec::new();
@@ -840,6 +898,12 @@ impl AreaTree {
                         }
                     }
                 }
+                if let Some((_, editor, forward)) = area_extra.filter(|(area, ..)| area == id) {
+                    let at = out.iter().position(|t| *t == Editor::Parts.tab()).map_or(out.len(), |k| k + 1);
+                    map.insert(editor.tab(), tab_item(editor));
+                    out.insert(at, editor.tab());
+                    front = if forward { Some(at) } else { front.map(|k| if at <= k { k + 1 } else { k }) };
+                }
                 // one view without a toolbar of its own: no tab bar, only the nub
                 let hide_tab_bar = out.len() == 1 && alone.is_some_and(|e| e.bare_alone());
                 map.insert(id.area_live_id(), DockItem::Tabs { tabs: out, selected: front.unwrap_or(0), closable: false, hide_tab_bar });
@@ -847,8 +911,8 @@ impl AreaTree {
             }
             AreaTree::Split { id, axis, align, a, b } => {
                 let (align, room_a, room_b) = narrowed(*axis, *align, room);
-                let a = a.put(map, how, extra, room_a);
-                let b = b.put(map, how, extra, room_b);
+                let a = a.put(map, how, extra, area_extra, room_a);
+                let b = b.put(map, how, extra, area_extra, room_b);
                 map.insert(id.split_live_id(), DockItem::Splitter { axis: *axis, align, a, b });
                 id.split_live_id()
             }
@@ -910,23 +974,73 @@ pub struct Present<'a> {
 
 /// `tree` as the dock's whole map, shown `how`: its top node is the dock's root.
 pub fn present(tree: &AreaTree, how: &Present) -> DockMap {
-    if let Some(editor) = how.page {
+    how.with_area_extra(tree, None)
+}
+
+impl Present<'_> {
+    /// Present the tree with an additional transient editor in one particular area.
+    pub fn with_area_extra(&self, tree: &AreaTree, area_extra: Option<(AreaId, Editor, bool)>) -> DockMap {
+        if let Some(editor) = self.page {
+            let mut map = DockMap::new();
+            map.insert(editor.tab(), tab_item(editor));
+            map.insert(live_id!(root), DockItem::Tabs { tabs: vec![editor.tab()], selected: 0, closable: false, hide_tab_bar: true });
+            return map;
+        }
+        let extra: Vec<(Editor, Editor, bool)> = self.extra.iter().copied().filter(|(_, editor, _)| tree.showing(*editor).is_none()).collect();
         let mut map = DockMap::new();
-        map.insert(editor.tab(), tab_item(editor));
-        map.insert(live_id!(root), DockItem::Tabs { tabs: vec![editor.tab()], selected: 0, closable: false, hide_tab_bar: true });
-        return map;
+        let node = self.maximized.and_then(|area| tree.node(area)).filter(|node| matches!(node, AreaTree::Area { .. })).unwrap_or(tree);
+        let area_extra = area_extra.filter(|(_, editor, _)| tree.showing(*editor).is_none());
+        let top = node.put(&mut map, self, &extra, area_extra, self.narrow);
+        if let Some(item) = map.remove(&top) {
+            map.insert(live_id!(root), item);
+        }
+        map
     }
-    let extra: Vec<(Editor, Editor, bool)> = how.extra.iter().copied().filter(|(_, editor, _)| tree.showing(*editor).is_none()).collect();
-    let mut map = DockMap::new();
-    let node = how.maximized.and_then(|area| tree.node(area)).filter(|node| matches!(node, AreaTree::Area { .. })).unwrap_or(tree);
-    let top = node.put(&mut map, how, &extra, how.narrow);
-    if let Some(item) = map.remove(&top) {
-        map.insert(live_id!(root), item);
-    }
-    map
 }
 
 /// `tree` as the dock's whole map, as stored.
 pub fn layout_map(tree: &AreaTree) -> DockMap {
     present(tree, &Present::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspaces::Origin;
+
+    #[test]
+    fn area_width_matches_default_design_and_narrow_splits() {
+        let (mut tree, _) = Origin::Design.tree();
+        let plate = tree.lead_plate_area(None).unwrap();
+        let code = tree.showing(Editor::Code).unwrap();
+        let width = |tree: &AreaTree, area, room, narrow, alone| {
+            tree.area_width(area, room, narrow, alone, 3.0, (216.0, 50.0))
+        };
+        for (room, expected) in [(1594.0, 581.0), (1600.0, 587.0), (1500.0, 487.0), (1700.0, 687.0)] {
+            assert_eq!(width(&tree, plate, room, false, None), Some(expected));
+        }
+        assert!((width(&tree, plate, 900.0, true, None).unwrap() - 2573.0 / 9.0).abs() < 1e-9);
+        assert_eq!(tree.lead_plate_area(Some(code)), None);
+        assert_eq!(width(&tree, plate, 1600.0, false, Some(code)), None);
+        assert_eq!(width(&tree, plate, 1600.0, false, Some(plate)), Some(1600.0));
+
+        let mut split = tree.clone();
+        split.apply(WorkspaceOp::Split { area: plate, side: Side::Right, editor: Editor::Viewport,
+            align: SplitterAlign::Weighted(0.5) }).unwrap();
+        let other = split.holding(Instance { editor: Editor::Viewport, n: 1 }).unwrap();
+        assert_eq!(split.lead_plate_area(None), Some(plate));
+        assert_eq!(width(&split, plate, 1600.0, false, None), Some(293.5));
+        assert_eq!(width(&split, other, 1600.0, false, None), Some(290.5));
+
+        tree.apply(WorkspaceOp::Close { area: code }).unwrap();
+        assert_eq!(width(&tree, plate, 1594.0, false, None), Some(1021.0));
+        assert_eq!(width(&tree, plate, 1600.0, false, None), Some(1027.0));
+        assert!((width(&tree, plate, 900.0, true, None).unwrap() - 1291.0 / 3.0).abs() < 1e-9);
+
+        let split = AreaTree::split(SplitterAxis::Horizontal, SplitterAlign::FromA(100.0),
+            AreaTree::area(Editor::Viewport), AreaTree::area(Editor::Code)).numbered();
+        for (editor, expected) in [(Editor::Viewport, 216.0), (Editor::Code, 281.0)] {
+            assert_eq!(width(&split, split.showing(editor).unwrap(), 500.0, false, None), Some(expected));
+        }
+    }
 }

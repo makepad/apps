@@ -7,24 +7,16 @@
 use fab_printer_link::safety::nonplanar::HeadEnvelope;
 use makepad_fab_slicer::nonplanar::NpBox;
 
-/// `FAB_HEAD_ENVELOPE` names another file (test runs: a test head, or none).
-pub fn file() -> std::path::PathBuf {
-    match std::env::var_os("FAB_HEAD_ENVELOPE").filter(|f| !f.is_empty()) {
-        Some(f) => f.into(),
-        None => crate::model_host::documents_dir().join("head-envelope.conf"),
-    }
-}
-
 /// The installed envelope, when the file is there and reads. Whether it may allow
 /// non-planar moves is the print check's call (`HeadEnvelope::usable`).
-pub fn installed() -> Option<HeadEnvelope> {
-    let text = std::fs::read_to_string(file()).ok()?;
+pub fn installed_from(path: &std::path::Path) -> Option<HeadEnvelope> {
+    let text = std::fs::read_to_string(path).ok()?;
     HeadEnvelope::parse(&text).ok()
 }
 
 /// What the slicer plans with: the installed envelope, else the placeholder.
-pub fn for_slicing() -> HeadEnvelope {
-    installed().unwrap_or_else(HeadEnvelope::placeholder_two_nozzle)
+pub fn for_slicing_from(path: &std::path::Path) -> HeadEnvelope {
+    installed_from(path).unwrap_or_else(HeadEnvelope::placeholder_two_nozzle)
 }
 
 /// The slicer's head boxes: both nozzles' parts together (a part may print on either, and

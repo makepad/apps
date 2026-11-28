@@ -1,5 +1,5 @@
-//! The plate's test prints, listed in the plate view's Tests sidebar in its Test prints mode (each
-//! is a feature of its model in the Features tree too). A test print is a box cut out of the plate
+//! The plate's test prints, listed in the Tests sidebar in Design and Test prints (each
+//! is a feature of its model in the Parts tree too). A test print is a box cut out of the plate
 //! to print that piece alone. It holds its place, size, turn and name; what it prints comes from
 //! the plate, so nothing else of it can be edited. Each test is a section that folds: its tick
 //! (what prints in Test prints), its name and its delete in its bar; unfolded, its fields, and
@@ -7,7 +7,7 @@
 //! its footing flags. Unfolding a test picks it: its box and its piece show in the view.
 
 use crate::api::*;
-use crate::print::{format_time, PrintAction};
+use crate::print::format_time;
 use crate::ui::keymap::{self, ShortcutId as Key};
 use crate::ui::overrides::{self, Override, Target};
 use crate::ui::parts::active_part;
@@ -36,10 +36,33 @@ script_mod! {
 
     // The test prints, each a section that folds: its tick, its name and its delete in the bar,
     // its properties under it (unfolding it picks it: its box and its piece show in the view).
+    mod.widgets.FabTestSection = #(FabTestSection::register_widget(vm)){
+        grip: false
+        margin: mod.widgets.PropSection.margin
+        draw_bg: mod.widgets.PropSection.draw_bg
+        body: mod.widgets.PropSection.body
+        header: mod.widgets.PropSection.header{hdr +: {
+            draw_bg +: {
+                // The opaque row ground keeps the resting bar dim on the floating card.
+                color: fab.color_editor color_hover: fab.color_editor
+                selected: instance(0.0) color_selected: uniform(fab.color_selection_bg)
+                pixel: fn() {
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
+                    sdf.fill(self.color.mix(self.color_hover, self.hover).mix(self.color_selected, self.selected))
+                    return sdf.result
+                }
+            }
+            title +: {draw_text +: {
+                hover: instance(0.0) color_hover: uniform(fab.color_text_hover)
+                get_color: fn() { return self.color.mix(self.color_hover, self.hover) }
+            }}
+        }}
+    }
     mod.widgets.FabTestSectionsBase = #(FabTestSections::register_widget(vm))
     mod.widgets.FabTestSections = set_type_default() do mod.widgets.FabTestSectionsBase{
         width: Fill height: Fit flow: Down
-        Test := PropSection{
+        Test := mod.widgets.FabTestSection{
             header +: {hdr +: {
                 title +: {text: ""}
                 trail +: {
@@ -228,24 +251,34 @@ pub fn show_rows(state: &mut AppState) {
     }
 }
 
-/// "+ Test cube": a true cube in the middle of the part under the click, or else the picked one;
-/// with none, nothing but the status saying why. The plate goes to its Test prints mode, the
-/// tests' sidebar open; the view stays as it is.
+/// The clicked or active part on the original plate. In the pieces view, fall back
+/// to the picked cube's part or the part held when the whole plate was put away.
+pub fn target_part<'a>(state: &'a AppState, under: Option<&str>) -> Option<&'a str> {
+    let original = |s: &str| {
+        let object = s.split_once('#').map_or(s, |(base, _)| base);
+        state.plate.whole_parts().iter().find(|p| p.object == object).map(|p| p.object.as_str())
+    };
+    under.and_then(original)
+        .or_else(|| active_part(state).and_then(|i| original(&state.plate.parts[i].object)))
+        .or_else(|| {
+            state.plate.whole.as_ref()?;
+            picked(state).and_then(|t| original(&t.object))
+                .or_else(|| state.plate.whole_active.as_deref().and_then(original))
+        })
+}
+
+/// Add a cube in the current view and open its sidebar.
 pub fn add(cx: &mut Cx, state: &AppState, under: Option<String>) {
-    if state.plate.whole.is_some() {
-        cx.action(ShellAction::Notice { view: NoticeView::Plate, text: "Test print: a cube goes on the model, choose Whole plate".into() });
+    if state.steps.shown.is_some() {
+        cx.action(ShellAction::Notice { view: NoticeView::Plate, text: "Test print: return to the end of the part first (Back to the end, or Esc)".into() });
         return;
     }
-    match under.or_else(|| active_part(state).map(|i| state.plate.parts[i].object.clone())) {
+    match target_part(state, under.as_deref()) {
         Some(object) => {
             if !state.ui.in_mode(PlateMode::Design) {
                 cx.action(ShellAction::SetWorkspace(Workspace::Design));
             }
-            cx.action(TestPrintAction::Add { object });
-            // the tests' mode, its sidebar open on them
-            if !state.print.test_mode {
-                cx.action(PrintAction::TestMode(true));
-            }
+            cx.action(TestPrintAction::Add { object: object.to_owned() });
             cx.action(StageAction::TestsSidebar(true));
         }
         None => cx.action(ShellAction::Notice { view: NoticeView::Plate, text: format!("Test print: {}, the cube goes on it", crate::ui::stage::SELECT_A_PART) }),
@@ -267,6 +300,77 @@ pub fn footing_flags(state: &AppState, t: &TestPrintView) -> Vec<String> {
         };
         format!("{}: {brim}", i.message)
     }).collect()
+}
+
+/// A test's disclosure header and its fields share the feature tree's pick.
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabTestSection {
+    #[deref] section: PropSection,
+    #[rust] test_name: String,
+    #[rust] selected: bool,
+    #[rust] pos_in_set: u32,
+    #[rust] set_size: u32,
+    #[rust] ink: Option<(bool, bool)>,
+}
+
+impl FabTestSection {
+    fn set_row(&mut self, name: String, selected: bool, pos_in_set: u32, set_size: u32) {
+        self.test_name = name;
+        self.selected = selected;
+        self.pos_in_set = pos_in_set;
+        self.set_size = set_size;
+    }
+}
+
+impl Widget for FabTestSection {
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        self.section.semantics(cx, node);
+        node.states.set(a11y_tree::States::SELECTABLE, true);
+        node.states.set(a11y_tree::States::SELECTED, self.selected);
+        node.pos_in_set = self.pos_in_set;
+        node.set_size = self.set_size;
+        node.actions.insert(a11y_tree::Actions::PRESS | a11y_tree::Actions::SELECT);
+    }
+
+    fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
+        use a11y_tree::{Actions, ActionResult};
+        let open = match request.action {
+            Actions::SELECT | Actions::EXPAND => true,
+            Actions::COLLAPSE => false,
+            Actions::PRESS => !(self.selected && self.section.is_open(cx)),
+            _ => return self.section.handle_action(cx, request, scope),
+        };
+        self.section.set_is_open(cx, open, Animate::Yes);
+        if open {
+            cx.action(TestPrintAction::Pick { name: self.test_name.clone() });
+        } else if self.selected {
+            cx.action(ShellAction::PickOverride(None));
+        }
+        ActionResult::Handled
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.section.handle_event(cx, event, scope);
+    }
+
+    fn visit_cancel(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        self.section.visit_cancel(visit)
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let ink = (self.selected, self.section.hovered());
+        if self.ink != Some(ink) {
+            let header = self.section.header();
+            if let Some(mut bg) = header.widget(cx, ids!(hdr)).borrow_mut::<View>() {
+                bg.draw_bg.set_dyn_instance(cx, id!(selected), &[ink.0 as u8 as f32]);
+            }
+            if let Some(mut title) = header.label(cx, ids!(hdr.title)).borrow_mut() {
+                title.draw_text.set_dyn_instance(cx, id!(hover), &[ink.1 as u8 as f32]);
+            }
+            self.ink = Some(ink);
+        }
+        self.section.draw_walk(cx, scope, walk)
+    }
 }
 
 /// The test prints as sections, made from the `Test` template, one per test and kept. Each
@@ -323,11 +427,6 @@ fn test_id(name: &str) -> LiveId {
 }
 
 impl FabTestSections {
-    /// The sections shown, in order: their headers for the sidebar's swipe-fold.
-    pub fn headers(&self) -> Vec<WidgetRef> {
-        self.shown.iter().filter_map(|(id, _)| self.items.get(id).cloned()).collect()
-    }
-
     fn item(&mut self, cx: &mut Cx, id: LiveId, template: LiveId) -> Option<WidgetRef> {
         if let Some(w) = self.items.get(&id) {
             return Some(w.clone());
@@ -335,11 +434,6 @@ impl FabTestSections {
         let value: ScriptValue = self.templates.get(&template)?.as_object().into();
         let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
         cx.widget_tree_insert_child(self.uid, id, w.clone());
-        if template == live_id!(Test) {
-            // a test starts folded; the picked one opens (`draw_walk`)
-            w.as_prop_section().set_is_open(cx, false, Animate::No);
-            self.open.insert(id, false);
-        }
         self.items.insert(id, w.clone());
         Some(w)
     }
@@ -471,13 +565,18 @@ impl Widget for FabTestSections {
             }
         }
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        // a section unfolded picks its test
+        // Pointer and keyboard folds come from PropSection. The source pick drives the other folds.
         for (id, name) in &shown {
             let Some(w) = self.items.get(id) else { continue };
-            let open = w.as_prop_section().is_open(cx);
-            if self.open.insert(*id, open) == Some(false) && open && self.picked.as_deref() != Some(name.as_str()) {
-                self.picked = Some(name.clone());
-                cx.action(TestPrintAction::Pick { name: name.clone() });
+            let Some(section) = w.borrow::<FabTestSection>() else { continue };
+            let open = section.section.is_open(cx);
+            let was = self.open.insert(*id, open);
+            if was == Some(!open) {
+                if open && self.picked.as_deref() != Some(name) {
+                    cx.action(TestPrintAction::Pick { name: name.clone() });
+                } else if !open && self.picked.as_deref() == Some(name) {
+                    cx.action(ShellAction::PickOverride(None));
+                }
             }
         }
         let Event::Actions(actions) = event else { return };
@@ -492,21 +591,29 @@ impl Widget for FabTestSections {
         cx.begin_turtle(walk, self.layout);
         self.shown.clear();
         if let Some(state) = scope.data.get::<AppState>() {
-            let picked_name = picked(state).map(|t| t.name.clone());
-            // a test picked elsewhere (its tree row, the view) unfolds its section
-            let newly = (picked_name != self.picked).then(|| picked_name.clone()).flatten();
-            self.picked = picked_name;
+            let picked_name = picked(state).map(|t| t.name.as_str());
+            let pick_changed = picked_name != self.picked.as_deref();
+            if pick_changed { self.picked = picked_name.map(str::to_owned); }
             if state.test_prints.is_empty() {
                 if let Some(w) = self.item(cx, live_id!(empty), live_id!(Empty)) {
                     w.draw_all(cx, &mut Scope::empty());
                 }
             }
-            for t in &state.test_prints {
+            let count = state.test_prints.len() as u32;
+            for (pos, t) in state.test_prints.iter().enumerate() {
                 let id = test_id(&t.name);
                 let Some(w) = self.item(cx, id, live_id!(Test)) else { continue };
-                if newly.as_deref() == Some(t.name.as_str()) && !w.as_prop_section().is_open(cx) {
-                    w.as_prop_section().set_is_open(cx, true, Animate::Yes);
-                    self.open.insert(id, true);
+                if let Some(mut s) = w.borrow_mut::<FabTestSection>() {
+                    let selected = picked_name == Some(t.name.as_str());
+                    let new = !self.open.contains_key(&id);
+                    if new || pick_changed {
+                        s.section.set_is_open(cx, selected, if new { Animate::No } else { Animate::Yes });
+                        self.open.insert(id, selected);
+                    }
+                    let position = pos as u32 + 1;
+                    if new || pick_changed || s.pos_in_set != position || s.set_size != count {
+                        s.set_row(t.name.clone(), selected, position, count);
+                    }
                 }
                 self.sync(cx, id, &w, t, state);
                 w.draw_all(cx, &mut Scope::empty());
@@ -532,6 +639,94 @@ mod tests {
 
     fn cube() -> TestPrintView {
         TestPrintView { name: "Neck".into(), object: "figure/body".into(), center: [100.0, 100.0, 80.0], size: [40.0; 3], turn: [0.0; 3], pose: None, lay: None, on: true, brim: false }
+    }
+
+    fn pieces_view() -> AppState {
+        let mut state = AppState::default();
+        state.ui.enter(Workspace::Design);
+        state.print.test_mode = true;
+        let object = "block/block".to_owned();
+        state.plate.whole = Some(Arc::new(vec![PlatePart { object: object.clone(), ..Default::default() }]));
+        state.plate.parts = vec![PlatePart { object: format!("{object}#0"), ..Default::default() }];
+        state.plate.whole_active = Some(object);
+        state
+    }
+
+    #[test]
+    fn fab_test_section_semantics_reports_selected_and_select_action_is_idempotent() {
+        use a11y_tree::{ActionArg, ActionRequest, ActionResult, Actions, Node, NodeId, Role, States};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut section = cx.with_vm(|vm| {
+            makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[makepad_widgets_fab::fab_mod]);
+            crate::theme::script_mod(vm);
+            crate::ui::script_mod_kit(vm);
+            script_mod(vm);
+            let value = vm.eval(script! { mod.widgets.FabTestSection{header +: {hdr +: {title +: {text: "Corner"}}}} });
+            FabTestSection::script_from_value(vm, value)
+        });
+        let mut node = Node::default();
+        for selected in [false, true] {
+            section.set_row("Corner".into(), selected, 1, 2);
+            section.section.set_is_open(&mut cx, selected, Animate::No);
+            section.semantics(&cx, &mut node);
+            assert_eq!((node.role, node.name.as_str()), (Role::DisclosureButton, "Corner"));
+            assert_eq!((node.pos_in_set, node.set_size), (1, 2));
+            assert!(node.states.contains(States::SELECTABLE));
+            assert_eq!(node.states.contains(States::SELECTED), selected);
+            assert_eq!(node.states.contains(States::EXPANDED), selected);
+            assert_eq!(node.states.contains(States::COLLAPSED), !selected);
+            assert!(node.actions.contains(Actions::PRESS | Actions::SELECT));
+        }
+        for action in [Actions::SELECT, Actions::SELECT, Actions::COLLAPSE] {
+            let request = ActionRequest { req: 1, node: NodeId::NONE, action, arg: ActionArg::None };
+            let emitted = cx.capture_actions(|cx| {
+                assert_eq!(section.handle_action(cx, &request, &mut Scope::empty()), ActionResult::Handled);
+            });
+            if action == Actions::SELECT {
+                assert!(section.section.is_open(&cx));
+                assert!(emitted.iter().any(|a| matches!(a.downcast_ref::<TestPrintAction>(), Some(TestPrintAction::Pick { name }) if name == "Corner")));
+            } else {
+                assert!(!section.section.is_open(&cx));
+                assert!(emitted.iter().any(|a| matches!(a.downcast_ref::<ShellAction>(), Some(ShellAction::PickOverride(None)))));
+            }
+        }
+    }
+
+    #[test]
+    fn target_part_strips_piece_suffix_and_uses_held_whole_plate() {
+        let mut state = pieces_view();
+        assert_eq!(target_part(&state, None), Some("block/block"), "held whole-plate pick");
+        state.plate.whole_active = None;
+        assert_eq!(target_part(&state, Some("block/block#0")), Some("block/block"), "clicked piece");
+        assert_eq!(target_part(&state, None), None, "nothing picked");
+        let row = crate::ui::code::FeatureRow::test_print("Test 1", "block/block");
+        state.source.selected = Some(row.id.clone());
+        state.source.features.push(row);
+        state.test_prints.push(TestPrintView { name: "Test 1".into(), object: "block/block".into(), ..Default::default() });
+        assert_eq!(target_part(&state, None), Some("block/block"), "picked test");
+    }
+
+    #[test]
+    fn add_emits_no_mode_switch_and_never_names_retired_radio() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut state = pieces_view();
+        for tests in [true, false] {
+            if !tests {
+                state.print.test_mode = false;
+                state.plate.parts = Arc::unwrap_or_clone(state.plate.whole.take().unwrap());
+                state.plate.whole_active = None;
+            }
+            let under = (!tests).then(|| "block/block".to_string());
+            let actions = cx.capture_actions(|cx| add(cx, &state, under));
+            assert_eq!(actions.len(), 2, "Add and open the sidebar are the only actions");
+            assert_eq!(actions[0].downcast_ref::<TestPrintAction>(), Some(&TestPrintAction::Add { object: "block/block".into() }));
+            assert!(matches!(actions[1].downcast_ref::<StageAction>(), Some(StageAction::TestsSidebar(true))));
+        }
+        state.steps.shown = Some(0);
+        let actions = cx.capture_actions(|cx| add(cx, &state, Some("block/block".into())));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0].downcast_ref::<ShellAction>(), Some(ShellAction::Notice { text, .. })
+            if text.contains("Back to the end") && !text.contains("Whole plate")));
     }
 
     fn figure(state: &mut AppState) {

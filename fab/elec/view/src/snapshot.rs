@@ -18,14 +18,16 @@ use crate::states::{SheetIndex, StatesOf};
 use fab_elec_board::{Connectivity, RuleMatrix, ZoneFill};
 use fab_elec_cam::Export;
 use fab_elec_circuit::Violation;
+pub use fab_elec_circuit::CheckKind;
 use crate::live::sim::{LiveScreen, SimLive};
-use fab_elec_core::{BoardId, CompId, CompRef, Diag, DocId, NetId, Sel};
+use fab_elec_core::{BoardId, CompId, CompRef, Diag, DocId, ItemId, NetId, Sel};
 use fab_elec_design::{By, Design, DesignOp, Focus, Place, SystemNet, TextEdit, TimeCursor};
 use fab_elec_lang::sys_sim::SimSettings;
 use fab_elec_lang::{SourceMap, UnitState};
 use fab_elec_route::{GestureId, GestureSample, JobId, JobStatus, Method, Reason, RouteProposal, RouteScope};
 use makepad_widgets_core::Texture;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// A preview tag unique across every pane of the process.
@@ -186,6 +188,119 @@ pub struct CaseHeld {
     pub cased: bool,
 }
 
+/// A decision names one proposal across all loads and engines in the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProposalAuthor {
+    Local(By),
+    /// The person checking and accepting a peer's text owns the local history entry.
+    /// The journal will record the peer label in slice 3.
+    Peer { label: Arc<str> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalFinding {
+    pub unit: String,
+    /// The check's family as published (erc, drc, factory, case, system, route, custom).
+    pub family: &'static str,
+    pub kind: CheckKind,
+    pub severity: fab_elec_core::Severity,
+    pub title: String,
+    pub message: String,
+    pub items: String,
+    pub fix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProposalChecks {
+    pub counts: std::collections::BTreeMap<(CheckKind, fab_elec_core::Severity), usize>,
+    pub pending: bool,
+    /// Every non-awaiting finding, errors first. Pages and display limits belong to the readers.
+    pub findings: Vec<ProposalFinding>,
+    pub pending_labels: Vec<String>,
+}
+
+/// Requirement verdicts for the whole proposed project. Detail entries are (name, reason)
+/// in document order, so Review can explain each failed or unavailable measurement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReqSummary {
+    pub pass: usize,
+    pub fail: usize,
+    pub unknown: usize,
+    pub waived: usize,
+    pub failures: Vec<(String, String)>,
+    pub unjudged: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProposalState {
+    Unchecked,
+    Checking,
+    Ready,
+    Stale(String),
+    Refused(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalDoc {
+    pub name: String,
+    pub before: Option<Arc<str>>,
+    pub after: Option<Arc<str>>,
+}
+
+/// The pool start of one verification, shared by its job and all views of that run.
+#[derive(Debug, Default)]
+pub struct RunClock(AtomicU64);
+
+static RUN_BASE: OnceLock<Instant> = OnceLock::new();
+
+impl RunClock {
+    pub fn started(&self) -> Option<Instant> {
+        // Store offset + 1 so even a job starting exactly at the base has a timestamp.
+        let nanos = self.0.load(Relaxed).checked_sub(1)?;
+        Some(*RUN_BASE.get()? + Duration::from_nanos(nanos))
+    }
+
+    pub fn start(&self) {
+        let base = RUN_BASE.get_or_init(Instant::now);
+        let start = base.elapsed().as_nanos() as u64 + 1;
+        if self.0.compare_exchange(0, start, Relaxed, Relaxed).is_ok() {
+            makepad_widgets_core::SignalToUI::set_ui_signal();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProposalBoard {
+    pub unit: BoardId,
+    pub fills: Arc<Vec<ZoneFill>>,
+    /// Sorted zone ids whose published fills still owe a refill.
+    pub pending_zones: Arc<[ItemId]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProposalView {
+    pub id: ProposalId,
+    pub shown: u64,
+    pub slot: Arc<str>,
+    pub label: Arc<str>,
+    pub by: ProposalAuthor,
+    pub state: ProposalState,
+    pub run: Arc<RunClock>,
+    pub docs: Arc<Vec<ProposalDoc>>,
+    pub design: Option<Arc<Design>>,
+    /// Ready geometry, shared with the held candidate. Both collections clear with the design.
+    pub boards: Arc<Vec<ProposalBoard>>,
+    pub sheets: Arc<std::collections::BTreeMap<BoardId, Arc<SheetIndex>>>,
+    pub created: Arc<Vec<Sel>>,
+    /// None until the first verification. While rechecking, the last summary is kept.
+    pub checks: Option<Arc<ProposalChecks>>,
+    /// Published with checks and retained through a recheck. None without a requirements document.
+    pub requirements: Option<Arc<ReqSummary>>,
+}
+
 /// What every view reads.
 #[derive(Clone, Debug)]
 pub struct DesignSnapshot {
@@ -197,6 +312,8 @@ pub struct DesignSnapshot {
     pub profile_diags: Arc<Vec<Diag>>,
     /// The live preview, drawn over the ghost.
     pub preview: Option<Arc<Design>>,
+    /// Held document sets, independent of the live gesture.
+    pub proposals: Arc<Vec<Arc<ProposalView>>>,
     /// The tag of the sample shown by the live preview.
     pub preview_tag: Option<u64>,
     /// The live preview's author, for its accent styling.
@@ -331,6 +448,8 @@ impl Invocation {
 /// What a view emits; the host applies it (views never touch the model or the text).
 #[derive(Clone, PartialEq, Debug)]
 pub enum ViewAction {
+    ProposalDecision { id: ProposalId, shown: u64, accept: bool },
+    CheckProposal(ProposalId),
     /// Keep the original pane action for hosts that operate without a journal.
     Planned { call: Invocation, action: Box<ViewAction> },
     /// The planner answered the press locally. Nothing is submitted to the engine.
@@ -393,6 +512,12 @@ pub enum ViewAction {
 /// item states (`shared/item-state.md`); schematic rows come from ESCH's SheetRows.
 pub struct ElecLive {
     pub snap: Arc<DesignSnapshot>,
+    /// Same-plate reload notice, dismissed locally by the Review strip.
+    pub ended_proposals: Option<Arc<str>>,
+    /// The global still holds the previous engine's snapshot until the replacement is published.
+    pub proposals_reloading: bool,
+    /// The person's chosen design comparison, shared by Board panes.
+    pub previewing: Option<ProposalId>,
     /// The router's newest answer to the live gesture, written by the host in the frame it
     /// arrives; replaced answers are retired to the engine strand. None outside a route drag.
     pub gesture: Option<Arc<RouteProposal>>,
@@ -422,6 +547,8 @@ pub struct ElecLive {
     /// requirements document. The same Arc until a judged input changes.
     pub requirements: Option<Arc<ReqShown>>,
     pub bom: Option<Arc<crate::bom::Shown>>,
+    pub imported_catalog: Arc<Vec<fab_elec_lang::CatalogEntry>>,
+    pub price_book: Option<Arc<fab_elec_bom::prices::Library>>,
 }
 
 /// The project's requirements as the Requirements editor and the bar's chip show them
@@ -431,6 +558,9 @@ pub struct ReqShown {
     pub report: fab_elec_req::Report,
     /// Per row of `report`, the document it is written in and its 1-based line.
     pub at: Vec<(Arc<str>, usize)>,
+    /// Source positions for the unmeasured wishes and the project's brief.
+    pub wish_at: Vec<(Arc<str>, usize)>,
+    pub brief_at: Option<(Arc<str>, usize)>,
     /// The documents' mistakes and notes in words, each led by its document and line.
     pub mistakes: Vec<String>,
 }
@@ -446,7 +576,38 @@ pub enum ElecPanel {
 
 impl ElecLive {
     pub fn new(snap: Arc<DesignSnapshot>) -> ElecLive {
-        ElecLive { snap, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None, requirements: None, bom: None }
+        ElecLive { snap, ended_proposals: None, proposals_reloading: false, previewing: None, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None, requirements: None, bom: None, imported_catalog: Arc::default(), price_book: None }
+    }
+
+    fn preview_in<'a>(&self, snap: &'a DesignSnapshot, chosen: Option<ProposalId>) -> Option<&'a Arc<ProposalView>> {
+        let id = chosen?;
+        if self.proposals_reloading || snap.preview.is_some() { return None; }
+        snap.proposals.iter().find(|p| p.id == id && p.state == ProposalState::Ready && p.design.is_some())
+    }
+
+    /// Select a comparison from the strip, or return from one of its panes. The old source's
+    /// finished boards can be adopted even when its last Board pane is hidden.
+    pub fn select_preview(cx: &mut makepad_widgets_core::Cx, next: Option<ProposalId>) {
+        let live = cx.get_global::<ElecLive>();
+        if live.previewing != next && (next.is_none() || live.preview_in(&live.snap, next).is_some()) {
+            live.previewing = next;
+            let snap = live.snap.clone();
+            crate::board::BoardDraws::keep_preview(cx, next, &snap);
+            cx.redraw_all();
+        }
+    }
+
+    pub fn previewed(&self) -> Option<&Arc<ProposalView>> {
+        self.preview_in(&self.snap, self.previewing)
+    }
+
+    /// Check every incoming publication, including intermediate pictures in one UI event.
+    pub fn end_invalid_preview(&mut self, snap: &DesignSnapshot) -> bool {
+        if self.previewing.is_some() && self.preview_in(snap, self.previewing).is_none() {
+            self.previewing = None;
+            return true;
+        }
+        false
     }
 
     pub fn run_bench(&self) -> Option<&fab_elec_lang::BenchView> {
@@ -457,9 +618,9 @@ impl ElecLive {
     /// no design sheet, so keep the previous unit when it still belongs to this design.
     pub(crate) fn sheet_unit(&self, previous: Option<(BoardId, &str)>) -> Option<usize> {
         let units = &self.snap.live().units;
-        self.run_bench().and_then(|bench| units.iter().position(|u| u.id == bench.out.scope_id() && !u.circuit.comps.is_empty()))
+        self.run_bench().and_then(|bench| units.iter().position(|u| u.id == bench.out.scope_id() && (!u.circuit.comps.is_empty() || u.circuit.tree.len() > 1)))
             .or_else(|| previous.and_then(|(id, name)| units.iter().position(|u| u.id == id && u.name == name)))
-            .or_else(|| units.iter().position(|u| !u.circuit.comps.is_empty()))
+            .or_else(|| units.iter().position(|u| !u.circuit.comps.is_empty() || u.circuit.tree.len() > 1))
     }
 
     /// The host's item-state texture for one owner. Cost: O(owners), a handful per design.
@@ -478,5 +639,59 @@ impl ElecLive {
     /// The live display panel of one part, None for a part that is not one. Cost: O(panels).
     pub fn screen(&self, comp: CompRef) -> Option<&LiveScreen> {
         self.sim.screens.iter().find(|screen| screen.comp == comp)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn snapshot(design: Arc<fab_elec_design::Design>) -> DesignSnapshot {
+        DesignSnapshot {
+            proposals: Default::default(),
+            profiles: Arc::default(), profile_diags: Arc::default(),
+            design, preview: None, preview_tag: None, preview_by: None, created: vec![], last_commit: None,
+            sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![], sysnets: None, export: vec![], benches: Arc::default(),
+            violations: Tagged { unit: None, of: StateOf::Committed, generation: 0, value: Arc::new(vec![]) },
+            awaiting: Arc::new(vec![]), cases: Arc::default(), checking: vec![], last_refusal: None, stale: StageFlags::default(), head: String::new(),
+            source_map: None, docs: None, catalog: None,
+        }
+    }
+
+    #[test]
+    fn preview_requires_continuously_ready_work() {
+        let design = Arc::new(Design::default());
+        let mut snap = snapshot(design.clone());
+        let id = ProposalId(1);
+        let view = Arc::new(ProposalView { id, shown: 1, slot: "stage".into(), label: "Stage".into(),
+            by: ProposalAuthor::Local(By::Person), state: ProposalState::Ready, design: Some(design.clone()),
+            run: Arc::default(), docs: Arc::default(), boards: Arc::default(), sheets: Arc::default(),
+            created: Arc::default(), checks: None, requirements: None });
+        snap.proposals = Arc::new(vec![view.clone()]);
+        let mut live = ElecLive::new(Arc::new(snap.clone()));
+        live.previewing = Some(id);
+        assert!(Arc::ptr_eq(live.previewed().unwrap(), &view) && !live.end_invalid_preview(&snap),
+            "a ready proposal retains the chosen picture");
+        let mut ends = |next: &DesignSnapshot, reloading: bool, why: &str| {
+            live.previewing = Some(id);
+            live.proposals_reloading = reloading;
+            assert!(live.end_invalid_preview(next), "{why} ends the preview");
+            live.proposals_reloading = false;
+            assert!(live.previewed().is_none(), "{why} cannot resume on the old Ready view");
+        };
+        ends(&snap, true, "reload");
+        snap.preview = Some(design);
+        ends(&snap, false, "a gesture picture");
+        snap.preview = None;
+        for state in [ProposalState::Unchecked, ProposalState::Checking, ProposalState::Stale("changed".into()), ProposalState::Refused("error".into())] {
+            Arc::make_mut(&mut snap.proposals)[0] = Arc::new(ProposalView { state: state.clone(), ..(*view).clone() });
+            ends(&snap, false, &format!("{state:?}"));
+        }
+        Arc::make_mut(&mut snap.proposals)[0] = Arc::new(ProposalView { design: None, ..(*view).clone() });
+        ends(&snap, false, "loss of the verified design");
+        Arc::make_mut(&mut snap.proposals)[0] = Arc::new(ProposalView { id: ProposalId(2), ..(*view).clone() });
+        ends(&snap, false, "replacement in the same slot");
+        snap.proposals = Arc::default();
+        ends(&snap, false, "accept or dismissal");
     }
 }

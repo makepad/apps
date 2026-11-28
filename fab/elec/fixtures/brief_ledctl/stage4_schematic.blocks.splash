@@ -1,0 +1,68 @@
+let e = mod.elec
+
+let usb_power = e.block({
+    name: "USB-C power"
+    role: "USB-C power input"
+    ports: {vbus: e.port(@power_out, {volts: 5V current: 500mA}) gnd: e.port(@ground)}
+    build: fn(p, o) {
+        let j = e.part("USB-C power", {pins: {VBUS: p.vbus GND: p.gnd SHIELD: p.gnd}})
+        let cc1 = e.part("5K1", {value: 5.1kohm pins: [j.CC1 p.gnd]})
+        let cc2 = e.part("5K1", {value: 5.1kohm pins: [j.CC2 p.gnd]})
+    }
+})
+
+let reg_3v3 = e.block({
+    name: "3.3 V regulator"
+    role: "3.3 V LDO"
+    ports: {vin: e.port(@power_in, {volts: [4.5V 5.5V] current: 150mA}) vout: e.port(@power_out, {volts: 3.3V current: 600mA}) gnd: e.port(@ground)}
+    build: fn(p, o) {
+        let u = e.part("LDO 3V3", {pins: {VIN: p.vin EN: p.vin GND: p.gnd VOUT: p.vout} nc: [@NC]})
+        let c_in = e.part("1uF", {value: 1uF pins: [p.vin p.gnd]})
+        let c_out = e.part("1uF", {value: 1uF pins: [p.vout p.gnd]})
+        e.near(c_in, u.VIN, 2mm)
+        e.near(c_out, u.VOUT, 2mm)
+    }
+})
+
+let mcu = e.block({
+    name: "20-pin controller"
+    role: "MCU with SWD header"
+    ports: {vdd: e.port(@power_in, {volts: [2.0V 3.6V] current: 30mA}) gnd: e.port(@ground) led: e.port(@out, {width: 8}) key: e.port(@in)}
+    build: fn(p, o) {
+        let swd = e.bus("SWD", [@SWDIO @SWCLK @NRST])
+        let u = e.part("MCU 20", {pins: {
+            VDD: p.vdd VSS: p.gnd PA13: swd.SWDIO PA14: swd.SWCLK NRST: swd.NRST PB7: p.key
+            PA0: p.led[0] PA1: p.led[1] PA2: p.led[2] PA3: p.led[3]
+            PA4: p.led[4] PA5: p.led[5] PA6: p.led[6] PA7: p.led[7]
+        } nc: [@PA8 @PA9 @PA10 @PB6 @PC14]})
+        let bypass = e.part("100nF", {value: 100nF pins: [p.vdd p.gnd]})
+        let bulk = e.part("4u7", {value: 4.7uF pins: [p.vdd p.gnd]})
+        let reset = e.part("100nF", {value: 100nF pins: [swd.NRST p.gnd]})
+        let boot = e.part("10K", {value: 10kohm pins: [u.BOOT0 p.gnd]})
+        let debug = e.part("SWD 5", {pins: [p.vdd swd.SWDIO swd.SWCLK swd.NRST p.gnd]})
+        e.near(bypass, u.VDD, 3mm)
+        e.near(bulk, u.VDD, 3mm)
+    }
+})
+
+let led_bank = e.block({
+    name: "Indicator bank"
+    role: "8 green status LEDs"
+    ports: {vdd: e.port(@power_in, {volts: 3.3V current: 40mA}) ctl: e.port(@in, {width: 8})}
+    build: fn(p, o) {
+        let lamps = for i in 0..8 {
+            let d = e.part("Green LED", {pins: {K: p.ctl[i]}})
+            let r = e.part("220R", {value: 220ohm pins: [p.vdd d.A]})
+        }
+    }
+})
+
+let button = e.block({
+    name: "Mode button"
+    role: "Tactile pushbutton"
+    ports: {vdd: e.port(@power_in, {volts: 3.3V current: 0.33mA}) out: e.port(@out) gnd: e.port(@ground)}
+    build: fn(p, o) {
+        let sw = e.part("Mode switch", {pins: {A: p.out B: p.gnd}})
+        let pullup = e.part("10K", {value: 10kohm pins: [p.vdd p.out]})
+    }
+})

@@ -120,7 +120,7 @@ script_mod! {
     mod.draw.FabBodySurface = {
         alpha_blend: false
         depth_write: true
-        backface_culling: true
+        cull_mode: @Back
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -542,9 +542,13 @@ macro_rules! body_draw {
                 self.draw_vars.geometry_id = Some(batch.geometry.geometry_id());
                 // Reflections reverse winding. Keep a single call even for a mixed batch:
                 // hardware culling stays on otherwise, and dot(normal, eye) culls both cases.
-                self.draw_vars.options.backface_culling = !batch.windings.iter().any(|&(board, rest_reflected)| {
+                self.draw_vars.options.cull_mode = if batch.windings.iter().any(|&(board, rest_reflected)| {
                     rest_reflected != moves.get(board).and_then(Option::as_ref).is_some_and(reflected)
-                });
+                }) {
+                    CullMode::None
+                } else {
+                    CullMode::Back
+                };
                 if cx.new_draw_call(&mut self.draw_vars).is_none() {
                     return 0;
                 }

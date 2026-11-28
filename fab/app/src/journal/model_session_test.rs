@@ -28,7 +28,7 @@ fn mechanical_calls_rebuild_the_saved_revision_even_after_cancellation() {
             }
         }
     }));
-    let mut host = ModelHost::start(&cx, false);
+    let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
     let store = fab_ai::plates::PlateStore::under(&root.join("settings"), &root.join("documents"));
     let (plate, dir, mut head) = on_worker(&host, move |state| {
         // The fixture has no plate-browser thumbnails to build.

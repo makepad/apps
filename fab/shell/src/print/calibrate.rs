@@ -6,6 +6,7 @@
 //! the part is the Print button's and its confirm, never this. The app fills the state; the
 //! steps only show it and send [`CalibrateAction`]s.
 
+use makepad_widgets_core::tip::TipWidgetRefExt;
 use crate::api::AppState;
 use makepad_widgets_core::*;
 
@@ -33,6 +34,8 @@ pub struct CalStepRow {
     pub done: Option<String>,
     /// The stored values, said short ("0.30 mm", "2 layers", "mu 0.32").
     pub summary: String,
+    /// Clearing removes data recorded for this target.
+    pub can_clear: bool,
     /// The step cannot run yet, and why (shown instead of Make).
     pub blocked: Option<String>,
 }
@@ -50,6 +53,8 @@ pub struct CouponView {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CalibrateState {
+    pub owner_id: Option<String>,
+    pub owner_title: Option<String>,
     pub printer: String,
     pub filament: String,
     pub steps: Vec<CalStepRow>,
@@ -58,6 +63,49 @@ pub struct CalibrateState {
     pub coupon: Option<CouponView>,
     /// The last thing that happened ("Saved: clearance 0.30 mm for Mechanics", an error ...).
     pub status: String,
+}
+
+impl CalibrateState {
+    pub fn context_text(&self) -> String {
+        if self.printer.is_empty() || self.filament.is_empty() {
+            "Choose a printer and filament in the Job editor".into()
+        } else if let Some(title) = &self.owner_title {
+            format!("Calibrating {title} with {}", self.filament)
+        } else {
+            format!("For {} · {}", self.printer, self.filament)
+        }
+    }
+
+    pub fn clear_label(&self) -> String {
+        self.owner_title.as_ref().map_or_else(|| "Clear result".into(), |title| format!("Clear {title}'s results"))
+    }
+
+    pub fn clear_tip(&self) -> String {
+        match &self.owner_title {
+            Some(title) => format!("Forget this step's saved result for {title} and {} (keeps {}'s preset result)", self.filament, self.printer),
+            None => "Forget this step's saved result for this preset and filament".into(),
+        }
+    }
+}
+
+pub fn inherited_summary(summary: &str, preset: &str) -> String {
+    format!("{summary} (from {preset})")
+}
+
+pub fn cleared_status(owner_title: Option<&str>, preset: &str, step_title: &str, has_preset_fallback: bool) -> String {
+    match owner_title {
+        Some(title) if has_preset_fallback => format!("Cleared {title}'s results for {step_title}; using {preset}'s result."),
+        Some(title) => format!("Cleared {title}'s results for {step_title}; back to Fab's defaults."),
+        None => format!("{step_title}: back to Fab's defaults."),
+    }
+}
+
+pub fn saved_status(feeds: &str, values_text: &str, saved_target: Option<(&str, &str)>) -> String {
+    let mut message = format!("Saved for {feeds}: {values_text}.");
+    if let Some((target, filament)) = saved_target {
+        message.push_str(&format!(" Saved to {target} · {filament}."));
+    }
+    message
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,7 +198,7 @@ pub struct FabCalibrateSteps {
     #[rust] count: usize,
     /// Preserve drafts across redraws, but never carry an answer into another step or setup.
     #[rust]
-    shown: Option<(String, String, usize, Option<CouponView>)>,
+    shown: Option<(Option<String>, String, String, usize, Option<CouponView>)>,
     #[rust]
     error: String,
     #[redraw] #[rust] area: Area,
@@ -212,12 +260,12 @@ impl FabCalibrateSteps {
 
     /// The selected step's form, emptied when the step, the setup or its part changes. Whether it did.
     fn sync_form(&mut self, cx: &mut Cx, state: &CalibrateState) -> bool {
-        let changed = self.shown.as_ref().is_none_or(|(printer, filament, selected, coupon)| {
-            printer != &state.printer || filament != &state.filament || *selected != state.selected || coupon != &state.coupon
+        let changed = self.shown.as_ref().is_none_or(|(owner, printer, filament, selected, coupon)| {
+            owner != &state.owner_id || printer != &state.printer || filament != &state.filament || *selected != state.selected || coupon != &state.coupon
         });
         if changed {
-            let opened = self.shown.as_ref().is_none_or(|(_, _, selected, coupon)| *selected != state.selected || (coupon.is_none() && state.coupon.is_some()));
-            self.shown = Some((state.printer.clone(), state.filament.clone(), state.selected, state.coupon.clone()));
+            let opened = self.shown.as_ref().is_none_or(|(_, _, _, selected, coupon)| *selected != state.selected || (coupon.is_none() && state.coupon.is_some()));
+            self.shown = Some((state.owner_id.clone(), state.printer.clone(), state.filament.clone(), state.selected, state.coupon.clone()));
             if let Some(w) = self.items.get(&step_id(state.selected)).cloned() {
                 w.text_input(cx, ids!(coupon.first.input)).set_text(cx, "");
                 w.text_input(cx, ids!(coupon.second.input)).set_text(cx, "");
@@ -235,12 +283,14 @@ impl FabCalibrateSteps {
         w.label(cx, ids!(hdr.title)).set_text(cx, &row.title);
         w.label(cx, ids!(done)).set_text(cx, &row.done.as_ref().map(|d| format!("✓ {d}")).unwrap_or_default());
         w.label(cx, ids!(feeds)).set_text(cx, &row.feeds);
-        w.label(cx, ids!(result)).set_visible(cx, row.done.is_some() && !row.summary.is_empty());
+        w.label(cx, ids!(result)).set_visible(cx, !row.summary.is_empty());
         w.label(cx, ids!(result)).set_text(cx, &row.summary);
         w.label(cx, ids!(blocked)).set_visible(cx, row.blocked.is_some());
         w.label(cx, ids!(blocked)).set_text(cx, row.blocked.as_deref().unwrap_or(""));
         w.view(cx, ids!(make)).set_visible(cx, row.blocked.is_none());
-        w.widget(cx, ids!(clear_result)).set_visible(cx, row.done.is_some());
+        w.widget(cx, ids!(clear_result)).set_visible(cx, row.can_clear);
+        w.tip(cx, ids!(clear_result)).set_text(&state.clear_tip());
+        w.button(cx, ids!(clear_result.clear)).set_text(cx, &state.clear_label());
         let part = state.coupon.as_ref().filter(|_| i == state.selected);
         let coupon = w.view(cx, ids!(coupon));
         coupon.set_visible(cx, part.is_some());
@@ -321,7 +371,7 @@ impl Widget for FabCalibrateSteps {
                 }
                 cx.action(CalibrateAction::MakePart);
             }
-            if w.button(cx, ids!(clear_result.clear)).clicked(actions) && row.done.is_some() {
+            if w.button(cx, ids!(clear_result.clear)).clicked(actions) && row.can_clear {
                 if i != state.selected {
                     cx.action(CalibrateAction::Select(i));
                 }

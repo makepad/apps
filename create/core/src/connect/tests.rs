@@ -159,8 +159,9 @@ fn both_devices_report_a_version_mismatch_under_loss() {
             assert!(world.conns.iter().all(|c| c.phase() != &Phase::Linked), "older side {older}: incompatible devices never link");
         }
         assert!(lost_at.is_some(), "older side {older}: the first refusal transmission was lost");
-        for c in &world.conns {
-            assert_eq!(c.phase(), &Phase::Failed(Failure::Refused(Refusal::Version)), "older side {older}: both devices explain the mismatch");
+        for (side, c) in world.conns.iter().enumerate() {
+            let peer_newest = Some(if side == older { crate::link::VERSION } else { 1 });
+            assert_eq!(c.phase(), &Phase::Failed(Failure::Refused(Refusal::Version { peer_newest })), "older side {older}: both devices explain the mismatch");
             assert!(c.done(world.net.now()), "older side {older}: the worker can stop within five virtual seconds");
         }
     }

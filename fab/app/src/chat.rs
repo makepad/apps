@@ -1475,13 +1475,27 @@ pub(crate) mod journal {
                 self.page.drawn = true;
                 self.pump_until(true, done);
             }
+            /// Pump the tab until `done`. Its answers come from the reader worker and
+            /// from jobs on the process's one shared pool, which other tests in the
+            /// binary keep busy, so the wait follows their deliveries with no deadline.
+            /// Each update also flushes reader commands that found its slot full.
             fn pump_until(&mut self, shown: bool, done: impl Fn(&Self) -> bool) {
-                let start = std::time::Instant::now();
                 loop {
                     self.browser.update(shown, true, &mut self.page, &mut self.calls);
                     if done(self) { return }
-                    assert!(start.elapsed() < std::time::Duration::from_secs(5), "journal worker did not deliver the requested page or answer");
                     std::thread::yield_now();
+                }
+            }
+            /// A query's own answer. Pumping flushes the query into the reader;
+            /// a query dropped unanswered disconnects and fails at once.
+            fn answer_of<T>(&mut self, answers: &std::sync::mpsc::Receiver<T>, what: &str) -> T {
+                loop {
+                    self.browser.update(true, true, &mut self.page, &mut self.calls);
+                    match answers.try_recv() {
+                        Ok(answer) => return answer,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("{what}"),
+                    }
                 }
             }
             fn tool(&mut self, name: &str, args: Value) -> Value {
@@ -1861,13 +1875,7 @@ pub(crate) mod journal {
                 let copy = b.script(&k, &k, Filter::default(), b.complete_end());
                 result.send((detail_missing, copy.err().map(|e| e.kind()))).unwrap();
             }).unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let (record, log) = loop {
-                f.browser.update(true, true, &mut f.page, &mut f.calls);
-                if let Ok(pair) = handle.try_recv() { break pair }
-                assert!(std::time::Instant::now() < deadline, "reader must deliver the validated source");
-                std::thread::yield_now();
-            };
+            let (record, log) = f.answer_of(&handle, "reader must deliver the validated source");
             f.browser.action(&JournalAction::Replay, &mut f.page);
             f.browser.action(&JournalAction::Copy, &mut f.page);
             let archived = f.root.join("archived");
@@ -1881,7 +1889,8 @@ pub(crate) mod journal {
             fs::rename(f.root.join("held-log"), archived.join("records.jsonl")).unwrap();
             resume.send(()).unwrap();
 
-            let (missing, copy_error) = inspected.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            // The held query is already running; its sender drops if it panics.
+            let (missing, copy_error) = inspected.recv().unwrap();
             assert!(missing, "detail validated against A must never return B's record");
             assert_eq!(copy_error, Some(io::ErrorKind::NotFound), "copy must refuse B's bytes under A's offsets");
             let pool = f.cx.task_pool();
@@ -1921,12 +1930,19 @@ pub(crate) mod journal {
             fs::write(dir.join("incarnation"), "c".repeat(32)).unwrap();
             let reader = f.browser.reader.as_mut().unwrap();
             reader.request(crate::journal::reader::Request::Count(Filter::default())).unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // The worker scans before it answers the count: Replaced must come first.
+            // An idle scan may report the half-written id as an error; the count's
+            // own scan starts after the write.
+            let mut replaced = false;
             loop {
-                if reader.try_recv().unwrap().is_some_and(|r| matches!(r.answer, Read::Replaced)) { break }
-                assert!(std::time::Instant::now() < deadline, "changing the incarnation alone must deliver Replaced");
-                std::thread::yield_now();
+                let Some(reply) = reader.try_recv().unwrap() else { std::thread::yield_now(); continue };
+                match reply.answer {
+                    Read::Replaced => replaced = true,
+                    Read::Count(_) => break,
+                    _ => (),
+                }
             }
+            assert!(replaced, "changing the incarnation alone must deliver Replaced");
         }
 
         #[test]
@@ -2114,7 +2130,7 @@ pub(crate) mod journal {
                     && [binary_before,binary_after].iter().all(|v| binary.label.contains(v.as_str().unwrap()));
                 tx.send(ok).unwrap();
             }).unwrap();
-            assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "the prepared diff must preserve both revisions and binary hashes");
+            assert!(f.answer_of(&rx, "the diff query must run"), "the prepared diff must preserve both revisions and binary hashes");
 
             // Another linked effect adds a file that sorts first. Keep the
             // existing document's editor as it moves into the second row.

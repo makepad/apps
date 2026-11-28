@@ -22,7 +22,10 @@ pub struct Entity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldState {
     pub value: Value,
+    /// Most recent event that wrote or restored this field.
     pub writer: Id,
+    /// Authoring event of the current value, preserved across undo and redo.
+    pub origin: Id,
 }
 
 impl Entity {
@@ -43,7 +46,7 @@ impl Entity {
         }
     }
 
-    pub(crate) fn write(&mut self, field: Key, value: Value, writer: Id, position: u64) -> Option<FieldState> {
+    pub(crate) fn write(&mut self, field: Key, value: Value, writer: Id, origin: Id, position: u64) -> Option<FieldState> {
         self.last_activity = position;
         if field == field::ORDER {
             self.order_written = position;
@@ -52,7 +55,7 @@ impl Entity {
             self.z_written = position;
         }
         // During replay even a clear needs a writer, so a later UNDO can test ownership.
-        self.fields.insert(field, FieldState { value, writer })
+        self.fields.insert(field, FieldState { value, writer, origin })
     }
 
     /// Name keys follow all numeric keys and sort lexicographically by UTF-8 bytes.
@@ -93,9 +96,8 @@ pub fn links_from(state: &State, id: Id) -> Vec<&Entity> {
 }
 
 pub fn project_entities(state: &State, project: Option<Id>, kind: Option<u16>) -> Vec<&Entity> {
-    let mut entities: Vec<_> = state.entities.values().filter(|e| {
+    let mut entities: Vec<_> = state.visible_entities(move |e| {
         e.project == project && kind.is_none_or(|k| e.kind == k)
-            && !e.flag(field::DELETED) && !e.flag(field::ARCHIVED)
     }).collect();
     entities.sort_unstable_by_key(|e| (std::cmp::Reverse(e.last_activity), e.id));
     entities
@@ -121,11 +123,19 @@ pub mod kind {
     pub const INLINE_APP: u16 = 13;
     pub const DOC: u16 = 14;
     pub const RECORDING: u16 = 15;
+    /// On a CLIP, W and H are the media's pixel dimensions, or zero when unknown.
     pub const CLIP: u16 = 16;
     pub const SHOT: u16 = 17;
     pub const COMMIT_REF: u16 = 18;
     pub const LINK: u16 = 19;
     pub const COMMENT: u16 = 20;
+    /// The town's own name: its `TITLE`, on an entity with no project. When two computers
+    /// each make one, the lowest id is the name for everyone.
+    pub const TOWN: u16 = 21;
+    pub const DESIGN: u16 = 22;
+    pub const APP: u16 = 24;
+    pub const APP_EDIT: u16 = 25;
+    pub const ISSUE: u16 = 26;
 }
 
 /// Coordinates and sizes (X, Y, W, H) are integers in 1/64 canvas units.
@@ -154,10 +164,50 @@ pub mod field {
     pub const STATUS: Key = Key::Number(19);
     pub const LABEL: Key = Key::Number(20);
     pub const SHAPE: Key = Key::Number(21);
+    /// A design's Splash source. Its preset is not stored: it is read from the folded size.
+    pub const SRC: Key = Key::Number(23);
+    /// Blob for a clip's poster image.
+    pub const POSTER: Key = Key::Number(24);
+    /// Clip duration in milliseconds.
+    pub const DURATION: Key = Key::Number(25);
+    /// Text hint naming the clip's container and codec.
+    pub const MEDIA: Key = Key::Number(26);
+    /// Timeline session id of a clip or shared app.
+    pub const SESSION: Key = Key::Number(27);
 
     pub fn geometry(key: &Key) -> bool { [X, Y, W, H, Z].contains(key) }
+
+    /// Task id that surviving references follow after a merge.
+    pub const MERGED_INTO: Key = Key::Number(28);
+    pub const SHARER: Key = Key::Number(29);
+    pub const EDIT_SEAT: Key = Key::Number(30);
+    /// Read only, for AI edits saved before EDIT_AGENT. New edits never write this field.
+    pub const EDIT_AI: Key = Key::Number(31);
+    pub const WIDGET_PATH: Key = Key::Number(32);
+    pub const PROPERTY: Key = Key::Number(33);
+    pub const OLD_VALUE: Key = Key::Number(34);
+    pub const NEW_VALUE: Key = Key::Number(35);
+    pub const EDIT_SEQ: Key = Key::Number(36);
+
+    /// A task proposed by a hub service. It is hidden from AI members until a person accepts it.
+    pub const PROPOSED: Key = Key::Number(37);
+    /// The agent that made a shared app edit on its owner's seat.
+    pub const EDIT_AGENT: Key = Key::Number(38);
+    /// Blob for an issue's video recording.
+    pub const VIDEO: Key = Key::Number(39);
+    pub const GH_REPO: Key = Key::Number(40);
+    pub const GH_NUMBER: Key = Key::Number(41);
+    pub const GH_STATE: Key = Key::Number(42);
+    pub const GH_FOLDER: Key = Key::Number(43);
+    pub const GH_FILTER: Key = Key::Number(44);
+    pub const GH_TITLE: Key = Key::Number(45);
+    pub const GH_BODY: Key = Key::Number(46);
+    /// Reserved field number. Copy provenance is carried in event::TAG_COPIED_FROM.
+    pub const COPIED_FROM: Key = Key::Number(47);
+    /// Critical read policy of a projectless TOWN entity, written by the founder seat.
+    pub const POLICY: Key = Key::Number(48);
 }
 
 use crate::fold::cache::fields as cache_fields;
 cache_fields!(Entity { id, kind, project, author, actor, created, last_activity, fields, order_written, z_written });
-cache_fields!(FieldState { value, writer });
+cache_fields!(FieldState { value, writer, origin });

@@ -2,6 +2,7 @@
 //! Bone rotations are parent-relative degrees, clockwise with y down. Rest
 //! uses the authored constant or first key, never the pose at a seek time.
 
+use crate::plain::{EllipseProps, PathProps, PrimitiveFrame, RectProps};
 use crate::frame::{Affine, ImageMesh, Item, ItemKind, Local};
 use crate::geometry::{self, PathCmd, VectorPath};
 use crate::model::{Join, Layer, LayerKind, Loc, Media, PathShape, Prop};
@@ -285,9 +286,9 @@ impl Skin {
         let mut skin = Self { rigid, contour: None, size: None, weights: Arc::from([]) };
         if rigid.is_some() { return skin; }
         let shape = match &layer.kind {
-            LayerKind::Path { data: PathShape::Static(path), .. } => Some((path.clone(), path_size(path))),
-            LayerKind::Rect { size, radius, .. } => size.constant().zip(radius.constant()).map(|(s, r)| (Arc::new(geometry::rect_path(s, r[0])), s)),
-            LayerKind::Ellipse { size, .. } => size.constant().map(|s| (Arc::new(geometry::ellipse_path(s)), s)),
+            LayerKind::Path(PathProps { data: PathShape::Static(path), .. }) => Some((path.clone(), path_size(path))),
+            LayerKind::Rect(RectProps { size, radius, .. }) => size.constant().zip(radius.constant()).map(|(s, r)| (Arc::new(geometry::rect_path(s, r[0])), s)),
+            LayerKind::Ellipse(EllipseProps { size, .. }) => size.constant().map(|s| (Arc::new(geometry::ellipse_path(s)), s)),
             _ => None,
         };
         if let Some((path, size)) = shape {
@@ -318,9 +319,9 @@ impl Skin {
             return;
         }
         let (path, size, style) = match &item.kind {
-            ItemKind::Path { path, fill, stroke, width, trim, cap, join } => (Some(path.clone()), self.size.unwrap_or_else(|| path_size(path)), Some((*fill, *stroke, *width, *trim, *cap, *join))),
-            ItemKind::Rect { size, radius, fill, stroke, width, trim, cap } => (Some(self.contour.clone().unwrap_or_else(|| Arc::new(geometry::rect_path(*size, *radius)))), *size, Some((*fill, *stroke, *width, *trim, *cap, Join::Miter))),
-            ItemKind::Ellipse { size, fill, stroke, width, trim, cap } => (Some(self.contour.clone().unwrap_or_else(|| Arc::new(geometry::ellipse_path(*size)))), *size, Some((*fill, *stroke, *width, *trim, *cap, Join::Round))),
+            ItemKind::Primitive(PrimitiveFrame::Path { path, fill, stroke, width, trim, cap, join }) => (Some(path.clone()), self.size.unwrap_or_else(|| path_size(path)), Some((*fill, *stroke, *width, *trim, *cap, *join))),
+            ItemKind::Primitive(PrimitiveFrame::Rect { size, radius, fill, stroke, width, trim, cap }) => (Some(self.contour.clone().unwrap_or_else(|| Arc::new(geometry::rect_path(*size, *radius)))), *size, Some((*fill, *stroke, *width, *trim, *cap, Join::Miter))),
+            ItemKind::Primitive(PrimitiveFrame::Ellipse { size, fill, stroke, width, trim, cap }) => (Some(self.contour.clone().unwrap_or_else(|| Arc::new(geometry::ellipse_path(*size)))), *size, Some((*fill, *stroke, *width, *trim, *cap, Join::Round))),
             ItemKind::Image { size: Some(size), .. } => (None, *size, None),
             _ => { place_item(item, placed); return; }
         };
@@ -341,7 +342,7 @@ impl Skin {
                     *y = p[1] as f32;
                 }
             }
-            item.kind = ItemKind::Path { path: path.into(), fill, stroke, width: width * map.mean_scale(), trim, cap, join };
+            item.kind = ItemKind::Primitive(PrimitiveFrame::Path { path: path.into(), fill, stroke, width: width * map.mean_scale(), trim, cap, join });
         } else if let (LayerKind::Image { mesh: Some(grid), .. }, ItemKind::Image { mesh, .. }) = (&layer.kind, &mut item.kind) {
             *mesh = Some(Arc::new(ImageMesh {
                 positions: grid.uvs.iter().map(|uv| point([uv[0] * size[0], uv[1] * size[1]])).collect(),

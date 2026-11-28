@@ -141,7 +141,7 @@ script_mod! {
         label := mod.widgets.FabLabel{ width: Fill text: "" }
         shortcut := mod.widgets.FabLabelSmall{
             text: ""
-            draw_text +: { ink_centered: true color: fab.color_text_muted }
+            draw_text +: { ink_centered: true color: fab.color_text_dim }
         }
     }
 
@@ -178,10 +178,17 @@ script_mod! {
                             border_radius: fab.radius
                         }
                         draw_text +: {
-                            color: fab.color_text
+                            color: fab.color_text_input
+                            color_hover: fab.color_text_input
+                            color_focus: fab.color_text_input
+                            color_down: fab.color_text_input
+                            color_empty: fab.color_text_input_dim
+                            color_empty_hover: fab.color_text_input_dim
+                            color_empty_focus: fab.color_text_input_dim
                             ink_centered: true
                             text_style: theme.font_regular{ font_size: fab.font_size_header }
                         }
+                        draw_cursor +: { color: fab.color_text_input }
                     }
                     rows := View{
                         width: Fill

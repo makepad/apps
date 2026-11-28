@@ -1,5 +1,5 @@
 //! This device's key: a P-256 key made by the OS and kept in the home directory (0600). It is
-//! Create's own key, never the fleet's, so Create's identity and the fleet's admin rights stay
+//! Town's own key, never the fleet's, so Town's identity and the fleet's admin rights stay
 //! apart. The private half is used only by two functions, each taking its purpose:
 //! [`DeviceKey::sign`] with a [`Domain`], and [`DeviceKey::agree`] with an [`Agreement`]. Each
 //! purpose has its own label (see [`label`]), so a signature or a secret made for one can never
@@ -16,12 +16,12 @@ use std::path::Path;
 /// An uncompressed P-256 public point (`04 | X | Y`).
 pub type PublicKey = [u8; 65];
 
-/// Every label Create hashes, signs or derives under: `makepad create v1 <purpose>`, NUL-ended,
+/// Every label Town hashes, signs or derives under: `makepad create v1 <purpose>`, NUL-ended,
 /// so none is a prefix of another. They are wire constants and never change; a new purpose gets a
 /// new label.
 pub mod label {
     pub const EVENT: &[u8] = b"makepad create v1 event\0";
-    pub const ROOM_ID: &[u8] = b"makepad create v1 group\0";
+    pub const TOWN_ID: &[u8] = b"makepad create v1 group\0";
     pub const LINK: &[u8] = b"makepad create v1 link\0";
     pub const DEVICE_INTRO: &[u8] = b"makepad create v1 device intro\0";
     pub const MEMBER: &[u8] = b"makepad create v1 member\0";
@@ -36,7 +36,7 @@ pub mod label {
     /// All of them, for the test that keeps them apart.
     #[cfg(test)]
     pub const ALL: &[&[u8]] = &[
-        EVENT, ROOM_ID, LINK, DEVICE_INTRO, MEMBER, LINK_SECRET, DEVICE_WORDS, MEDIA,
+        EVENT, TOWN_ID, LINK, DEVICE_INTRO, MEMBER, LINK_SECRET, DEVICE_WORDS, MEDIA,
         BLOB_LEAF, BLOB_NODE, BLOB_ID,
     ];
 }
@@ -138,7 +138,7 @@ impl DeviceKey {
         Ok(out)
     }
 
-    /// The link secret this device shares with `peer`, one per device pair and whatever rooms the
+    /// The link secret this device shares with `peer`, one per device pair and whatever towns the
     /// two share: the context is `lower key | higher key`, so both sides derive the same bytes.
     pub fn link_secret(&self, peer: &PublicKey) -> io::Result<[u8; 32]> {
         let me = self.public();

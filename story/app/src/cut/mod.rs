@@ -2013,7 +2013,7 @@ impl VideoCut {
 
     /// A render's folder: a library revision's, else the open folder cut's.
     fn render_dir(&self, edit: Option<&AssetRevisionRef>) -> std::path::PathBuf {
-        let renders = makepad_ai_hub::home::makepad_home().join("stage-product").join("edit-renders");
+        let renders = makepad_widgets::makepad_platform::home::app_state_home().join("stage-product").join("edit-renders");
         match edit {
             Some(edit) => renders.join(format!("{}-{}", edit.asset_id, &edit.revision.to_string()[5..17])),
             None => renders.join(format!("folder-{}", self.folder.as_ref().map_or("cut", |folder| folder.doc.name.as_str()))),
@@ -4260,10 +4260,6 @@ impl VideoCut {
         let video = ui.video(cx, ids!(cut_lib_video));
         video.set_source(VideoDataSource::Filesystem { path: path.to_string_lossy().into_owned() });
         video.begin_playback(cx);
-        // Hidden test runs stay silent.
-        if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() {
-            video.mute_playback(cx);
-        }
         play.started = true;
         play.playing = true;
         // The player over the fitted picture.

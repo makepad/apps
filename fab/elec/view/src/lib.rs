@@ -7,6 +7,7 @@ pub mod bom;
 pub mod canvas;
 pub mod explorer;
 pub mod firmware;
+pub mod flow;
 pub mod fw_rows;
 pub mod fw_state;
 pub mod instruments;

@@ -9,17 +9,21 @@
 //!    stood taller than the well and its line sat about 3 px low.
 //!    The field's semantics give its line box there as well (`text.lines`, which a widget
 //!    measures as it draws and its parents' alignment moves afterwards).
-//! 2. The two controls share a top, a bottom and a baseline: the button's face and the well's
-//!    outline start and end within 0.5 logical px of each other, and so do the cap bands of the
-//!    two labels (`N` of New plate, `S` of the placeholder). Before, the well filled its whole
-//!    rect where a button keeps a ring's width clear for its focus ring, so the field read taller.
+//! 2. The two controls share a top, a bottom and a baseline: the button's face and the search
+//!    well's face start and end within 0.5 logical px of each other (both inset one point for
+//!    their focus ring), and so do the cap bands of the two labels (`N` of New plate, `S` of the
+//!    placeholder).
 
+#[path = "common/wait.rs"]
+mod idle_wait;
+use idle_wait::wait_poll;
 use makepad_test::{run_with_config, NodeMatch, Role, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const HANG: Duration = Duration::from_secs(300);
 const TOLERANCE_LPX: f64 = 0.5;
 
 struct Frame {
@@ -88,6 +92,53 @@ fn rim(frame: &Frame, x: usize, outside: usize, step: isize) -> f64 {
     if step > 0 { (y + 1) as f64 - covered } else { y as f64 + covered }
 }
 
+/// `Sdf2d.viewport` (`draw/src/shader/sdf.rs`) defaults `edge = 0.0` and `aa = dpi / sqrt(2)`,
+/// placing the whole AA ramp inside a filled box and shifting `rim` inward by `1 / sqrt(2)` dev px.
+const SDF_AA_INSET_PX: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// A control's geometric face edge (top for `step == 1`, bottom for `step == -1`), in logical px.
+/// `ButtonFlat` and `TextInputFlat` both fill `sdf.box(border_size, ...)` and draw their focus
+/// outline via `sdf.stroke(stroke, border_size)` centered on that face boundary. When the open
+/// search field's bright focus outline dominates its darker fill on a dark toolbar, the outline
+/// ridge's centroid recovers the face edge directly (both sides' AA ramps cancel); otherwise
+/// `rim` reads the fill edge and removes `SDF_AA_INSET_PX`.
+fn face_edge(frame: &Frame, x: usize, outside: usize, mid: usize, step: isize, dpi: f64) -> f64 {
+    let bg = frame.at(x, outside);
+    let interior = frame.at(x, mid);
+    let ceil = bg.max(interior);
+    let span = ((mid as isize - outside as isize) * step).max(0) as usize;
+    let limit = span.min((6.0 * dpi).ceil() as usize);
+    let (mut peak, mut peak_i) = (0.0_f64, 0usize);
+    for i in 1..=limit {
+        let y = (outside as isize + step * i as isize) as usize;
+        let over = frame.at(x, y) - ceil;
+        if over > peak {
+            peak = over;
+            peak_i = i;
+        }
+    }
+    if peak > 4.0 && interior <= bg + 1.0 && (bg - interior).abs() < peak {
+        let (mut lo, mut hi) = (peak_i, peak_i);
+        while lo > 1 {
+            let y = (outside as isize + step * (lo - 1) as isize) as usize;
+            if frame.at(x, y) - ceil > 0.5 { lo -= 1; } else { break; }
+        }
+        while hi < limit {
+            let y = (outside as isize + step * (hi + 1) as isize) as usize;
+            if frame.at(x, y) - ceil > 0.5 { hi += 1; } else { break; }
+        }
+        let (mut sum_w, mut sum_wy) = (0.0, 0.0);
+        for i in lo..=hi {
+            let y = (outside as isize + step * i as isize) as usize;
+            let w = frame.at(x, y) - ceil;
+            sum_w += w;
+            sum_wy += w * (y as f64 + 0.5);
+        }
+        return (sum_wy / sum_w) / dpi;
+    }
+    (rim(frame, x, outside, step) - step as f64 * SDF_AA_INSET_PX) / dpi
+}
+
 /// The ink band (top, bottom, in device px) of the first glyph in a control's text area: per row,
 /// the most ink of the glyph's first four points, as a share of the label's strongest ink; the
 /// edges are the first and last rows past half of it, each moved out by the rest of the ramp.
@@ -127,7 +178,9 @@ pub struct Header {
     /// The centre of the field's line box as its semantics give it (`text.lines`) less the
     /// field's box centre: a single-line field centres its line box.
     pub line_off: f64,
-    /// The button's face top and bottom, then the well's outline top and bottom.
+    /// The shared layout row's top and bottom.
+    pub row: (f64, f64),
+    /// The button's and the search well's geometric face top and bottom.
     pub button: (f64, f64),
     pub well: (f64, f64),
     /// The cap bands (top, bottom) of `N` (New plate) and `S` (the placeholder).
@@ -138,7 +191,18 @@ pub struct Header {
 pub fn measure(app: &TestApp) -> Header {
     app.locator(Selector::role(Role::Tab).name("Plates")).click();
     app.locator(Selector::role(Role::Button).name("New plate")).wait_visible();
-    let field = app.locator(Selector::role(Role::TextField).name("Search plates")).wait_visible().snapshot();
+    app.locator(Selector::role(Role::Button).name("Search plates")).wait_visible().press();
+    let search = app.locator(Selector::role(Role::TextField).name("Search plates")).wait_visible();
+    let field = wait_poll(app, || {
+        let first = search.snapshot();
+        std::thread::sleep(Duration::from_millis(50));
+        let field = search.snapshot();
+        if field.visible() && field.bounds.w > 40.0 && field.node.text.as_ref().and_then(|t| t.lines.first()).is_some() && first.bounds == field.bounds {
+            Ok(field)
+        } else {
+            Err(format!("the open search field has not settled at {:?}", field.bounds))
+        }
+    });
     let window = app.locator(Selector::role(Role::Window)).wait_visible().snapshot();
     let nodes = app.widget_snapshot().nodes();
     let button = nodes.iter().find(|w| w.visible() && w.node.role == Role::Button && w.node.name == "New plate").expect("the New plate button");
@@ -153,17 +217,20 @@ pub fn measure(app: &TestApp) -> Header {
     let edges = |x: f64| {
         let x = x.round() as usize;
         let (above, below) = ((b.y0 - 2.0 * dpi).floor() as usize, (b.y1 + 2.0 * dpi).ceil() as usize);
-        (rim(&frame, x, above, 1) / dpi, rim(&frame, x, below, -1) / dpi)
+        let mid = ((b.y0 + b.y1) / 2.0).round() as usize;
+        (face_edge(&frame, x, above, mid, 1, dpi), face_edge(&frame, x, below, mid, -1, dpi))
     };
     // the button between its rounded corner and its label; the well past the placeholder
     let button_edges = edges(b.x0 + 7.5 * dpi);
-    let well_edges = edges(f.x1 - 6.5 * dpi);
+    let well_edges = edges(f.x1 - 4.5 * dpi);
     let label_area = Dev { x0: b.x0 + 4.0 * dpi, x1: b.x1 - 4.0 * dpi, ..b };
     let (lt, lb) = first_glyph_band(&frame, label_area, dpi, "New plate");
-    let (pt, pb) = first_glyph_band(&frame, f, dpi, "the placeholder");
+    let placeholder_area = Dev { x0: (line.rect.x as f64 + 1.5) * dpi, x1: f.x1 - 6.0 * dpi, ..f };
+    let (pt, pb) = first_glyph_band(&frame, placeholder_area, dpi, "the placeholder");
     Header {
         dpi,
         grab,
+        row: (b.y0 / dpi, b.y1 / dpi),
         placeholder_off: ((pt + pb) / 2.0 - f.center_y()) / dpi,
         glyph_off: (g.center_y() - f.center_y()) / dpi,
         line_off: (line.rect.y + line.rect.h / 2.0) as f64 - f.center_y() / dpi,
@@ -179,6 +246,7 @@ pub fn check(h: &Header) {
     assert!(h.placeholder_off.abs() <= TOLERANCE_LPX, "dpi {}: the placeholder's ink sits {:+.3} logical px off the field's centre (tolerance {TOLERANCE_LPX}); {h:?}", h.dpi, h.placeholder_off);
     assert!(h.glyph_off.abs() <= TOLERANCE_LPX, "dpi {}: the magnifier sits {:+.3} logical px off the field's centre; {h:?}", h.dpi, h.glyph_off);
     assert!(h.line_off.abs() <= TOLERANCE_LPX, "dpi {}: the field's line box, as its semantics give it, sits {:+.3} logical px off the field's centre (the row's alignment left out?); {h:?}", h.dpi, h.line_off);
+    assert!(near(h.button.0, h.row.0 + 1.0) && near(h.button.1, h.row.1 - 1.0), "dpi {}: the button's face {:.3}..{:.3} must sit one point inside the row {:.3}..{:.3}; {h:?}", h.dpi, h.button.0, h.button.1, h.row.0, h.row.1);
     assert!(near(h.button.0, h.well.0) && near(h.button.1, h.well.1), "dpi {}: the button's face spans {:.3}..{:.3} but the search well {:.3}..{:.3} (tolerance {TOLERANCE_LPX}); {h:?}", h.dpi, h.button.0, h.button.1, h.well.0, h.well.1);
     let center = |(t, b): (f64, f64)| (t + b) / 2.0;
     assert!(near(center(h.label), center(h.placeholder)) && near(h.label.1, h.placeholder.1), "dpi {}: New plate's cap band {:.3?} and the placeholder's {:.3?} do not share a centre and a baseline; {h:?}", h.dpi, h.label, h.placeholder);

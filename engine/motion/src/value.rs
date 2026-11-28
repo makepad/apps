@@ -74,13 +74,7 @@ pub(crate) fn fmt_num(value: f64) -> String {
     }
 }
 
-pub(crate) fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        format!("{}…", text.chars().take(max).collect::<String>())
-    }
-}
+pub(crate) use makepad_motion_plain::truncate;
 
 /// How the evaluated source maps back to the author's.
 #[derive(Clone, Debug)]

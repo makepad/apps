@@ -1,6 +1,7 @@
 //! Value-driven forms stay pure in time and in each instance's inputs.
 //! These are evaluation tests; the lane lead runs them with the native suite.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use makepad_motion::character::{self, pose::{self, Pose}};
 
@@ -59,7 +60,7 @@ fn vectors_colours_and_angles_use_the_fields_value_kinds() {
     let doc = load("Rect{size: blend(0.25, [vec2(20, 40), vec2(60, 80)]) fill: blend(0.5, [#ff000080, #0000ff]) rotate: blend(0.5, [350, 10])}");
     let frame = doc.eval(0.7);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
-    let ItemKind::Rect { size, fill: Some(fill), .. } = frame.items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, fill: Some(fill), .. }) = frame.items[0].kind else { panic!() };
     assert_eq!(size, [30.0, 50.0]);
     assert_eq!(&fill[..3], &[0.5, 0.0, 0.5]);
     near(fill[3], (128.0 / 255.0 + 1.0) * 0.5);
@@ -173,12 +174,12 @@ fn input_blends(doc: MotionDoc) {
         let frame = doc.eval_with(1.0, &mut a);
         near(frame_x(&frame), 40.0);
         near(frame.items[0].world.f, 15.0);
-        let ItemKind::Rect { fill: Some(fill), .. } = frame.items[0].kind else { panic!() };
+        let ItemKind::Primitive(PrimitiveFrame::Rect { fill: Some(fill), .. }) = frame.items[0].kind else { panic!() };
         assert_eq!(fill, [0.0, 0.5, 0.5, 1.0]);
         let other = doc.eval_with(1.0, &mut b);
         near(frame_x(&other), 20.0);
         near(other.items[0].world.f, 10.0);
-        let ItemKind::Rect { fill: Some(other_fill), .. } = other.items[0].kind else { panic!() };
+        let ItemKind::Primitive(PrimitiveFrame::Rect { fill: Some(other_fill), .. }) = other.items[0].kind else { panic!() };
         assert_eq!(other_fill, [0.5, 0.0, 0.5, 1.0]);
         assert_ne!(frame_x(&frame), frame_x(&other), "the functions read each instance's inputs");
         near(frame_x(&doc.eval(1.0)), 0.0);

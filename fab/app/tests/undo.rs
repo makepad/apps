@@ -7,14 +7,18 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
 #[path = "common/wait.rs"]
 mod idle_wait;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_script::syntax::{self, Kind};
 use makepad_strict_json::Value;
-use makepad_test::{makepad_test, KeyCode, KeyModifiers, Role, Selector, TestApp};
+use makepad_test::{makepad_test, KeyCode, KeyModifiers, RemoteMouseDown, RemoteMouseUp, Role, Selector, StudioToApp, TestApp};
 use std::time::Duration;
 
 fn call(app: &TestApp, tool: &str, args: &str) -> Result<String, String> {
@@ -112,9 +116,9 @@ fn post_x(source: &str) -> Option<f64> {
 /// The feature tree's rows ("type id"): the program's solids.
 fn tree(app: &TestApp) -> Vec<String> {
     // The tree is the Design workspace's.
-    if !show_tab(app, "Features") {
+    if !show_tab(app, "Parts") {
         workspace_row::press(app, "3D modeling");
-        show_tab(app, "Features");
+        parts_tab::open(app);
     }
     app.widget_snapshot()
         .nodes()
@@ -204,7 +208,7 @@ fn round_trip(app: &TestApp, name: &str, edit: impl FnOnce(), changed: impl Fn(&
 }
 
 fn pick_part(app: &TestApp, name: &str) {
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name(name)).wait_visible().click();
     // The tools start at Select: the move gizmo is Move's.
     app.locator(Selector::id("t_move")).wait_visible().click();
@@ -244,6 +248,7 @@ object(post)
 
     // ---- the part panel's generated parameter control ----
     pick_part(&app, "Post");
+    part_editor::open(&app);
     round_trip(&app, "the parameter control", || {
         app.locator(Selector::role(Role::SpinButton).name("Post radius")).wait_visible().set_value(11);
     }, |p| param_value(p, "r").is_some_and(|v| (v - 11.0).abs() < 1e-6));
@@ -263,24 +268,31 @@ object(post)
     // ---- the feature tree's delete removes the solid and its emission ----
     let before_delete = program(&app);
     round_trip(&app, "the tree's delete", || {
-        let _ = show_tab(&app, "Features");
         let label = label_of(&app, "Cylinder post");
-        app.locator(Selector::role(Role::ListItem).name(label)).wait_visible().select();
-        app.locator(Selector::role(Role::Button).name("Delete feature")).wait_visible().press();
+        let row = app.locator(Selector::role(Role::ListItem).name(label)).wait_visible().select().snapshot().bounds;
+        let (x, y) = (f64::from(row.x + row.w * 0.5), f64::from(row.y + row.h * 0.5));
+        let secondary = 1 << 1;
+        app.forward(vec![
+            StudioToApp::MouseDown(RemoteMouseDown { button_raw_bits: secondary, x, y, ..Default::default() }),
+            StudioToApp::MouseUp(RemoteMouseUp { button_raw_bits: secondary, x, y, ..Default::default() }),
+        ]);
+        app.locator(Selector::role(Role::MenuItem).name("Delete")).wait_visible().press();
     }, |p| p.rows.is_empty() && !p.source.contains("let post =") && !p.source.contains("object(post)"));
     undo(&app);
     wait_until(&app, "the post and its placement back", || program(&app) == before_delete);
 
     // ---- the Add menu ----
     round_trip(&app, "the Add menu", || {
-        let _ = show_tab(&app, "Features");
-        app.locator(Selector::role(Role::Button).name("Add feature")).wait_visible().press();
+        pick_part(&app, "Post");
+        app.locator(Selector::role(Role::Button).name("Modify")).wait_visible().press();
+        app.locator(Selector::role(Role::MenuItem).name("Add feature")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("From a sketch")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("Extrude")).wait_visible().press();
     }, |p| p.rows.iter().any(|r| r.starts_with("Extrude ")));
 
     // ---- the Part panel's position field ----
     pick_part(&app, "Post");
+    part_editor::open(&app);
     round_trip(&app, "the position field", || {
         app.locator(Selector::role(Role::SpinButton).name("X")).wait_visible().set_value(120);
     }, |p| post_x(&p.project).is_some_and(|x| (x - 120.0).abs() < 1e-6));

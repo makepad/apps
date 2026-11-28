@@ -56,7 +56,7 @@ impl LibPane {
                 rows.extend(paths.iter().map(|path| (library::file_title(path), path)).filter(|(title, _)| hit(title))
                     .map(|(title, path)| Row::Score { title, path: path.clone() }));
                 if !paths.is_empty() {
-                    match RequestJob::submit(cx, PrepareControl::default(), move |word| library::titles(paths, word)) {
+                    match RequestJob::submit(cx, PrepareControl::default(), move |word| async move { library::titles(paths, &word).await }) {
                         Ok(job) => self.titles = Some(job),
                         Err(error) => log!("score library titles: {error}"),
                     }

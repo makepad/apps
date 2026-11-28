@@ -1,5 +1,6 @@
 //! Edge softness is common to drawn shapes, independent of post blur.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 const SHAPES: &[(&str, &str)] = &[
@@ -74,7 +75,7 @@ fn split_text_keeps_its_layers_edge_softness() {
     assert_eq!(item.feather, 10.0);
     assert_eq!(item.feather_side, FeatherSide::Inner);
     assert_eq!(item.blur, 0.0);
-    let ItemKind::Text { units, .. } = &item.kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &item.kind else { panic!() };
     assert_eq!(units.len(), 4);
     assert!(units.iter().all(|unit| unit.blur == 2.0));
 }

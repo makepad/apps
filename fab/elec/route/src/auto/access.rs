@@ -2,7 +2,8 @@
 //! A route starts or ends at a cell whose centre is free for a track end (the grid's exact
 //! centre test, [`Grid::step_pass`] from a cell to itself); neighbouring pads can still block a
 //! fine-pitch pad's own centre. Access searches nearby free centres and checks the connecting
-//! stubs with the same `check_to` that DRC uses, or attaches inside the copper. On a track it
+//! stubs with the same `check_to` that DRC uses. On a pad or via a stub starts at its centre,
+//! where the board puts an anchored end, straight or through one knee. On a track it
 //! attaches on the centreline, where the board puts the anchored end, with a checked stub to a
 //! centre inside the track's copper. At a free end of fixed track copper ([`end_access`]) it
 //! attaches exactly at the end point, so the end is continued from its tip.
@@ -127,13 +128,11 @@ pub fn access(
                                 }
                                 Some(knee)
                             });
-                            if let Some(knee) = knee {
-                                (point, Some(knee))
-                            } else if point_clearance(centre, &piece.shape) == 0 {
-                                (centre, None)
-                            } else {
-                                continue;
-                            }
+                            // The board puts an end anchored on a pad or via at its centre, so
+                            // the stub from that centre is the copper: an attach elsewhere inside
+                            // the copper would be moved back onto the stub just refused.
+                            let Some(knee) = knee else { continue };
+                            (point, Some(knee))
                         }
                     } else if point_clearance(centre, &piece.shape) == 0 {
                         // The board puts an end anchored on a track onto its centreline, so a

@@ -462,9 +462,11 @@ let desk_out = CutOutput{frame: desk_stack.out(@frame)}
 
 - `Camera{device width height fps crop rotate mirror adjust fit rect span}` is a layer like any other (`Fx`, `Stack`,
   `Reframe` and slide transitions apply to it). Use `add_slide{kind: "camera", ...}` or edit the containing cut with `doc_patch`.
-  - `device`: part of the camera's name in any case (`"OBSBOT"`), its number (`0`, `1`, as the picker lists
-    them), or nothing for the first camera. A name that matches no connected camera falls back to the first one; with
-    no camera connected at all the slide shows a card saying so.
+  - Choose the camera with one of these `device` forms. When a slide requests a hardware camera and none are connected, it shows a status card.
+    - `device: nil` or omit the field to use the first camera.
+    - `device: 0` selects by position in the picker's list, starting at zero.
+    - `device: "OBSBOT"` matches part of a name in any case and falls back to the first camera if no name matches.
+    - `device: @test_pattern` generates colour bars, a greyscale ramp and a moving marker without opening a camera. In tool calls use `"device": "@test_pattern"`.
   - `width height fps`: the capture format asked for, 1280 x 720 at 30 by default. The nearest format the camera
     offers is used. A cheap camera gives its higher rates only as MJPEG; Stage decodes that for you.
   - `crop: [x, y, w, h]`: the part of the picture shown, as fractions (`[0.1, 0.0, 0.8, 1.0]` trims the sides).

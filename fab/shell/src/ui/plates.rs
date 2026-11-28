@@ -201,7 +201,7 @@ script_mod! {
                 width: 22
                 height: 22
                 icon_walk: Walk{ width: 22 height: 22 }
-                draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") }
+                draw_icon +: { color: fab.color_text_well_muted svg: crate_resource("self://resources/icons/cube.svg") }
             }
             thumb := Image{
                 width: Fill
@@ -217,7 +217,7 @@ script_mod! {
                 padding: Inset{top: 2 right: 2}
                 more := ToolIcon{
                     a11y: {label: "Plate menu"}
-                    draw_icon +: {svg: crate_resource("self://resources/icons/dots.svg")}
+                    draw_icon +: {color: fab.color_text_well svg: crate_resource("self://resources/icons/dots.svg")}
                 }
             }
         }
@@ -297,7 +297,7 @@ script_mod! {
         }
         // the toolbar: the area's editor selector, then New plate and the search
         tools := mod.widgets.FabEditorBar{
-            new := mod.widgets.FabButtonAccent{ text: "New plate" a11y: {label: "New plate"} }
+            new := mod.widgets.FabButtonAccent{ text: "New plate" height: #(crate::ui::widgets::SEARCH_REST) a11y: {label: "New plate"} }
             search := mod.widgets.FabSearch{
                 width: Fill{min: 60}
                 row +: { input +: { empty_text: "Search plates" a11y: {label: "Search plates"} } }

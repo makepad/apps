@@ -111,7 +111,7 @@ fn a_scenes_music_follows_the_audio_and_the_documents_music_is_the_track() {
     assert!((m[12] - 5.0).abs() < 1e-4 && (m[13] - 0.25).abs() < 1e-4, "{:?}", &m[12..15]);
     // The document's own `music(@m)` outside a scene's closure is its track.
     let two_d = MotionDoc::load("use mod.motion.*; Motion{ size: vec2(100, 100) duration: 4 layers: [Rect{size: vec2(10, 10) x: music(@m).bpm}] }").unwrap();
-    assert!(matches!(two_d.layers[0].kind, LayerKind::Rect { .. }));
+    assert!(matches!(two_d.layers[0].kind, LayerKind::Rect(_)));
 }
 
 #[test]

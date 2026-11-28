@@ -2,372 +2,15 @@
 //! `Motion{...}` Splash value. Every value here is a plain copy of the
 //! source's; the source stays the document's truth (EDITS.md §1).
 
-use crate::Ease;
+use crate::plain::{EllipseProps, GroupProps, PathProps, RectProps, RepeatProps, TextProps};
+use crate::{Ease, LoadedLayers};
 use crate::features::AudioFeatures;
 use crate::signals::{LiveSignals, SignalSource};
-use crate::timing::{Length, TimeExpr, Timing};
+use crate::timing::Timing;
 use makepad_script::{LiveId, ScriptFnImage};
 use std::sync::Arc;
 
-/// 1-based line and column in the document's own source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
-pub struct Loc {
-    pub line: u32,
-    pub col: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Severity {
-    Error,
-    /// The document loads and draws; something is probably not what the
-    /// author meant (an unknown font, a key past the duration).
-    Warning,
-}
-
-/// A problem in a Motion document: where it is, which layer and property it
-/// is about, what is wrong, and how to fix it. Written for people and for
-/// the agents that author these documents, so every message names the
-/// property and every `hint` is a concrete fix.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    /// The file `loc` is in, where it is not the document's own text: an
-    /// inline document's is the game's script.
-    pub file: Option<Arc<str>>,
-    pub loc: Loc,
-    /// `layers[2].opacity`, `inputs.accent`, `duration`; empty for the
-    /// document as a whole.
-    pub path: String,
-    pub message: String,
-    pub hint: Option<String>,
-}
-
-impl Diagnostic {
-    pub(crate) fn error(loc: Loc, path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, file: None, loc, path: path.into(), message: message.into(), hint: None }
-    }
-
-    pub(crate) fn warning(loc: Loc, path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, file: None, loc, path: path.into(), message: message.into(), hint: None }
-    }
-
-    pub(crate) fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
-    pub fn is_error(&self) -> bool {
-        self.severity == Severity::Error
-    }
-}
-
-impl std::fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let severity = match self.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        if let Some(file) = &self.file {
-            write!(f, "{file}:")?;
-        }
-        write!(f, "{}:{}: {severity}: ", self.loc.line, self.loc.col)?;
-        if !self.path.is_empty() {
-            write!(f, "{}: ", self.path)?;
-        }
-        write!(f, "{}", self.message)?;
-        if let Some(hint) = &self.hint {
-            write!(f, "\n    hint: {hint}")?;
-        }
-        Ok(())
-    }
-}
-
-/// An exact library revision: `asset(id, rev)`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AssetRef {
-    pub id: String,
-    pub rev: String,
-}
-
-/// A colour, straight (not premultiplied) RGBA in 0..1.
-pub type Color = [f64; 4];
-
-/// A time as written and as resolved. `value` is seconds on the clock of
-/// the layer it belongs to; musical and spoken references are resolved into
-/// it by [`MotionDoc::with_context`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct Time {
-    pub expr: TimeExpr,
-    pub value: f64,
-}
-
-impl Time {
-    pub fn seconds(value: f64) -> Self {
-        Self { expr: TimeExpr::Seconds(value), value }
-    }
-}
-
-/// A length as written and as resolved (`beats(x)` depends on the tempo).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Dur {
-    pub expr: Length,
-    pub value: f64,
-}
-
-impl Dur {
-    pub fn seconds(value: f64) -> Self {
-        Self { expr: Length::Seconds(value), value }
-    }
-}
-
-/// One key: at `t` the value is `v`; `ease` shapes the segment arriving at
-/// it from the previous key, or `bez` makes that segment a bezier curve
-/// through both keys' handles.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Key<const N: usize> {
-    pub t: Time,
-    pub v: [f64; N],
-    pub ease: Ease,
-    /// `[t, v, @bezier]`, `[t, v, {ease: @bezier handle: @auto}]`,
-    /// `[t, v, {in: [-0.3, 5] out: [0.25, -4]}]`: the segment arriving here
-    /// is a cubic bezier, and this key's handles are these.
-    pub bez: Option<KeyHandles>,
-}
-
-/// How a key's handles are made.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum HandleMode {
-    /// Smooth through the key (the neighbours' slope).
-    Auto,
-    /// Smooth, never overshooting the neighbours (flat at a peak). The default.
-    #[default]
-    Clamped,
-    /// Written, in and out on one line.
-    Aligned,
-    /// Written, each on its own.
-    Free,
-    /// Pointing at the neighbouring keys (a corner).
-    Vector,
-}
-
-impl HandleMode {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Clamped => "clamped",
-            Self::Aligned => "aligned",
-            Self::Free => "free",
-            Self::Vector => "vector",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "auto" => Self::Auto,
-            "clamped" => Self::Clamped,
-            "aligned" => Self::Aligned,
-            "free" => Self::Free,
-            "vector" => Self::Vector,
-            _ => return None,
-        })
-    }
-
-    /// Its handles are written (else computed from the neighbours).
-    pub fn written(self) -> bool {
-        matches!(self, Self::Aligned | Self::Free)
-    }
-}
-
-/// A key's handles: its mode, and for a written mode the handles as offsets
-/// from the key (seconds, value), one value per component.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct KeyHandles {
-    /// The segment arriving at the key is a bezier (else its `ease`).
-    pub bezier: bool,
-    pub mode: HandleMode,
-    pub r#in: Option<[f64; 2]>,
-    pub out: Option<[f64; 2]>,
-}
-
-/// What a track does before its first key and after its last.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Extrap {
-    /// The end key's value. The default.
-    #[default]
-    Constant,
-    /// On along the end key's slope.
-    Linear,
-    /// The keys again, from the first to the last.
-    Cycle,
-}
-
-impl Extrap {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Constant => "constant",
-            Self::Linear => "linear",
-            Self::Cycle => "cycle",
-        }
-    }
-}
-
-/// How a looped track repeats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoopMode {
-    /// Start over at every period.
-    Restart,
-    /// Play forward, then backward.
-    PingPong,
-}
-
-/// Keys, optionally looped: `keys(...)`, `tween(...)` and `sequence(...)`
-/// all lower to keys; `repeat(...)` adds the loop.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Track<const N: usize> {
-    /// Times strictly increase.
-    pub keys: Vec<Key<N>>,
-    pub repeat: Option<Repeat>,
-    /// Before the first key, after the last (`keys(…, {before: @linear
-    /// after: @cycle})`).
-    pub before: Extrap,
-    pub after: Extrap,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Repeat {
-    /// The loop's length; the track's own keys cover `[first key, first key + period)`.
-    pub period: Dur,
-    pub mode: LoopMode,
-    /// How many times it plays; `None` forever.
-    pub count: Option<u32>,
-}
-
-/// A property function: `fn(t) {...}` (or `fn(t, i)` on per-unit text
-/// properties), called at every frame in the document's own VM with the
-/// layer's local time. It may read inputs and audio features
-/// (`voice(@vo).amplitude(t)`, `music(@m).energy(t)`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct FnProp {
-    /// The function's index in the document's evaluation (stable: the
-    /// document evaluates the same way every time).
-    pub index: usize,
-    pub loc: Loc,
-}
-
-/// One blend space for keyable values and named character poses. Values are
-/// row-major; a 1D blend has no y driver and one row at 0. Grid allocation
-/// and shape validation happen at load; sampling uses the property samplers.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BlendForm<T> {
-    pub x: Prop<1>,
-    pub y: Option<Prop<1>>,
-    pub cols: Vec<f64>,
-    pub rows: Vec<f64>,
-    pub values: Vec<T>,
-    /// Number of components before field shorthand (None for only
-    /// functions, whose results must fit the destination field).
-    pub value_kind: Option<usize>,
-    pub ease: crate::Ease,
-}
-
-impl<T> BlendForm<T> {
-    /// Sample at most four values and mix across x, then y. Clamping and
-    /// exact stops avoid sampling unused values (including their functions).
-    pub fn sample<V>(&self, x: f64, y: f64, mut value: impl FnMut(&T) -> V, mix: impl Fn(V, V, f64) -> V) -> V {
-        let (a, b, u) = blend_segment(&self.cols, x);
-        let (c, d, v) = blend_segment(&self.rows, y);
-        let u = if a == b { 0.0 } else { self.ease.apply(u, 1.0) };
-        let v = if c == d { 0.0 } else { self.ease.apply(v, 1.0) };
-        let mut row = |r| {
-            let first = value(&self.values[r * self.cols.len() + a]);
-            if a == b { first } else { mix(first, value(&self.values[r * self.cols.len() + b]), u) }
-        };
-        let first = row(c);
-        if c == d { first } else { mix(first, row(d), v) }
-    }
-}
-
-/// Adjacent stops and linear weight. Axes are nonempty, finite and strictly
-/// increasing (checked at load). Exact stops and clamped ends select one
-/// value, including a singleton axis. NaN follows the first-stop rule used
-/// by key tracks; it never indexes outside the grid.
-fn blend_segment(stops: &[f64], x: f64) -> (usize, usize, f64) {
-    if !(x > stops[0]) { return (0, 0, 0.0); }
-    let next = stops.partition_point(|stop| *stop <= x);
-    let a = next - 1;
-    if next == stops.len() || x == stops[a] { return (a, a, 0.0); }
-    (a, next, (x - stops[a]) / (stops[next] - stops[a]))
-}
-
-/// The moment a `Freeze` shows: one (`16.2`, `beat(32)`), or one per frame
-/// (`fn(t) {…}`, keys: seconds of the document, read on the layer's clock).
-#[derive(Clone, Debug, PartialEq)]
-pub enum FreezeTime {
-    Moment(Time),
-    Moving(Prop<1>),
-}
-
-/// An animatable property: a constant, keys, a function or a blend of
-/// properties, all sampled on the same layer clock.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Prop<const N: usize> {
-    Const([f64; N]),
-    Track(Track<N>),
-    Fn(FnProp),
-    Blend(Box<BlendForm<Prop<N>>>),
-}
-
-impl<const N: usize> Prop<N> {
-    pub fn is_animated(&self) -> bool {
-        match self {
-            Prop::Const(_) => false,
-            Prop::Blend(blend) => blend.x.is_animated() || blend.y.as_ref().is_some_and(Prop::is_animated) || blend.values.iter().any(Prop::is_animated),
-            _ => true,
-        }
-    }
-
-    pub fn constant(&self) -> Option<[f64; N]> {
-        match self {
-            Prop::Const(value) => Some(*value),
-            Prop::Blend(blend) => {
-                let x = blend.x.constant()?[0];
-                let y = match &blend.y { Some(y) => y.constant()?[0], None => 0.0 };
-                blend.sample(x, y, Prop::constant, |a, b, w| {
-                    let (a, b) = (a?, b?);
-                    Some(std::array::from_fn(|i| a[i] + (b[i] - a[i]) * w))
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-impl Prop<1> {
-    pub fn scalar(value: f64) -> Self {
-        Prop::Const([value])
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum Blend {
-    #[default]
-    Normal,
-    Add,
-    Screen,
-    Multiply,
-}
-
-impl Blend {
-    pub fn from_id(id: &str) -> Option<Self> {
-        Some(match id {
-            "normal" => Self::Normal,
-            "add" => Self::Add,
-            "screen" => Self::Screen,
-            "multiply" => Self::Multiply,
-            _ => return None,
-        })
-    }
-}
+pub use makepad_motion_plain::model::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub enum Fit {
@@ -392,61 +35,6 @@ impl Fit {
             _ => return None,
         })
     }
-}
-
-/// Which side of a layer's edges receives the feather transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum FeatherSide {
-    #[default]
-    Both,
-    Inner,
-    Outer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum Cap {
-    #[default]
-    Round,
-    Butt,
-    Square,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum Join {
-    #[default]
-    Round,
-    Miter,
-    Bevel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum Align {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
-
-/// Where a Text's `at.y` is: the top of its box, its middle or its bottom.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum VAlign {
-    #[default]
-    Top,
-    Center,
-    Bottom,
-}
-
-/// What a Text's animated properties apply to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum TextBy {
-    /// The text as one piece.
-    #[default]
-    Whole,
-    Word,
-    Letter,
-    Line,
-    /// A voiceover's syllables (`source: voice(@vo)` only).
-    Syllable,
 }
 
 /// A range's axis target and the font's default when Text does not set it.
@@ -489,101 +77,6 @@ impl TextRange {
             || self.color.as_ref().is_some_and(Prop::is_animated)
             || self.axes.iter().any(|a| a.value.is_animated())
     }
-}
-
-/// In which order units (letters, words, group children) start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum StaggerOrder {
-    #[default]
-    Forward,
-    Reverse,
-    /// From the middle outwards.
-    Center,
-    /// From both ends inwards.
-    Edges,
-    /// A fixed shuffle from `seed`: the same every frame and every run.
-    Random(u32),
-}
-
-/// `stagger: 0.03`, `stagger: beats(1/8)` or `stagger(step, @center)`:
-/// unit `i` (in `order`) runs its animations `i * step` later.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Stagger {
-    pub step: Dur,
-    pub order: StaggerOrder,
-}
-
-impl Stagger {
-    pub fn none() -> Self {
-        Self { step: Dur::seconds(0.0), order: StaggerOrder::Forward }
-    }
-
-    /// Unit `index` of `count`'s delay: the tween library's stagger (its
-    /// `each` the step, its `from` the order).
-    pub fn delay(&self, index: usize, count: usize) -> f64 {
-        use makepad_tween::stagger::{Stagger as Spread, StaggerFrom};
-        let from = match self.order {
-            StaggerOrder::Forward => StaggerFrom::Start,
-            StaggerOrder::Reverse => StaggerFrom::End,
-            StaggerOrder::Center => StaggerFrom::Center,
-            StaggerOrder::Edges => StaggerFrom::Edges,
-            StaggerOrder::Random(seed) => StaggerFrom::Random(seed as u64),
-        };
-        Spread::each(self.step.value).from(from).delay(index as u32, count.max(1) as u32)
-    }
-}
-
-/// A layer's placement. `at` places the layer's origin (top-left of its
-/// box); `x`/`y` add to it (the usual things to animate); `scale` and
-/// `rotate` (degrees, clockwise) turn about `anchor`, a fraction of the
-/// layer's box (0.5, 0.5 is its centre).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Transform {
-    pub at: Prop<2>,
-    pub x: Prop<1>,
-    pub y: Prop<1>,
-    pub scale: Prop<2>,
-    pub rotate: Prop<1>,
-    pub anchor: [f64; 2],
-    /// `at: along(points_or_svg, progress)`: the origin rides a path, at
-    /// `progress` (0..1) of its length; `x`/`y` still add.
-    pub along: Option<Along>,
-}
-
-/// A path the origin moves along.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Along {
-    /// SVG path data (points become lines).
-    pub path: Arc<str>,
-    pub progress: Prop<1>,
-}
-
-impl Default for Transform {
-    fn default() -> Self {
-        Self {
-            at: Prop::Const([0.0, 0.0]),
-            x: Prop::scalar(0.0),
-            y: Prop::scalar(0.0),
-            scale: Prop::Const([1.0, 1.0]),
-            rotate: Prop::scalar(0.0),
-            anchor: [0.5, 0.5],
-            along: None,
-        }
-    }
-}
-
-/// Where an image, SVG, video or model comes from: an exact library
-/// revision, an input the host fills (`in(@logo)`), or (SVG only) markup
-/// written in the document.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Media {
-    /// `src: @backdrop`: what is under the layer in the document (an
-    /// Image magnifies it with `zoom` about `focus`).
-    Backdrop,
-    Asset(AssetRef),
-    Inline(Arc<str>),
-    /// An input of an asset type left empty: draws nothing.
-    Empty,
 }
 
 /// Text's source: its own string, or a voiceover's words.
@@ -642,15 +135,6 @@ pub struct Plate {
     /// `plate_style: @underline`: a band under each line instead of a box
     /// behind it.
     pub underline: bool,
-}
-
-/// A Path's outline: fixed, or morphing between keyed outlines that share
-/// their commands.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PathShape {
-    Static(Arc<makepad_svg::VectorPath>),
-    /// Compiled SVG commands with number slots and keyed number lists.
-    Morph { template: Arc<crate::geometry::PathTemplate>, track: Track<1>, shapes: Arc<[Vec<f64>]> },
 }
 
 /// A voice-bound Text's behaviours (§10.3).
@@ -713,17 +197,26 @@ pub enum VoiceShow {
     Line,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
-pub enum MaskMode {
-    /// Show the group where the mask is opaque.
-    #[default]
-    Alpha,
-    /// Show it where the mask is transparent.
-    Inverse,
-    /// Show it by the mask's brightness (a luma matte: white shows).
-    Luma,
-    /// Show it where the mask is dark.
-    LumaInverse,
+/// The moment a `Freeze` shows: one (`16.2`, `beat(32)`), or one per frame
+/// (`fn(t) {…}`, keys: seconds of the document, read on the layer's clock).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FreezeTime {
+    Moment(Time),
+    Moving(Prop<1>),
+}
+
+/// Where an image, SVG, video or model comes from: an exact library
+/// revision, an input the host fills (`in(@logo)`), or (SVG only) markup
+/// written in the document.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Media {
+    /// `src: @backdrop`: what is under the layer in the document (an
+    /// Image magnifies it with `zoom` about `focus`).
+    Backdrop,
+    Asset(AssetRef),
+    Inline(Arc<str>),
+    /// An input of an asset type left empty: draws nothing.
+    Empty,
 }
 
 /// A Shader layer's program.
@@ -872,41 +365,21 @@ pub enum SceneSource {
 pub enum LayerKind {
     /// `trim_start`/`trim_end` draw part of the stroke, clockwise from the
     /// top-left corner.
-    Rect { size: Prop<2>, radius: Prop<1>, fill: Option<Prop<4>>, stroke: Option<Prop<4>>, width: Prop<1>, trim_start: Prop<1>, trim_end: Prop<1>, cap: Cap },
+    Rect(RectProps),
     /// Trims run clockwise from 12 o'clock.
-    Ellipse { size: Prop<2>, fill: Option<Prop<4>>, stroke: Option<Prop<4>>, width: Prop<1>, trim_start: Prop<1>, trim_end: Prop<1>, cap: Cap },
+    Ellipse(EllipseProps),
     /// `data` is SVG path data in the layer's own coordinates; its box is
     /// the path's bounds from (0, 0). `trim_start`/`trim_end` (0..1) draw
     /// that part of the stroke's length (a path "drawing itself").
-    Path { data: PathShape, fill: Option<Prop<4>>, stroke: Option<Prop<4>>, width: Prop<1>, trim_start: Prop<1>, trim_end: Prop<1>, cap: Cap, join: Join },
+    Path(PathProps),
     /// A whole SVG, fitted into `size` (its own size when none).
     Svg { src: Media, size: Option<Prop<2>> },
     Text {
         source: TextSource,
-        font: String,
-        weight: f64,
-        italic: bool,
-        size: Prop<1>,
-        color: Prop<4>,
-        align: Align,
-        valign: VAlign,
-        by: TextBy,
-        stagger: Stagger,
+        props: TextProps,
         ranges: Vec<TextRange>,
-        line_height: f64,
-        /// Letter spacing in document units (animatable: `@tracking_slam`).
-        tracking: Prop<1>,
-        /// Wrap width in document units; `None` keeps explicit lines.
-        wrap: Option<f64>,
-        /// `fit:` the widest line's largest width: the size shrinks (never
-        /// grows) until every line fits, measured with the fonts it draws
-        /// with. `fit: @safe` is the width inside the side margins.
-        fit: Option<f64>,
         voice: VoiceStyle,
         plate: Option<Plate>,
-        /// A typewriter: the characters shown (a fraction of them at 0..1,
-        /// a count above 1).
-        reveal: Option<Prop<1>>,
         /// A caret after the last shown character: its opacity and colour.
         /// `caret_style: @block` draws a block instead of a bar.
         caret: Option<(Prop<1>, Prop<4>, bool)>,
@@ -934,7 +407,7 @@ pub enum LayerKind {
     Video { src: Media, size: Option<Prop<2>>, fit: Fit, source_in: Time, speed: f64 },
     /// `post: [...]`: passes over the group's own picture (STRUCTURE.md),
     /// as the document's post is over the frame.
-    Group { layers: Vec<Layer>, mask: Option<Box<Layer>>, mask_mode: MaskMode, stagger: Stagger, size: Option<Prop<2>>, post: GroupPost, glyphs: bool },
+    Group { layers: Vec<Layer>, mask: Option<Box<Layer>>, props: GroupProps, post: GroupPost, glyphs: bool },
     Bones(Box<crate::rig::Bones>),
     /// `Crowd{…}`: rows of seeded silhouettes reacting to the music.
     Crowd(Box<Crowd>),
@@ -1007,7 +480,7 @@ pub enum LayerKind {
     /// functions in the copy get the copy's index as `i`. With a `source`
     /// list, `items` holds one copy per item (the template with its
     /// `item()` fields filled) and `count` is their number.
-    Repeat { layer: Box<Layer>, items: Vec<Layer>, count: usize, layout: RepeatLayout, delay: f64, step: RepeatStep, jitter: RepeatStep, seed: u32 },
+    Repeat { layer: Box<Layer>, items: Vec<Layer>, props: RepeatProps },
     /// `Draw2D{draw: fn(c, t, edit) {…}}`: an immediate-mode 2D layer.
     Draw2d { draw: FnProp, size: Option<Prop<2>> },
 }
@@ -1023,9 +496,9 @@ pub enum WidgetProp {
 impl LayerKind {
     pub fn type_name(&self) -> &'static str {
         match self {
-            LayerKind::Rect { .. } => "Rect",
-            LayerKind::Ellipse { .. } => "Ellipse",
-            LayerKind::Path { .. } => "Path",
+            LayerKind::Rect(_) => "Rect",
+            LayerKind::Ellipse(_) => "Ellipse",
+            LayerKind::Path(_) => "Path",
             LayerKind::Svg { .. } => "Svg",
             LayerKind::Text { .. } => "Text",
             LayerKind::Image { .. } => "Image",
@@ -1111,39 +584,6 @@ pub struct VectorPart {
     pub draw_on: Option<Prop<1>>,
 }
 
-/// Where a `Repeat`'s copies go.
-#[derive(Clone, Debug, PartialEq)]
-pub enum RepeatLayout {
-    /// Rows of `columns`, `spacing` apart, filled left to right.
-    Grid { columns: usize, spacing: [f64; 2] },
-    /// Round a circle of `radius` from `start` degrees over `sweep`
-    /// degrees (clockwise from 12 o'clock); `face` turns each copy along.
-    Radial { radius: f64, start: f64, sweep: f64, face: bool },
-    /// Along path data, evenly by length; `face` turns each copy along.
-    Along { path: Arc<str>, face: bool },
-    /// Only the `step` offsets (a line when `step` moves them).
-    Line,
-}
-
-/// Per-index offsets of a `Repeat` (each times the index), or seeded
-/// random ones of up to this much (`jitter`).
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct RepeatStep {
-    pub x: f64,
-    pub y: f64,
-    pub rotate: f64,
-    pub scale: f64,
-    pub opacity: f64,
-}
-
-/// `span: [start, length]`: the layer shows on `[start, start + length)` of
-/// its parent's clock, and its own clock starts at `start`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Span {
-    pub start: Time,
-    pub length: Dur,
-}
-
 /// `data_layer: true` (or `data_layer: {mips: true aniso: 8}`): a root layer drawn into
 /// a texture of its own (linear values, no colour management) that post
 /// passes read by the layer's `name`, instead of into the frame.
@@ -1198,106 +638,6 @@ impl Layer {
             None => format!("{} ({})", self.path, self.kind.type_name()),
         }
     }
-}
-
-/// The type of a declared input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum InputType {
-    Text,
-    Number,
-    Color,
-    Vec2,
-    Bool,
-    Image,
-    Svg,
-    Video,
-    Model,
-    /// A list of values (text, numbers, colours, vec2s, bools, assets or
-    /// records): what a `Repeat{source: in(@rows)}` makes one copy per item of.
-    List,
-}
-
-impl InputType {
-    pub fn from_id(id: &str) -> Option<Self> {
-        Some(match id {
-            "text" | "string" => Self::Text,
-            "number" | "num" => Self::Number,
-            "color" | "colour" => Self::Color,
-            "vec2" => Self::Vec2,
-            "bool" => Self::Bool,
-            "image" => Self::Image,
-            "svg" => Self::Svg,
-            "video" => Self::Video,
-            "model" => Self::Model,
-            "list" => Self::List,
-            _ => return None,
-        })
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Number => "number",
-            Self::Color => "color",
-            Self::Vec2 => "vec2",
-            Self::Bool => "bool",
-            Self::Image => "image",
-            Self::Svg => "svg",
-            Self::Video => "video",
-            Self::Model => "model",
-            Self::List => "list",
-        }
-    }
-}
-
-/// A value an input holds: its default, or what the host (an edit's
-/// `Graphic{params: …}`) gives it.
-#[derive(Clone, Debug, PartialEq)]
-pub enum InputValue {
-    Text(String),
-    Number(f64),
-    Color(Color),
-    Vec2([f64; 2]),
-    Bool(bool),
-    Asset(AssetRef),
-    /// SVG markup given inline.
-    Markup(String),
-    /// An asset input with no default.
-    Empty,
-    /// A list input's items.
-    List(Vec<InputValue>),
-    /// One item of a list given as fields (`{name: "Ada" score: 12}`), read
-    /// in a Repeat's copy as `item(@name)`.
-    Record(Vec<(String, InputValue)>),
-}
-
-impl InputValue {
-    pub fn describe(&self) -> &'static str {
-        match self {
-            Self::Text(_) => "text",
-            Self::Number(_) => "a number",
-            Self::Color(_) => "a colour",
-            Self::Vec2(_) => "a vec2",
-            Self::Bool(_) => "a bool",
-            Self::Asset(_) => "an asset",
-            Self::Markup(_) => "SVG markup",
-            Self::Empty => "nothing",
-            Self::List(_) => "a list",
-            Self::Record(_) => "a record",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct InputDecl {
-    /// The input as hosts name it: `in(@name)`'s identifier.
-    pub id: LiveId,
-    /// Its written name (messages and scene templates).
-    pub name: String,
-    pub ty: InputType,
-    pub default: InputValue,
-    pub doc: String,
-    pub loc: Loc,
 }
 
 /// The host's context (EDITS.md §10.3): musical and spoken time, the
@@ -1430,16 +770,7 @@ pub struct MotionDoc {
     pub tags: Vec<String>,
     /// `camera: Camera{…}`: the comp camera of 2.5D effects (R2's kit).
     pub camera: Option<Vec<(String, EffectArg)>>,
-    /// Width and height in document units; a renderer draws it at any
-    /// scale (the output's size over this).
-    pub size: [f64; 2],
-    pub duration: f64,
-    /// The frame rate tools sample it at when nothing else says (60 by
-    /// default; within an edit it follows the edit's rate).
-    pub fps: f64,
-    /// Tempo of musical references when the context has no beat grid.
-    pub bpm: f64,
-    pub background: Option<Color>,
+    pub plain: LoadedLayers,
     /// `color: @hdr`: the frame is linear half-float light (colours over 1
     /// glow), tone mapped once after `post`; the default is the 8-bit
     /// display frame.
@@ -1450,18 +781,13 @@ pub struct MotionDoc {
     /// `motion_blur: MotionBlur{shutter samples tol}`: the whole frame
     /// sampled over its shutter.
     pub motion_blur: Option<MotionBlurSpec>,
-    pub inputs: Vec<InputDecl>,
-    /// The inputs' current values, in `inputs` order.
-    pub input_values: Vec<InputValue>,
     /// Per declared input: whether the document read it while it evaluated
     /// (it decides structure: a layer's text, a count), so a changed value
     /// needs [`MotionDoc::reevaluate`]. The others are read by property
     /// functions at frame time and take effect at the next
     /// [`MotionDoc::eval_with`].
     pub structural: Vec<bool>,
-    pub layers: Vec<Layer>,
     pub warnings: Vec<Diagnostic>,
-    pub context: Arc<MotionContext>,
     /// Whether any property is a function (the evaluation then runs the
     /// document's VM; see [`crate::eval`]).
     pub has_functions: bool,
@@ -1479,10 +805,18 @@ pub struct MotionDoc {
     pub(crate) _literals: Option<Arc<crate::schema::DocLiterals>>,
 }
 
-/// The identifier of the input named `name`, for a host that holds names (an
-/// edit's text, a command line). A host with identifiers uses them.
-pub fn input_id(name: &str) -> LiveId {
-    LiveId::from_str_with_lut(name).unwrap_or_else(|_| LiveId::from_str(name))
+impl std::ops::Deref for MotionDoc {
+    type Target = LoadedLayers;
+
+    fn deref(&self) -> &LoadedLayers {
+        &self.plain
+    }
+}
+
+impl std::ops::DerefMut for MotionDoc {
+    fn deref_mut(&mut self) -> &mut LoadedLayers {
+        &mut self.plain
+    }
 }
 
 /// One instance's values of a document's declared inputs, in declaration
@@ -1529,7 +863,7 @@ impl MotionDoc {
         InstanceInputs { slots: Arc::new((*self.own).clone()) }
     }
 
-    /// Write the input at `index` (from [`MotionDoc::input_index`]). No
+    /// Write the input at `index` (from [`LoadedLayers::input_index`]). No
     /// allocation for a value that holds none. The value is coerced to the
     /// input's type as a host's params are; one that does not fit is an error.
     pub fn write_input(&self, inputs: &mut InstanceInputs, index: usize, value: InputValue) -> Result<InputWrite, String> {
@@ -1554,19 +888,6 @@ impl MotionDoc {
         self.vm.with(|e| e.evaluations)
     }
 
-    /// The index of the declared input `id`: resolved once by a host, which
-    /// then writes by index.
-    pub fn input_index(&self, id: LiveId) -> Option<usize> {
-        self.inputs.iter().position(|input| input.id == id)
-    }
-
-    /// Whether the document declares `pointer_x` and/or `pointer_y`: a host
-    /// with a presenter's pointer ([`MotionDoc::eval_pointer`]) feeds only
-    /// these documents.
-    pub fn declares_pointer(&self) -> bool {
-        self.input_index(input_id("pointer_x")).is_some() || self.input_index(input_id("pointer_y")).is_some()
-    }
-
     /// The frame at `t` with the pointer over the picture as fractions 0..1
     /// (x left to right, y top to bottom), -1 on both while it is not over
     /// it, written to the declared `pointer_x` / `pointer_y`. A document
@@ -1585,51 +906,6 @@ impl MotionDoc {
         self.eval_with_live(t, live, &mut inputs)
     }
 
-    /// The inputs' current values as the document's VM reads them (declaration order).
-    pub(crate) fn slots(&self) -> Vec<(LiveId, InputValue)> {
-        self.inputs.iter().map(|decl| decl.id).zip(self.input_values.iter().cloned()).collect()
-    }
-
-    pub fn input(&self, id: LiveId) -> Option<&InputValue> {
-        self.input_values.get(self.input_index(id)?)
-    }
-
-    /// Every layer, depth first (groups before their children, masks after
-    /// their group's children).
-    pub fn all_layers(&self) -> Vec<&Layer> {
-        fn walk<'a>(layers: &'a [Layer], out: &mut Vec<&'a Layer>) {
-            for layer in layers {
-                out.push(layer);
-                if let LayerKind::Bones(rig) = &layer.kind {
-                    walk(&rig.layers, out);
-                }
-                if let LayerKind::Group { layers, mask, .. } = &layer.kind {
-                    walk(layers, out);
-                    if let Some(mask) = mask {
-                        walk(std::slice::from_ref(mask), out);
-                    }
-                }
-                if let LayerKind::Repeat { layer, .. } = &layer.kind {
-                    walk(std::slice::from_ref(layer), out);
-                }
-                if let LayerKind::FlyThrough { layers, .. } = &layer.kind {
-                    walk(layers, out);
-                }
-                if let LayerKind::Anchored { layer, .. } = &layer.kind {
-                    walk(std::slice::from_ref(layer.as_ref()), out);
-                }
-                if let LayerKind::Scene3dDoc { layers, .. } = &layer.kind {
-                    for (_, layer) in layers {
-                        walk(std::slice::from_ref(layer), out);
-                    }
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&self.layers, &mut out);
-        out
-    }
-
     /// Whether every frame of the document is the same picture: no layer
     /// (at any depth) is animated or confined to a span, no data layer, and
     /// the document has no camera, post pass or motion blur. Judged from the
@@ -1643,40 +919,5 @@ impl MotionDoc {
             && self.camera.is_none()
             && self.motion_blur.is_none()
             && self.all_layers().iter().all(|layer| !layer.animated && layer.span.is_none() && layer.data.is_none())
-    }
-
-    /// Every library revision the document uses (its manifest's
-    /// dependencies), each once, in source order.
-    pub fn dependencies(&self) -> Vec<AssetRef> {
-        let mut out: Vec<AssetRef> = Vec::new();
-        let mut push = |media: &Media| {
-            if let Media::Asset(asset) = media {
-                if !out.contains(asset) {
-                    out.push(asset.clone());
-                }
-            }
-        };
-        for layer in self.all_layers() {
-            match &layer.kind {
-                LayerKind::Svg { src, .. } | LayerKind::Image { src, .. } | LayerKind::Video { src, .. } | LayerKind::Scene3D { model: src, .. } | LayerKind::Vector { src, .. } => push(src),
-                LayerKind::Shader { program: ShaderProgram::Effect(asset), .. } => push(&Media::Asset(asset.clone())),
-                // A character drawn from a library SVG (lane CH1).
-                LayerKind::Character(ch) => {
-                    if let crate::character::Model::Asset(asset) = &ch.model {
-                        push(&Media::Asset(asset.clone()));
-                    }
-                }
-                LayerKind::Scene3dDoc { assets, textures, videos, .. } => {
-                    for asset in assets {
-                        push(&Media::Asset(asset.clone()));
-                    }
-                    for (_, media) in textures.iter().chain(videos) {
-                        push(media);
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
     }
 }

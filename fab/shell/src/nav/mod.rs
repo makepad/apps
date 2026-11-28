@@ -1730,7 +1730,7 @@ mod tests {
         let start = *state.view.camera(pane);
         send(&mut nav, &mut cx, &mut state, ViewportInputKind::KeyDown { key: KeyCode::Numpad6, mods: KeyModifiers::default(), repeat: false });
         let mut time = 0.0;
-        let mut frame = |nav: &mut Navigator, cx: &mut Cx, state: &mut AppState, time: &mut f64| {
+        let frame = |nav: &mut Navigator, cx: &mut Cx, state: &mut AppState, time: &mut f64| {
             *time += 1.0 / 60.0;
             send(nav, cx, state, ViewportInputKind::Frame { dt: 1.0 / 60.0, time: *time });
         };

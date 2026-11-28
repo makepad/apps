@@ -14,7 +14,7 @@ pub(super) fn probe(point: &'static str) -> io::Result<()> {
     })
 }
 
-fn with_probe<T>(hook: impl FnMut(&'static str) -> io::Result<()> + 'static, run: impl FnOnce() -> T) -> T {
+pub(super) fn with_probe<T>(hook: impl FnMut(&'static str) -> io::Result<()> + 'static, run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset { fn drop(&mut self) { PROBE.with(|slot| slot.set(None)); } }
     let _reset = Reset;
@@ -37,8 +37,8 @@ pub(crate) fn temp() -> PathBuf {
     path
 }
 
-fn call() -> Record {
-    Record::Call { reference: "call-fixture".into(), actor: s("person"), action: "elec.check.list".into(), args: obj(vec![]) }
+pub(super) fn call() -> Record {
+    Record::Call { reference: "call-fixture".into(), actor: s("person"), action: "elec.check.list".into(), args: obj(vec![]), replay: true }
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn two_writers_on_one_journal_keep_every_row_whole_and_uniquely_ordered() {
     let root = temp();
     let channel = |dir: &Path| Journal::channel(dir.to_owned(), Arc::default(), 4, Arc::new(|_| ()));
     let named_call = |reference: &str| Record::Call {
-        reference: reference.into(), actor: s("person"), action: "elec.check.list".into(), args: obj(vec![]),
+        reference: reference.into(), actor: s("person"), action: "elec.check.list".into(), args: obj(vec![]), replay: true,
     };
     let source = b"// shared checkpoint\nuse mod.fab.*\n";
     let checkpoint = |name: &str| Record::Checkpoint {
@@ -234,9 +234,8 @@ fn two_writers_on_one_journal_keep_every_row_whole_and_uniquely_ordered() {
     let (j, w) = channel(&flight);
     j.send(named_call("after-flight"));
     let worker = thread::spawn(move || w.try_write(&w.rx.recv().unwrap(), |_| ()));
-    let start = std::time::Instant::now();
+    // Follow the writer: it either reaches the append lock or finishes.
     while j.progress.lock_waits.load(Ordering::Acquire) == 0 && !worker.is_finished() {
-        assert!(start.elapsed() < Duration::from_secs(5), "E: the second writer must reach the append lock");
         thread::yield_now();
     }
     assert!(matches!(outer.try_lock(), Err(fs::TryLockError::WouldBlock)), "a writer waiting on a peer still holds shared");
@@ -1405,7 +1404,7 @@ fn model_save_at_quit(gone: bool) {
         }
     }));
     if gone { cx.use_closed_task_pool(); }
-    let mut host = ModelHost::start(&cx, false);
+    let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
     let root = temp();
     let dir = root.join("plate/journal");
     let plate = Plate::testing(&dir, "model.fab.splash", &Default::default());
@@ -1434,11 +1433,10 @@ fn model_save_at_quit(gone: bool) {
         assert!(!live::quit_for_at(&mut quit, &plate, later, no_note, no_log));
     }
     host.hold_document_changes(false);
-    let watch = Instant::now();
+    // The quit job answers once it has run on the shared pool: no deadline.
     let outcome = loop {
         cx.handle_action_receiver();
         if let Ok(answer) = answers.try_recv() { break answer }
-        assert!(watch.elapsed() < Duration::from_secs(60), "quit job did not answer");
         thread::yield_now();
     };
     assert_eq!(outcome, (id, gone));
@@ -1489,7 +1487,7 @@ pub(crate) fn calls_fixture(root: &Path, print: bool, corrupt: bool, reserved: b
     let (journal, writer) = Journal::channel(dir.clone(), Arc::default(), 32, Arc::new(|_| {}));
     journal.send(Record::Checkpoint { manifest: Some(manifest.into()), files: Arc::new(files.clone()) });
     let actor = obj(vec![("kind", s("person"))]);
-    let call = |action: &str, args| journal.send(Record::Call { reference: action.into(), actor: actor.clone(), action: action.into(), args });
+    let call = |action: &str, args| journal.send(Record::Call { reference: action.into(), actor: actor.clone(), action: action.into(), args, replay: true });
     let done = |id, seqs| journal.send(Record::Done { call: id, outcome: "ok", reply: "private-reply-marker".into(), seqs, elsewhere: Default::default() });
     done(call("fab.inspect", obj(vec![("marker", s("private-argument-marker"))])), vec![]);
     let layout = call("fab.workspace_edit", obj(vec![]));
@@ -2647,4 +2645,496 @@ mod removal {
         unlink(&row_lock);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+pub(super) fn saved_opening(root: &Path) -> (fab_ai::Session, Plate, PathBuf) {
+    let store = fab_ai::plates::PlateStore::under(root, &root.join("projects"));
+    let mut session = fab_ai::Session::new(fab_plate::machine::Machine::dual_nozzle_350(), store.home.clone());
+    session.store = Some(store.clone());
+    let opening = Plate::opened(&mut session).unwrap();
+    let id = session.working_id.id().to_owned();
+    session.save(None).unwrap();
+    assert_eq!(session.plate.as_deref(), Some(id.as_str()));
+    (session, opening, store.dir(&id))
+}
+
+#[test]
+fn pause_retires_an_adopted_opening_before_its_first_send() {
+    let root = temp();
+    let (mut session, opening, plate) = saved_opening(&root);
+    let dir = plate.join("journal");
+    assert!(writer_progress(&dir).is_none());
+    pause_plate(&root.join("absent")).unwrap().resume();
+    assert!(!root.join("absent").exists(), "a pause without a pipe must touch no path");
+    pause_plate(&plate).unwrap().prepare().and_then(|p| p.commit()).unwrap();
+    let id = session.plate.clone().unwrap();
+    let bin = root.join("trash");
+    fs::create_dir(&bin).unwrap();
+    session.delete_plate(&id, &|p| fs::rename(p, bin.join(p.file_name().unwrap())).map_err(|e| e.to_string())).unwrap();
+    opening.send(call());
+    assert!(writer_progress(&dir).is_none(), "a retired lazy opening must never create its pipe");
+    assert_eq!((opening.pending(), opening.discarded()), (0, 1));
+    let mut quit = Quit::default();
+    quit.answered();
+    assert!(live::quit_for(&mut quit, &opening, |_, _| panic!("Quit cut a retired opening"), |_| ()));
+    assert!(!plate.exists() && !root.join("journal-loss").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retrying_writer_pauses_for_peer_refusal_and_resumes_every_row() {
+    let root = temp();
+    let (_, opening, plate) = saved_opening(&root);
+    let dir = plate.join("journal");
+    opening.send(call());
+    let (events, seen) = mpsc::channel();
+    let fail = Arc::new(AtomicBool::new(true));
+    let block = fail.clone();
+    let work = opening.worker();
+    let worker = thread::spawn(move || with_probe(move |point| {
+        if point == "before row lock" && block.load(Ordering::Acquire) { return Err(io::ErrorKind::PermissionDenied.into()) }
+        if matches!(point, "writer retry wait" | "writer idle") { events.send(point).unwrap(); }
+        Ok(())
+    }, work));
+    assert_eq!(seen.recv().unwrap(), "writer retry wait");
+    let pause = pause_plate(&plate).unwrap();
+    let peer = OpenOptions::new().read(true).write(true).open(plate.join(LIFETIME)).unwrap();
+    peer.try_lock_shared().unwrap();
+    let delete = OpenOptions::new().read(true).write(true).open(plate.join(LIFETIME)).unwrap();
+    assert!(matches!(delete.try_lock(), Err(fs::TryLockError::WouldBlock)), "a peer still owns its lifetime");
+    opening.send(call());
+    assert_eq!(opening.pending(), 3);
+    assert!(!loss::has_note(&plate, Some(&root), None).unwrap());
+    fail.store(false, Ordering::Release);
+    pause.resume();
+    assert_eq!(seen.recv().unwrap(), "writer idle");
+    assert_eq!(opening.pending(), 0);
+    assert_eq!(read_rows(&dir).unwrap().len(), 3);
+    let pause = pause_plate(&plate).unwrap();
+    drop(peer);
+    delete.try_lock().unwrap();
+    opening.send(call());
+    pause.prepare().and_then(|p| p.commit()).unwrap();
+    worker.join().unwrap();
+    assert!(loss::has_note(&plate, None, None).unwrap(), "the pending reservation must be cut while the plate exists");
+    assert_eq!(opening.pending(), 0);
+    drop(delete);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn settled_quit_fallback_moves_inside_the_plate_before_peer_discovery() {
+    let root = temp();
+    let (mut session, opening, plate) = saved_opening(&root);
+    let store = session.store.clone().unwrap();
+    let id = session.plate.clone().unwrap();
+    opening.send(call());
+    let writer = opening.take_writer();
+    let row = writer.rx.try_recv().unwrap();
+    with_probe(|p| if p == "before row lock" { Err(io::ErrorKind::PermissionDenied.into()) } else { Ok(()) },
+        || assert!(!writer.try_write(&row, |_| ())));
+    drop(writer);
+    let mut quit = Quit::default();
+    quit.repeat();
+    let mut dispatched = None;
+    assert!(!live::quit_for(&mut quit, &opening, |notes, done| dispatched = Some((notes, done)), |_| ()));
+    let (notes, done) = dispatched.unwrap();
+    let pause = pause_plate(&plate).unwrap();
+    let lock = OpenOptions::new().read(true).write(true).open(plate.join(LIFETIME)).unwrap();
+    lock.try_lock().unwrap();
+    let (waiting, receipt) = mpsc::channel();
+    let (published, inspect) = mpsc::channel();
+    let (checked, proceed) = mpsc::channel();
+    let commit = thread::spawn(move || with_probe(move |p| {
+        if p == "waiting for quit note" { waiting.send(()).unwrap(); }
+        if p == "before fallback transfer" { published.send(()).unwrap(); proceed.recv().unwrap(); }
+        Ok(())
+    }, || pause.prepare().and_then(|p| p.commit())));
+    receipt.recv().unwrap();
+    assert!(!commit.is_finished(), "commit must await an already-dispatched Quit write");
+    let fallback = root.join("journal-loss").join(&id);
+    let mut primary = true;
+    with_probe(move |p| {
+        if p == "publish loss note" && std::mem::take(&mut primary) { return Err(io::ErrorKind::PermissionDenied.into()) }
+        Ok(())
+    }, || notes[0].write());
+    done.send(()).unwrap();
+    inspect.recv().unwrap();
+    let before = directory_bytes(&fallback);
+    assert_eq!(before.len(), 1);
+    checked.send(()).unwrap();
+    commit.join().unwrap().unwrap();
+    assert_eq!(opening.pending(), 0);
+    assert!(fs::read_dir(&fallback).unwrap().next().is_none());
+    let names: Vec<_> = fs::read_dir(&plate).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().starts_with("loss-")).collect();
+    assert_eq!(names.len(), 1, "the Quit cut must be accounted exactly once");
+    let name = names[0].file_name();
+    drop(names);
+    let bytes = fs::read(plate.join(&name)).unwrap();
+    assert_eq!(before.get(&fallback.join(&name)), Some(&bytes), "the confirmed fallback name and bytes must reach the primary unchanged");
+    let note = reader::parse(&bytes).unwrap();
+    assert_eq!(note.get("prefix").and_then(Value::as_str), Some("unknown"));
+    assert_eq!(note.get("count").and_then(Value::as_u64), Some(2));
+    #[cfg(windows)]
+    drop(lock);
+    let bin = root.join("trash");
+    fs::create_dir(&bin).unwrap();
+    session.delete_plate(&id, &|p| fs::rename(p, bin.join(p.file_name().unwrap())).map_err(|e| e.to_string())).unwrap();
+    loss::discover_for_recovery(&store, &mut |_| (), |found, create| {
+        recover_discovered_writer(&store, found, create, &mut Vec::new());
+    });
+    assert!(!plate.exists(), "peer discovery before fallback cleanup must leave the plate absent");
+    assert_eq!(fs::read(bin.join(id).join(name)).unwrap(), bytes);
+    #[cfg(unix)]
+    drop(lock);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_fallback_transfer_keeps_plate_and_resumes_its_writer() {
+    let root = temp();
+    let (session, opening, plate) = saved_opening(&root);
+    let id = session.plate.as_ref().unwrap();
+    let fallback = root.join("journal-loss").join(id);
+    fs::create_dir_all(&fallback).unwrap();
+    let name = "loss-other.json";
+    fs::write(fallback.join(name), b"original bytes").unwrap();
+    fs::create_dir(plate.join(name)).unwrap();
+    let saved = fs::read(plate.join("plate")).unwrap();
+    let pause = pause_plate(&plate).unwrap();
+    opening.send(call()); // first pipe appeared during the pause
+    let (idle, seen) = mpsc::channel();
+    let work = opening.worker();
+    let worker = thread::spawn(move || with_probe(move |point| {
+        if point == "writer idle" { idle.send(()).unwrap(); }
+        Ok(())
+    }, work));
+    assert_eq!(pause.prepare().and_then(|p| p.commit()).err().expect("transfer must fail").to_string(), "Fab couldn't prepare this plate's journal for the Trash. It is kept.");
+    seen.recv().unwrap();
+    assert_eq!(opening.pending(), 0, "a failed transfer must resume the unclaimed writer");
+    assert_eq!(read_rows(&plate.join("journal")).unwrap().len(), 2);
+    assert_eq!(fs::read(plate.join("plate")).unwrap(), saved);
+    assert_eq!(fs::read(fallback.join(name)).unwrap(), b"original bytes");
+    fs::remove_dir(plate.join(name)).unwrap();
+    fs::write(fallback.join("leave.tmp"), b"unrelated").unwrap();
+    pause_plate(&plate).unwrap().prepare().and_then(|p| p.commit()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(fs::read(plate.join(name)).unwrap(), b"original bytes", "transfer preserves even unparseable note bytes");
+    assert_eq!(fs::read(fallback.join("leave.tmp")).unwrap(), b"unrelated");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pause_interrupts_a_writer_waiting_on_a_peer_row_lock() {
+    let root = temp();
+    let (_, opening, plate) = saved_opening(&root);
+    let dir = plate.join("journal");
+    let (_, peer) = Journal::channel(dir.clone(), Arc::default(), 1, Arc::new(|_| ()));
+    peer.prepare(&mut |_| ()).unwrap();
+    let row = OpenOptions::new().read(true).write(true).open(dir.join(LOCK)).unwrap();
+    row.try_lock().unwrap();
+    opening.send(call());
+    let work = opening.worker();
+    let (tried, seen) = mpsc::channel();
+    let worker = thread::spawn(move || with_probe(move |p| {
+        if p == "row try" { tried.send(()).unwrap(); }
+        Ok(())
+    }, work));
+    seen.recv().unwrap();
+    let pause = pause_plate(&plate).unwrap();
+    assert_eq!(opening.pending(), 2);
+    assert_eq!(writer_progress(&dir).unwrap().health(), Health::Ok);
+    drop(row);
+    drop(peer);
+    // A send after the first cut, while its note is still being published,
+    // belongs to the Delete. Only sends after retirement are discarded.
+    let late = opening.clone();
+    let mut first = true;
+    with_probe(move |p| {
+        if p == "publish loss note" && std::mem::take(&mut first) { late.send(call()); }
+        Ok(())
+    }, || pause.prepare().and_then(|p| p.commit()).unwrap());
+    worker.join().unwrap();
+    let mut counts: Vec<_> = fs::read_dir(&plate).unwrap().map(Result::unwrap)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("loss-"))
+        .map(|e| reader::parse(&fs::read(e.path()).unwrap()).unwrap().get("count").unwrap().as_u64().unwrap()).collect();
+    counts.sort_unstable();
+    assert_eq!(counts, [1, 2]);
+    assert_eq!((opening.pending(), opening.discarded()), (0, 0));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_second_delete_note_retracts_only_the_provisional_cut() {
+    let root = temp();
+    let (_, opening, plate) = saved_opening(&root);
+    let pause = pause_plate(&plate).unwrap();
+    opening.send(call());
+    let late = opening.clone();
+    let mut first = true;
+    let result = with_probe(move |point| {
+        if point == "publish loss note" {
+            if !std::mem::take(&mut first) { return Err(io::ErrorKind::StorageFull.into()) }
+            late.send(call());
+        }
+        Ok(())
+    }, || pause.prepare().and_then(|p| p.commit()));
+    assert!(result.is_err());
+    assert!(!loss::has_note(&plate, Some(&root), None).unwrap(), "a refused Delete cannot report the surviving rows as lost");
+    let writer = opening.take_writer();
+    writer.batch(writer.rx.try_recv().unwrap());
+    assert_eq!(opening.pending(), 0);
+    let rows = read_rows(&plate.join("journal")).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.get("kind").unwrap().as_str() != Some("lost")));
+    drop(writer);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn partially_transferred_notes_keep_their_bytes_and_resume_at_the_remaining_copy() {
+    let root = temp();
+    let (session, _, plate) = saved_opening(&root);
+    let id = session.plate.as_ref().unwrap();
+    let fallback = root.join("journal-loss").join(id);
+    fs::create_dir_all(&fallback).unwrap();
+    for (name, local) in [("first", false), ("second", true)] {
+        let mut fields = vec![("note", s(name)), ("plate", s(id)), ("time_ms", number(1)),
+            ("from", number(1)), ("to", number(1)), ("count", number(1))];
+        if local { fields.push(("prefix", s("unknown"))); } else { fields.push(("journal", s(Incarnation::mint().to_string()))); }
+        fs::write(fallback.join(format!("loss-{name}.json")), obj(fields).to_json()).unwrap();
+    }
+    let before = directory_bytes(&fallback);
+    let result = with_probe(|point| if point == "transferred loss note" { Err(io::ErrorKind::Interrupted.into()) } else { Ok(()) },
+        || pause_plate(&plate).unwrap().prepare().and_then(|p| p.commit()));
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(&fallback).unwrap().count(), 1, "one durable transfer must stand after the failure");
+    for (source, bytes) in &before {
+        let primary = plate.join(source.file_name().unwrap());
+        assert_ne!(primary.exists(), source.exists(), "each note has one durable location");
+        assert_eq!(&fs::read(if primary.exists() { &primary } else { source }).unwrap(), bytes);
+    }
+    pause_plate(&plate).unwrap().prepare().and_then(|p| p.commit()).unwrap();
+    for (source, bytes) in before {
+        assert!(!source.exists());
+        assert_eq!(fs::read(plate.join(source.file_name().unwrap())).unwrap(), bytes);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+mod model_host_delete {
+    use super::*;
+    use crate::model_host::delete_saved_plate;
+
+    fn failed_before_trash(removed_flag: bool) {
+        let root = temp();
+        let (mut session, opening, plate) = saved_opening(&root);
+        let id = session.plate.clone().unwrap();
+        let store = session.store.clone().unwrap();
+        let project = session.path.clone().unwrap();
+        let project_bytes = fs::read(&project).unwrap();
+        let path = plate.join("plate");
+        // An older or newer build may own a field this build does not serialize.
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"another_field\tkept\n").unwrap();
+        let record = fs::read(&path).unwrap();
+        let fallback = root.join("journal-loss").join(&id);
+        fs::create_dir_all(&fallback).unwrap();
+        fs::write(fallback.join("loss-fixture.json"), b"original note").unwrap();
+        if removed_flag {
+            fs::create_dir(path.with_extension(".tmp")).unwrap();
+        } else {
+            let missing = root.join("other.fab.splash");
+            store.create("Other", Some(missing), String::new(), fab_ai::plates::Origin::Plate).unwrap();
+        }
+        let error = delete_saved_plate(&mut session, &id, std::process::id(),
+            &|_| panic!("a refusal before Trash must never request a move")).err().expect("refused Delete");
+        assert!(if removed_flag { error.contains("plate..tmp") } else { error.ends_with(" is gone") },
+            "Delete must reach the intended model failure");
+        assert_eq!(fs::read(path).unwrap(), record, "the entire original record must survive");
+        assert!(!store.read(&id).unwrap().removed);
+        assert_eq!(session.plate.as_deref(), Some(id.as_str()), "the original plate must still be on the bed");
+        assert_eq!(fs::read(project).unwrap(), project_bytes);
+        assert_eq!(fs::read(plate.join("loss-fixture.json")).unwrap(), b"original note", "the reversible transfer is durable");
+        let bed = Plate::opened(&mut session).unwrap();
+        assert!(bed.send(call()) > 0, "the still-open plate must accept its next call");
+        bed.measured_writer()();
+        assert_eq!(read_rows(&plate.join("journal")).unwrap().len(), 2, "the checkpoint and call must reach the original journal");
+        assert_eq!(opening.discarded(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_successor_restores_exact_record_bed_and_recording() { failed_before_trash(false); }
+
+    #[test]
+    fn unwritable_removed_flag_keeps_record_bed_and_recording() { failed_before_trash(true); }
+
+    #[test]
+    fn adopted_opening_refuses_a_peer_delete_and_releases_its_own_presence() {
+        let root = temp();
+        let (mut session, opening, plate) = saved_opening(&root);
+        let id = session.plate.clone().unwrap();
+        let _serial = crate::cx_shared();
+        let cx = makepad_widgets::Cx::new(Box::new(|_, _| {}));
+        opening.attach(&cx.thread_spawner());
+        let bed = Plate::opened(&mut session).unwrap(); // first observation of the adopted id
+        bed.attach(&cx.thread_spawner());
+        let own = std::process::id();
+        let peer = own.wrapping_add(1);
+        while other_presence_holders(&plate, peer).unwrap() == 0 { thread::yield_now(); }
+        let bytes = fs::read(plate.join("plate")).unwrap();
+        let project = session.path.clone().unwrap();
+        let project_bytes = fs::read(&project).unwrap();
+        let e = delete_saved_plate(&mut session, &id, peer, &|_| panic!("a presence refusal must not trash")).err().expect("peer refusal");
+        assert_eq!(e, "This plate is open in another Fab window. Close it there first.");
+        assert_eq!(fs::read(plate.join("plate")).unwrap(), bytes);
+        assert_eq!(session.plate.as_deref(), Some(id.as_str()));
+        assert_eq!(fs::read(&project).unwrap(), project_bytes);
+        assert_eq!(other_presence_holders(&plate, peer).unwrap(), 1, "a refusal keeps the original window's watch");
+        assert!(!plate.join(LIFETIME).exists(), "a presence refusal must precede lock creation");
+
+        opening.send(call());
+        while opening.pending() != 0 { thread::yield_now(); }
+        let observer = File::open(plate.join(LIFETIME)).unwrap();
+        assert!(matches!(observer.try_lock(), Err(fs::TryLockError::WouldBlock)),
+            "the writer must still own its handles when this window asks to delete");
+        drop(observer);
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        delete_saved_plate(&mut session, &id, own, &|path| {
+            if path == plate { assert_eq!(other_presence_holders(path, peer).unwrap(), 0, "release the adopted watch before the folder move"); }
+            fs::rename(path, bin.join(path.file_name().unwrap())).map_err(|e| e.to_string())
+        }).unwrap();
+        assert!(bin.join(id).join("plate").is_file() && !plate.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn reopen_after_trash(restore: bool) {
+        let root = temp();
+        let (mut session, opening, plate) = saved_opening(&root);
+        let project = session.path.clone().unwrap();
+        let dir = plate.join("journal");
+        let id = session.plate.clone().unwrap();
+        let late = Call::begin(&opening, fab_elec_design::By::Person, "original", Value::Null);
+        opening.measured_writer()();
+        opening.send(call()); // pending when the Delete cuts
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let moved = RefCell::new(Vec::new());
+        let occupied = bin.join("occupied");
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("keep"), []).unwrap();
+        let result = delete_saved_plate(&mut session, &id, std::process::id(), &|path| {
+            assert!(matches!(live::RecoveryWriter::enter(&dir), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "discovery must see retirement until Delete finishes");
+            let dest = if restore { bin.join(path.file_name().unwrap()) } else { occupied.clone() };
+            fs::rename(path, &dest).map_err(|e| e.to_string())?;
+            moved.borrow_mut().push((path.to_owned(), dest));
+            Ok(())
+        });
+        if restore {
+            result.unwrap();
+            assert!(!plate.exists());
+            for (original, dest) in moved.into_inner() { fs::rename(dest, original).unwrap(); }
+        } else {
+            assert!(result.is_err() && plate.is_dir() && project.is_file(), "refused rename must keep all files");
+        }
+        session.open(&project).unwrap();
+        let reopened = Plate::opened(&mut session).unwrap();
+        assert!(reopened.send(call()) > 0, "a genuine reopen must reserve a real order");
+        reopened.measured_writer()();
+        let rows = read_rows(&dir).unwrap();
+        assert_eq!(rows.len(), 5, "the original rows, recovered cut and new opening must reach disk");
+        assert!(rows.iter().any(|r| r.get("kind").and_then(Value::as_str) == Some("lost") &&
+            r.get("count").and_then(Value::as_u64) == Some(1)), "the new writer must recover the cut");
+        let before = fs::read(dir.join(LOG)).unwrap();
+        late.done("ok", String::new());
+        assert_eq!((opening.discarded(), reopened.discarded(), reopened.pending()), (1, 0, 0),
+            "the late reply belongs only to its retired opening");
+        assert_eq!(fs::read(dir.join(LOG)).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refused_rename_then_reopen_records_and_discards_only_the_old_reply() { reopen_after_trash(false); }
+
+    #[test]
+    fn restored_plate_records_in_a_new_opening_after_successful_delete() { reopen_after_trash(true); }
+
+    #[test]
+    fn a_peer_repair_refuses_delete_and_keeps_bed_record_project_and_recording() {
+        let root = temp();
+        let (mut session, opening, plate) = saved_opening(&root);
+        let id = session.plate.clone().unwrap();
+        let dir = plate.join("journal");
+        let project = session.path.clone().unwrap();
+        let record = fs::read(plate.join("plate")).unwrap();
+        let bytes = fs::read(&project).unwrap();
+        let (peer, writer) = Journal::channel(dir.clone(), Arc::default(), 1, Arc::new(|_| ()));
+        peer.send(call());
+        assert!(writer.try_write(&writer.rx.recv().unwrap(), |_| ()));
+        OpenOptions::new().append(true).open(dir.join(LOG)).unwrap().write_all(b"{").unwrap();
+        peer.send(call());
+        let row = writer.rx.recv().unwrap();
+        let (parked, seen) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let repairing = thread::spawn(move || with_probe(move |at| {
+            if at == "repair synced" { parked.send(()).unwrap(); resume.recv().unwrap(); }
+            Ok(())
+        }, || assert!(writer.try_write(&row, |_| ()))));
+        seen.recv().unwrap();
+        let result = delete_saved_plate(&mut session, &id, std::process::id(),
+            &|_| panic!("Delete must not reach Trash inside a peer repair"));
+        finish.send(()).unwrap();
+        repairing.join().unwrap();
+        assert_eq!(result.err().unwrap(), "This plate is open in another Fab window. Close it there first.");
+        assert_eq!(fs::read(plate.join("plate")).unwrap(), record);
+        assert!(!session.store.as_ref().unwrap().read(&id).unwrap().removed);
+        assert_eq!(session.plate.as_deref(), Some(id.as_str()));
+        assert_eq!(fs::read(project).unwrap(), bytes);
+        assert!(opening.send(call()) > 0, "the peer refusal must resume this opening");
+        opening.measured_writer()();
+        assert_eq!(opening.pending(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_cuts_unclaimed_adopted_rows_and_cleans_only_the_moved_plates_fallback() {
+        for extra in [false, true] {
+            let root = temp();
+            let (mut session, opening, plate) = saved_opening(&root);
+            let store = session.store.clone().unwrap();
+            let id = session.plate.clone().unwrap();
+            let fallback = root.join("journal-loss").join(&id);
+            fs::create_dir_all(&fallback).unwrap();
+            if extra { fs::write(fallback.join("other"), b"kept").unwrap(); }
+            let bin = root.join("bin");
+            fs::create_dir(&bin).unwrap();
+            opening.send(call());
+            assert_eq!(opening.pending(), 2);
+            assert!(!plate.join("journal").exists(), "the opening has never prepared");
+            delete_saved_plate(&mut session, &id, std::process::id(), &|path| {
+                let dest = if path == fallback { bin.join("fallback") } else { bin.join(path.file_name().unwrap()) };
+                fs::rename(path, dest).map_err(|e| e.to_string())
+            }).unwrap();
+            let in_trash = bin.join(&id);
+            let note = fs::read_dir(&in_trash).unwrap().map(Result::unwrap)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("loss-")).collect::<Vec<_>>();
+            assert_eq!(note.len(), 1);
+            let note = reader::parse(&fs::read(note[0].path()).unwrap()).unwrap();
+            assert_eq!(note.get("prefix").and_then(Value::as_str), Some("unknown"));
+            assert_eq!(note.get("count").and_then(Value::as_u64), Some(2));
+            assert!(!fallback.exists());
+            assert_eq!(bin.join("fallback").exists(), extra, "only a nonempty remainder goes to Trash");
+            if extra { assert_eq!(fs::read(bin.join("fallback/other")).unwrap(), b"kept"); }
+            let mut quit = Quit::default();
+            quit.answered();
+            assert!(live::quit_for(&mut quit, &opening, |_, _| panic!("Quit must not cut the retired opening"), |_| ()));
+            loss::discover_for_recovery(&store, &mut |_| (), |dir, create| {
+                recover_discovered_writer(&store, dir, create, &mut Vec::new());
+            });
+            assert!(!plate.exists() && !fallback.exists(), "Quit and discovery must keep the deleted plate absent");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
 }

@@ -15,10 +15,14 @@
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window; screenshot
 //! pixels are layout points.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
 #[path = "common/picture.rs"]
 mod picture;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use makepad_script::syntax::{self, Node};
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, Role, Selector, TestApp};
@@ -258,10 +262,9 @@ fn the_gizmo_and_the_panel_follow_the_part_through_drags_and_commits(app: TestAp
     app.locator(Selector::id("t_rotate")).wait_checked(true);
 
     // Pick the vase in the parts list (a narrow window stacks it behind its tab).
-    if app.widget_snapshot().nodes().into_iter().any(|w| w.visible() && w.node.role == Role::Tab && w.node.name == "Parts") {
-        app.locator(Selector::role(Role::Tab).name("Parts")).click();
-    }
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Bud vase")).wait_visible().click();
+    part_editor::open(&app);
     app.locator(Selector::id("t_move")).wait_visible().click();
     app.locator(Selector::id("t_move")).wait_checked(true);
     let g0 = steady_gizmo(&app);
@@ -359,8 +362,9 @@ fn the_gizmo_and_the_panel_follow_the_part_through_drags_and_commits(app: TestAp
         mouse(&app, "move", a0.0 + out.0 * d, a0.1 + out.1 * d);
     }
     let (x3, y3, z3) = (panel_number(&app, "Scale X"), panel_number(&app, "Scale Y"), panel_number(&app, "Scale Z"));
-    let (n3, _) = grab(&app.screenshot()).vase(g, 200.0, (-1000.0, -1000.0));
-    // held there till the stretched vase is traced whole, for its picture
+    // The drag's own frame: each move gives the vase a new shape, traced tile by tile, so a frame
+    // before the last shape is traced whole shows only part of the stretch (on a loaded box, less
+    // of it). Held there till it is traced whole; its picture shows the widening.
     wait_within(&app, "the stretched vase traced", Duration::from_secs(20), || settled(&app));
     let shot = picture::finished_screenshot(&app);
     if let Some(dir) = std::env::var_os("DEVHUB_KEEP") {
@@ -369,10 +373,10 @@ fn the_gizmo_and_the_panel_follow_the_part_through_drags_and_commits(app: TestAp
     let preview = grab(&shot);
     let (nd, _) = preview.vase(g, 200.0, (-1000.0, -1000.0));
     let (_, inside) = preview.specks(&preview, g, 200.0);
-    println!("[fab-gizmo] scale along X: {s2:.1} % -> X {x3:.1} Y {y3:.1} Z {z3:.1} %, vase {n0} -> {n3} px");
+    println!("[fab-gizmo] scale along X: {s2:.1} % -> X {x3:.1} Y {y3:.1} Z {z3:.1} %, vase {n0} -> {nd} px");
     assert!(x3 > s2 + 5.0, "the panel's X kept the old scale during the drag: {s2} -> {x3}");
     assert!((y3 - y2).abs() < 0.05 && (z3 - z2).abs() < 0.05, "the X handle moved another axis: Y {y2} -> {y3}, Z {z2} -> {z3}");
-    assert!(n3 as f64 > n0 as f64 * 1.03, "the drawn vase did not widen during the drag: {n0} -> {n3} px");
+    assert!(nd as f64 > n0 as f64 * 1.03, "the drawn vase did not widen during the drag: {n0} -> {nd} px");
     assert_eq!(head(&app), head2, "a drag committed before it was let go");
     mouse(&app, "up", a0.0 + out.0 * 60.0, a0.1 + out.1 * 60.0);
     // Each frame till the committed field is drawn and settled: the vase as the drag left it,
@@ -408,6 +412,7 @@ fn the_gizmo_and_the_panel_follow_the_part_through_drags_and_commits(app: TestAp
     app.locator(Selector::id("t_move")).click();
     let g3 = steady_gizmo(&app);
     let (_, v3) = grab(&picture::finished_screenshot(&app)).vase(g3, 120.0, g3);
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Shelf bracket")).wait_visible().click();
     wait_within(&app, "the gizmo on the other part", Duration::from_secs(20), || gizmo(&app).is_some_and(|g| dist(g, g3) > 20.0));
     mouse(&app, "down", v3.0, v3.1);

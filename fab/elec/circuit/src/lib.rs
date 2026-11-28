@@ -245,8 +245,30 @@ pub struct BlockDef {
     pub sheet: BlockSheet,
     /// The layout document of the block's board template.
     pub template: Option<String>,
+    /// An architectural block whose implementation may still be absent.
+    pub planned: bool,
+    pub role: Option<String>,
 }
-canon_struct!(BlockDef { id, name, ports, params, sheet, template });
+
+impl fab_elec_core::Canon for BlockDef {
+    fn canon(&self, w: &mut fab_elec_core::Writer) {
+        let Self { id, name, ports, params, sheet, template, planned, role } = self;
+        id.canon(w);
+        name.canon(w);
+        ports.canon(w);
+        params.canon(w);
+        sheet.canon(w);
+        template.canon(w);
+        // Preserve the six-field encoding of existing definitions.
+        if *planned {
+            w.tag(1);
+        }
+        if let Some(role) = role {
+            w.tag(2);
+            role.canon(w);
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct PortDef {

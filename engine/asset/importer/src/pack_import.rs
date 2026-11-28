@@ -1565,7 +1565,7 @@ struct DirSnapshot {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
-    names: Vec<String>,
+    entries: Vec<(String, u8)>,
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1601,6 +1601,68 @@ fn scan_pack(root: &PackRoot) -> Result<(Vec<DiscoveredFile>, Vec<DirSnapshot>),
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug)]
+enum EntryOpen<T> {
+    Skip,
+    SkipUnreadable(PackImportError),
+    Opened(T),
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_walk_entry<T, F>(
+    name: &str,
+    child_rel: &str,
+    d_type: u8,
+    open: F,
+) -> Result<EntryOpen<T>, PackImportError>
+where
+    F: FnOnce() -> Result<T, PackImportError>,
+{
+    match d_type {
+        unix::DT_DIR => {
+            if name.starts_with('.') {
+                return Ok(EntryOpen::Skip);
+            }
+        }
+        unix::DT_REG => {
+            if skip_entry(name) {
+                return Ok(EntryOpen::Skip);
+            }
+            if name.starts_with('.') {
+                return Err(PackImportError::new(
+                    PackImportErrorKind::Unsupported,
+                    format!("hidden file {child_rel}"),
+                ));
+            }
+        }
+        unix::DT_LNK => {
+            return Err(PackImportError::new(
+                PackImportErrorKind::Special,
+                format!("refusing symlink {child_rel}"),
+            ));
+        }
+        unix::DT_UNKNOWN => {}
+        _ => {
+            return Err(PackImportError::new(
+                PackImportErrorKind::Special,
+                format!("refusing special file {child_rel}"),
+            ));
+        }
+    }
+    match open() {
+        Ok(entry) => Ok(EntryOpen::Opened(entry)),
+        Err(err)
+            if d_type == unix::DT_UNKNOWN
+                && err.kind == PackImportErrorKind::Io
+                && (name.starts_with('.') || skip_entry(name)) =>
+        {
+            Ok(EntryOpen::SkipUnreadable(err))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn walk_dir(
     dir: &File,
     rel: &str,
@@ -1625,7 +1687,7 @@ fn walk_dir(
         ));
     }
     unix::bind_resolved(dir, &root.path, rel)?;
-    let names = unix::list_dir_bounded(dir, rel, entries)?;
+    let dir_entries = unix::list_dir_bounded(dir, rel, entries)?;
     let meta = dir.metadata().map_err(|e| {
         PackImportError::new(PackImportErrorKind::Io, format!("fstat dir {}: {e}", dir_label(rel)))
     })?;
@@ -1635,9 +1697,9 @@ fn walk_dir(
         dev: meta.dev(),
         #[cfg(unix)]
         ino: meta.ino(),
-        names: names.clone(),
+        entries: dir_entries.clone(),
     });
-    for name in names {
+    for (name, d_type) in dir_entries {
         if name == "." || name == ".." {
             return Err(PackImportError::new(
                 PackImportErrorKind::Traversal,
@@ -1649,31 +1711,24 @@ fn walk_dir(
         } else {
             format!("{rel}/{name}")
         };
-        if name.starts_with('.') && skip_entry(&name) {
-            continue;
-        }
-        let kind = unix::fstatat_kind(dir, &name, &child_rel)?;
-        match kind {
-            unix::AtKind::Symlink => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("refusing symlink {child_rel}"),
-                ));
+        let opened = match open_walk_entry(&name, &child_rel, d_type, || {
+            unix::openat_entry_nofollow(dir, &name, &child_rel)
+        })? {
+            EntryOpen::Skip => continue,
+            EntryOpen::SkipUnreadable(err) => {
+                eprintln!("[asset-worker] import-pack: skipping unreadable {child_rel}: {err}");
+                continue;
             }
-            unix::AtKind::Special => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("refusing special file {child_rel}"),
-                ));
-            }
-            unix::AtKind::Directory => {
+            EntryOpen::Opened(entry) => entry,
+        };
+        match opened {
+            unix::AtEntry::Directory(child) => {
                 if name.starts_with('.') {
                     continue;
                 }
-                let child = unix::openat_nofollow(dir, &name, true, &child_rel)?;
                 walk_dir(&child, &child_rel, root, depth + 1, dirs, entries, out, snaps)?;
             }
-            unix::AtKind::Regular => {
+            unix::AtEntry::Regular(child, meta) => {
                 if skip_entry(&name) {
                     continue;
                 }
@@ -1683,11 +1738,7 @@ fn walk_dir(
                         format!("hidden file {child_rel}"),
                     ));
                 }
-                let child = unix::openat_nofollow(dir, &name, false, &child_rel)?;
                 unix::bind_resolved(&child, &root.path, &child_rel)?;
-                let meta = child.metadata().map_err(|e| {
-                    PackImportError::new(PackImportErrorKind::Io, format!("stat {child_rel}: {e}"))
-                })?;
                 let (pack_path, key, kind) = classify_rel(&child_rel)?;
                 if meta.len() == 0 {
                     return Err(PackImportError::new(
@@ -1719,162 +1770,97 @@ fn walk_dir(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod unix {
     use super::*;
+    use core::ffi::{c_char, c_int, c_uint, c_void};
     use std::ffi::{CStr, CString};
     use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
+    const EEXIST: c_int = 17;
+    const ENOTDIR: c_int = 20;
+    pub(super) const DT_UNKNOWN: u8 = 0;
+    pub(super) const DT_DIR: u8 = 4;
+    pub(super) const DT_REG: u8 = 8;
+    pub(super) const DT_LNK: u8 = 10;
+
     #[cfg(target_os = "macos")]
-    const O_RDONLY: i32 = 0;
+    type ModeT = u16;
     #[cfg(target_os = "macos")]
-    const O_WRONLY: i32 = 0x0001;
+    const ELOOP: c_int = 62;
     #[cfg(target_os = "macos")]
-    const O_NONBLOCK: i32 = 0x0004;
+    const EOPNOTSUPP: c_int = 102;
     #[cfg(target_os = "macos")]
-    const O_DIRECTORY: i32 = 0x0010_0000;
+    const O_NOCTTY: c_int = 0x0002_0000;
     #[cfg(target_os = "macos")]
-    const O_CLOEXEC: i32 = 0x0100_0000;
+    const O_RDONLY: c_int = 0;
     #[cfg(target_os = "macos")]
-    pub(super) const O_NOFOLLOW: i32 = 0x0100;
+    const O_WRONLY: c_int = 0x0001;
     #[cfg(target_os = "macos")]
-    const O_CREAT: i32 = 0x0200;
+    const O_NONBLOCK: c_int = 0x0004;
     #[cfg(target_os = "macos")]
-    const O_EXCL: i32 = 0x0800;
+    pub(super) const O_DIRECTORY: c_int = 0x0010_0000;
     #[cfg(target_os = "macos")]
-    const F_GETPATH: i32 = 50;
+    const O_CLOEXEC: c_int = 0x0100_0000;
     #[cfg(target_os = "macos")]
-    const AT_SYMLINK_NOFOLLOW: i32 = 0x0020;
+    pub(super) const O_NOFOLLOW: c_int = 0x0100;
     #[cfg(target_os = "macos")]
-    const AT_FDCWD: i32 = -2;
+    const O_CREAT: c_int = 0x0200;
     #[cfg(target_os = "macos")]
-    const RENAME_EXCL: u32 = 0x0004;
+    const O_EXCL: c_int = 0x0800;
     #[cfg(target_os = "macos")]
-    const S_IFMT: u32 = 0o170000;
+    const F_GETPATH: c_int = 50;
     #[cfg(target_os = "macos")]
-    const S_IFREG: u32 = 0o100000;
-    #[cfg(target_os = "macos")]
-    const S_IFDIR: u32 = 0o040000;
-    #[cfg(target_os = "macos")]
-    const S_IFLNK: u32 = 0o120000;
+    const RENAME_EXCL: c_uint = 0x0004;
 
     #[cfg(target_os = "linux")]
-    const O_RDONLY: i32 = 0;
+    type ModeT = u32;
     #[cfg(target_os = "linux")]
-    const O_WRONLY: i32 = 0x0001;
+    const ELOOP: c_int = 40;
     #[cfg(target_os = "linux")]
-    const O_NONBLOCK: i32 = 0x0800;
+    const ENXIO: c_int = 6;
     #[cfg(target_os = "linux")]
-    const O_DIRECTORY: i32 = 0x10000;
+    const O_NOCTTY: c_int = 0o400;
     #[cfg(target_os = "linux")]
-    const O_CLOEXEC: i32 = 0x80000;
+    const O_RDONLY: c_int = 0;
     #[cfg(target_os = "linux")]
-    pub(super) const O_NOFOLLOW: i32 = 0x20000;
+    const O_WRONLY: c_int = 0x0001;
     #[cfg(target_os = "linux")]
-    const O_CREAT: i32 = 0x40;
+    const O_NONBLOCK: c_int = 0x0800;
     #[cfg(target_os = "linux")]
-    const O_EXCL: i32 = 0x80;
+    const O_CLOEXEC: c_int = 0x80000;
+    // Linux's O_NOFOLLOW and O_DIRECTORY differ by architecture: arm, aarch64,
+    // powerpc and powerpc64 use 0o100000 and 0o40000 (where the generic values
+    // mean O_LARGEFILE / O_DIRECT on arm/aarch64 and O_DIRECT / O_LARGEFILE on
+    // powerpc); x86, x86_64, riscv and loongarch use the generic 0o400000 and
+    // 0o200000.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64")
+    ))]
+    pub(super) const O_NOFOLLOW: c_int = 0o100000;
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64"))
+    ))]
+    pub(super) const O_NOFOLLOW: c_int = 0o400000;
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64")
+    ))]
+    pub(super) const O_DIRECTORY: c_int = 0o40000;
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64"))
+    ))]
+    pub(super) const O_DIRECTORY: c_int = 0o200000;
     #[cfg(target_os = "linux")]
-    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const O_CREAT: c_int = 0x40;
     #[cfg(target_os = "linux")]
-    const AT_FDCWD: i32 = -100;
+    const O_EXCL: c_int = 0x80;
     #[cfg(target_os = "linux")]
-    const RENAME_NOREPLACE: u32 = 1;
-    #[cfg(target_os = "linux")]
-    const S_IFMT: u32 = 0o170000;
-    #[cfg(target_os = "linux")]
-    const S_IFREG: u32 = 0o100000;
-    #[cfg(target_os = "linux")]
-    const S_IFDIR: u32 = 0o040000;
-    #[cfg(target_os = "linux")]
-    const S_IFLNK: u32 = 0o120000;
+    const RENAME_NOREPLACE: c_uint = 1;
 
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_RDONLY: i32 = 0;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_WRONLY: i32 = 0x0001;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_NONBLOCK: i32 = 0x0004;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_DIRECTORY: i32 = 0x0010_0000;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_CLOEXEC: i32 = 0x0100_0000;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_NOFOLLOW: i32 = 0x0100;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_CREAT: i32 = 0x0200;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const O_EXCL: i32 = 0x0800;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const AT_SYMLINK_NOFOLLOW: i32 = 0x0020;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const AT_FDCWD: i32 = -2;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const S_IFMT: u32 = 0o170000;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const S_IFREG: u32 = 0o100000;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const S_IFDIR: u32 = 0o040000;
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    const S_IFLNK: u32 = 0o120000;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum AtKind {
-        Regular,
-        Directory,
-        Symlink,
-        Special,
-    }
-
-    #[repr(C)]
-    #[cfg(target_os = "macos")]
-    struct Timespec {
-        tv_sec: i64,
-        tv_nsec: i64,
-    }
-
-    #[repr(C)]
-    #[cfg(target_os = "macos")]
-    struct Stat {
-        st_dev: i32,
-        st_mode: u16,
-        st_nlink: u16,
-        st_ino: u64,
-        st_uid: u32,
-        st_gid: u32,
-        st_rdev: i32,
-        __pad0: i32,
-        st_atimespec: Timespec,
-        st_mtimespec: Timespec,
-        st_ctimespec: Timespec,
-        st_birthtimespec: Timespec,
-        st_size: i64,
-        st_blocks: i64,
-        st_blksize: i32,
-        st_flags: u32,
-        st_gen: u32,
-        st_lspare: i32,
-        st_qspare: [i64; 2],
-    }
-
-    #[repr(C)]
-    #[cfg(not(target_os = "macos"))]
-    struct Stat {
-        st_dev: u64,
-        st_ino: u64,
-        st_nlink: u64,
-        st_mode: u32,
-        st_uid: u32,
-        st_gid: u32,
-        __pad0: i32,
-        st_rdev: u64,
-        st_size: i64,
-        st_blksize: i64,
-        st_blocks: i64,
-        st_atime: i64,
-        st_atime_nsec: i64,
-        st_mtime: i64,
-        st_mtime_nsec: i64,
-        st_ctime: i64,
-        st_ctime_nsec: i64,
-        __unused: [i64; 3],
+    pub enum AtEntry {
+        Regular(File, fs::Metadata),
+        Directory(File),
     }
 
     #[repr(C)]
@@ -1885,158 +1871,137 @@ mod unix {
         d_reclen: u16,
         d_namlen: u16,
         d_type: u8,
-        d_name: [i8; 1024],
+        d_name: [c_char; 1024],
     }
 
+    // Matches `struct dirent` on all 64-bit Linux archs (glibc & musl) and
+    // 32-bit musl, and `struct dirent64` via `readdir64` on 32-bit glibc.
     #[repr(C)]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     struct Dirent {
         d_ino: u64,
         d_off: i64,
         d_reclen: u16,
         d_type: u8,
-        d_name: [i8; 256],
+        d_name: [c_char; 256],
     }
 
     extern "C" {
-        fn open(path: *const i8, flags: i32, ...) -> i32;
-        fn openat(dirfd: i32, path: *const i8, flags: i32, ...) -> i32;
-        fn close(fd: i32) -> i32;
-        fn fdopendir(fd: i32) -> *mut core::ffi::c_void;
-        fn readdir(dir: *mut core::ffi::c_void) -> *mut Dirent;
-        fn closedir(dir: *mut core::ffi::c_void) -> i32;
-        fn fstatat(dirfd: i32, path: *const i8, buf: *mut Stat, flag: i32) -> i32;
-        #[cfg(target_os = "macos")]
-        fn mkdirat(dirfd: i32, path: *const i8, mode: u16) -> i32;
-        #[cfg(not(target_os = "macos"))]
-        fn mkdirat(dirfd: i32, path: *const i8, mode: u32) -> i32;
+        fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        fn fdopendir(fd: c_int) -> *mut c_void;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        #[cfg_attr(
+            all(target_os = "linux", target_env = "gnu", target_pointer_width = "32"),
+            link_name = "readdir64"
+        )]
+        fn readdir(dir: *mut c_void) -> *mut Dirent;
+        fn closedir(dir: *mut c_void) -> c_int;
+        fn mkdirat(dirfd: c_int, path: *const c_char, mode: ModeT) -> c_int;
         #[cfg(target_os = "macos")]
         fn renameatx_np(
-            fromfd: i32,
-            from: *const i8,
-            tofd: i32,
-            to: *const i8,
-            flags: u32,
-        ) -> i32;
+            fromfd: c_int,
+            from: *const c_char,
+            tofd: c_int,
+            to: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
         #[cfg(target_os = "linux")]
         fn renameat2(
-            olddirfd: i32,
-            oldpath: *const i8,
-            newdirfd: i32,
-            newpath: *const i8,
-            flags: u32,
-        ) -> i32;
+            olddirfd: c_int,
+            oldpath: *const c_char,
+            newdirfd: c_int,
+            newpath: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
         #[cfg(target_os = "macos")]
-        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        fn getentropy(buf: *mut u8, buflen: usize) -> i32;
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        fn getentropy(buf: *mut c_void, buflen: usize) -> c_int;
         #[cfg(target_os = "macos")]
-        fn __error() -> *mut i32;
-        #[cfg(not(target_os = "macos"))]
-        fn __errno_location() -> *mut i32;
+        fn __error() -> *mut c_int;
+        #[cfg(target_os = "linux")]
+        fn __errno_location() -> *mut c_int;
     }
 
-    fn errno_ptr() -> *mut i32 {
+    fn is_special_open_errno(raw: Option<i32>) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            raw == Some(ENXIO)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            raw == Some(EOPNOTSUPP)
+        }
+    }
+
+    fn errno_ptr() -> *mut c_int {
         #[cfg(target_os = "macos")]
         unsafe {
             __error()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         unsafe {
             __errno_location()
         }
     }
 
-    fn set_errno(v: i32) {
+    fn set_errno(v: c_int) {
         unsafe {
             *errno_ptr() = v;
         }
     }
 
-    fn get_errno() -> i32 {
+    fn get_errno() -> c_int {
         unsafe { *errno_ptr() }
     }
 
-    fn mode_kind(mode: u32) -> AtKind {
-        match mode & S_IFMT {
-            S_IFREG => AtKind::Regular,
-            S_IFDIR => AtKind::Directory,
-            S_IFLNK => AtKind::Symlink,
-            _ => AtKind::Special,
-        }
-    }
-
-    fn stat_mode(st: &Stat) -> u32 {
-        #[cfg(target_os = "macos")]
-        {
-            st.st_mode as u32
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            st.st_mode
-        }
-    }
-
-    pub fn fstatat_kind(dir: &File, name: &str, what: &str) -> Result<AtKind, PackImportError> {
+    fn component_name(name: &str, what: &str) -> Result<CString, PackImportError> {
         if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
             return Err(PackImportError::new(
                 PackImportErrorKind::Traversal,
-                format!("{what}: illegal fstatat name"),
+                format!("{what}: illegal component name"),
             ));
         }
-        let c = CString::new(name).map_err(|_| {
+        CString::new(name).map_err(|_| {
             PackImportError::new(PackImportErrorKind::Malformed, format!("{what}: bad name"))
-        })?;
-        let mut st = unsafe { std::mem::zeroed::<Stat>() };
-        let rc = unsafe { fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(2) {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Empty,
-                    format!("{what}: fstatat {name}: {err}"),
-                ));
-            }
-            return Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                format!("{what}: fstatat {name}: {err}"),
-            ));
-        }
-        Ok(mode_kind(stat_mode(&st)))
+        })
     }
 
     pub fn open_path_regular_nofollow(path: &Path, what: &str) -> Result<File, PackImportError> {
-        let c = cstr_path(path, what)?;
-        let mut st = unsafe { std::mem::zeroed::<Stat>() };
-        let rc = unsafe { fstatat(AT_FDCWD, c.as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 {
+        let meta = fs::symlink_metadata(path).map_err(|e| {
+            PackImportError::new(PackImportErrorKind::Io, format!("{what}: symlink_metadata: {e}"))
+        })?;
+        if meta.file_type().is_symlink() {
             return Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                format!("{what}: fstatat: {}", std::io::Error::last_os_error()),
+                PackImportErrorKind::Special,
+                format!("{what}: refusing symlink"),
             ));
         }
-        match mode_kind(stat_mode(&st)) {
-            AtKind::Regular => {}
-            AtKind::Symlink => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("{what}: refusing symlink"),
-                ))
-            }
-            _ => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("{what}: not a regular file"),
-                ))
-            }
-        }
-        let fd = unsafe { open(c.as_ptr(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK) };
-        if fd < 0 {
+        if !meta.file_type().is_file() {
             return Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                format!("{what}: open: {}", std::io::Error::last_os_error()),
+                PackImportErrorKind::Special,
+                format!("{what}: not a regular file"),
             ));
         }
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+            .open(path)
+            .map_err(|e| {
+                let raw = e.raw_os_error();
+                let kind = if raw == Some(ELOOP) || is_special_open_errno(raw) {
+                    PackImportErrorKind::Special
+                } else {
+                    PackImportErrorKind::Io
+                };
+                PackImportError::new(kind, format!("{what}: open: {e}"))
+            })?;
         let meta = file.metadata().map_err(|e| {
             PackImportError::new(PackImportErrorKind::Io, format!("{what}: fstat: {e}"))
         })?;
@@ -2051,7 +2016,7 @@ mod unix {
 
     pub fn random_hex16() -> Result<String, PackImportError> {
         let mut seed = [0u8; 16];
-        let rc = unsafe { getentropy(seed.as_mut_ptr(), seed.len()) };
+        let rc = unsafe { getentropy(seed.as_mut_ptr().cast::<c_void>(), seed.len()) };
         if rc != 0 {
             return Err(PackImportError::new(
                 PackImportErrorKind::Io,
@@ -2067,15 +2032,16 @@ mod unix {
     }
 
     pub fn open_dir_path(path: &Path) -> Result<File, PackImportError> {
-        let c = cstr_path(path, "pack")?;
-        let fd = unsafe { open(c.as_ptr(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) };
-        if fd < 0 {
-            return Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                format!("open pack root {}: {}", path.display(), std::io::Error::last_os_error()),
-            ));
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+            .open(path)
+            .map_err(|e| {
+                PackImportError::new(
+                    PackImportErrorKind::Io,
+                    format!("open pack root {}: {e}", path.display()),
+                )
+            })
     }
 
     pub fn open_relative(
@@ -2115,79 +2081,82 @@ mod unix {
         Ok(cur)
     }
 
+    pub fn openat_entry_nofollow(
+        dir: &File,
+        name: &str,
+        what: &str,
+    ) -> Result<AtEntry, PackImportError> {
+        let c = component_name(name, what)?;
+        let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
+        let fd = unsafe { openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            let raw = err.raw_os_error();
+            let (kind, message) = if raw == Some(ELOOP) {
+                (PackImportErrorKind::Special, format!("refusing symlink {what}"))
+            } else if is_special_open_errno(raw) {
+                (PackImportErrorKind::Special, format!("refusing special file {what}"))
+            } else {
+                (PackImportErrorKind::Io, format!("{what}: openat {name}: {err}"))
+            };
+            return Err(PackImportError::new(kind, message));
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata().map_err(|e| {
+            PackImportError::new(PackImportErrorKind::Io, format!("{what}: fstat: {e}"))
+        })?;
+        let ft = meta.file_type();
+        if ft.is_file() {
+            Ok(AtEntry::Regular(file, meta))
+        } else if ft.is_dir() {
+            Ok(AtEntry::Directory(file))
+        } else {
+            Err(PackImportError::new(
+                PackImportErrorKind::Special,
+                format!("refusing special file {what}"),
+            ))
+        }
+    }
+
     pub fn openat_nofollow(
         dir: &File,
         name: &str,
         directory: bool,
         what: &str,
     ) -> Result<File, PackImportError> {
-        if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-            return Err(PackImportError::new(
-                PackImportErrorKind::Traversal,
-                format!("{what}: illegal openat name"),
-            ));
-        }
-        let c = CString::new(name).map_err(|_| {
-            PackImportError::new(PackImportErrorKind::Malformed, format!("{what}: bad name"))
-        })?;
-        let kind = fstatat_kind(dir, name, what)?;
-        match (directory, kind) {
-            (true, AtKind::Directory) => {}
-            (false, AtKind::Regular) => {}
-            (_, AtKind::Symlink) => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("{what}: refusing symlink {name}"),
-                ))
-            }
-            (_, AtKind::Special) => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("{what}: refusing special file {name}"),
-                ))
-            }
-            (true, _) => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Io,
-                    format!("{what}: {name} is not a directory"),
-                ))
-            }
-            (false, _) => {
-                return Err(PackImportError::new(
-                    PackImportErrorKind::Special,
-                    format!("{what}: {name} is not a regular file"),
-                ))
-            }
-        }
-        let mut flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
+        let c = component_name(name, what)?;
+        let mut flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
         if directory {
             flags |= O_DIRECTORY;
         }
         let fd = unsafe { openat(dir.as_raw_fd(), c.as_ptr(), flags) };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-            let kind = if err.raw_os_error() == Some(eloop_errno()) {
-                PackImportErrorKind::Special
+            let raw = err.raw_os_error();
+            let (kind, message) = if raw == Some(ELOOP) {
+                (PackImportErrorKind::Special, format!("{what}: refusing symlink {name}"))
+            } else if directory && raw == Some(ENOTDIR) {
+                (PackImportErrorKind::Special, format!("{what}: {name} is not a directory"))
+            } else if is_special_open_errno(raw) {
+                (PackImportErrorKind::Special, format!("{what}: refusing special file {name}"))
             } else {
-                PackImportErrorKind::Io
+                (PackImportErrorKind::Io, format!("{what}: openat {name}: {err}"))
             };
-            return Err(PackImportError::new(
-                kind,
-                format!("{what}: openat {name}: {err}"),
-            ));
+            return Err(PackImportError::new(kind, message));
         }
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-
-    fn eloop_errno() -> i32 {
-        #[cfg(target_os = "macos")]
-        {
-            62
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !directory {
+            let meta = file.metadata().map_err(|e| {
+                PackImportError::new(PackImportErrorKind::Io, format!("{what}: fstat: {e}"))
+            })?;
+            if !meta.file_type().is_file() {
+                return Err(PackImportError::new(
+                    PackImportErrorKind::Special,
+                    format!("{what}: {name} is not a regular file"),
+                ));
+            }
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            40
-        }
+        Ok(file)
     }
 
     pub fn bind_resolved(file: &File, root: &Path, what: &str) -> Result<(), PackImportError> {
@@ -2233,7 +2202,7 @@ mod unix {
     fn fd_path(file: &File, what: &str) -> Result<PathBuf, PackImportError> {
         #[cfg(target_os = "macos")]
         {
-            let mut buf = [0i8; 1024];
+            let mut buf = [0 as c_char; 1024];
             let rc = unsafe { fcntl(file.as_raw_fd(), F_GETPATH, buf.as_mut_ptr()) };
             if rc != 0 {
                 return Err(PackImportError::new(
@@ -2260,21 +2229,13 @@ mod unix {
                 )
             })
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = file;
-            Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                format!("{what}: cannot resolve opened handle path on this unix"),
-            ))
-        }
     }
 
     pub fn list_dir_bounded(
         dir: &File,
         rel: &str,
         entries: &mut usize,
-    ) -> Result<Vec<String>, PackImportError> {
+    ) -> Result<Vec<(String, u8)>, PackImportError> {
         let before = dir.metadata().map_err(|e| {
             PackImportError::new(PackImportErrorKind::Io, format!("fstat dir {}: {e}", dir_label(rel)))
         })?;
@@ -2305,20 +2266,25 @@ mod unix {
         dir: &File,
         rel: &str,
         entries: Option<&mut usize>,
-    ) -> Result<Vec<String>, PackImportError> {
+    ) -> Result<Vec<(String, u8)>, PackImportError> {
+        struct DirGuard(*mut c_void);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                unsafe { closedir(self.0); }
+            }
+        }
+
         let fresh = reopen_dir(dir, rel)?;
-        let fd = fresh.into_raw_fd();
-        let dp = unsafe { fdopendir(fd) };
+        let dp = unsafe { fdopendir(fresh.as_raw_fd()) };
         if dp.is_null() {
-            unsafe { close(fd) };
             return Err(PackImportError::new(
                 PackImportErrorKind::Io,
                 format!("fdopendir {}: {}", dir_label(rel), std::io::Error::last_os_error()),
             ));
         }
-        let result = collect_dir_names(dp, rel, entries);
-        unsafe { closedir(dp) };
-        result
+        let _ = fresh.into_raw_fd();
+        let guard = DirGuard(dp);
+        collect_dir_names(guard.0, rel, entries)
     }
 
     fn reopen_dir(dir: &File, what: &str) -> Result<File, PackImportError> {
@@ -2342,10 +2308,10 @@ mod unix {
     }
 
     fn collect_dir_names(
-        dp: *mut core::ffi::c_void,
+        dp: *mut c_void,
         rel: &str,
         mut entries: Option<&mut usize>,
-    ) -> Result<Vec<String>, PackImportError> {
+    ) -> Result<Vec<(String, u8)>, PackImportError> {
         let mut names = Vec::new();
         loop {
             set_errno(0);
@@ -2360,7 +2326,8 @@ mod unix {
                 }
                 break;
             }
-            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let d_type = unsafe { core::ptr::addr_of!((*ent).d_type).read() };
+            let name = unsafe { CStr::from_ptr(core::ptr::addr_of!((*ent).d_name).cast::<c_char>()) };
             let name = name.to_str().map_err(|_| {
                 PackImportError::new(
                     PackImportErrorKind::Malformed,
@@ -2388,7 +2355,7 @@ mod unix {
                     ),
                 ));
             }
-            names.push(name.to_string());
+            names.push((name.to_string(), d_type));
         }
         names.sort();
         Ok(names)
@@ -2482,32 +2449,26 @@ mod unix {
         published
     }
 
-    fn mkdirat_or_open_dir(dir: &File, name: &str) -> Result<File, PackImportError> {
-        match fstatat_kind(dir, name, name) {
-            Ok(AtKind::Directory) => openat_nofollow(dir, name, true, name),
-            Ok(AtKind::Symlink) => Err(PackImportError::new(
-                PackImportErrorKind::Special,
-                format!("--out component {name} is a symlink"),
-            )),
-            Ok(_) => Err(PackImportError::new(
-                PackImportErrorKind::Special,
-                format!("--out component {name} is not a directory"),
-            )),
-            Err(e) if e.kind == PackImportErrorKind::Empty => {
-                mkdirat_excl(dir, name)?;
-                openat_nofollow(dir, name, true, name)
+    pub(super) fn mkdirat_or_open_dir(dir: &File, name: &str) -> Result<File, PackImportError> {
+        let what = format!("--out component {name}");
+        let c = component_name(name, &what)?;
+        let rc = unsafe { mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(EEXIST) {
+                return Err(PackImportError::new(
+                    PackImportErrorKind::Io,
+                    format!("mkdirat {name}: {err}"),
+                ));
             }
-            Err(e) => Err(e),
         }
+        openat_nofollow(dir, name, true, &what)
     }
 
     fn mkdirat_excl(dir: &File, name: &str) -> Result<(), PackImportError> {
         let c = CString::new(name).map_err(|_| {
             PackImportError::new(PackImportErrorKind::Malformed, format!("{name}: bad name"))
         })?;
-        #[cfg(target_os = "macos")]
-        let rc = unsafe { mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
-        #[cfg(not(target_os = "macos"))]
         let rc = unsafe { mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
         if rc != 0 {
             return Err(PackImportError::new(
@@ -2529,7 +2490,7 @@ mod unix {
             PackImportError::new(PackImportErrorKind::Malformed, format!("{name}: bad name"))
         })?;
         let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
-        let fd = unsafe { openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600) };
+        let fd = unsafe { openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600 as c_uint) };
         if fd < 0 {
             return Err(PackImportError::new(
                 PackImportErrorKind::Io,
@@ -2578,14 +2539,6 @@ mod unix {
                 )
             };
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (from_c, to_c, dir);
-            return Err(PackImportError::new(
-                PackImportErrorKind::Io,
-                "exclusive renameat is required and unavailable on this unix",
-            ));
-        }
         if rc != 0 {
             return Err(PackImportError::new(
                 PackImportErrorKind::Io,
@@ -2595,20 +2548,6 @@ mod unix {
         Ok(())
     }
 
-    fn cstr_path(path: &Path, what: &str) -> Result<CString, PackImportError> {
-        let s = path.to_str().ok_or_else(|| {
-            PackImportError::new(
-                PackImportErrorKind::Malformed,
-                format!("{what}: non-utf8 path"),
-            )
-        })?;
-        CString::new(s).map_err(|_| {
-            PackImportError::new(
-                PackImportErrorKind::Malformed,
-                format!("{what}: path contains NUL"),
-            )
-        })
-    }
 }
 
 /// A directory's relative path as a person can read it. The pack root's
@@ -3538,14 +3477,14 @@ fn reverify_tree(root: &PackRoot, snaps: &[DirSnapshot]) -> Result<(), PackImpor
                 root.open_relative_dir(&snap.rel, &snap.rel)?
             };
             unix::bind_resolved(&dir, &root.path, &snap.rel)?;
-            let names = unix::list_dir_bounded(&dir, &snap.rel, &mut entries)?;
+            let dir_entries = unix::list_dir_bounded(&dir, &snap.rel, &mut entries)?;
             let meta = dir.metadata().map_err(|e| {
                 PackImportError::new(
                     PackImportErrorKind::Io,
                     format!("fstat dir {}: {e}", snap.rel),
                 )
             })?;
-            if meta.dev() != snap.dev || meta.ino() != snap.ino || names != snap.names {
+            if meta.dev() != snap.dev || meta.ino() != snap.ino || dir_entries != snap.entries {
                 return Err(PackImportError::new(
                     PackImportErrorKind::Changed,
                     format!(
@@ -7493,6 +7432,312 @@ mod tests {
         assert_eq!(err.kind, PackImportErrorKind::Malformed);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_nofollow_and_directory_flags_enforce_kernel_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_root("unix_flags");
+        let file = dir.join("file");
+        let sub = dir.join("sub");
+        let file_link = dir.join("file_link");
+        let dir_link = dir.join("dir_link");
+        let bytes = b"pack";
+        fs::write(&file, bytes).unwrap();
+        fs::create_dir(&sub).unwrap();
+        symlink("file", &file_link).unwrap();
+        symlink("sub", &dir_link).unwrap();
+
+        let mut nofollow = OpenOptions::new();
+        nofollow.read(true).custom_flags(unix::O_NOFOLLOW);
+        let err = nofollow.open(&file_link).unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(err.raw_os_error(), Some(40), "expected ELOOP");
+        #[cfg(target_os = "macos")]
+        assert_eq!(err.raw_os_error(), Some(62), "expected ELOOP");
+        let mut contents = Vec::new();
+        nofollow.open(&file).unwrap().read_to_end(&mut contents).unwrap();
+        assert_eq!(contents.as_slice(), bytes);
+
+        let mut directory = OpenOptions::new();
+        directory.read(true).custom_flags(unix::O_DIRECTORY);
+        let err = directory.open(&file).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(20), "expected ENOTDIR");
+        directory.open(&sub).unwrap();
+
+        unix::open_dir_path(&sub).unwrap();
+        assert_eq!(unix::open_dir_path(&dir_link).unwrap_err().kind, PackImportErrorKind::Io);
+        assert_eq!(unix::open_dir_path(&file).unwrap_err().kind, PackImportErrorKind::Io);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_openat_entry_and_nofollow_classify_all_entry_kinds() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        fn assert_error<T>(result: Result<T, PackImportError>, kind: PackImportErrorKind, name: &str) {
+            let err = result.err().unwrap_or_else(|| panic!("unexpected success for {name:?}"));
+            assert_eq!(err.kind, kind, "{name:?}: {err}");
+        }
+
+        let dir = test_root("unix_entry");
+        fs::write(dir.join("reg.bin"), b"hello").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        symlink("reg.bin", dir.join("lnk_file")).unwrap();
+        symlink("sub", dir.join("lnk_dir")).unwrap();
+        symlink("missing", dir.join("lnk_bad")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe.fifo"))
+            .status()
+            .expect("mkfifo")
+            .success());
+        let socket = UnixListener::bind(dir.join("s.sock")).unwrap();
+        let d = unix::open_dir_path(&dir).unwrap();
+
+        match unix::openat_entry_nofollow(&d, "reg.bin", "reg.bin").unwrap() {
+            unix::AtEntry::Regular(mut file, meta) => {
+                assert!(meta.file_type().is_file());
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes.as_slice(), b"hello");
+            }
+            unix::AtEntry::Directory(_) => panic!("reg.bin classified as a directory"),
+        }
+        match unix::openat_entry_nofollow(&d, "sub", "sub").unwrap() {
+            unix::AtEntry::Directory(sub) => assert!(sub.metadata().unwrap().file_type().is_dir()),
+            unix::AtEntry::Regular(_, _) => panic!("sub classified as a regular file"),
+        }
+        for name in ["lnk_file", "lnk_dir", "lnk_bad", "pipe.fifo", "s.sock"] {
+            assert_error(
+                unix::openat_entry_nofollow(&d, name, name),
+                PackImportErrorKind::Special,
+                name,
+            );
+        }
+        assert_error(
+            unix::openat_entry_nofollow(&d, "missing", "missing"),
+            PackImportErrorKind::Io,
+            "missing",
+        );
+        for name in [".", "..", "a/b", "a\0b"] {
+            assert_error(
+                unix::openat_entry_nofollow(&d, name, name),
+                PackImportErrorKind::Traversal,
+                name,
+            );
+        }
+
+        unix::openat_nofollow(&d, "reg.bin", false, "reg.bin").unwrap();
+        for name in ["sub", "pipe.fifo", "s.sock", "lnk_file", "lnk_bad"] {
+            assert_error(
+                unix::openat_nofollow(&d, name, false, name),
+                PackImportErrorKind::Special,
+                name,
+            );
+        }
+        unix::openat_nofollow(&d, "sub", true, "sub").unwrap();
+        for name in ["reg.bin", "pipe.fifo", "s.sock", "lnk_dir", "lnk_bad"] {
+            assert_error(
+                unix::openat_nofollow(&d, name, true, name),
+                PackImportErrorKind::Special,
+                name,
+            );
+        }
+
+        unix::open_path_regular_nofollow(&dir.join("reg.bin"), "reg").unwrap();
+        for name in ["lnk_file", "lnk_bad", "sub", "pipe.fifo", "s.sock"] {
+            assert_error(
+                unix::open_path_regular_nofollow(&dir.join(name), name),
+                PackImportErrorKind::Special,
+                name,
+            );
+        }
+        assert_error(
+            unix::open_path_regular_nofollow(&dir.join("missing"), "missing"),
+            PackImportErrorKind::Io,
+            "missing",
+        );
+        assert_error(
+            unix::open_dir_path(&dir.join("pipe.fifo")),
+            PackImportErrorKind::Io,
+            "pipe.fifo",
+        );
+
+        unix::mkdirat_or_open_dir(&d, "created").unwrap();
+        assert!(dir.join("created").is_dir());
+        unix::mkdirat_or_open_dir(&d, "created").unwrap();
+        for name in ["lnk_dir", "lnk_bad", "reg.bin", "pipe.fifo", "s.sock"] {
+            assert_error(
+                unix::mkdirat_or_open_dir(&d, name),
+                PackImportErrorKind::Special,
+                name,
+            );
+        }
+
+        drop(socket);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_domain_socket_in_pack_is_refused_as_special() {
+        let pack = test_root("sock");
+        let socket = std::os::unix::net::UnixListener::bind(pack.join("s.png")).unwrap();
+        let out = test_bundle("sock_out");
+        let err = compile_pack(&pack, &out, licensed_spec(), None, false).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Special, "{err}");
+
+        drop(socket);
+        let _ = fs::remove_dir_all(&pack);
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn skipped_unreadable_entries_pass_and_special_dot_entries_refuse() {
+        use std::os::unix::{
+            fs::{symlink, PermissionsExt},
+            net::UnixListener,
+        };
+
+        let pack = test_root("skip");
+        fs::write(pack.join("ok.png"), valid_png(32, 32)).unwrap();
+
+        let readme = pack.join("README.md");
+        fs::write(&readme, b"docs").unwrap();
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let ds_store = pack.join(".DS_Store");
+        fs::write(&ds_store, b"finder").unwrap();
+        fs::set_permissions(&ds_store, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dot_git = pack.join(".git");
+        fs::create_dir(&dot_git).unwrap();
+        fs::write(dot_git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::set_permissions(&dot_git, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out_ok = test_bundle("skip_unreadable_ok");
+        let report = compile_pack(&pack, &out_ok, licensed_spec(), None, false)
+            .expect("unreadable README.md, .DS_Store, and .git/ must be skipped before open");
+        assert_eq!(report.assets, 1);
+
+        fs::set_permissions(&ds_store, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&ds_store).unwrap();
+        symlink("ok.png", &ds_store).unwrap();
+        let out_lnk = test_bundle("skip_unreadable_lnk");
+        let err = compile_pack(&pack, &out_lnk, licensed_spec(), None, false).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Special, "{err}");
+
+        fs::remove_file(&ds_store).unwrap();
+        let socket = UnixListener::bind(&ds_store).unwrap();
+        let out_sock = test_bundle("skip_unreadable_sock");
+        let err = compile_pack(&pack, &out_sock, licensed_spec(), None, false).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Special, "{err}");
+
+        drop(socket);
+        let _ = fs::set_permissions(&readme, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(&dot_git, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&pack);
+        for out in [&out_ok, &out_lnk, &out_sock] {
+            let _ = fs::remove_dir_all(out.parent().unwrap());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn walk_entry_dt_unknown_and_preopen_decisions() {
+        fn must_not_open() -> Result<(), PackImportError> {
+            panic!("open must not be called")
+        }
+        fn io_err() -> Result<(), PackImportError> {
+            Err(PackImportError::new(PackImportErrorKind::Io, "eacces"))
+        }
+        fn special_err() -> Result<(), PackImportError> {
+            Err(PackImportError::new(PackImportErrorKind::Special, "special"))
+        }
+        fn ok_open() -> Result<&'static str, PackImportError> {
+            Ok("opened")
+        }
+
+        // DT_UNKNOWN + Io on dot or skip_entry names -> SkipUnreadable (logged & skipped).
+        for (name, rel) in [
+            ("README.md", "README.md"),
+            (".DS_Store", ".DS_Store"),
+            (".git", ".git"),
+            (".env", "sub/.env"),
+        ] {
+            match open_walk_entry(name, rel, unix::DT_UNKNOWN, io_err).unwrap() {
+                EntryOpen::SkipUnreadable(err) => assert_eq!(err.kind, PackImportErrorKind::Io, "{rel}: {err}"),
+                other => panic!("{rel}: expected SkipUnreadable(Io), got {other:?}"),
+            }
+        }
+
+        // DT_UNKNOWN + Io on a real asset -> Err(Io).
+        let err = open_walk_entry("ok.png", "ok.png", unix::DT_UNKNOWN, io_err).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Io, "{err}");
+
+        // DT_UNKNOWN + Special on ignored/dot names -> Err(Special), never skipped.
+        for name in [".DS_Store", "README.md", ".git"] {
+            let err = open_walk_entry(name, name, unix::DT_UNKNOWN, special_err).unwrap_err();
+            assert_eq!(err.kind, PackImportErrorKind::Special, "{name}: {err}");
+        }
+
+        // Non-DT_UNKNOWN (DT_DIR) + Io on a non-dot skip_entry-named directory -> Err(Io).
+        let err = open_walk_entry("license", "license", unix::DT_DIR, io_err).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Io, "{err}");
+
+        // DT_UNKNOWN + Ok -> Opened (delegated to post-open classification).
+        for name in ["ok.png", "README.md", ".git"] {
+            match open_walk_entry(name, name, unix::DT_UNKNOWN, ok_open).unwrap() {
+                EntryOpen::Opened(v) => assert_eq!(v, "opened"),
+                other => panic!("{name}: expected Opened, got {other:?}"),
+            }
+        }
+
+        // Pre-open skips never call open (even under root CAP_DAC_OVERRIDE).
+        for (name, d_type) in [
+            (".git", unix::DT_DIR),
+            ("README.md", unix::DT_REG),
+            (".DS_Store", unix::DT_REG),
+        ] {
+            match open_walk_entry(name, name, d_type, must_not_open).unwrap() {
+                EntryOpen::Skip => {}
+                other => panic!("{name}: expected Skip, got {other:?}"),
+            }
+        }
+
+        // Pre-open refusals never call open.
+        let err = open_walk_entry(".env", ".env", unix::DT_REG, must_not_open).unwrap_err();
+        assert_eq!(err.kind, PackImportErrorKind::Unsupported, "{err}");
+        for (name, d_type) in [
+            (".DS_Store", unix::DT_LNK),
+            ("README.md", unix::DT_LNK),
+            (".DS_Store", 1u8),  // DT_FIFO
+            (".DS_Store", 12u8), // DT_SOCK
+        ] {
+            let err = open_walk_entry(name, name, d_type, must_not_open).unwrap_err();
+            assert_eq!(err.kind, PackImportErrorKind::Special, "{name}/{d_type}: {err}");
+        }
+
+        // Admitted d_type entries invoke open and propagate Ok / Err.
+        for (name, d_type) in [("sub", unix::DT_DIR), ("ok.png", unix::DT_REG)] {
+            match open_walk_entry(name, name, d_type, ok_open).unwrap() {
+                EntryOpen::Opened(v) => assert_eq!(v, "opened"),
+                other => panic!("{name}: expected Opened, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            open_walk_entry("ok.png", "ok.png", unix::DT_REG, io_err).unwrap_err().kind,
+            PackImportErrorKind::Io
+        );
+        assert_eq!(
+            open_walk_entry("ok.png", "ok.png", unix::DT_REG, special_err).unwrap_err().kind,
+            PackImportErrorKind::Special
+        );
+    }
+
     #[test]
     fn traversal_symlink_and_collisions_refuse() {
         assert_eq!(
@@ -8357,6 +8602,7 @@ mod tests {
                 lightmap_uvs: None,
                 detail_png: None,
                 detail_scale: [1.0, 1.0],
+                material_bytes: None,
             }
         }
         let glb = makepad_gltf::write_glb_mesh_textured_parts(

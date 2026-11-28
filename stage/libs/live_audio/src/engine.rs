@@ -381,6 +381,21 @@ struct Slot {
     target: f32,
 }
 
+/// One finished chunk lent by [`AudioEngine::render_with_tap`].
+/// `left` and `right` carry the gated program mix, and `cue_left` and
+/// `cue_right` carry the gated headphone cue. `pre_gate_left` and
+/// `pre_gate_right` carry the program mix arriving at the output gates.
+#[derive(Clone, Copy)]
+pub struct RenderChunk<'a> {
+    pub offset: usize,
+    pub left: &'a [f32],
+    pub right: &'a [f32],
+    pub cue_left: &'a [f32],
+    pub cue_right: &'a [f32],
+    pub pre_gate_left: &'a [f32],
+    pub pre_gate_right: &'a [f32],
+}
+
 pub struct AudioEngine {
     /// Host-installed timestamp source for rendered clocks; `None` publishes
     /// clocks without a time (`clock_at: None`). See `set_timestamp_sampler`.
@@ -413,6 +428,9 @@ pub struct AudioEngine {
     /// The headphone cue's mix (CueOutput nodes), beside the program's.
     cue_mix: [f32; SPAN],
     slot_cue: [f32; SPAN],
+    /// Program mix at the AudioOutput inputs before their enabled gates.
+    tap_mix: [f32; SPAN],
+    slot_tap: [f32; SPAN],
     reserved_returns: usize,
     format: u64,
     /// Whether a silent schedule rests. On unless the host turns it off, to
@@ -472,6 +490,8 @@ impl AudioEngine {
             slot_mix: [0.0; SPAN],
             cue_mix: [0.0; SPAN],
             slot_cue: [0.0; SPAN],
+            tap_mix: [0.0; SPAN],
+            slot_tap: [0.0; SPAN],
             reserved_returns: 0,
             format: 0,
             resting_enabled: true,
@@ -497,6 +517,20 @@ impl AudioEngine {
     /// must be RT-safe.
     #[relax(O3, always)]
     pub fn render_with(&mut self, rate: f64, frames: usize, mut sink: impl FnMut(usize, &[f32], &[f32], &[f32], &[f32])) {
+        self.render_inner(rate, frames, false, |chunk| {
+            sink(chunk.offset, chunk.left, chunk.right, chunk.cue_left, chunk.cue_right);
+        });
+    }
+
+    /// As [`Self::render_with`], also lending each chunk's pre-gate program
+    /// mix for audio analysis.
+    #[relax(O3, always)]
+    pub fn render_with_tap(&mut self, rate: f64, frames: usize, sink: impl FnMut(RenderChunk<'_>)) {
+        self.render_inner(rate, frames, true, sink);
+    }
+
+    #[relax(O3, always)]
+    fn render_inner(&mut self, rate: f64, frames: usize, tap: bool, mut sink: impl FnMut(RenderChunk<'_>)) {
         let rate = rate.round().clamp(0.0, u32::MAX as f64) as u32;
         self.state.callbacks = self.state.callbacks.wrapping_add(1);
         self.state.frames = self.state.frames.wrapping_add(frames as u64);
@@ -515,14 +549,35 @@ impl AudioEngine {
             self.mix[CHUNK..CHUNK + count].fill(0.0);
             self.cue_mix[..count].fill(0.0);
             self.cue_mix[CHUNK..CHUNK + count].fill(0.0);
-            for index in 0..self.slots.len() { self.pass(index, rate, count); }
+            if tap {
+                self.tap_mix[..count].fill(0.0);
+                self.tap_mix[CHUNK..CHUNK + count].fill(0.0);
+            }
+            for index in 0..self.slots.len() { self.pass(index, rate, count, tap); }
             for frame in 0..count {
                 for mix in [&mut self.mix, &mut self.cue_mix] {
                     mix[frame] = mix[frame].clamp(-1.0, 1.0);
                     mix[CHUNK + frame] = mix[CHUNK + frame].clamp(-1.0, 1.0);
                 }
+                if tap {
+                    self.tap_mix[frame] = self.tap_mix[frame].clamp(-1.0, 1.0);
+                    self.tap_mix[CHUNK + frame] = self.tap_mix[CHUNK + frame].clamp(-1.0, 1.0);
+                }
             }
-            sink(offset, &self.mix[..count], &self.mix[CHUNK..CHUNK + count], &self.cue_mix[..count], &self.cue_mix[CHUNK..CHUNK + count]);
+            let (pre_gate_left, pre_gate_right) = if tap {
+                (&self.tap_mix[..count], &self.tap_mix[CHUNK..CHUNK + count])
+            } else {
+                (&[][..], &[][..])
+            };
+            sink(RenderChunk {
+                offset,
+                left: &self.mix[..count],
+                right: &self.mix[CHUNK..CHUNK + count],
+                cue_left: &self.cue_mix[..count],
+                cue_right: &self.cue_mix[CHUNK..CHUNK + count],
+                pre_gate_left,
+                pre_gate_right,
+            });
             offset += count;
         }
         self.publish_audio_probes();
@@ -1132,7 +1187,7 @@ impl AudioEngine {
         slot.target = 1.0;
     }
 
-    fn pass(&mut self, index: usize, rate: u32, frames: usize) {
+    fn pass(&mut self, index: usize, rate: u32, frames: usize, tap: bool) {
         self.settle(index, false);
         let mismatch = self.slots[index].active.as_ref().is_some_and(|schedule| schedule.rate != rate);
         self.settle_decks(index, mismatch);
@@ -1163,6 +1218,10 @@ impl AudioEngine {
         self.slot_mix[CHUNK..CHUNK + frames].fill(0.0);
         self.slot_cue[..frames].fill(0.0);
         self.slot_cue[CHUNK..CHUNK + frames].fill(0.0);
+        if tap {
+            self.slot_tap[..frames].fill(0.0);
+            self.slot_tap[CHUNK..CHUNK + frames].fill(0.0);
+        }
         run_awake(schedule, frames, &mut |cue, left, right| {
             let mix = if cue { &mut self.slot_cue } else { &mut self.slot_mix };
             for frame in 0..frames {
@@ -1170,6 +1229,16 @@ impl AudioEngine {
                 mix[CHUNK + frame] += right[frame];
             }
         }, &mut DeckRun, self.resting_enabled);
+        if tap {
+            schedule.for_each_pre_gate_output(frames, |cue, left, right| {
+                if !cue {
+                    for frame in 0..frames {
+                        self.slot_tap[frame] += left[frame];
+                        self.slot_tap[CHUNK + frame] += right[frame];
+                    }
+                }
+            });
+        }
         self.state.slots[index].resting = self.resting_enabled && schedule.rest.asleep();
         // Once per sample, including muted/absent outputs and all sinks.
         let mut dip = [0.0f32; CHUNK];
@@ -1180,6 +1249,10 @@ impl AudioEngine {
             self.mix[CHUNK + frame] += self.slot_mix[CHUNK + frame] * gain;
             self.cue_mix[frame] += self.slot_cue[frame] * gain;
             self.cue_mix[CHUNK + frame] += self.slot_cue[CHUNK + frame] * gain;
+            if tap {
+                self.tap_mix[frame] += self.slot_tap[frame] * gain;
+                self.tap_mix[CHUNK + frame] += self.slot_tap[CHUNK + frame] * gain;
+            }
         }
         for sink in &schedule.sinks {
             let span = &mut schedule.arena[*sink as usize * SPAN..][..SPAN];
@@ -1360,9 +1433,9 @@ mod exchange_tests {
     use crate::deck::{DeckTrack, TrackLease};
     use crate::paged::{PagePacket, PageReturn, PAGE_ROUTES};
     use crate::schedule::{compile, trigger_id, AudioBudget, Compiled, ControlBank};
-    use makepad_flow::document::ident::DNode;
+    use makepad_flow::document::ident::{DNode, DPort};
     use makepad_flow::document::types::TypeKey;
-    use makepad_flow::live::plan::{LiveNode, OwnerSlice};
+    use makepad_flow::live::plan::{LiveInput, LiveNode, LiveSource, OwnerSlice};
     use makepad_lock_free::{ring, triple_buffer, Consumer, Producer};
     use makepad_flow::Literal;
     use makepad_stage_audio_media::pcm::TrackPcm;
@@ -1384,6 +1457,21 @@ mod exchange_tests {
         }
     }
 
+    fn output(id: &str, kind: &str, enabled: f64, from: &str) -> LiveNode {
+        LiveNode {
+            node: DNode::root(id), id: id.into(), type_name: kind.into(),
+            params: vec![("enabled".into(), Literal::Num(enabled))],
+            inputs: vec![LiveInput {
+                port: "audio".into(), ty: TypeKey::new(crate::nodes::AUDIO), many: None, control: None,
+                sources: vec![LiveSource {
+                    from: DPort { node: DNode::root(from), port: "audio".into() },
+                    conn: None, via: vec![], lineage: vec![],
+                }],
+            }],
+            outputs: vec![],
+        }
+    }
+
     struct Rig {
         engine: AudioEngine,
         commands: Producer<Command>,
@@ -1399,6 +1487,10 @@ mod exchange_tests {
 
     impl Rig {
         fn new() -> Self {
+            Self::with_nodes(vec![deck("deck_a"), deck("deck_b")])
+        }
+
+        fn with_nodes(nodes: Vec<LiveNode>) -> Self {
             let (commands, command_queue) = ring::<Command>(64);
             let (retire, retired) = ring::<Retired>(64);
             let (packets, packet_queue) = ring::<Packet>(64);
@@ -1408,7 +1500,7 @@ mod exchange_tests {
             let (page_writer, page_returns) = ring::<PageReturn>(PAGE_ROUTES);
             let engine = AudioEngine::new(command_queue, retire, packet_queue, writer, audio_writer, Arc::new(AtomicU64::new(FORMAT)), page_queue, page_writer);
             let budget = Arc::new(AudioBudget::default());
-            let (compiled, _board) = compile(&OwnerSlice { owner: crate::nodes::OWNER.into(), nodes: vec![deck("deck_a"), deck("deck_b")] }, 1, 1, FORMAT, None, &budget).unwrap();
+            let (compiled, _board) = compile(&OwnerSlice { owner: crate::nodes::OWNER.into(), nodes }, 1, 1, FORMAT, None, &budget).unwrap();
             let (bank, layout) = (compiled.schedule.controls.clone(), compiled.layout.clone());
             let mut rig = Self { engine, commands, retired, budget, compiled: Some(compiled), bank, layout, _packets: packets, _pages: pages, _page_returns: page_returns };
             let schedule = rig.compiled.take().unwrap().schedule;
@@ -1434,7 +1526,11 @@ mod exchange_tests {
         }
 
         fn load(&mut self, node: &str, sequence: u64, frames: usize) {
-            let pcm = TrackPcm { frames: vec![[sequence as i16, 0]; frames], sample_rate: 48_000 };
+            self.load_stereo(node, sequence, [sequence as i16, 0], frames);
+        }
+
+        fn load_stereo(&mut self, node: &str, sequence: u64, sample: [i16; 2], frames: usize) {
+            let pcm = TrackPcm { frames: vec![sample; frames], sample_rate: 48_000 };
             let lease = TrackLease::reserve(&self.budget, frames * 4).unwrap();
             let track: Arc<DeckTrack> = lease.finish(pcm).unwrap();
             let (target, continuity) = self.deck_key(node);
@@ -1460,6 +1556,44 @@ mod exchange_tests {
         fn exchange(&mut self, serial: u64) {
             let (a, b) = (self.deck_key("deck_a"), self.deck_key("deck_b"));
             self.send(Command::Exchange { slot: 0, incarnation: 1, a, b, serial });
+        }
+    }
+
+    #[test]
+    fn closed_output_gate_silences_device_but_feeds_pre_gate_tap() {
+        let mut rig = Rig::with_nodes(vec![
+            deck("deck_a"), deck("deck_b"),
+            output("out", "AudioOutput", 0.0, "deck_a"),
+            output("cue", "CueOutput", 1.0, "deck_b"),
+        ]);
+        rig.load_stereo("deck_a", 1, [16384, -8192], 4096);
+        rig.load_stereo("deck_b", 2, [8192, 8192], 4096);
+        rig.bank.set_manual(rig.control("deck_a.play"), 1.0);
+        rig.bank.set_manual(rig.control("deck_b.play"), 1.0);
+
+        for (enabled, frames) in [(false, 1024), (true, 512)] {
+            if enabled { rig.bank.set_manual(rig.control("out.enabled"), 1.0); }
+            let mut rendered = 0;
+            rig.engine.render_with_tap(48_000.0, frames, |chunk| {
+                assert_eq!(chunk.offset, rendered, "chunks must cover the device buffer in order");
+                rendered += chunk.left.len();
+                if !enabled {
+                    assert_eq!(chunk.left, &[0.0; CHUNK], "closed left device channel");
+                    assert_eq!(chunk.right, &[0.0; CHUNK], "closed right device channel");
+                }
+                if rendered == frames {
+                    // After the gain ramps the two decks have distinct, exact PCM values.
+                    assert_eq!(chunk.cue_left, &[0.25; CHUNK], "left cue carries deck B");
+                    assert_eq!(chunk.cue_right, &[0.25; CHUNK], "right cue carries deck B");
+                    assert_eq!(chunk.pre_gate_left, &[0.5; CHUNK], "left tap carries only deck A");
+                    assert_eq!(chunk.pre_gate_right, &[-0.25; CHUNK], "right tap carries only deck A");
+                    if enabled {
+                        assert_eq!(chunk.left, chunk.pre_gate_left, "open left gate matches tap");
+                        assert_eq!(chunk.right, chunk.pre_gate_right, "open right gate matches tap");
+                    }
+                }
+            });
+            assert_eq!(rendered, frames, "complete render with output enabled={enabled}");
         }
     }
 

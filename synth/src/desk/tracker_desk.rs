@@ -36,8 +36,8 @@ pub struct TrackerDesk {
     /// The revision the model was built for, and the played parts it has.
     built: (u64, u64),
     /// The read-only parts as played, for a revision; the job making the next.
-    played: (u64, Played),
-    rx: Option<(u64, RequestJob<Result<Played, LoadError>>)>,
+    pub(super) played: (u64, Played),
+    pub(super) rx: Option<(u64, RequestJob<Result<Played, LoadError>>)>,
     wired: bool,
     /// The track the instrument browser is open for.
     pub(super) browse: Option<TrackBrowse>,
@@ -106,7 +106,7 @@ impl Desk {
     }
 
     /// Only an applied, valid document supplies a tracker model and its played parts.
-    fn sync_tracker_model(&mut self, cx: &mut Cx, widget: &WidgetRef) {
+    pub(super) fn sync_tracker_model(&mut self, cx: &mut Cx, widget: &WidgetRef) {
         // What the code parts play, again when the source changes.
         self.tracker.cancel_stale_played(self.revision);
         if let Some(result) = self.tracker.rx.as_mut().and_then(|(_, job)| job.try_take()) {
@@ -115,12 +115,15 @@ impl Desk {
                 Ok(Ok(notes)) => self.tracker.played = (self.revision, notes),
                 Ok(Err(LoadError::Problems(_))) => self.tracker.played = (self.revision, Played::default()),
                 Ok(Err(LoadError::Cancelled)) => {}
+                Ok(Err(error @ (LoadError::Unfinished { .. } | LoadError::Memory { .. }))) => makepad_widgets::log!("tracker: {error}"),
                 Err(error) => log!("score notes: {error}"),
             }
         }
-        if self.tracker.played.0 != self.revision && self.tracker.rx.is_none() {
-            let source = self.source.clone();
-            match RequestJob::submit(cx, PrepareControl::default(), move |control| tm::played_parts(&source, control)) {
+        // Only the applied revision: a draft still loading (or stopped) is not evaluated a second time.
+        let wanted = self.tracker.played.0 != self.revision && self.tracker.rx.is_none();
+        if let Some(applied) = self.loads.applied.as_ref().filter(|load| wanted && load.revision == self.revision) {
+            let source = applied.source.clone();
+            match RequestJob::submit(cx, PrepareControl::default(), move |control| async move { tm::played_parts_async(&source, &control).await }) {
                 Ok(job) => self.tracker.rx = Some((self.revision, job)),
                 Err(error) => { log!("score notes: {error}"); self.frame = cx.new_next_frame(); }
             }
@@ -364,12 +367,12 @@ Score{clock pulse}
     let (started, inside) = sync_channel(1);
     let (resume, paused) = sync_channel(1);
     let (finished, outcome) = sync_channel(1);
-    let job = RequestJob::submit(cx, PrepareControl::default(), move |control| {
+    let job = RequestJob::submit(cx, PrepareControl::default(), move |control| async move {
         makepad_score_live::model::on_next_shader_compile(move || {
             started.send(()).unwrap();
             paused.recv_timeout(timeout).expect("the tracker revision should be replaced");
         });
-        let notes = tm::played_parts(source, control);
+        let notes = tm::played_parts_async(source, &control).await;
         // Observe the score worker's result, even though its FrameJob has been discarded.
         finished.send(matches!(&notes, Err(LoadError::Cancelled))).unwrap();
         notes

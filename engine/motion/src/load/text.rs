@@ -1,5 +1,6 @@
 //! The text layers: Text and KineticText, read from their components.
 
+use crate::plain::TextProps;
 use super::{check_path_data, At, Reader};
 use super::did_you_mean;
 use crate::layers::{Field, KineticText, Text};
@@ -310,23 +311,25 @@ impl Text {
         };
         LayerKind::Text {
             source,
-            font,
-            weight,
-            italic,
-            size,
-            color: self.color.prop(c, at, "color", [1.0, 1.0, 1.0, 1.0]),
-            align: self.align.pick(c, at, "align", Align::Left),
-            valign: self.valign.pick(c, at, "valign", VAlign::Top),
-            by,
-            stagger,
+            props: TextProps {
+                font,
+                weight,
+                italic,
+                size,
+                color: self.color.prop(c, at, "color", [1.0, 1.0, 1.0, 1.0]),
+                align: self.align.pick(c, at, "align", Align::Left),
+                valign: self.valign.pick(c, at, "valign", VAlign::Top),
+                by,
+                stagger,
+                line_height,
+                tracking,
+                wrap,
+                fit,
+                reveal,
+            },
             ranges,
-            line_height,
-            tracking,
-            wrap,
-            fit,
             voice,
             plate,
-            reveal,
             caret,
             axes,
             path: match self.path.look(c) {

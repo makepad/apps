@@ -1,5 +1,6 @@
 //! Geometry for authoring checks, in document pixels. No rasterisation.
 
+use crate::plain::PrimitiveFrame;
 use crate::{geometry, Affine, Align, Blend, Cap, Item, ItemKind, Join, VAlign};
 use makepad_typography::{font::OutlineFont, layout::{layout, TextStyle}};
 use std::ops::Range;
@@ -187,7 +188,7 @@ struct Glyph {
 }
 
 fn text_ink(item: &Item, opacity: f64, canvas: Box2, out: &mut Ink) -> Result<(), String> {
-    let ItemKind::Text { text, font, weight, italic, axes, size, align, valign, line_height, tracking, wrap, fit, units, reveal, path, outline, .. } = &item.kind else { return Ok(()) };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, font, weight, italic, axes, size, align, valign, line_height, tracking, wrap, fit, units, reveal, path, outline, .. }) = &item.kind else { return Ok(()) };
     if text.trim().is_empty() || *reveal == Some(0) || *size <= 0.0 { return Ok(()) }
     let family = makepad_doc_fonts::drawn_family(font);
     let weight = family.map_or(*weight, |f| makepad_doc_fonts::drawn_weight(f, *weight, *italic));
@@ -391,9 +392,9 @@ pub(super) fn collect(items: &[Item], opacity: f64, normal: bool, canvas: Box2, 
         }
         let mut ink = Ink::new(item);
         let shape = match &item.kind {
-            ItemKind::Rect { size, radius, fill, stroke, width, trim, cap, .. } => Some((geometry::rect_path(*size, *radius), *size, fill, stroke, width, trim, cap, Join::Miter)),
-            ItemKind::Ellipse { size, fill, stroke, width, trim, cap, .. } => Some((geometry::ellipse_path(*size), *size, fill, stroke, width, trim, cap, Join::Round)),
-            ItemKind::Path { path: vector, fill, stroke, width, trim, cap, join } => {
+            ItemKind::Primitive(PrimitiveFrame::Rect { size, radius, fill, stroke, width, trim, cap, .. }) => Some((geometry::rect_path(*size, *radius), *size, fill, stroke, width, trim, cap, Join::Miter)),
+            ItemKind::Primitive(PrimitiveFrame::Ellipse { size, fill, stroke, width, trim, cap, .. }) => Some((geometry::ellipse_path(*size), *size, fill, stroke, width, trim, cap, Join::Round)),
+            ItemKind::Primitive(PrimitiveFrame::Path { path: vector, fill, stroke, width, trim, cap, join }) => {
                 let path = (**vector).clone();
                 let size = geometry::bounds(&path).map_or([0.0, 0.0], |b| [b[2].max(0.0), b[3].max(0.0)]);
                 Some((path, size, fill, stroke, width, trim, cap, *join))
@@ -411,7 +412,7 @@ pub(super) fn collect(items: &[Item], opacity: f64, normal: bool, canvas: Box2, 
             if *width > 0.0 && trim[1] > trim[0] && stroke.is_some_and(|c| c[3] * opacity > super::VISIBLE_ALPHA) {
                 let scale = map.a.hypot(map.b).max(map.c.hypot(map.d)).max(1e-6);
                 let path = geometry::trim(&path, trim[0], trim[1], 0.25 / scale);
-                ink.stroke = if matches!(item.kind, ItemKind::Path { .. }) || *trim != [0.0, 1.0] {
+                ink.stroke = if matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Path { .. })) || *trim != [0.0, 1.0] {
                     // Vector strokes keep a uniform output width; whole
                     // rectangles/ellipses use their local distance field.
                     let path = geometry::transformed(&path, &map);
@@ -432,7 +433,7 @@ pub(super) fn collect(items: &[Item], opacity: f64, normal: bool, canvas: Box2, 
             }
         } else if let ItemKind::Draw2d { picture, size } = &item.kind {
             draw2d_ink(&picture.list, item.transform(*size), opacity, canvas, &mut ink);
-        } else if matches!(item.kind, ItemKind::Text { .. }) {
+        } else if matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. })) {
             if let Err(error) = text_ink(item, opacity, canvas, &mut ink) { unchecked.push((item.path.clone(), error)); }
         } else if let Some(size) = item.box_size() {
             if size[0] > 0.0 && size[1] > 0.0 {

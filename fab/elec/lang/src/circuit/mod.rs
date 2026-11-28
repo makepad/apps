@@ -157,7 +157,7 @@ pub(crate) struct BusRec {
 
 pub(crate) struct DefRec {
     pub def: BlockDef,
-    pub build: ScriptValue,
+    pub build: Option<ScriptValue>,
     pub params: Option<ScriptObject>,
     /// The `e.block` call.
     pub here: Here,

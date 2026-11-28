@@ -8,6 +8,8 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, Role, Selector, TestApp};
@@ -75,9 +77,7 @@ fn a_drag_keeps_its_preview_when_a_committed_plate_replaces_it(app: TestApp) {
     // committed plate below is what proves the preview comes again.
     wait_poll(&app, || drag(&app, &bracket, 300.0, 300.0));
     app.locator(Selector::role(Role::Window)).wait_visible();
-    if app.widget_snapshot().nodes().into_iter().any(|w| w.visible() && w.node.role == Role::Tab && w.node.name == "Parts") {
-        app.locator(Selector::role(Role::Tab).name("Parts")).click();
-    }
+    parts_tab::open(&app);
     wait_rows(&app, "the dragged bracket on its way in", |r| r == ["bracket"]);
 
     // A plate committed while the drag is over the window (a script placed from elsewhere): the

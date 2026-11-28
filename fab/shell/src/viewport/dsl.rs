@@ -80,7 +80,7 @@ script_mod! {
         depth_write: true
         // Back faces stay: with a section plane on, the inside of a cut
         // solid IS the cap, and it is the only thing left to draw there.
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1039,7 +1039,7 @@ script_mod! {
     mod.draw.DrawFabGrid = mod.std.set_type_default() do #(DrawFabGrid::script_shader(vm)){
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1145,7 +1145,7 @@ script_mod! {
     mod.draw.DrawFabResinLayer = mod.std.set_type_default() do #(DrawFabResinLayer::script_shader(vm)){
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1205,7 +1205,7 @@ script_mod! {
     mod.draw.DrawFabSeeThrough = mod.std.set_type_default() do #(DrawFabSeeThrough::script_shader(vm)){
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1540,7 +1540,7 @@ script_mod! {
     mod.draw.DrawFabLines = mod.std.set_type_default() do #(DrawFabLines::script_shader(vm)){
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1623,7 +1623,7 @@ script_mod! {
     mod.draw.DrawFabPickLines = mod.std.set_type_default() do #(DrawFabPickLines::script_shader(vm)){
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)

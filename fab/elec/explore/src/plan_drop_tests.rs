@@ -69,7 +69,7 @@ fn drop_plans_pick_the_idiom_by_direction() {
     for b in &mut c.tree { b.ports.clear(); }
     c.block_defs.push(BlockDef {
         id: BlockDefId(0), name: "driver".into(), ports: vec![], params: vec![],
-        sheet: Default::default(), template: None,
+        sheet: Default::default(), template: None, planned: false, role: None,
     });
     c.tree[block.ix()].def = Some(BlockDefId(0));
     c.tree[block.ix()].path = "bank.led_driver".into();

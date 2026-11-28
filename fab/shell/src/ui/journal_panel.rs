@@ -1,6 +1,7 @@
 //! The plate's journal. The app supplies a page and the selected detail from its reader worker.
 use crate::api::AppState;
 use makepad_widgets_core::*;
+use makepad_git::diff::{diff_lines_bounded, DiffOp, Exhaustion};
 use makepad_code_editor::{CodeDocument, CodeEditor, CodeSession, diff::PreparedDiffDocument, session::PreparedView};
 pub use makepad_code_editor::diff::{DiffRowKind, DiffRowSpec};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -11,7 +12,44 @@ pub struct JournalDiff {
     pub text: Option<(PreparedDiffDocument, PreparedView, usize)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextDiffError {
+    Cancelled,
+    Invalid,
+}
+
 impl JournalDiff {
+    /// Prepare the line diff, syntax tokens and editor layout on the calling worker.
+    pub fn text(name: &str, before: &str, after: &str, current: &dyn Fn() -> bool) -> Result<Self, TextDiffError> {
+        let diff = diff_lines_bounded(before, after, &Default::default(), &|| !current());
+        if !current() { return Err(TextDiffError::Cancelled) }
+        let mut rows = Vec::new();
+        let mut hunk = 0;
+        let mut changed = false;
+        for op in diff.ops {
+            let equal = matches!(op, DiffOp::Equal { .. });
+            if !equal && !changed { hunk += 1; }
+            changed = !equal;
+            let (kind, old, new, len) = match op {
+                DiffOp::Equal { old_index, new_index, len } => (DiffRowKind::Equal, Some(old_index), Some(new_index), len),
+                DiffOp::Delete { old_index, len } => (DiffRowKind::Removed, Some(old_index), None, len),
+                DiffOp::Insert { new_index, len } => (DiffRowKind::Added, None, Some(new_index), len),
+            };
+            for line in 0..len {
+                let number = |i: usize| u32::try_from(i + line).map_err(|_| TextDiffError::Invalid);
+                rows.push(DiffRowSpec { kind, old_line: old.map(number).transpose()?, new_line: new.map(number).transpose()?, hunk: if equal { 0 } else { hunk } });
+            }
+        }
+        let mut prepared = Self::prepare(name, &rows, before, after).map_err(|_| TextDiffError::Invalid)?;
+        if diff.unavailable.is_some() {
+            prepared.label.push_str(" · ");
+            prepared.label.push_str(Exhaustion::LABEL);
+        } else if hunk == 0 && before != after {
+            prepared.label.push_str(" · Line endings changed");
+        }
+        Ok(prepared)
+    }
+
     pub fn note(label: String) -> Self { Self { label, text: None } }
     pub fn prepare(name: &str, rows: &[DiffRowSpec], old: &str, new: &str) -> Result<Self, makepad_code_editor::diff::PrepareDiffError> {
         let document = CodeDocument::prepare_diff_for_path(name, rows, old, new)?;
@@ -174,6 +212,12 @@ script_mod! {
     use mod.widgets.*
 
     let DiffEditor = #(JournalDiffEditor::register_widget(vm))
+    mod.widgets.FabJournalDiffEditor = DiffEditor{width: Fill height: 172
+        editor +: {read_only: true show_gutter: true word_wrap: false empty_page_at_end: false
+            draw_bg +: {color: fab.color_editor}
+            draw_text +: {text_style: theme.font_code{font_size: 9.0}}
+        }
+    }
     let Entry = #(JournalItem::register_widget(vm))
     mod.widgets.FabJournalPanelBase = #(FabJournalPanel::register_widget(vm))
     mod.widgets.FabJournalPanel = set_type_default() do mod.widgets.FabJournalPanelBase{
@@ -235,12 +279,7 @@ script_mod! {
             diffs := FlatList{width: Fill height: Fit flow: Down
                 Document := View{width: Fill height: Fit flow: Down spacing: 3
                     name := FabLabel{width: Fill height: Fit}
-                    editor := DiffEditor{width: Fill height: 172
-                        editor +: {read_only: true show_gutter: true word_wrap: false empty_page_at_end: false
-                            draw_bg +: {color: fab.color_editor}
-                            draw_text +: {text_style: theme.font_code{font_size: 9.0}}
-                        }
-                    }
+                    editor := mod.widgets.FabJournalDiffEditor{}
                 }
             }
             text := FabLabel{width: Fill height: Fit}
@@ -491,6 +530,12 @@ struct JournalDiffEditor {
     #[rust] session: Option<Rc<RefCell<CodeSession>>>,
 }
 
+pub(super) fn bind_diff_editor(cx: &mut Cx, widget: &WidgetRef, session: Rc<RefCell<CodeSession>>, first: usize) {
+    if let Some(mut editor) = widget.borrow_mut::<JournalDiffEditor>() {
+        editor.bind(cx, &Some((session, first)));
+    }
+}
+
 impl JournalDiffEditor {
     fn bind(&mut self, cx: &mut Cx, text: &Option<(Rc<RefCell<CodeSession>>, usize)>) {
         if let Some((session, first)) = text {
@@ -521,6 +566,26 @@ impl Widget for JournalDiffEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_text_diff_prepares_edits_line_endings_and_created_documents() {
+        let name = "stage.ckt.splash";
+        let prepare = |before: &str, after: &str| JournalDiff::text(name, before, after, &|| true).unwrap();
+        let (edited, _, _) = prepare("old\nsame\nlast\n", "new\nsame\nend\n").text.expect("an edit has a prepared document");
+        for kind in [DiffRowKind::Added, DiffRowKind::Removed] {
+            let hunks: Vec<_> = edited.metadata().rows.iter().filter(|r| r.kind == Some(kind)).map(|r| r.hunk).collect();
+            assert_eq!(hunks, [Some(1), Some(2)], "{kind:?} rows number the two separated edits from one");
+        }
+
+        assert_eq!(prepare("a\r\n", "a\n").label, format!("{name} · Line endings changed"),
+            "a change only to the terminator is identified in the label");
+        let (created, _, _) = prepare("", "one\ntwo\nthree\n").text.expect("a creation has a prepared document");
+        let rows = &created.metadata().rows;
+        assert!(rows.len() == 3 && rows.iter().all(|r| r.kind == Some(DiffRowKind::Added)),
+            "an empty before text shows all three new lines as added");
+        assert!(matches!(JournalDiff::text(name, "old", "new", &|| false), Err(TextDiffError::Cancelled)),
+            "a cancelled comparison returns Cancelled");
+    }
 
     #[test]
     fn journal_panel_remove_and_empty_confirmations_keep_the_list_rect() {

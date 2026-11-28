@@ -1,6 +1,6 @@
 //! The Jobs editor and Monitor show active jobs first, the queue in print order, then history newest first.
 //!
-//! A draw groups job indices in one pass, resolves the selected job once and builds labels only for visible portal rows.
+//! History and printing-job changes regroup job indices. Draw resolves the selected job once and builds labels only for visible portal rows.
 //! Workers load the history and previews.
 
 use super::jobs::{CommittedJob, JobState};
@@ -26,7 +26,7 @@ pub fn rows(p: &PrintState, _now: f64) -> Vec<JobRow> {
     order.into_iter().map(|i| row(&p.follow.jobs[i], p, shown)).collect()
 }
 
-fn fill_order(f: &follow::Follow, order: &mut Vec<usize>) {
+pub(super) fn fill_order(f: &follow::Follow, order: &mut Vec<usize>) {
     let len = f.jobs.len();
     order.resize(len, 0);
     let printing = f.job.as_ref().and_then(|live| live.id.as_deref());
@@ -47,6 +47,24 @@ fn fill_order(f: &follow::Follow, order: &mut Vec<usize>) {
     order[..active].reverse();
     order.copy_within(len.., active);
     order.truncate(len);
+}
+
+#[derive(Default)]
+pub(super) struct JobOrder {
+    indices: Vec<usize>,
+    key: Option<(u64, Option<String>)>,
+}
+
+impl JobOrder {
+    pub(super) fn indices(&mut self, f: &follow::Follow) -> &[usize] {
+        let rev = f.jobs.rev();
+        let printing = f.job.as_ref().and_then(|j| j.id.as_deref());
+        if !self.key.as_ref().is_some_and(|(r, id)| *r == rev && id.as_deref() == printing) {
+            fill_order(f, &mut self.indices);
+            self.key = Some((rev, printing.map(str::to_owned)));
+        }
+        &self.indices
+    }
 }
 
 fn row(job: &CommittedJob, p: &PrintState, shown: Option<&str>) -> JobRow {
@@ -228,7 +246,7 @@ pub struct FabJobList {
     #[live]
     fill: bool,
     #[rust]
-    order: Vec<usize>,
+    order: JobOrder,
 }
 
 impl Widget for FabJobList {
@@ -245,8 +263,8 @@ impl Widget for FabJobList {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
-        fill_order(&state.print.follow, &mut self.order);
-        let len = self.order.len();
+        let order = self.order.indices(&state.print.follow);
+        let len = order.len();
         if len == 0 { return DrawStep::done(); }
         let shown = state.print.follow.shown().map(|j| j.meta.id.clone());
         self.view.view(cx, ids!(heading)).set_visible(cx, !self.fill);
@@ -258,7 +276,7 @@ impl Widget for FabJobList {
             let Some(mut list) = list_ref.borrow_mut() else { continue };
             list.set_item_range(cx, 0, len);
             while let Some(index) = list.next_visible_item(cx) {
-                let Some(&job_index) = self.order.get(index) else { continue };
+                let Some(&job_index) = order.get(index) else { continue };
                 let Some(state) = scope.data.get::<AppState>() else { continue };
                 let f = &state.print.follow;
                 let row = row(&f.jobs[job_index], &state.print, shown.as_deref());
@@ -299,7 +317,7 @@ mod tests {
             job("preparing", JobState::Preparing, 3.0),
             job("queue_old", JobState::Queued, 2.0),
             job("finished", JobState::Finished, 1.0),
-        ];
+        ].into();
         let listed = rows(&p, 100.0);
         assert_eq!(listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["sent", "preparing", "queue_old", "queue_new", "unseen", "stopped", "failed", "finished"],
@@ -313,7 +331,7 @@ mod tests {
     #[test]
     fn printer_layer_and_picked_job() {
         let mut p = PrintState::default();
-        p.follow.jobs = vec![job("queued", JobState::Queued, 2.0), job("printing", JobState::Sent, 1.0)];
+        p.follow.jobs = vec![job("queued", JobState::Queued, 2.0), job("printing", JobState::Sent, 1.0)].into();
         p.follow.job = Some(PrinterJob {
             id: Some("printing".into()), layer: 12, total_layers: Some(100), progress: Some(40.0), ..Default::default()
         });
@@ -339,11 +357,14 @@ mod tests {
         Arc::make_mut(&mut ended.meta).filament_g = vec![1.5, 2.5];
         p.follow.jobs.push(ended);
         assert_eq!(rows(&p, 9999.0)[0].detail, "Elapsed 30:10 · Planned 31:52 · 4.0 g", "elapsed uses the end, and grams sum all slots");
-        p.follow.jobs[0].state = JobState::EndedUnseen;
+        p.follow.jobs.at_mut(0).state = JobState::EndedUnseen;
         assert_eq!(rows(&p, 9999.0)[0].detail, "Planned 31:52 · 4.0 g", "unseen end has no known elapsed time");
-        p.follow.jobs[0].state = JobState::Finished;
-        p.follow.jobs[0].ended_at = None;
-        Arc::make_mut(&mut p.follow.jobs[0].meta).filament_g = vec![0.0, 0.0];
+        {
+            let mut job = p.follow.jobs.at_mut(0);
+            job.state = JobState::Finished;
+            job.ended_at = None;
+            Arc::make_mut(&mut job.meta).filament_g = vec![0.0, 0.0];
+        }
         assert_eq!(rows(&p, 9999.0)[0].detail, "Planned 31:52", "unknown elapsed and zero grams are omitted");
     }
 }

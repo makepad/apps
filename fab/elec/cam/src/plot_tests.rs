@@ -20,7 +20,7 @@ fn board_geometry_attributes_and_factory_roundtrip() {
         graphics: vec![(LayerId::F_SILK, Gfx::Stroke { path: Path::new(P::mm(-0.5, 0.6)).line(P::mm(0.5, 0.6)).arc(P::mm(0.7, 0.8), P::mm(0.5, 1.0)), w: mm(0.1) })],
         ..Footprint::default()
     });
-    let part = Arc::new(PartDef { name: "resistor".into(), kind: fab_elec_parts::PartKind::Resistor, symbol: Default::default(), footprint: Some(fp.clone()), body: None, pins: vec![], fields: Default::default(), emitter: None, gpio: None });
+    let part = Arc::new(PartDef { name: "resistor".into(), kind: fab_elec_parts::PartKind::Resistor, symbol: Default::default(), footprint: Some(fp.clone()), body: None, pins: vec![], fields: Default::default(), emitter: None, gpio: None, lifecycle: None, approved: false });
     let mut circuit = Circuit::default();
     circuit.comps = ["R1", "R2", "R3"].iter().enumerate().map(|(i, r)| Component {
         id: CompId(i as u32), path: (*r).into(), refdes: (*r).into(), ref_kind: Default::default(), part: part.clone(), value: None,

@@ -25,8 +25,12 @@
 //! [`MotionDraw::handle_event`] on every event and draw once
 //! [`MotionDraw::ready`].
 
+use makepad_motion::plain::PrimitiveFrame;
 pub mod coverage;
 mod draw2d;
+/// The frame tool (`makepad-motion`, and hosts' pixel tests), on full Scene3D.
+#[cfg(feature = "scene3d")]
+pub mod frame_tool;
 mod scene;
 pub mod paint;
 #[cfg(feature = "scene3d")]
@@ -41,7 +45,7 @@ mod widget;
 pub use widget::widget_ui;
 
 use makepad_motion::frame::*;
-use makepad_motion::geometry;
+use makepad_motion::{geometry, plain, LoadedPlainFrame, PlainFrame};
 use makepad_motion::model::{Blend, Cap, Fit, Join, Media, ShaderProgram};
 use makepad_motion::render_effects::{camera_spec, kit_effect};
 use makepad_stage_render_kit::{Camera as KitCamera, Painted as KitPainted, RenderKit};
@@ -535,6 +539,14 @@ pub struct Drawn {
     pub exact: bool,
 }
 
+/// What the frame stall watch observes between checks.
+pub struct LoadProgress {
+    /// While work the frame needs is running, the stall clock stays at zero.
+    pub working: bool,
+    /// A change in this value restarts the stall clock. Repainting the same state leaves it alone.
+    pub mark: u64,
+}
+
 pub use scene3d::{SceneDoc, SceneLoad, SceneLoaded};
 
 /// The warm draw's blur (pixels): over the kit's blur per level, so it
@@ -557,7 +569,112 @@ pub enum Need {
     EditFrame(String, u64),
 }
 
+// The standalone editor/compiler entry points have no MotionDraw argument.
+// They must also refuse document code throughout a plain recording on this thread.
+thread_local! {
+    static PLAIN_RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A VM-free picture from the peer reader or the full loader.
+pub enum PlainPicture<'a> {
+    Data(&'a PlainFrame),
+    Loaded(&'a LoadedPlainFrame),
+}
+
+impl<'a> From<&'a PlainFrame> for PlainPicture<'a> {
+    fn from(frame: &'a PlainFrame) -> Self { Self::Data(frame) }
+}
+
+impl<'a> From<&'a LoadedPlainFrame> for PlainPicture<'a> {
+    fn from(frame: &'a LoadedPlainFrame) -> Self { Self::Loaded(frame) }
+}
+
+// Text and vector painting borrow the sampled values from either item.
+trait PaintItem {
+    fn primitive(&self) -> Option<&PrimitiveFrame>;
+    fn path(&self) -> &str;
+    fn world(&self) -> &Affine;
+    fn local(&self) -> &Local;
+    fn feather(&self) -> f64;
+    fn feather_side(&self) -> makepad_motion::FeatherSide;
+}
+
+// A group's children and mask belong to its own tree.
+trait CanvasItem: PaintItem + Clone + std::fmt::Debug {
+    fn rich(&self) -> Option<&Item>;
+    fn group(&self) -> Option<(&[Self], Option<&Self>, makepad_motion::MaskMode)>;
+    fn is_static(&self) -> bool;
+    fn opacity(&self) -> f64;
+    fn blur(&self) -> f64;
+    fn blend(&self) -> Blend;
+    fn effects(&self) -> &[EffectFrame];
+    fn without_blend(&self) -> Self;
+    fn before_effects(&self) -> Self;
+}
+
+macro_rules! canvas_item {
+    ($item:ty, $kind:ident, $this:ident, $rich:expr) => {
+        impl PaintItem for $item {
+            fn primitive(&self) -> Option<&PrimitiveFrame> {
+                match &self.kind { $kind::Primitive(shape) => Some(shape), _ => None }
+            }
+            fn path(&self) -> &str { &self.path }
+            fn world(&self) -> &Affine { &self.world }
+            fn local(&self) -> &Local { &self.local }
+            fn feather(&self) -> f64 { self.feather }
+            fn feather_side(&self) -> makepad_motion::FeatherSide { self.feather_side }
+        }
+
+        impl CanvasItem for $item {
+            fn rich(&$this) -> Option<&Item> { $rich }
+            fn group(&self) -> Option<(&[Self], Option<&Self>, makepad_motion::MaskMode)> {
+                match &self.kind {
+                    $kind::Group { children, mask, mask_mode, .. } => Some((children, mask.as_deref(), *mask_mode)),
+                    _ => None,
+                }
+            }
+            fn is_static(&self) -> bool { self.is_static }
+            fn opacity(&self) -> f64 { self.opacity }
+            fn blur(&self) -> f64 { self.blur }
+            fn blend(&self) -> Blend { self.blend }
+            fn effects(&self) -> &[EffectFrame] { &self.effects }
+            fn without_blend(&self) -> Self {
+                let mut layer = self.clone();
+                layer.blend = Blend::Normal;
+                layer
+            }
+            fn before_effects(&self) -> Self {
+                let mut layer = self.without_blend();
+                layer.blur = 0.0;
+                layer.opacity = 1.0;
+                layer.effects.clear();
+                layer
+            }
+        }
+    };
+}
+
+use plain::ItemKind as PlainItemKind;
+canvas_item!(Item, ItemKind, self, Some(self));
+canvas_item!(plain::Item, PlainItemKind, self, None);
+
+struct PlainRecording<'a> {
+    draw: &'a mut MotionDraw,
+    previous_draw: bool,
+    previous_thread: bool,
+}
+
+impl Drop for PlainRecording<'_> {
+    fn drop(&mut self) {
+        self.draw.plain = self.previous_draw;
+        PLAIN_RECORDING.set(self.previous_thread);
+    }
+}
+
 pub struct MotionDraw {
+    plain: bool,
+    /// Refusals already logged, by document path, for the life of this draw.
+    plain_errors: std::collections::BTreeMap<String, String>,
     /// Meshes this recording asked for past what can be made (memory, one
     /// GPU buffer), each said once: "too much geometry: N vertices in
     /// layer X". The shapes before that point draw; a recording without
@@ -604,13 +721,15 @@ pub struct MotionDraw {
     /// Textures prepared for this frame by item path (and text unit).
     prepared: HashMap<(String, usize), Texture>,
     /// The kept picture of the frame's static bottom layers.
-    static_cache: Option<(u64, RenderTarget)>,
+    static_cache: Option<((u64, bool), RenderTarget)>,
     recorded: Option<(u64, Vec<DrawPassId>, Vec<String>)>,
     last: Option<DrawPassId>,
     output: Option<Texture>,
     exact: bool,
     /// Why the last recording was not exact (for [`Self::debug_state`]).
     inexact: String,
+    /// Host resources the last recording still needed.
+    missing_at_record: Vec<Need>,
     /// Glyphs drawn so far, by face and pixel size (see `text::note_glyphs`).
     glyphs_seen: std::collections::HashSet<(u64, char)>,
     fresh_glyphs: bool,
@@ -710,7 +829,7 @@ impl MotionDraw {
         }
         if let Some((key, target)) = &mut self.static_cache {
             target.release(cx);
-            *key = 0;
+            key.0 = 0;
         }
         self.graph = Default::default();
         self.accum = Default::default();
@@ -727,6 +846,7 @@ impl MotionDraw {
             width: 2, height: 2, data: Some(vec![0; 4]), updated: TextureUpdated::Full,
         });
         Self {
+            plain: false, plain_errors: Default::default(),
             geometry_errors: Vec::new(), layer_path: String::new(), vector_layer: String::new(),
             pick_names: Vec::new(), pick_ids: HashMap::new(), pick_path: String::new(),
             draws, pool: RenderTargetPool::new(TARGET_IDLE_FRAMES), spans: Vec::new(), passes: Vec::new(), base: Affine::IDENTITY, pixels: (1, 1), transparent,
@@ -734,7 +854,7 @@ impl MotionDraw {
             shaders: shader::Shaders::default(), widgets: widget::Widgets::default(), scenes: scene::Scenes::default(),
             draw2d: Default::default(), scenes3d: Default::default(), layer_targets: HashMap::new(), vectors: Default::default(), vector_open: false,
             prepared: HashMap::new(), static_cache: None, recorded: None, last: None, output: None, exact: false,
-            glyphs_seen: Default::default(), fresh_glyphs: false, fresh_why: "", kinds_seen: Default::default(), inexact: String::new(),
+            glyphs_seen: Default::default(), fresh_glyphs: false, fresh_why: "", kinds_seen: Default::default(), inexact: String::new(), missing_at_record: Vec::new(),
             kit: RenderKit::new(cx), backdrop: None, host_backdrop: None,
             frame_t: 0.0, fps: 60.0, camera: None, kit_errors: Vec::new(), warm: None, warm_drawn: false,
             hdr: false, locked: false, frames: None, graph: Default::default(), accum: Default::default(), accumulating: None, finished: None, inputs_pending: None, last_drawn: None,
@@ -752,6 +872,7 @@ impl MotionDraw {
     /// scene loading, loaded or drawing is not asked for again. A scene
     /// that leaves a draw keeps its document the same way.
     pub fn scene_loads(&self, frame: &MotionFrame) -> Vec<SceneLoad> {
+        if self.plain { return Vec::new(); }
         scene3d::scene_loads(self, frame)
     }
 
@@ -843,16 +964,20 @@ impl MotionDraw {
 
     /// What `frame` needs from the host that has not been given.
     pub fn missing(&self, frame: &MotionFrame) -> Vec<Need> {
+        self.missing_in_mode(frame, self.plain)
+    }
+
+    fn missing_in_mode(&self, frame: &MotionFrame, plain: bool) -> Vec<Need> {
         let mut out = Vec::new();
         for (_, item) in frame.walk() {
             let need = match &item.kind {
                 ItemKind::Image { src: src @ Media::Asset(_), .. } if !self.images.contains_key(src) => Need::Image(src.clone()),
                 ItemKind::Svg { src: src @ Media::Asset(_), .. } if !self.svgs.contains_key(src) => Need::Svg(src.clone()),
                 ItemKind::Vector { src: src @ Media::Asset(_), .. } if !self.vectors.markups.contains_key(src) => Need::Svg(src.clone()),
-                ItemKind::Scene3D { model: src @ Media::Asset(_), .. } if !self.scenes.has(src) => Need::Model(src.clone()),
+                ItemKind::Scene3D { model: src @ Media::Asset(_), .. } if !plain && !self.scenes.has(src) => Need::Model(src.clone()),
                 ItemKind::Video { src: src @ Media::Asset(_), .. } if !self.videos.contains_key(&item.path) => Need::VideoFrame(item.path.clone(), src.clone()),
                 ItemKind::Video { src: Media::Backdrop, source_time, .. } if !self.videos.contains_key(&item.path) => Need::EditFrame(item.path.clone(), source_time.to_bits()),
-                ItemKind::Scene3dDoc { textures, videos, .. } => {
+                ItemKind::Scene3dDoc { textures, videos, .. } if !plain => {
                     for (_, media) in textures {
                         if matches!(media, Media::Asset(_)) && !self.images.contains_key(media) && !out.contains(&Need::Image(media.clone())) {
                             out.push(Need::Image(media.clone()));
@@ -866,7 +991,7 @@ impl MotionDraw {
                     }
                     continue;
                 }
-                ItemKind::Shader { .. } => match self.shaders.needs_source(item) {
+                ItemKind::Shader { .. } if !plain => match self.shaders.needs_source(item) {
                     Some(asset) => Need::Effect(asset),
                     None => continue,
                 },
@@ -887,6 +1012,12 @@ impl MotionDraw {
     /// Problems found while drawing (shader compile errors, effect builds,
     /// widget evaluation), each once, with the layer path.
     pub fn errors(&self) -> Vec<String> {
+        let mut out = self.draw_errors();
+        out.extend(self.plain_errors.values().cloned());
+        out
+    }
+
+    fn draw_errors(&self) -> Vec<String> {
         let mut out = self.shaders.errors();
         out.extend(self.kit_errors.iter().cloned());
         out.extend(self.widgets.errors());
@@ -916,7 +1047,7 @@ impl MotionDraw {
             return Affine::IDENTITY;
         }
         fn find<'a>(item: &'a Item, target: &str) -> Option<&'a Item> {
-            if item.path == target && matches!(item.kind, ItemKind::Text { .. }) {
+            if item.path == target && matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. })) {
                 return Some(item);
             }
             match &item.kind {
@@ -932,7 +1063,7 @@ impl MotionDraw {
 
     pub fn item_bounds(&mut self, cx: &mut Cx2d, item: &Item) -> Option<[f64; 4]> {
         match &item.kind {
-            ItemKind::Text { .. } => {
+            ItemKind::Primitive(PrimitiveFrame::Text { .. }) => {
                 let layout = text::layout(self, cx, item)?;
                 if layout.size[0] <= 0.0 && layout.size[1] <= 0.0 {
                     return None;
@@ -940,7 +1071,7 @@ impl MotionDraw {
                 let m = item.world.then(&Affine::translate(layout.shift[0], layout.shift[1])).then(&item.local.affine(layout.size));
                 Some(aabb(&m, layout.size))
             }
-            ItemKind::Path { path, stroke, width, .. } => {
+            ItemKind::Primitive(PrimitiveFrame::Path { path, stroke, width, .. }) => {
                 let size = geometry::bounds(path).map_or([0.0, 0.0], |b| [b[2].max(0.0), b[3].max(0.0)]);
                 let m = item.transform(size);
                 let b = geometry::bounds(&geometry::transformed(path, &m))?;
@@ -1003,8 +1134,8 @@ impl MotionDraw {
     }
 
     /// The pixel map of an item's own box of `size`.
-    fn pixel_map(&self, item: &Item, size: [f64; 2]) -> Affine {
-        self.base.then(&item.transform(size))
+    fn pixel_map(&self, item: &dyn PaintItem, size: [f64; 2]) -> Affine {
+        self.base.then(&item.world().then(&item.local().affine(size)))
     }
 
     /// The pixel scale an item drawn into its own target (a 3D scene, a
@@ -1036,36 +1167,134 @@ impl MotionDraw {
         self.draw_placed(cx, frame, pixels, base)
     }
 
+    /// Draw a frame read as data at `base`. A widget, shader or 3D scene
+    /// draws as a neutral tile. Refusals are reported once per item path.
+    pub fn draw_plain<'a>(&mut self, cx: &mut Cx2d, frame: impl Into<PlainPicture<'a>>, pixels: (u32, u32), base: Affine) -> Drawn {
+        let previous_draw = std::mem::replace(&mut self.plain, true);
+        let guard = PlainRecording { draw: self, previous_draw, previous_thread: PLAIN_RECORDING.replace(true) };
+        match frame.into() {
+            PlainPicture::Loaded(frame) => guard.draw.draw_placed(cx, frame.frame(), pixels, base),
+            PlainPicture::Data(frame) => {
+                let frame = frame.frame();
+                let draw = &mut *guard.draw;
+                draw.begin_ldr();
+                let (texture, exact, asked) = draw.record_items(cx, &frame.items, frame.t, frame.fps, frame.size,
+                    frame.background, None, pixels, base);
+                draw.finish_record(cx, texture, exact, asked)
+            }
+        }
+    }
+
+    /// Draw a VM-free picture with the placement used by [`Self::draw_fit`].
+    pub fn draw_plain_fit<'a>(&mut self, cx: &mut Cx2d, frame: impl Into<PlainPicture<'a>>, pixels: (u32, u32), fit: Fit) -> Drawn {
+        let frame = frame.into();
+        let size = match &frame {
+            PlainPicture::Loaded(frame) => frame.frame().size,
+            PlainPicture::Data(frame) => frame.frame().size,
+        };
+        self.draw_plain(cx, frame, pixels, fit_transform([pixels.0 as f64, pixels.1 as f64], size, fit))
+    }
+
+    fn plain_refusal(&mut self, path: &str, what: &str, with_post: bool) {
+        if !self.plain_errors.contains_key(path) {
+            let suffix = if with_post { " with its post pass" } else { "" };
+            let message = format!("motion: {path} is not drawn{suffix}: {what} runs code, and this picture was read as data");
+            makepad_widgets::log!("{message}");
+            self.plain_errors.insert(path.to_owned(), message);
+        }
+    }
+
+    /// Preparation sinks leave the tile to the item's turn in its canvas,
+    /// where it has the correct transform, mask and stacking order.
+    fn refuse_plain_item(&mut self, item: &Item) -> bool {
+        if !self.plain {
+            return false;
+        }
+        let what = match item.kind {
+            ItemKind::Widget { .. } => "a widget",
+            ItemKind::Shader { .. } => "a shader",
+            ItemKind::Scene3D { .. } | ItemKind::Scene3dDoc { .. } => "a 3D scene",
+            _ => return false,
+        };
+        self.plain_refusal(&item.path, what, false);
+        true
+    }
+
+    fn plain_tile(&mut self, cx: &mut Cx2d, item: &Item) {
+        let size = item.box_size().unwrap_or_default();
+        let m = self.pixel_map(item, size);
+        // Measure perpendicular to each edge in target pixels. Even a
+        // stretched or sheared placement then has a one-pixel inside rim.
+        let area = (m.a * m.d - m.b * m.c).abs();
+        if area == 0.0 { return; }
+        let x = area / m.c.hypot(m.d);
+        let y = area / m.a.hypot(m.b);
+        let placement = m.then(&Affine::scale(1.0 / x, 1.0 / y));
+        self.flush_vector(cx);
+        self.note_kind("vector");
+        paint::sdf(cx, &mut self.draws.shape, &placement, [size[0] * x, size[1] * y], paint::Shape::Rect { radius: 0.0 },
+            vec4(0.5, 0.5, 0.5, 1.0), vec4(0.25, 0.25, 0.25, 1.0), -1.0, 1.0,
+            0.0, DrawFeatherSide::Both, 0.25 * item.opacity.clamp(0.0, 1.0));
+    }
+
     /// Render into `pixels` with an explicit map from authored document units.
     pub fn draw_placed(&mut self, cx: &mut Cx2d, frame: &MotionFrame, pixels: (u32, u32), base: Affine) -> Drawn {
-        if frame.hdr {
+        if !self.plain && frame.hdr {
             return self.draw_hdr(cx, frame, pixels, base);
         }
+        self.begin_ldr();
+        let (texture, exact, asked) = self.record_frame(cx, frame, pixels, base);
+        self.finish_record(cx, texture, exact, asked)
+    }
+
+    fn begin_ldr(&mut self) {
         self.hdr = false;
         self.accumulating = None;
         self.spans.clear();
         self.passes.clear();
-        let (texture, exact, asked) = self.record_frame(cx, frame, pixels, base);
-        self.finish_record(cx, texture, exact, asked)
     }
 
     /// Record `frame`'s layers into its canvas (linear half float when the
     /// frame is HDR). Returns the canvas, whether everything it shows was
     /// ready, and whether a redraw was asked before.
     fn record_frame(&mut self, cx: &mut Cx2d, frame: &MotionFrame, pixels: (u32, u32), base: Affine) -> (Texture, bool, bool) {
+        self.record_items(cx, &frame.items, frame.t, frame.fps, frame.size, frame.background, Some(frame), pixels, base)
+    }
+
+    fn record_items(&mut self, cx: &mut Cx2d, items: &[impl CanvasItem], t: f64, fps: f64, size: [f64; 2],
+                    background: Option<makepad_motion::Color>, loaded: Option<&MotionFrame>, pixels: (u32, u32), base: Affine) -> (Texture, bool, bool) {
         // A draw that is missing something asks for another redraw (text
         // whose glyphs are not rasterised yet does): watch for it.
         let asked = std::mem::replace(&mut cx.new_draw_event.redraw_all, false);
-        let missing = self.missing(frame);
-        let exact = missing.is_empty() && self.ready() && self.inputs_pending.is_none();
+        let missing = loaded.map_or_else(Vec::new, |f| self.missing(f));
+        let exact = missing.is_empty() && (self.plain || self.ready()) && self.inputs_pending.is_none();
         self.inexact = if !missing.is_empty() { format!("missing {missing:?}") } else if let Some(why) = &self.inputs_pending { why.clone() } else if !exact { format!("not ready (shaders {}, scenes {})", self.shaders.ready(), self.scenes.ready()) } else { String::new() };
+        self.missing_at_record = missing;
         self.fresh_glyphs = false;
         // Targets this recording does not use go free; long-idle ones give
         // their texture back.
         self.pool.next_frame(cx);
         self.draw2d.begin_frame();
         self.prepared.clear();
-        self.group_posts = frame.group_post.iter().cloned().collect();
+        self.group_posts.clear();
+        if let Some(frame) = loaded {
+            if self.plain {
+                for (path, _) in &frame.group_post {
+                    self.plain_refusal(path, "a post pass", true);
+                }
+                for (present, path, what) in [
+                    (frame.post.is_some(), "post", "a post pass"),
+                    (frame.camera.is_some(), "camera", "a camera"),
+                    (frame.motion_blur.is_some(), "motion_blur", "motion blur"),
+                ] {
+                    if present {
+                        self.plain_refusal(path, what, false);
+                    }
+                }
+            } else {
+                self.group_posts = frame.group_post.iter().cloned().collect();
+            }
+        }
         let posted: std::collections::HashSet<String> = self.group_posts.keys().cloned().collect();
         self.group_graphs.retain(|path, _| posted.contains(path));
         self.scenes3d.begin_frame(cx);
@@ -1075,21 +1304,22 @@ impl MotionDraw {
         self.kit.set_hdr(self.hdr);
         self.warm_drawn = false;
         self.backdrop = None;
-        self.frame_t = frame.t;
-        self.fps = frame.fps;
-        self.camera = frame.camera.as_ref().and_then(|camera| camera_spec(camera).ok()).map(|spec| spec.at(frame.t, [self.pixels.0 as f64, self.pixels.1 as f64]));
+        self.frame_t = t;
+        self.fps = fps;
+        self.camera = loaded.and_then(|f| f.camera.as_ref()).filter(|_| !self.plain).and_then(|camera| camera_spec(camera).ok()).map(|spec| spec.at(t, [self.pixels.0 as f64, self.pixels.1 as f64]));
         self.pixels = (pixels.0.max(1), pixels.1.max(1));
         self.base = base;
-        let clear = frame.background.map_or(vec4(0.0, 0.0, 0.0, 0.0), |c| {
+        let clear = background.map_or(vec4(0.0, 0.0, 0.0, 0.0), |c| {
             let c = self.lin(c);
             vec4((c[0] * c[3]) as f32, (c[1] * c[3]) as f32, (c[2] * c[3]) as f32, c[3] as f32)
         });
         // The static bottom layers: kept, or drawn once more into the kept target.
-        let prefix = frame.static_prefix();
+        let prefix = items.iter().take_while(|i| i.is_static() && !matches!(i.rich().map(|r| &r.kind), Some(ItemKind::Shader { below: true, .. }))).count();
         let mut base: Option<Texture> = None;
         if prefix > 0 {
-            let key = frame.static_key() ^ ((self.pixels.0 as u64) << 32 | self.pixels.1 as u64) ^ (self.hdr as u64) << 63
+            let key = makepad_motion::frame::static_prefix_key(size, background, &items[..prefix]) ^ ((self.pixels.0 as u64) << 32 | self.pixels.1 as u64) ^ (self.hdr as u64) << 63
                 ^ LiveId::from_str(&format!("{:?}", self.base)).0;
+            let key = (key, self.plain);
             let fresh = self.static_cache.as_ref().is_some_and(|(k, _)| *k == key);
             if !fresh {
                 let mut kept = match self.static_cache.take() {
@@ -1097,22 +1327,27 @@ impl MotionDraw {
                     None => RenderTarget::new(cx, "motion_static"),
                 };
                 kept.ensure_kept(cx, self.pixels, target_format(self.hdr));
-                let texture = self.canvas_into(cx, &frame.items[..prefix], clear, None, Some(&mut kept));
+                let texture = self.canvas_into(cx, &items[..prefix], clear, None, Some(&mut kept));
                 self.static_cache = Some((key, kept));
                 base = Some(texture);
             } else {
                 base = self.static_cache.as_ref().map(|(_, t)| t.texture.clone());
             }
         }
-        let rest = &frame.items[prefix..];
+        let rest = &items[prefix..];
         let texture = if prefix > 0 && rest.is_empty() {
             // Everything is static: still copy, so the output is this frame's own.
-            self.canvas(cx, &[], vec4(0.0, 0.0, 0.0, 0.0), base)
+            self.canvas(cx, &[] as &[Item], vec4(0.0, 0.0, 0.0, 0.0), base)
         } else if prefix > 0 {
             self.canvas(cx, rest, vec4(0.0, 0.0, 0.0, 0.0), base)
         } else {
             self.canvas(cx, rest, clear, None)
         };
+        // A sub-frame uses this answer before the shutter adds its texture.
+        if let Some(path) = self.scenes3d.waiting_document() {
+            self.inexact = format!("Scene3D {path} is loading");
+            return (texture, false, asked);
+        }
         (texture, exact, asked)
     }
 
@@ -1256,6 +1491,12 @@ impl MotionDraw {
     /// passes, the tone map into an 8-bit target, @display and @final
     /// passes. Records into the frame's spans; returns the picture.
     fn post(&mut self, cx: &mut Cx2d, frame: &MotionFrame, color: Texture, pixels: (u32, u32)) -> Texture {
+        if self.plain {
+            if frame.post.is_some() {
+                self.plain_refusal("post", "a post pass", false);
+            }
+            return color;
+        }
         // Post resamples what was drawn: it passes their ids on.
         cx.set_pick_id(0);
         let (decls, values): (&[makepad_render_graph::PassDecl], Vec<makepad_render_graph::PassValues>) = match &frame.post {
@@ -1345,6 +1586,10 @@ impl MotionDraw {
     /// post comes after).
     fn group_post(&mut self, cx: &mut Cx2d, path: &str, color: Texture) -> Texture {
         let Some(key) = self.group_post_of(path) else { return color };
+        if self.plain {
+            self.plain_refusal(&key, "a post pass", true);
+            return color;
+        }
         let Some((decls, values)) = self.group_posts.get(&key).cloned() else { return color };
         let pixels = self.pixels;
         let mut graph = self.group_graphs.remove(&key).unwrap_or_default();
@@ -1403,7 +1648,7 @@ impl MotionDraw {
         if !exact {
             // What was kept may be incomplete too: draw it again next time.
             if let Some((key, _)) = &mut self.static_cache {
-                *key = 0;
+                key.0 = 0;
             }
         }
         self.exact = exact;
@@ -1447,6 +1692,36 @@ impl MotionDraw {
     /// again until this is false.
     pub fn environment_pending(&self) -> bool {
         self.scenes3d.environment_pending()
+    }
+
+    /// The work and progress of the current frame, for a host watching for a stall.
+    pub fn load_progress(&self, cx: &Cx) -> LoadProgress {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let effects_ready = self.shaders.ready();
+        let mut mark = DefaultHasher::new();
+        // Check which needs from the recording are still outstanding. This
+        // tracks waiting_for without evaluating or walking the document again.
+        for need in &self.missing_at_record {
+            let supplied = match need {
+                Need::Image(media) => self.images.contains_key(media),
+                Need::Svg(media) => self.svgs.contains_key(media),
+                Need::Model(media) => self.scenes.has(media),
+                Need::VideoFrame(path, _) | Need::EditFrame(path, _) => self.videos.contains_key(path),
+                Need::Effect(asset) => self.shaders.has_source(asset),
+            };
+            if !supplied {
+                need.hash(&mut mark);
+            }
+        }
+        effects_ready.hash(&mut mark);
+        self.scenes.ready().hash(&mut mark);
+        self.inexact.hash(&mut mark);
+        self.shutter_progress().hash(&mut mark);
+        self.scenes3d.hash_progress(&mut mark);
+        LoadProgress {
+            working: self.scenes3d.loading() || self.environment_pending() || !effects_ready || cx.draw_shaders_pending(),
+            mark: mark.finish(),
+        }
     }
 
     /// Draw each Scene3D layer's coverage id map with its frames from the
@@ -1530,16 +1805,16 @@ impl MotionDraw {
     /// `item`'s render-kit effects over its (full-target) picture. Each
     /// effect is built from its values at this frame; a name or value the
     /// kit refuses is reported (`errors`) and skipped.
-    fn effected(&mut self, cx: &mut Cx2d, item: &Item, texture: Texture) -> Texture {
-        if item.effects.is_empty() {
+    fn effected(&mut self, cx: &mut Cx2d, item: &impl CanvasItem, texture: Texture) -> Texture {
+        if item.effects().is_empty() {
             return texture;
         }
         let mut stack = Vec::new();
-        for effect in &item.effects {
+        for effect in item.effects() {
             match kit_effect(effect) {
                 Ok(built) => stack.push(built.at(self.frame_t)),
                 Err(error) => {
-                    let error = format!("{}: effect `{}`: {error}", item.path, effect.name);
+                    let error = format!("{}: effect `{}`: {error}", item.path(), effect.name);
                     if !self.kit_errors.contains(&error) {
                         self.kit_errors.push(error);
                     }
@@ -1550,7 +1825,7 @@ impl MotionDraw {
             return texture;
         }
         self.note_kind("kit effects");
-        for effect in &item.effects {
+        for effect in item.effects() {
             self.note_kind(&format!("kit {}", effect.name));
         }
         let layers = HashMap::new();
@@ -1571,14 +1846,14 @@ impl MotionDraw {
 
     /// Draw `items` into a fresh full-frame canvas (after preparing what
     /// they need), starting from `base` when given. Returns its texture.
-    fn canvas(&mut self, cx: &mut Cx2d, items: &[Item], clear: Vec4f, base: Option<Texture>) -> Texture {
+    fn canvas(&mut self, cx: &mut Cx2d, items: &[impl CanvasItem], clear: Vec4f, base: Option<Texture>) -> Texture {
         self.canvas_into(cx, items, clear, base, None)
     }
 
-    fn canvas_into(&mut self, cx: &mut Cx2d, items: &[Item], clear: Vec4f, base: Option<Texture>, kept: Option<&mut RenderTarget>) -> Texture {
+    fn canvas_into(&mut self, cx: &mut Cx2d, items: &[impl CanvasItem], clear: Vec4f, base: Option<Texture>, kept: Option<&mut RenderTarget>) -> Texture {
         for item in items {
             // A backdrop needs the canvas under it: prepared when it is drawn.
-            if !shows_backdrop(item) {
+            if !item.rich().is_some_and(shows_backdrop) {
                 self.prepare(cx, item);
             }
         }
@@ -1591,7 +1866,7 @@ impl MotionDraw {
                 self.draw_item(cx, item, current.index());
             }
         }
-        let warm = self.warm.is_some() && !std::mem::replace(&mut self.warm_drawn, true);
+        let warm = !self.plain && self.warm.is_some() && !std::mem::replace(&mut self.warm_drawn, true);
         if warm && self.hdr {
             self.warm_vector_emit(cx);
         }
@@ -1731,38 +2006,42 @@ impl MotionDraw {
 
     /// Items that read the canvas under them: end the canvas, run them,
     /// and open a new canvas holding the result. `None` for every other item.
-    fn below_item(&mut self, cx: &mut Cx2d, item: &Item, current: &mut Canvas, kept: &mut Option<&mut RenderTarget>) -> Option<Canvas> {
+    fn below_item(&mut self, cx: &mut Cx2d, item: &impl CanvasItem, current: &mut Canvas, kept: &mut Option<&mut RenderTarget>) -> Option<Canvas> {
         let full = [self.pixels.0 as f64, self.pixels.1 as f64];
-        let reads_below = match &item.kind {
-            ItemKind::Shader { below: true, .. } => true,
-            _ => item.blend != Blend::Normal || shows_backdrop(item),
+        if item.rich().is_some_and(|r| self.refuse_plain_item(r)) {
+            // The caller draws its tile directly over the open canvas.
+            return None;
+        }
+        let reads_below = match item.rich().map(|r| &r.kind) {
+            Some(ItemKind::Shader { below: true, .. }) => true,
+            _ => item.blend() != Blend::Normal || item.rich().is_some_and(shows_backdrop),
         };
-        if !reads_below || item.opacity <= 0.0 {
+        if !reads_below || item.opacity() <= 0.0 {
             return None;
         }
         let under = self.close_canvas(cx, std::mem::replace(current, Canvas::Pool(usize::MAX)), kept.as_deref_mut());
         // The item alone over transparent, or the effect of what is under it.
-        let layer = match &item.kind {
+        let below_effect = item.rich().filter(|r| matches!(r.kind, ItemKind::Shader { program: ShaderProgram::Preset(_) | ShaderProgram::Effect(_), below: true, .. }));
+        let layer = match below_effect {
             // An effect of what is under it. (One that makes its own
             // picture was rendered in `prepare`; blended, it is composited
             // below like any layer: rendering it again here would record
             // the view twice in one frame, the first copy sampling the
             // second's output, and never finish painting.)
-            ItemKind::Shader { program: ShaderProgram::Preset(_) | ShaderProgram::Effect(_), below: true, .. } => {
-                self.effect(cx, item, under.clone(), self.pixels)
+            Some(effect) => {
+                self.effect(cx, effect, under.clone(), self.pixels)
             }
             _ => {
                 // What shows the frame under it is prepared now that it exists.
                 let outer = self.backdrop.clone();
-                if shows_backdrop(item) {
+                if item.rich().is_some_and(shows_backdrop) {
                     self.backdrop = Some(under.clone());
                     self.prepare(cx, item);
                 }
                 // Inline shaders, blended layers, backdrops: drawn alone.
                 let index = self.target(cx, self.pixels, "motion_layer");
                 self.pool[index].begin(cx, vec4(0.0, 0.0, 0.0, 0.0));
-                let mut alone = item.clone();
-                alone.blend = Blend::Normal;
+                let alone = item.without_blend();
                 self.draw_item_below(cx, &alone, Some(&under));
                 self.flush_vector(cx);
                 self.pool[index].end(cx);
@@ -1775,18 +2054,18 @@ impl MotionDraw {
         let index = self.target(cx, self.pixels, "motion_canvas");
         self.pool[index].begin(cx, vec4(0.0, 0.0, 0.0, 0.0));
         self.note_kind("blend");
-        self.note_kind(&format!("below {}", item.path));
+        self.note_kind(&format!("below {}", item.path()));
         match layer {
             Some(layer) => {
-                let (mode, amount) = match (&item.kind, item.blend) {
+                let (mode, amount) = match (below_effect, item.blend()) {
                     // An effect replaces what is under it by its opacity.
-                    (ItemKind::Shader { program: ShaderProgram::Preset(_) | ShaderProgram::Effect(_), below: true, .. }, _) => (blend_mode::NORMAL, item.opacity),
+                    (Some(_), _) => (blend_mode::NORMAL, item.opacity()),
                     (_, Blend::Add) => (blend_mode::ADD, 1.0),
                     (_, Blend::Screen) => (blend_mode::SCREEN, 1.0),
                     (_, Blend::Multiply) => (blend_mode::MULTIPLY, 1.0),
                     (_, Blend::Normal) => (blend_mode::NORMAL, 1.0),
                 };
-                if matches!(item.kind, ItemKind::Shader { program: ShaderProgram::Preset(_) | ShaderProgram::Effect(_), below: true, .. }) {
+                if below_effect.is_some() {
                     // below, then the effect's picture at the layer's opacity.
                     self.draws.quad.quad(cx, &under, None, &Affine::IDENTITY, full, [0.0, 0.0, 1.0, 1.0], 1.0);
                     self.draws.quad.quad(cx, &layer, None, &Affine::IDENTITY, full, [0.0, 0.0, 1.0, 1.0], amount);
@@ -1807,76 +2086,81 @@ impl MotionDraw {
 
     /// Render everything `item` needs a texture of its own for, before any
     /// canvas that shows it is opened.
-    fn prepare(&mut self, cx: &mut Cx2d, item: &Item) {
-        if !item.path.is_empty() {
-            self.layer_path = item.path.clone();
+    fn prepare(&mut self, cx: &mut Cx2d, item: &impl CanvasItem) {
+        if !item.path().is_empty() {
+            self.layer_path = item.path().to_owned();
         }
-        let saved = self.pick_enter(cx, &item.path);
+        let saved = self.pick_enter(cx, item.path());
         self.prepare_item(cx, item);
         self.pick_leave(cx, saved);
     }
 
-    fn prepare_item(&mut self, cx: &mut Cx2d, item: &Item) {
-        if item.opacity <= 0.0 {
+    fn prepare_item(&mut self, cx: &mut Cx2d, item: &impl CanvasItem) {
+        if item.opacity() <= 0.0 || item.rich().is_some_and(|r| self.refuse_plain_item(r)) {
             return;
         }
-        if let ItemKind::Fly { inner, target, letter, zoom } = &item.kind {
-            let saved = self.base;
-            self.base = self.fly_camera(cx, inner, target, *letter, *zoom).then(&saved);
-            self.prepare(cx, inner);
-            self.base = saved;
-            return;
-        }
-        if let ItemKind::Anchored { inner, scene, node } = &item.kind {
-            if let Some((p, true)) = self.scenes3d.anchor(scene, node) {
+        if let Some(item) = item.rich() {
+            if let ItemKind::Fly { inner, target, letter, zoom } = &item.kind {
                 let saved = self.base;
-                self.base = saved.then(&Affine::translate(p[0], p[1]));
-                self.prepare(cx, inner);
+                self.base = self.fly_camera(cx, inner, target, *letter, *zoom).then(&saved);
+                self.prepare(cx, inner.as_ref());
                 self.base = saved;
+                return;
             }
-            return;
-        }
-        // SVG markup written in the document loads on first use.
-        if let ItemKind::Svg { src: src @ Media::Inline(markup), .. } = &item.kind {
-            if !self.svgs.contains_key(src) {
-                let markup = markup.to_string();
-                self.set_svg(cx, src.clone(), &markup);
+            if let ItemKind::Anchored { inner, scene, node } = &item.kind {
+                if self.plain { return; } // A plain frame has no scene to project this anchor.
+                if let Some((p, true)) = self.scenes3d.anchor(scene, node) {
+                    let saved = self.base;
+                    self.base = saved.then(&Affine::translate(p[0], p[1]));
+                    self.prepare(cx, inner.as_ref());
+                    self.base = saved;
+                }
+                return;
+            }
+            // SVG markup written in the document loads on first use.
+            if let ItemKind::Svg { src: src @ Media::Inline(markup), .. } = &item.kind {
+                if !self.svgs.contains_key(src) {
+                    let markup = markup.to_string();
+                    self.set_svg(cx, src.clone(), &markup);
+                }
             }
         }
         // Post blur applies to the item's picture, after edge coverage.
-        let sigma = item.blur * self.unit_px();
-        let effected = !item.effects.is_empty();
-        if (effected || sigma > 0.3) && !matches!(item.kind, ItemKind::Group { .. }) && !(matches!(item.kind, ItemKind::Text { .. }) && !effected && item.blur <= 0.0) {
-            let mut alone = item.clone();
-            alone.blur = 0.0;
-            alone.opacity = 1.0;
-            alone.blend = Blend::Normal;
-            alone.effects.clear();
+        let sigma = item.blur() * self.unit_px();
+        let effected = !item.effects().is_empty();
+        if (effected || sigma > 0.3) && item.group().is_none() && !(matches!(item.primitive(), Some(PrimitiveFrame::Text { .. })) && !effected && item.blur() <= 0.0) {
+            let alone = item.before_effects();
             let texture = self.canvas(cx, std::slice::from_ref(&alone), vec4(0.0, 0.0, 0.0, 0.0), None);
             let texture = if sigma > 0.3 { self.blurred(cx, &texture, self.pixels, sigma) } else { texture };
             let texture = self.effected(cx, item, texture);
-            self.prepared.insert((item.path.clone(), BLURRED), texture);
+            self.prepared.insert((item.path().to_owned(), BLURRED), texture);
             return;
         }
-        match &item.kind {
-            ItemKind::Group { children, mask, .. } => {
-                if group_isolated(item) || self.group_post_of(&item.path).is_some() {
-                    let texture = self.canvas(cx, children, vec4(0.0, 0.0, 0.0, 0.0), None);
-                    let texture = self.group_post(cx, &item.path, texture);
-                    let texture = if sigma > 0.3 { self.blurred(cx, &texture, self.pixels, sigma) } else { texture };
-                    let texture = self.effected(cx, item, texture);
-                    self.prepared.insert((item.path.clone(), 0), texture);
-                    if let Some(mask) = mask {
-                        let texture = self.canvas(cx, std::slice::from_ref(mask.as_ref()), vec4(0.0, 0.0, 0.0, 0.0), None);
-                        self.prepared.insert((item.path.clone(), 1), texture);
-                    }
-                } else {
-                    for child in children {
-                        self.prepare(cx, child);
-                    }
+        if let Some((children, mask, _)) = item.group() {
+            if group_isolated(item) || self.group_post_of(item.path()).is_some() {
+                let texture = self.canvas(cx, children, vec4(0.0, 0.0, 0.0, 0.0), None);
+                let texture = self.group_post(cx, item.path(), texture);
+                let texture = if sigma > 0.3 { self.blurred(cx, &texture, self.pixels, sigma) } else { texture };
+                let texture = self.effected(cx, item, texture);
+                self.prepared.insert((item.path().to_owned(), 0), texture);
+                if let Some(mask) = mask {
+                    let texture = self.canvas(cx, std::slice::from_ref(mask), vec4(0.0, 0.0, 0.0, 0.0), None);
+                    self.prepared.insert((item.path().to_owned(), 1), texture);
+                }
+            } else {
+                for child in children {
+                    self.prepare(cx, child);
                 }
             }
-            ItemKind::Text { .. } => text::prepare(self, cx, item),
+        } else if matches!(item.primitive(), Some(PrimitiveFrame::Text { .. })) {
+            text::prepare(self, cx, item);
+        } else if let Some(rich) = item.rich() {
+            self.prepare_rich(cx, rich);
+        }
+    }
+
+    fn prepare_rich(&mut self, cx: &mut Cx2d, item: &Item) {
+        match &item.kind {
             ItemKind::Svg { src, size } => {
                 let natural = self.svgs.get(src).map(|s| s.1);
                 let Some(natural) = natural else { return };
@@ -1923,7 +2207,6 @@ impl MotionDraw {
             }
             ItemKind::Scene3dDoc { size, .. } => {
                 let m = self.pixel_map(item, *size);
-                self.scenes3d.place(&item.path, item.transform(*size), *size);
                 if let Some(texture) = scene3d::render(self, cx, item, self.layer_scale(*size, m.mean_scale())) {
                     self.prepared.insert((item.path.clone(), 0), texture);
                 }
@@ -1951,7 +2234,7 @@ impl MotionDraw {
         }
     }
 
-    fn draw_item(&mut self, cx: &mut Cx2d, item: &Item, _canvas: usize) {
+    fn draw_item(&mut self, cx: &mut Cx2d, item: &impl CanvasItem, _canvas: usize) {
         self.draw_item_below(cx, item, None)
     }
 
@@ -1970,11 +2253,11 @@ impl MotionDraw {
 
     /// Draw `item` into the open canvas pass. `below` is the canvas under
     /// it for a shader that reads it.
-    fn draw_item_below(&mut self, cx: &mut Cx2d, item: &Item, below: Option<&Texture>) {
-        if !item.path.is_empty() {
-            self.layer_path = item.path.clone();
+    fn draw_item_below(&mut self, cx: &mut Cx2d, item: &impl CanvasItem, below: Option<&Texture>) {
+        if !item.path().is_empty() {
+            self.layer_path = item.path().to_owned();
         }
-        let saved = self.pick_enter(cx, &item.path);
+        let saved = self.pick_enter(cx, item.path());
         self.draw_item_below_inner(cx, item, below);
         self.pick_leave(cx, saved);
     }
@@ -2036,73 +2319,102 @@ impl MotionDraw {
         self.pick_names.get((id as usize).checked_sub(1)?)
     }
 
-    fn draw_item_below_inner(&mut self, cx: &mut Cx2d, item: &Item, below: Option<&Texture>) {
-        let opacity = item.opacity.clamp(0.0, 1.0);
+    fn draw_item_below_inner(&mut self, cx: &mut Cx2d, item: &impl CanvasItem, below: Option<&Texture>) {
+        let opacity = item.opacity().clamp(0.0, 1.0);
         if opacity <= 0.0 {
             return;
         }
-        if let ItemKind::Fly { inner, target, letter, zoom } = &item.kind {
-            let saved = self.base;
-            self.base = self.fly_camera(cx, inner, target, *letter, *zoom).then(&saved);
-            self.draw_item_below(cx, inner, below);
-            self.base = saved;
-            return;
-        }
-        if let ItemKind::Anchored { inner, scene, node } = &item.kind {
-            // Hidden until its scene has drawn, and while behind the camera.
-            if let Some((p, true)) = self.scenes3d.anchor(scene, node) {
-                let saved = self.base;
-                self.base = saved.then(&Affine::translate(p[0], p[1]));
-                self.draw_item_below(cx, inner, below);
-                self.base = saved;
+        if let Some(item) = item.rich() {
+            if self.refuse_plain_item(item) {
+                self.plain_tile(cx, item);
+                return;
             }
-            return;
+            if let ItemKind::Fly { inner, target, letter, zoom } = &item.kind {
+                let saved = self.base;
+                self.base = self.fly_camera(cx, inner, target, *letter, *zoom).then(&saved);
+                self.draw_item_below(cx, inner.as_ref(), below);
+                self.base = saved;
+                return;
+            }
+            if let ItemKind::Anchored { inner, scene, node } = &item.kind {
+                // Hidden until its scene has drawn, and while behind the camera.
+                if self.plain { return; } // A plain frame has no scene to project this anchor.
+                if let Some((p, true)) = self.scenes3d.anchor(scene, node) {
+                    let saved = self.base;
+                    self.base = saved.then(&Affine::translate(p[0], p[1]));
+                    self.draw_item_below(cx, inner.as_ref(), below);
+                    self.base = saved;
+                }
+                return;
+            }
         }
-        let batched = matches!(item.kind, ItemKind::Rect { .. } | ItemKind::Ellipse { .. } | ItemKind::Path { .. } | ItemKind::Group { .. });
-        if !batched || self.prepared.contains_key(&(item.path.clone(), BLURRED)) || group_isolated(item) || self.group_post_of(&item.path).is_some() {
+        let batched = item.group().is_some() || matches!(item.primitive(), Some(PrimitiveFrame::Rect { .. } | PrimitiveFrame::Ellipse { .. } | PrimitiveFrame::Path { .. }));
+        if !batched || self.prepared.contains_key(&(item.path().to_owned(), BLURRED)) || group_isolated(item) || self.group_post_of(item.path()).is_some() {
             self.flush_vector(cx);
         }
-        if let Some(texture) = self.prepared.get(&(item.path.clone(), BLURRED)).cloned() {
+        if let Some(texture) = self.prepared.get(&(item.path().to_owned(), BLURRED)).cloned() {
             let full = [self.pixels.0 as f64, self.pixels.1 as f64];
             self.note_kind("quad");
             self.draws.quad.quad(cx, &texture, None, &Affine::IDENTITY, full, [0.0, 0.0, 1.0, 1.0], opacity);
             return;
         }
-        let kind = match &item.kind {
-            ItemKind::Rect { .. } | ItemKind::Ellipse { .. } | ItemKind::Path { .. } => "vector",
-            ItemKind::Svg { .. } => "svg",
-            ItemKind::Text { .. } => "text",
-            ItemKind::Shader { .. } => "shader",
-            _ => "quad",
+        let kind = match item.primitive() {
+            Some(PrimitiveFrame::Text { .. }) => "text",
+            Some(_) => "vector",
+            None => match item.rich().map(|r| &r.kind) {
+                Some(ItemKind::Svg { .. }) => "svg",
+                Some(ItemKind::Shader { .. }) => "shader",
+                _ => "quad",
+            },
         };
         self.note_kind(kind);
         self.note_kind("quad");
+        if let Some(primitive) = item.primitive() {
+            match primitive {
+                PrimitiveFrame::Rect { size, radius, fill, stroke, width, trim, .. } if *trim == [0.0, 1.0] => {
+                    self.sdf_shape(cx, item, false, *size, *radius, *fill, *stroke, *width, opacity);
+                }
+                PrimitiveFrame::Ellipse { size, fill, stroke, width, trim, .. } if *trim == [0.0, 1.0] => {
+                    self.sdf_shape(cx, item, true, *size, 0.0, *fill, *stroke, *width, opacity);
+                }
+                PrimitiveFrame::Rect { size, radius, fill, stroke, width, trim, cap, .. } => {
+                    let path = geometry::rect_path(*size, *radius);
+                    self.shape(cx, item, &path, *size, *fill, *stroke, *width, *trim, *cap, Join::Miter, opacity);
+                }
+                PrimitiveFrame::Ellipse { size, fill, stroke, width, trim, cap, .. } => {
+                    let path = geometry::ellipse_path(*size);
+                    self.shape(cx, item, &path, *size, *fill, *stroke, *width, *trim, *cap, Join::Round, opacity);
+                }
+                PrimitiveFrame::Path { path, fill, stroke, width, trim, cap, join } => {
+                    let size = geometry::bounds(path).map_or([0.0, 0.0], |b| [b[2].max(0.0), b[3].max(0.0)]);
+                    if fill.is_some() {
+                        self.vector(cx, item, path, size, *fill, None, 0.0, *cap, *join, opacity);
+                    }
+                    if stroke.is_some() && trim[1] > trim[0] {
+                        let tolerance = 0.25 / self.pixel_map(item, size).mean_scale().max(1e-6);
+                        let trimmed = (trim[0] > 0.0 || trim[1] < 1.0).then(|| geometry::trim(path, trim[0], trim[1], tolerance));
+                        self.vector(cx, item, trimmed.as_ref().unwrap_or(path), size, None, *stroke, *width, *cap, *join, opacity);
+                    }
+                }
+                PrimitiveFrame::Text { .. } => text::draw(self, cx, item, opacity),
+            }
+        } else if let Some((children, mask, mask_mode)) = item.group() {
+            if let Some(texture) = self.prepared.get(&(item.path().to_owned(), 0)).cloned() {
+                let full = [self.pixels.0 as f64, self.pixels.1 as f64];
+                let mask = mask.and(self.prepared.get(&(item.path().to_owned(), 1)).cloned());
+                self.draws.quad.quad(cx, &texture, mask.as_ref().map(|m| (m, mask_mode)), &Affine::IDENTITY, full, [0.0, 0.0, 1.0, 1.0], opacity);
+            } else {
+                for child in children {
+                    self.draw_item_below(cx, child, below);
+                }
+            }
+        } else if let Some(rich) = item.rich() {
+            self.draw_rich(cx, rich, below, opacity);
+        }
+    }
+
+    fn draw_rich(&mut self, cx: &mut Cx2d, item: &Item, below: Option<&Texture>, opacity: f64) {
         match &item.kind {
-            ItemKind::Rect { size, radius, fill, stroke, width, trim, .. } if *trim == [0.0, 1.0] => {
-                self.sdf_shape(cx, item, false, *size, *radius, *fill, *stroke, *width, opacity);
-            }
-            ItemKind::Ellipse { size, fill, stroke, width, trim, .. } if *trim == [0.0, 1.0] => {
-                self.sdf_shape(cx, item, true, *size, 0.0, *fill, *stroke, *width, opacity);
-            }
-            ItemKind::Rect { size, radius, fill, stroke, width, trim, cap, .. } => {
-                let path = geometry::rect_path(*size, *radius);
-                self.shape(cx, item, &path, *size, *fill, *stroke, *width, *trim, *cap, Join::Miter, opacity);
-            }
-            ItemKind::Ellipse { size, fill, stroke, width, trim, cap, .. } => {
-                let path = geometry::ellipse_path(*size);
-                self.shape(cx, item, &path, *size, *fill, *stroke, *width, *trim, *cap, Join::Round, opacity);
-            }
-            ItemKind::Path { path, fill, stroke, width, trim, cap, join } => {
-                let size = geometry::bounds(path).map_or([0.0, 0.0], |b| [b[2].max(0.0), b[3].max(0.0)]);
-                if fill.is_some() {
-                    self.vector(cx, item, path, size, *fill, None, 0.0, *cap, *join, opacity);
-                }
-                if stroke.is_some() && trim[1] > trim[0] {
-                    let tolerance = 0.25 / self.pixel_map(item, size).mean_scale().max(1e-6);
-                    let trimmed = (trim[0] > 0.0 || trim[1] < 1.0).then(|| geometry::trim(path, trim[0], trim[1], tolerance));
-                    self.vector(cx, item, trimmed.as_ref().unwrap_or(path), size, None, *stroke, *width, *cap, *join, opacity);
-                }
-            }
             ItemKind::Svg { src, size } => {
                 let Some(natural) = self.svgs.get(src).map(|s| s.1) else { return };
                 let size = size.unwrap_or(natural);
@@ -2145,18 +2457,6 @@ impl MotionDraw {
                 let Some((texture, natural)) = self.videos.get(&item.path).cloned() else { return };
                 self.picture(cx, item, &texture, natural, *size, *fit, opacity);
             }
-            ItemKind::Text { .. } => text::draw(self, cx, item, opacity),
-            ItemKind::Group { children, mask, mask_mode, .. } => {
-                if let Some(texture) = self.prepared.get(&(item.path.clone(), 0)).cloned() {
-                    let full = [self.pixels.0 as f64, self.pixels.1 as f64];
-                    let mask = mask.as_ref().and(self.prepared.get(&(item.path.clone(), 1)).cloned());
-                    self.draws.quad.quad(cx, &texture, mask.as_ref().map(|m| (m, *mask_mode)), &Affine::IDENTITY, full, [0.0, 0.0, 1.0, 1.0], opacity);
-                } else {
-                    for child in children {
-                        self.draw_item_below(cx, child, below);
-                    }
-                }
-            }
             ItemKind::Shader { program: ShaderProgram::Inline { .. }, size, .. } => {
                 let m = self.pixel_map(item, *size);
                 let below = below.cloned().unwrap_or_else(|| self.transparent.clone());
@@ -2164,7 +2464,7 @@ impl MotionDraw {
                 self.inline_shader(cx, item, &m, *size, px, &below, opacity);
             }
             // Handled before (the camera moves, then `inner` draws).
-            ItemKind::Fly { .. } | ItemKind::Anchored { .. } => {}
+            ItemKind::Primitive(_) | ItemKind::Group { .. } | ItemKind::Fly { .. } | ItemKind::Anchored { .. } => {}
             ItemKind::Vector { size, .. } => {
                 if let Some(texture) = self.prepared.get(&(item.path.clone(), 0)).cloned() {
                     let pad = item.feather * 1.5;
@@ -2187,7 +2487,7 @@ impl MotionDraw {
     /// A whole (untrimmed) Rect or Ellipse from its distance field: one
     /// instance, nothing tessellated or uploaded.
     #[allow(clippy::too_many_arguments)]
-    fn sdf_shape(&mut self, cx: &mut Cx2d, item: &Item, ellipse: bool, size: [f64; 2], radius: f64, fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, opacity: f64) {
+    fn sdf_shape(&mut self, cx: &mut Cx2d, item: &dyn PaintItem, ellipse: bool, size: [f64; 2], radius: f64, fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, opacity: f64) {
         self.flush_vector(cx);
         let m = self.pixel_map(item, size);
         let fill = fill.map(|c| self.lin(c));
@@ -2196,10 +2496,10 @@ impl MotionDraw {
         let shape = if ellipse { paint::Shape::Ellipse } else { paint::Shape::Rect { radius } };
         let width = if stroke.is_some() { width } else { 0.0 };
         let scale = m.mean_scale().max(1e-6);
-        paint::sdf(cx, &mut self.draws.shape, &m, size, shape, pm(fill), pm(stroke), width, scale, item.feather * 0.5 * scale, feather_side(item.feather_side), opacity);
+        paint::sdf(cx, &mut self.draws.shape, &m, size, shape, pm(fill), pm(stroke), width, scale, item.feather() * 0.5 * scale, feather_side(item.feather_side()), opacity);
     }
 
-    fn shape(&mut self, cx: &mut Cx2d, item: &Item, path: &geometry::VectorPath, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, trim: [f64; 2], cap: Cap, join: Join, opacity: f64) {
+    fn shape(&mut self, cx: &mut Cx2d, item: &dyn PaintItem, path: &geometry::VectorPath, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, trim: [f64; 2], cap: Cap, join: Join, opacity: f64) {
         if trim == [0.0, 1.0] {
             self.vector(cx, item, path, size, fill, stroke, width, cap, join, opacity);
             return;
@@ -2236,7 +2536,7 @@ impl MotionDraw {
 
     /// A filled and/or stroked outline in the item's own coordinates.
     #[allow(clippy::too_many_arguments)]
-    fn vector(&mut self, _cx: &mut Cx2d, item: &Item, path: &geometry::VectorPath, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, cap: Cap, join: Join, opacity: f64) {
+    fn vector(&mut self, _cx: &mut Cx2d, item: &dyn PaintItem, path: &geometry::VectorPath, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: f64, cap: Cap, join: Join, opacity: f64) {
         let m = self.pixel_map(item, size);
         let path = geometry::without_tiny_segments(&geometry::transformed(path, &m), 0.05);
         let fill = fill.map(|c| self.lin(c));
@@ -2252,8 +2552,8 @@ impl MotionDraw {
             let ev = &mut self.draws.vector_emit;
             ev.begin();
             ev.cur_tolerance = 0.2;
-            if item.feather > 0.0 {
-                ev.set_feather((item.feather * 0.5 * m.mean_scale()) as f32, feather_side(item.feather_side));
+            if item.feather() > 0.0 {
+                ev.set_feather((item.feather() * 0.5 * m.mean_scale()) as f32, feather_side(item.feather_side()));
             }
             ev.draw_vars.set_uniform(_cx.cx, live_id!(gain), &[k as f32]);
             if let Some(c) = fill {
@@ -2293,8 +2593,8 @@ impl MotionDraw {
             self.vector_open = true;
             self.vector_layer = self.layer_path.clone();
         }
-        if item.feather > 0.0 {
-            dv.set_feather((item.feather * 0.5 * m.mean_scale()) as f32, feather_side(item.feather_side));
+        if item.feather() > 0.0 {
+            dv.set_feather((item.feather() * 0.5 * m.mean_scale()) as f32, feather_side(item.feather_side()));
         }
         if let Some(c) = fill {
             dv.path = path.clone();
@@ -2370,11 +2670,8 @@ impl Canvas {
 
 /// Whether a group composes as one picture (its opacity, mask or blend
 /// apply to the whole) rather than drawing its children in place.
-fn group_isolated(item: &Item) -> bool {
-    match &item.kind {
-        ItemKind::Group { mask, .. } => mask.is_some() || item.opacity < 1.0 || item.blend != Blend::Normal || item.blur > 0.0 || !item.effects.is_empty(),
-        _ => false,
-    }
+fn group_isolated(item: &impl CanvasItem) -> bool {
+    item.group().is_some_and(|(_, mask, _)| mask.is_some() || item.opacity() < 1.0 || item.blend() != Blend::Normal || item.blur() > 0.0 || !item.effects().is_empty())
 }
 
 /// Whether an item shows the picture under it (`@backdrop`), itself or in

@@ -40,7 +40,7 @@ enum Request {
 /// merges, and the pieces the scene draws.
 pub struct Laid {
     pub gen: u64,
-    pub sheet: SheetLayout,
+    pub sheet: Arc<SheetLayout>,
     /// A Library preview's exact keep hints, or its no-room note when the lead layout was drawn.
     pub kept: Option<KeepHints>,
     pub trees: Prepared,
@@ -51,6 +51,7 @@ pub struct Laid {
     pub ms: f64,
     /// The pane shape it was laid out for (`Opts::aspect`).
     pub aspect: f64,
+    pub mode: fab_elec_explore::SheetMode,
 }
 
 /// A finished reveal with its wiring prepared for the host on the worker.
@@ -205,7 +206,7 @@ impl LayoutJobs {
                     sheet.translate(shift);
                     let ms = (Cx::monotonic_now() - start) * 1000.0;
                     let SheetTrees { trees, pieces } = sheet_trees(&design, unit, &sheet);
-                    Result::Layout(Laid { gen, sheet, kept, trees: SegRows::prepare(trees), pieces, shift, ms, aspect: opts.aspect })
+                    Result::Layout(Laid { gen, sheet: Arc::new(sheet), kept, trees: SegRows::prepare(trees), pieces, shift, ms, aspect: opts.aspect, mode: opts.mode })
                 }
                 Request::Reveal { design, unit, sheet, focus, gen } => {
                     let circuit = &design.units[unit].circuit;

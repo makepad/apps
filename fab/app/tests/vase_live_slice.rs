@@ -15,11 +15,17 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/drawn_runs.rs"]
 mod drawn_runs;
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 
 use common::slice_state;
@@ -142,9 +148,9 @@ fn follows_drags(app: TestApp, drags: &[(&str, &str, f64)]) {
         let primary = if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } };
         app.press_key_with_modifiers(KeyCode::KeyO, primary);
     }
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name(drags[0].0)).wait_visible();
-    app.locator(Selector::id("rm_slice")).select();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     wait_until(&app, "the demo plate to be Sliced", || {
         collect_logs(&app, &mut startup_cursor, &mut startup);
         seen_slice(&app) == "Sliced"
@@ -155,9 +161,10 @@ fn follows_drags(app: TestApp, drags: &[(&str, &str, f64)]) {
         println!("[fab-vase-live] startup: {}", line.split(" - ").last().unwrap_or(line));
     }
     for &(object, parameter, step_px) in drags {
-        app.locator(Selector::role(Role::Tab).name("Parts")).click();
+        parts_tab::open(&app);
         app.locator(Selector::role(Role::TreeItem).name(object)).wait_visible().click();
         app.locator(Selector::id("t_shape")).wait_visible().click();
+        part_editor::open(&app);
         app.locator(Selector::role(Role::SpinButton).name(parameter)).wait_visible();
         // The first drag moves FIRST_PX in all: past the control's drag threshold, so it edits even
         // with a small step (3 steps of 1 px never started a drag and nothing was ever sliced). So

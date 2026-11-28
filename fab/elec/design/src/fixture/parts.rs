@@ -47,7 +47,7 @@ fn part(name: &str, kind: PartKind, pins: Vec<PinDef>, symbol: Symbol, footprint
         pins,
         fields: Fields::default(),
         emitter: None,
-        gpio: None,
+        gpio: None, lifecycle: None, approved: false,
     })
 }
 

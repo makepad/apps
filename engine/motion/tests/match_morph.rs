@@ -1,6 +1,7 @@
 //! MatchMorph: the shared pieces of two layouts fly to their places, the
 //! rest fade, deterministically.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn fixture() -> MotionDoc {
@@ -158,7 +159,7 @@ fn fills(doc: &MotionDoc, t: f64) -> Vec<(f64, [f64; 3])> {
     leaves(&frame.items[0], &mut out);
     out.iter()
         .map(|c| match &c.kind {
-            ItemKind::Path { fill: Some(f), .. } => (c.opacity, [f[0], f[1], f[2]]),
+            ItemKind::Primitive(PrimitiveFrame::Path { fill: Some(f), .. }) => (c.opacity, [f[0], f[1], f[2]]),
             other => panic!("not a filled path: {other:?}"),
         })
         .collect()

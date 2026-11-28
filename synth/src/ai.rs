@@ -20,7 +20,7 @@ use makepad_widgets::*;
 pub const SERVICE: &str = "synth";
 
 fn brief() -> String {
-    "Makepad Synth: live-coded music. A score is a document the app plays; the person hears it while you edit it, and every change plays at once. Work only through the tools. \
+    "Makepad Synth: live-coded music. A score is a document the app plays; the person hears it while you edit it; each change plays as soon as it loads, and the last good score keeps playing while an edit evaluates. Work only through the tools. \
 First call score_guide once (its sections, such as piano or composing, one at a time when you need them) and read the score with score_read, then build a piece in small steps, a part per tool call (a fugue: subject, answer, then each episode), never planning all of it before the first call. Make focused changes with score_patch (exact old text, new text: small, source-preserving) or score_write (a rewrite), and check each change with score_listen: you cannot hear, so read its levels, band balance, onset grid and notes, and fix what is off. \
 Check the result with score_check, and when a piece you were asked for is done, start it with score_play so the person hears it. Keep what the person did not ask to change. Answer in one or two short sentences, in plain words a musician uses; never paste source into your reply. \
 The score has one editor panel (a synthesiser UI written into the score): to change it, read score_panel_guide and score_editor_paths, write it with score_editor_write, and check it with score_panel_status; score_editor_make makes the instruments' tweaks at once. \
@@ -316,18 +316,17 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let mut desk = Desk::default();
         let word = PrepareControl::default();
-        let worker = word.clone();
         let (done, completed) = channel();
         // Listen uses the jobs list, outside the tool-preparation queue.
-        let request = desk.jobs.spawn(&cx, Class::Visible, Some(word.clone()), move || {
+        let request = desk.jobs.start_job(&cx, word.clone(), move |worker| async move {
             let source = "use mod.score.*\nmod.std.log(\"held_chat_score_evaluation\")\nlet sum = 0\nfor i in 0..2048 { sum += i }\nScore{}";
             let result = read_document_controlled(source, &worker);
             done.send(matches!(result, Err(LoadError::Cancelled))).unwrap();
             result.map(|_| Json::Null).map_err(|error| error.to_string())
         });
         let other = PrepareControl::default();
-        let Answer::Later(independent) = desk.jobs.submit_tool(&cx, "score_text", None, Some(other.clone()),
-            || Ok(PreparedTool::Reply(Json::Null))) else { panic!("the independent tool must be admitted") };
+        let Answer::Later(independent) = desk.jobs.submit_tool(&cx, "score_text", None, other.clone(),
+            |_| async { Ok(PreparedTool::Reply(Json::Null)) }) else { panic!("the independent tool must be admitted") };
         let release = entry.recv_timeout(Duration::from_secs(10)).expect("the score VM reached its log call");
         let (port, link) = AiServicePort::in_process(manifest()).unwrap();
         let ServiceUp::Register { port_tag, .. } = link.up.try_recv().unwrap().msg else { panic!("missing port registration") };

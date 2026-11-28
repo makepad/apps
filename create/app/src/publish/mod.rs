@@ -11,6 +11,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The background publish jobs must finish their private index and history writes before returning.
+pub(super) fn write_private_bg(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("new");
+    {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_data()?;
+    }
+    fs::rename(&tmp, path)
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -22,7 +37,7 @@ fn field<'a>(value: &'a Value, key: &str) -> io::Result<&'a str> {
 fn nonce() -> io::Result<String> {
     let mut bytes = [0; 16];
     makepad_network::tls::os_random(&mut bytes)?;
-    Ok(makepad_work_core::hex(&bytes))
+    Ok(makepad_town_core::hex(&bytes))
 }
 
 struct Scratch(PathBuf);

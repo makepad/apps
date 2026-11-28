@@ -45,8 +45,12 @@ impl Backend {
         }
     }
 
-    /// Whether it can be started here, and why not.
+    /// Whether it can be started here, and why not. A launch with no model
+    /// (`MAKEPAD_AI_PROVIDER=none`) starts none of them.
     pub fn unavailable(&self) -> Option<String> {
+        if let Some(reason) = makepad_ai_hub::providers::no_model() {
+            return Some(reason.into());
+        }
         match self {
             Backend::ClaudeCode { .. } => makepad_ai_hub::providers::claude::find_cli().is_none().then(|| "the Claude Code CLI (`claude`) is not installed here".into()),
             Backend::ClaudeApi { .. } => crate::claude_api::credential().is_none().then(|| crate::claude_api::NO_CREDENTIAL.into()),
@@ -430,7 +434,7 @@ impl<P: ChatProvider> Brain for TextBrain<P> {
 #[cfg(feature = "hub")]
 mod hub {
     use super::*;
-    use makepad_ai_hub::hub_chat::{HubChatConfig, HubChatSession};
+    use makepad_ai_hub::hub_chat::{ChatReach, HubChatConfig, HubChatSession};
     use makepad_ai_hub::local_llm::{ChatEvent, LocalLlmConfig, ToolSpec};
 
     /// The fleet chat on the LAN. The session's election is given no local
@@ -448,6 +452,7 @@ mod hub {
         pub fn new(model: Option<String>, label: String, system: &str, tools: &[ToolDef]) -> Self {
             let tools = tools.iter().map(|tool| ToolSpec::new(tool.name.clone(), tool.description.clone(), tool.parameters.clone())).collect();
             let session = HubChatSession::start(HubChatConfig {
+                reach: ChatReach::Lan,
                 llm: LocalLlmConfig::new(std::path::PathBuf::new()),
                 preferred_model: model,
                 // The hub row has no Claude menu: a hub that runs it on its

@@ -1,6 +1,7 @@
 //! Gaps found authoring the reference-film plates (FP1): template keys at
 //! time 0, outlined text.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -12,7 +13,7 @@ fn wrap(layers: &str) -> String {
 }
 
 fn texts(frame: &MotionFrame) -> Vec<Item> {
-    frame.walk().into_iter().filter(|(_, i)| matches!(i.kind, ItemKind::Text { .. })).map(|(_, i)| i.clone()).collect()
+    frame.walk().into_iter().filter(|(_, i)| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. }))).map(|(_, i)| i.clone()).collect()
 }
 
 /// A key at 0 s in a template's own schedule repeated its "nothing yet"
@@ -21,7 +22,7 @@ fn texts(frame: &MotionFrame) -> Vec<Item> {
 fn templates_take_a_key_at_time_zero() {
     let doc = load(&wrap(r#"TokenStream{prompt: "Moonlit, harbor" tokens: ["Moon", "lit, ", "harbor"] times: [0.0, 0.5, 1.0] enter: true}"#));
     let typed = |t: f64| texts(&doc.eval(t)).iter().find_map(|i| match &i.kind {
-        ItemKind::Text { text, reveal: Some(n), caret: Some(_), .. } if text.starts_with("Moonlit") => Some(*n),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, reveal: Some(n), caret: Some(_), .. }) if text.starts_with("Moonlit") => Some(*n),
         _ => None,
     }).unwrap();
     // The first token is there from 0.
@@ -46,7 +47,7 @@ fn text_stroke_reaches_the_frame() {
         Text{text: "PLAIN" size: 90}"#));
     let frame = doc.eval(1.0);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
-    let outline = |item: &Item| match &item.kind { ItemKind::Text { outline, .. } => *outline, _ => unreachable!() };
+    let outline = |item: &Item| match &item.kind { ItemKind::Primitive(PrimitiveFrame::Text { outline, .. }) => *outline, _ => unreachable!() };
     let items = texts(&frame);
     assert_eq!(outline(&items[0]), Some(([1.0, 90.0 / 255.0, 31.0 / 255.0, 1.0], 3.0)));
     assert_eq!(outline(&items[1]).map(|o| o.1), Some(2.0), "width defaults to 2");
@@ -69,7 +70,7 @@ fn property_functions_return_emissive_colours() {
     let fill = |t: f64| {
         let frame = doc.eval(t);
         assert!(frame.errors.is_empty(), "{:?}", frame.errors);
-        match &frame.items[0].kind { ItemKind::Rect { fill: Some(c), .. } => *c, other => panic!("{other:?}") }
+        match &frame.items[0].kind { ItemKind::Primitive(PrimitiveFrame::Rect { fill: Some(c), .. }) => *c, other => panic!("{other:?}") }
     };
     assert_eq!(fill(0.5), [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(fill(2.0), [4.0, 0.0, 0.0, 1.0]);
@@ -77,7 +78,7 @@ fn property_functions_return_emissive_colours() {
     let doc = load(&wrap(r#"Ellipse{size: vec2(10, 10) fill: fn(t) { emit(#ffffff, 1.0 + t) }}"#));
     let frame = doc.eval(2.0);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
-    assert!(matches!(&frame.items[0].kind, ItemKind::Ellipse { fill: Some(c), .. } if (c[0] - 3.0).abs() < 1e-9 && c[3] == 1.0));
+    assert!(matches!(&frame.items[0].kind, ItemKind::Primitive(PrimitiveFrame::Ellipse { fill: Some(c), .. }) if (c[0] - 3.0).abs() < 1e-9 && c[3] == 1.0));
 }
 
 /// `log(x)` is the natural log in every part of a document: a document that

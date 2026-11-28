@@ -195,8 +195,12 @@ impl Widget for FabDropdownButton {
     fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         let _ = cx;
         node.role = a11y_tree::Role::Button;
+        // The label is what the button shows: its name, unless the instance names the button
+        // itself (`a11y: {label: ..}`), and always its value, so a choice button reports its
+        // choice ("Render mode" = "Sliced").
         if !self.label_text.is_empty() {
             makepad_platform::a11y::set_string(&mut node.name, &self.label_text);
+            makepad_platform::a11y::set_string(&mut node.value, &self.label_text);
         }
         node.states = a11y_tree::States::FOCUSABLE | a11y_tree::States::HAS_POPUP;
         node.states.set(a11y_tree::States::EXPANDED, self.open);

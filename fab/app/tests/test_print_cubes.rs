@@ -1,13 +1,17 @@
-//! Test cubes by hand in the Normal view, on a 20 mm block: "+ Test cube" in the Test prints editor puts a
+//! Test cubes by hand in the Normal view, on a 20 mm block: "Add test cube" in Test prints puts a
 //! true cube on the picked part and picks it, one undo step, with no change of render mode; it is
-//! a feature of the block in the Features tree, not a part in the Parts list. Its fields and its
+//! a feature of the block in the Parts tree, not a part in the Parts list. In Design its fields and its
 //! gizmo edit it, one undo step each, and a face's drag keeps the opposite face. A click on the
 //! model picks the part, not the cube, and its handles go; a row in the list or the tree picks
 //! that one alone. Its tick, its name and its delete write the project; `fab.tree` lists it. It
 //! moves with its part.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/picture.rs"]
 mod picture;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use fab::ui::print_settings::control_name;
 use makepad_script::syntax;
 use makepad_strict_json::Value;
@@ -113,9 +117,12 @@ fn shown(app: &TestApp, role: Role) -> Vec<NodeMatch> {
 }
 
 fn rows(app: &TestApp) -> Vec<(String, bool)> {
-    let Some(list) = shown(app, Role::List).into_iter().find(|w| w.node.name == "Test prints") else { return Vec::new() };
-    shown(app, Role::ListItem).into_iter().filter(|w| { let (x, y) = w.bounds.center(); list.bounds.contains(x, y) })
-        .map(|w| (w.node.name.to_string(), w.node.states.contains(States::SELECTED))).collect()
+    let snapshot = app.widget_snapshot();
+    let nodes = snapshot.nodes();
+    let Some(list) = nodes.iter().find(|w| w.visible() && w.role == Role::List && w.name == "Test prints") else { return Vec::new() };
+    let tree = &snapshot.windows.iter().find(|(window, _)| *window == list.window).unwrap().1;
+    nodes.iter().filter(|w| w.visible() && w.window == list.window && w.role == Role::DisclosureButton && tree.ancestors(w.id).contains(&list.id))
+        .map(|w| (w.name.to_string(), w.states.contains(States::SELECTED))).collect()
 }
 
 fn handle(app: &TestApp, name: &str) -> bool {
@@ -126,8 +133,11 @@ fn undo(app: &TestApp) {
     app.locator(Selector::id("undo").nth(0)).press();
 }
 
-fn test_prints_tab(app: &TestApp) {
-    app.locator(Selector::role(Role::Tab).name("Test prints")).click();
+fn close_tests_sidebar(app: &TestApp) {
+    let close = app.locator(Selector::role(Role::Button).name("Close tests"));
+    if close.count() > 0 { close.press(); }
+    app.locator(Selector::role(Role::Button).name("Close tests")).wait_hidden();
+    app.locator(Selector::role(Role::Tooltip).name("Close the tests")).wait_hidden();
 }
 
 fn field(app: &TestApp, name: &str) -> makepad_test::Locator {
@@ -164,31 +174,26 @@ fn a_test_cube_is_added_edited_and_picked_like_a_settings_box_one_undo_step_each
     call(&app, "script", &batch).expect("script");
     let edits = Value::Str(PLACE.to_string()).to_json();
     call(&app, "place", &format!(r#"{{"request_id":"place","expected":"{}","edits":{edits}}}"#, head(&app))).expect("place");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    test_prints_tab(&app);
-
-    // Added: a true cube as big as the part, in its middle, picked; the view stays Normal.
-    app.locator(Selector::role(Role::Button).name("Add test cube")).wait_visible().press();
-    let cube = wait(&app, "the cube", || listed(&app).into_iter().next());
+    // Add in the pieces view, then edit in place in Design. Both stay Normal.
+    let cube = add_cube_in_test_prints(&app);
     assert_eq!((cube.name.as_str(), cube.on), ("Test 1", true), "{cube:?}");
     assert!(near(cube.size, [20.0; 3], 1e-3), "a true cube: {cube:?}");
     wait(&app, "its row, lit", || (rows(&app) == [("Test 1".to_string(), true)]).then_some(()));
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
-    app.locator(Selector::id("rm_slice")).wait_checked(false);
+    render_mode::wait_not_shown(&app, "Sliced");
 
     // A feature of the block in the tree, listed by fab.tree; not in the Parts list.
     let tree = call(&app, "tree", "{}").expect("tree");
     assert!(tree.contains("test print") && tree.contains("Test 1"), "{tree}");
-    app.locator(Selector::role(Role::Tab).name("Features")).click();
     let row = app.locator(Selector::role(Role::ListItem).name("base test print Test 1 level 1")).wait_visible().snapshot();
     assert!(row.node.states.contains(States::SELECTED), "its row in the tree is picked");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     let parts = wait(&app, "the Parts list", || Some(shown(&app, Role::TreeItem).into_iter().map(|w| w.node.name.to_string()).collect::<Vec<_>>()).filter(|p| !p.is_empty()));
     assert_eq!(parts, ["Block"], "the Parts list lists the block alone");
-    test_prints_tab(&app);
 
     // Typed: one undo step.
     field(&app, "Test print size Z").set_value("30");
@@ -216,16 +221,15 @@ fn a_test_cube_is_added_edited_and_picked_like_a_settings_box_one_undo_step_each
     app.press_at(0.5 * f64::from(a.0 + b.0), 0.5 * f64::from(a.1 + b.1)).release();
     wait(&app, "the handles to go", || (!handle(&app, SIZE_X)).then_some(()));
     assert_eq!(rows(&app), [("Test 1".to_string(), false)], "unpicked");
+    app.locator(Selector::role(Role::DisclosureButton).name("Test 1").state("collapsed")).wait_visible();
 
     // Two: a click on a row picks that one alone.
-    app.locator(Selector::role(Role::Button).name("Add test cube")).wait_visible().press();
+    app.locator(Selector::id("side_add").name("Add test cube")).wait_visible().press();
     wait(&app, "the second, lit", || (rows(&app) == [("Test 1".to_string(), false), ("Test 2".to_string(), true)]).then_some(()));
-    app.locator(Selector::role(Role::ListItem).name("Test 1")).press();
+    app.locator(Selector::role(Role::DisclosureButton).name("Test 1")).select();
     wait(&app, "the first alone", || (rows(&app) == [("Test 1".to_string(), true), ("Test 2".to_string(), false)]).then_some(()));
     // ... and in the tree.
-    app.locator(Selector::role(Role::Tab).name("Features")).click();
     app.locator(Selector::role(Role::ListItem).name("base test print Test 2 level 1")).wait_visible().select();
-    test_prints_tab(&app);
     wait(&app, "the tree's pick", || (rows(&app) == [("Test 1".to_string(), false), ("Test 2".to_string(), true)]).then_some(()));
 
     // Its tick, its name, its delete, each undone.
@@ -234,7 +238,7 @@ fn a_test_cube_is_added_edited_and_picked_like_a_settings_box_one_undo_step_each
     wait(&app, "the second unticked", || listed(&app).get(1).filter(|t| !t.on).cloned());
     undo(&app);
     wait(&app, "the second ticked", || listed(&app).get(1).filter(|t| t.on).cloned());
-    app.locator(Selector::role(Role::TextField).name("Test print name")).wait_visible().fill("Corner").press_key(KeyCode::ReturnKey);
+    app.locator(Selector::role(Role::TextField).name("Test print name").state("visible")).wait_count(1).fill("Corner").press_key(KeyCode::ReturnKey);
     wait(&app, "the new name, still lit", || (rows(&app) == [("Test 1".to_string(), false), ("Corner".to_string(), true)]).then_some(()));
     app.locator(Selector::role(Role::Button).name("Delete test print").nth(1)).wait_visible().press();
     wait(&app, "the delete", || (listed(&app).len() == 1).then_some(()));
@@ -282,18 +286,29 @@ fn num_of_figure(n: &syntax::Node, key: &str) -> Option<f64> {
     n.field(key).and_then(|f| num_of(&f.value, "grams"))
 }
 
-/// The Test prints editor's choice of what the Slicer slices, by hand.
+/// The Plate mode menu chooses what the Slicer slices.
 fn choose(app: &TestApp, tests: bool) {
-    app.locator(Selector::role(Role::Radio).name(if tests { "Test prints" } else { "Whole plate" })).wait_visible().select();
+    app.locator(Selector::role(Role::Button).name("Plate mode")).wait_visible().press();
+    app.locator(Selector::role(Role::MenuItem).name(if tests { "Test prints" } else { "Design" })).wait_visible().press();
     wait(app, "the choice", || (text_of(&read(app), "slicing") == if tests { "test prints" } else { "whole plate" }).then_some(()));
 }
 
-/// The plate of one block with a test cube at its corner, in the Sliced view of the Test prints editor.
+/// Add through the toolbar once the test pieces have replaced the original plate.
+fn add_cube_in_test_prints(app: &TestApp) -> Listed {
+    choose(app, true);
+    wait(app, "the pieces view before Add", || view_pieces(app));
+    app.locator(Selector::id("add_test").name("Add test cube")).wait_visible().press();
+    let cube = wait(app, "the cube", || listed(app).into_iter().next());
+    choose(app, false);
+    cube
+}
+
+/// The plate of one block with a test cube, in Design's Sliced view.
 fn block_with_a_cube(app: &TestApp) {
     part_with_a_cube(app, BLOCK);
 }
 
-/// The plate of one part, `source`'s, with a test cube on it, in the Sliced view of the Test prints editor.
+/// The plate of one part, `source`'s, with a test cube on it, in Design's Sliced view.
 fn part_with_a_cube(app: &TestApp, source: &str) {
     app.locator(Selector::role(Role::Window)).wait_visible();
     fab_tools(app);
@@ -301,13 +316,10 @@ fn part_with_a_cube(app: &TestApp, source: &str) {
     call(app, "script", &batch).expect("script");
     let edits = Value::Str(PLACE.to_string()).to_json();
     call(app, "place", &format!(r#"{{"request_id":"place","expected":"{}","edits":{edits}}}"#, head(app))).expect("place");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
-    test_prints_tab(app);
-    app.locator(Selector::role(Role::Button).name("Add test cube")).wait_visible().press();
-    wait(app, "the cube", || listed(app).into_iter().next());
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    add_cube_in_test_prints(app);
+    render_mode::pick(app, "Sliced");
 }
 
 /// The cube set to a true cube of `side` by the tool, and on the list so.
@@ -399,8 +411,7 @@ fn the_slicer_switches_to_test_prints_and_back_with_no_fresh_slice_until_somethi
     assert_ne!(fresh, whole, "the plate slices anew under the new settings");
 
     // In Normal nothing slices, so no later slice covers for a kept one: unchanged, each shows again ...
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     choose(&app, true);
     assert_eq!(num_of(&read(&app), "slice_id"), Some(tests_now), "the test print's slice left shows in Normal too");
     choose(&app, false);
@@ -517,11 +528,10 @@ fn click_at(app: &TestApp, x: f64, y: f64) {
 #[makepad_test]
 fn a_test_prints_piece_lays_flat_by_tool_and_by_hand_and_undo_gives_its_gcode_back(app: TestApp) {
     block_with_a_cube(&app);
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    test_prints_tab(&app);
     // A slab in the block's middle: on its front it is another shape on the bed.
     let at = head(&app);
     call(&app, "test_print", &format!(r#"{{"request_id":"slab-{at}","expected":"{at}","action":"set","name":"Test 1","size":[8,8,4]}}"#)).expect("the slab");
@@ -548,9 +558,8 @@ fn a_test_prints_piece_lays_flat_by_tool_and_by_hand_and_undo_gives_its_gcode_ba
 
     // By hand, on the piece in place in Normal: Lay flat, then a click on it in the view's middle.
     choose(&app, false);
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
-    app.locator(Selector::role(Role::ListItem).name("Test 1")).wait_visible().click();
+    render_mode::pick(&app, "Normal");
+    app.locator(Selector::role(Role::DisclosureButton).name("Test 1")).wait_visible().select();
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
     app.locator(Selector::role(Role::Button).name("Test print lay flat")).wait_visible().press();
     let (x0, y0, x1, y1) = viewport_rect(&app);
@@ -580,7 +589,7 @@ fn a_tall_test_piece_on_a_small_footing_is_flagged_and_takes_a_brim_of_its_own(a
         (text_of(&r, "state") == "Sliced" && flag_of(&r, "current") && num_of(&r, "slice_id") != after).then_some(r)
     });
     let footing = |p: &syntax::Node| p.field("flags").and_then(|f| f.value.items()).is_some_and(|a| a.iter().any(|f| text_of(f, "kind") == "plate_contact"));
-    let row = |app: &TestApp, says: &str| shown(app, Role::ListItem).iter().any(|w| w.node.name.contains("on the plate holds a part") && w.node.name.contains(says));
+    let row = |app: &TestApp, says: &str| shown(app, Role::StaticText).iter().any(|w| w.node.name.contains("on the plate holds a part") && w.node.name.contains(says));
     let r = settled(&app, "the test slice", None);
     let p = piece(&r);
     assert!(footing(&p), "a pin of 3 mm by 3 mm, 30 mm tall, is flagged for its footing");
@@ -588,7 +597,7 @@ fn a_tall_test_piece_on_a_small_footing_is_flagged_and_takes_a_brim_of_its_own(a
     let profiles = num_of(&p, "brim_grams").expect("its brim's grams");
     wait(&app, "its row's flag", || row(&app, if profiles > 0.0 { "the profile's brim rings it" } else { "give it a brim" }).then_some(()));
 
-    app.locator(Selector::role(Role::ListItem).name("Test 1")).wait_visible().click();
+    app.locator(Selector::role(Role::DisclosureButton).name("Test 1")).wait_visible().select();
     app.locator(Selector::role(Role::CheckBox).name("Test print brim")).wait_visible().click();
     wait(&app, "its own brim", || (text_of(&piece(&read(&app)), "brim") == "its own").then_some(()));
     assert!(text_of(&inspect(&app), "project").lines().any(|l| l.contains("test_print(") && l.contains("brim: true")), "the project keeps it");
@@ -646,7 +655,7 @@ fn a_picked_test_cube_cuts_the_view_to_its_piece_and_leaves_the_bed_whole(app: T
     call(&app, "script", &batch).expect("script");
     let edits = Value::Str(PLACE.to_string()).to_json();
     call(&app, "place", &format!(r#"{{"request_id":"place","expected":"{}","edits":{edits}}}"#, head(&app))).expect("place");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
     // Seen from the top, framed: the view's middle is the block's top face, the face the key
     // lights. A side face in the key's shade reads the same grey as its ghost over the bed does at
@@ -656,20 +665,19 @@ fn a_picked_test_cube_cuts_the_view_to_its_piece_and_leaves_the_bed_whole(app: T
     app.locator(Selector::role(Role::MenuItem).name("Top")).wait_visible().press();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    test_prints_tab(&app);
     let (x0, y0, x1, y1) = viewport_rect(&app);
     let (w, n, whole, _) = settled_picture(&app);
 
     // Picked, a cube at a corner away from the view's middle: only that much of the block stays
     // solid; the view stays Normal.
-    app.locator(Selector::role(Role::Button).name("Add test cube")).wait_visible().press();
-    let cube = wait(&app, "the cube", || listed(&app).into_iter().next());
+    let cube = add_cube_in_test_prints(&app);
+    close_tests_sidebar(&app);
     let corner = [cube.at[0] + 8.0, cube.at[1] + 8.0, cube.at[2] + 8.0];
     let set = format!(r#"{{"request_id":"small","expected":"{}","action":"set","name":"Test 1","at":[{},{},{}],"size":6}}"#, head(&app), corner[0], corner[1], corner[2]);
     call(&app, "test_print", &set).expect("the small cube");
     wait(&app, "the small cube", || listed(&app).first().filter(|t| near(t.size, [6.0; 3], 1e-3)).cloned());
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
-    app.locator(Selector::id("rm_slice")).wait_checked(false);
+    render_mode::wait_not_shown(&app, "Sliced");
     let (_, _, cut, path) = picture_cut_to(&app, corner, 6.0);
     let same = |x0: usize, y0: usize, x1: usize, y1: usize| {
         let at = |x: usize, y: usize| (y * w + x) * n;
@@ -720,14 +728,13 @@ fn pieces_in_their_scene(app: &TestApp) -> Option<(Vec<(bool, [[f64; 3]; 2])>, S
 fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(app: TestApp) {
     block_with_a_cube(&app);
     cube_side(&app, 8.0);
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     // The block picked, framed: the plate shows whole, nothing cut.
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    test_prints_tab(&app);
+    close_tests_sidebar(&app);
     assert!(view_pieces(&app).is_none(), "Whole plate: the view is the plate's");
     let (x0, y0, x1, y1) = viewport_rect(&app);
     let (w, n, plate, _) = settled_picture(&app);
@@ -742,7 +749,7 @@ fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(a
     for k in 0..3 {
         assert!(hi[k] - lo[k] <= 8.0 + 1e-6, "no more of the block than its cube: {lo:?} {hi:?}");
     }
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     let (_, _, tests, path) = settled_picture(&app);
     // The pixels of the view two pictures differ at: how many, and the box they lie in.
     let moved = |a: &[u8], b: &[u8]| {
@@ -777,7 +784,7 @@ fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(a
     // Back: the plate, the same picture (the block picked again), in the same render mode.
     choose(&app, false);
     wait(&app, "the plate", || view_pieces(&app).is_none().then_some(()));
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     let (_, _, back, path) = settled_picture(&app);
     // Back, the plate's parts are drawn afresh, and their finished picture is the first one, pixel
     // for pixel: anything left of the pieces, a part drawn otherwise or the block's pick lost shows.

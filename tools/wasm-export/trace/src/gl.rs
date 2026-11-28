@@ -92,6 +92,9 @@ pub struct Gl {
     /// its format's), until freed.
     pub live_textures: std::collections::HashMap<usize, u64>,
     pub peak_texture_bytes: u64,
+    /// The repaint's packed uniform stream (`FromWasmUploadUniformStream`): the draws' uniform
+    /// ranges are byte ranges of it.
+    uniform_stream: Vec<u8>,
 }
 
 /// What the page sends back for a GL message.
@@ -122,6 +125,7 @@ impl Gl {
             live_textures: Default::default(),
             peak_texture_bytes: 0,
             buffer_bytes: 0,
+            uniform_stream: Vec::new(),
         }
     }
 
@@ -231,28 +235,26 @@ impl Gl {
         self.buffer_bytes += b.len() as u64;
         self.upload(2, m.buffer_id, &b);
     }
-    pub fn retained_buffer(&mut self, m: FromWasmRetainedArrayBuffer) {
-        let b = f32s(&m.data);
-        self.buffer_bytes += b.len() as u64;
-        self.hash.u64(m.first_slot as u64);
-        self.upload(3, m.buffer_id, &b);
-    }
-    pub fn retained_update(&mut self, m: FromWasmRetainedArrayUpdate) {
-        self.hash.u64(4);
-        self.hash.u64(m.buffer_id as u64);
-        self.hash.u64(m.slot_count as u64);
+    /// An instance slab's backing: its identity and capacity (nothing is uploaded yet).
+    pub fn create_slab(&mut self, m: FromWasmCreateInstanceSlab) {
+        self.hash.u64(3);
+        self.hash.u64(m.slab_slot as u64);
+        self.hash.u64(m.backing_generation as u64);
         self.hash.u64(m.capacity_bytes as u64);
-        self.hash.u64(m.replace as u64);
-        for c in &m.copies {
-            self.hash.u64(c.source_slot as u64);
-            self.hash.u64(c.destination_slot as u64);
-            self.hash.u64(c.slot_count as u64);
+    }
+    /// One region's instance rows: its place in the slab, and the bytes of its parts in order.
+    pub fn write_region(&mut self, m: FromWasmWriteInstanceRegion) {
+        self.hash.u64(4);
+        for v in [m.backing_generation, m.region.index, m.region.gen] {
+            self.hash.u64(v as u64);
         }
-        for w in &m.writes {
-            let b = f32s(&w.data);
-            self.buffer_bytes += b.len() as u64;
-            self.upload(5, w.destination_slot, &b);
+        self.hash.u64(m.byte_off as u64);
+        let mut b = Vec::with_capacity(m.byte_len);
+        for part in &m.parts {
+            b.extend(u8s(part));
         }
+        self.buffer_bytes += b.len() as u64;
+        self.upload(5, m.slab_slot as usize, &b);
     }
     pub fn index_buffer(&mut self, m: FromWasmAllocIndexBuffer) {
         let mut b = u32s(&m.data);
@@ -263,7 +265,13 @@ impl Gl {
     }
     pub fn vao(&mut self, m: FromWasmAllocVao) {
         self.hash.u64(7);
-        for v in [m.vao_id, m.shader_id, m.geom_ib_id, m.geom_vb_id, m.inst_vb_id] {
+        for v in [m.vao_id, m.shader_id, m.geom_ib_id, m.geom_vb_id] {
+            self.hash.u64(v as u64);
+        }
+        for v in [m.slab_slot, m.backing_generation, m.region.index, m.region.gen] {
+            self.hash.u64(v as u64);
+        }
+        for v in [m.byte_off, m.byte_len, m.instance_byte_offset] {
             self.hash.u64(v as u64);
         }
     }
@@ -277,6 +285,11 @@ impl Gl {
             for v in l {
                 self.hash.u64(*v as u64);
             }
+        }
+        self.hash.u64(m.instance_slabs.len() as u64);
+        for slab in &m.instance_slabs {
+            self.hash.u64(slab.slab_slot as u64);
+            self.hash.u64(slab.backing_generation as u64);
         }
     }
     pub fn texture(&mut self, kind: u64, id: usize, w: usize, h: usize, bytes: Vec<u8>) {
@@ -334,6 +347,9 @@ impl Gl {
             self.hash.u64(f.to_bits() as u64);
         }
     }
+    pub fn uniform_stream(&mut self, m: FromWasmUploadUniformStream) {
+        self.uniform_stream = u8s(&m.data);
+    }
     pub fn draw(&mut self, m: FromWasmDrawCall, out: &mut Vec<Reply>) {
         // first draws spread (web_gl.js FromWasmDrawCall): a waiting program's first draw goes in a
         // frame of its own; a second one waits for the next frame
@@ -351,13 +367,16 @@ impl Gl {
         }
         self.frame.draw_calls += 1;
         self.hash.u64(15);
-        for v in [m.vao_id, m.shader_id, m.index_width as usize, m.depth_write as usize, m.alpha_blend as usize, m.blend_max as usize, m.backface_culling as usize, m.reset_draw_uniforms as usize] {
+        for v in [m.vao_id, m.shader_id, m.index_width as usize, m.depth_write as usize, m.alpha_blend as usize, m.blend_max as usize, m.cull_mode as usize] {
             self.hash.u64(v as u64);
         }
-        for u in [&m.pass_uniforms, &m.draw_list_uniforms, &m.draw_call_uniforms, &m.user_uniforms, &m.live_uniforms, &m.const_table] {
-            let b = f32s(u);
+        // each block's bytes in the stream (clamped to it, as nodegate's subarray is)
+        for r in [m.pass_uniforms, m.draw_list_uniforms, m.draw_call_uniforms, m.user_uniforms, m.live_uniforms] {
+            let s = &self.uniform_stream;
+            let start = (r.off as usize).min(s.len());
+            let b = &s[start..(r.off as usize + r.len as usize).min(s.len())];
             self.hash.u64(b.len() as u64);
-            self.hash.bytes(&b);
+            self.hash.bytes(b);
         }
         for c in &m.custom_uniforms {
             self.hash.str(&c.block_name);

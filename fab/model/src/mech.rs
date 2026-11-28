@@ -537,25 +537,11 @@ impl Mech {
     /// The joint checks on the sliced beads (geometry: as printed): gaps, layers, fused risk and limits from what
     /// the printer lays down. `plate_part[k]` / `to_plate[k]`: plan part k's plate part and model-to-plate map.
     pub fn check_as_printed(&self, layers: &[makepad_fab_toolpath::Layer], plate_part: &[Option<usize>], to_plate: &[[[f64; 4]; 3]]) -> Vec<(JointCheck, PrintedJointSummary)> {
-        // one thread per joint (bounded), each on its own beads
-        let n = self.plan.joints.len();
-        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4).min(8).min(n.max(1));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let out = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|s| {
-            for _ in 0..threads {
-                s.spawn(|| loop {
-                    let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if j >= n {
-                        break;
-                    }
-                    if let Some(r) = self.check_printed_joint(j, layers, plate_part, to_plate) {
-                        out.lock().unwrap().push(r);
-                    }
-                });
-            }
-        });
-        let mut v = out.into_inner().unwrap();
+        // one index per joint, each on its own beads, on the slicer's maps: as many threads as the run's
+        // CPU budget gives them (`par::set_threads`), on the app's pool where it set one, and on the
+        // caller alone inside another map
+        let checked = makepad_fab_toolpath::par::map(self.plan.joints.len(), |j| self.check_printed_joint(j, layers, plate_part, to_plate));
+        let mut v: Vec<_> = checked.into_iter().flatten().collect();
         v.sort_by_key(|(c, _)| c.joint);
         v
     }

@@ -12,8 +12,16 @@
 //! under it, framed from the front in the Feature colours (the supports green, the part's outer
 //! walls orange). Each step's picture is kept (`DEVHUB_KEEP`). HAL offscreen, native GPU.
 
+#[path = "common/view_options.rs"]
+mod view_options;
+#[path = "common/view_menu.rs"]
+mod view_menu;
+#[path = "common/render_mode.rs"]
+mod render_mode;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, KeyCode, Role, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyModifiers, Role, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
 use std::time::Duration;
@@ -40,7 +48,7 @@ place("mushroom", object: "mushroom", at: [175mm 160mm], name: "Mushroom")
 const WINDOW: (f64, f64) = (1280.0, 860.0);
 
 /// The bar's toggles of the Sliced view, besides the projection.
-const SLICED: [&str; 3] = ["show_supports", "show_travel", "show_parts"];
+const SLICED: [&str; 3] = ["Supports", "Travel", "Parts"];
 
 /// A fab tool's reply text; an error when the tool refused (its edit not committed).
 fn call(app: &TestApp, tool: &str, args: &str) -> Result<String, String> {
@@ -135,31 +143,27 @@ fn revisions(app: &TestApp) -> (String, String) {
     (value("revision"), value("served"))
 }
 
-/// A command of the palette (F3), as the person runs it.
+/// A command of the palette (Cmd/Ctrl+Shift+P), as the person runs it.
 fn command(app: &TestApp, name: &str) {
     app.press_key(KeyCode::Escape);
-    app.press_key(KeyCode::F3);
+    app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
     app.type_text(name);
     app.press_key(KeyCode::ReturnKey);
 }
 
-/// A row of the View menu, picked.
-fn view_menu(app: &TestApp, row: &str) {
-    app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
-    app.locator(Selector::role(Role::MenuItem).name(row)).wait_visible().press();
-}
-
 /// The bar in `mode` shows the projection, and the Sliced view's toggles if `sliced`, else not.
 fn bar_holds(app: &TestApp, mode: &str, sliced: bool, failed: &mut Vec<String>) {
-    if app.locator(Selector::id("ortho")).try_wait_visible().is_err() {
+    view_options::toggle(app);
+    if app.locator(view_options::tile("Orthographic")).try_wait_visible().is_err() {
         failed.push(format!("{mode}: the bar does not show the projection"));
     }
     for id in SLICED {
-        let toggle = app.locator(Selector::id(id));
+        let toggle = app.locator(view_options::tile(id));
         if (if sliced { toggle.try_wait_visible() } else { toggle.try_wait_hidden() }).is_err() {
             failed.push(format!("{mode}: the bar {} its {id}", if sliced { "does not show" } else { "shows" }));
         }
     }
+    view_options::toggle(app);
 }
 
 /// A grab's pixels.
@@ -249,22 +253,23 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
         });
 
         // Normal: the projection alone.
-        app.locator(Selector::id("rm_normal")).wait_visible().wait_checked(true);
+        render_mode::wait_shown(&app, "Normal");
         bar_holds(&app, "Normal", false, &mut failed);
         finished_grab(&app, "1-normal", 0);
 
         // Framed from the front, the part selected; then Sliced, its trees planned: all four.
         command(&app, "View: Front");
-        app.locator(Selector::role(Role::Tab).name("Parts")).click();
+        parts_tab::open(&app);
         app.locator(Selector::role(Role::TreeItem).name("Mushroom")).wait_visible().click();
-        view_menu(&app, "Frame Selected");
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        view_menu::pick(&app, "Frame Selected");
+        render_mode::pick(&app, "Sliced");
         app.wait_until_within(HANG, || {
             if call(&app, "slice", "{}").is_ok_and(|t| whole_slice(&t)) { None } else { Some("the slice".into()) }
         });
         bar_holds(&app, "Sliced", true, &mut failed);
-        app.locator(Selector::id("show_supports")).wait_checked(true);
+        view_options::toggle(&app);
+        app.locator(view_options::tile("Supports")).wait_checked(true);
+        view_options::toggle(&app);
         // The part let go: a click above the cap. The pictures are read over the view's middle,
         // where the framed part stands, clear of what draws over the view (the bar, the view
         // cube, the playback).
@@ -280,8 +285,10 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
         // Hidden from the bar: none of their green, the walls' orange kept (more of it: the stem
         // stood behind the trees).
         let since = records(&app);
-        app.locator(Selector::id("show_supports")).click();
-        app.locator(Selector::id("show_supports")).wait_checked(false);
+        view_options::toggle(&app);
+        app.locator(view_options::tile("Supports")).click();
+        app.locator(view_options::tile("Supports")).wait_checked(false);
+        view_options::toggle(&app);
         let hidden = finished_grab(&app, "3-supports-hidden", since);
         let (green_off, orange_off) = (hidden.count(rect, support_green), hidden.count(rect, wall_orange));
         println!("[view-bar] the supports hidden: {green_off} green pixels, {orange_off} orange");
@@ -295,7 +302,9 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
         // Their key shows them again, as they were.
         let since = records(&app);
         app.locator(Selector::id("viewport")).press_key(KeyCode::KeyU);
-        app.locator(Selector::id("show_supports")).wait_checked(true);
+        view_options::toggle(&app);
+        app.locator(view_options::tile("Supports")).wait_checked(true);
+        view_options::toggle(&app);
         let again = finished_grab(&app, "4-supports-again", since);
         let green_again = again.count(rect, support_green);
         println!("[view-bar] U, the supports shown again: {green_again} green pixels");
@@ -305,10 +314,12 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
 
         // The View menu's row hides and shows them too, the bar's toggle with it.
         for on in [false, true] {
-            view_menu(&app, "Show Supports");
-            if app.locator(Selector::id("show_supports")).try_wait_checked(on).is_err() {
+            view_menu::pick(&app, "Show Supports");
+            view_options::toggle(&app);
+            if app.locator(view_options::tile("Supports")).try_wait_checked(on).is_err() {
                 failed.push(format!("the View menu's Show Supports left the bar's toggle {}", if on { "off" } else { "on" }));
             }
+            view_options::toggle(&app);
         }
         let after = revisions(&app);
         if after != slice {
@@ -322,10 +333,12 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
         });
         let before = view(&app);
         let ortho = camera_ortho(&app);
-        app.locator(Selector::id("ortho")).click();
+        view_options::toggle(&app);
+        app.locator(view_options::tile("Orthographic")).click();
         app.wait_until_within(HANG, || if camera_ortho(&app) != ortho { None } else { Some("the bar's projection".into()) });
-        app.locator(Selector::id("ortho")).wait_checked(!ortho);
-        view_menu(&app, "Orthographic");
+        app.locator(view_options::tile("Orthographic")).wait_checked(!ortho);
+        view_options::toggle(&app);
+        view_menu::pick(&app, "Orthographic");
         app.wait_until_within(HANG, || if camera_ortho(&app) == ortho { None } else { Some("the menu's projection".into()) });
         app.wait_until_within(HANG, || {
             if at(&recording(&app), &["settled"]).and_then(Value::as_bool) == Some(true) { None } else { Some("the view at rest after the menu's projection".into()) }
@@ -336,14 +349,16 @@ fn the_view_bar_holds_each_modes_toggles_and_hides_the_supports_without_a_new_sl
         if d > 1e-9 {
             failed.push(format!("the bar's projection and back by the menu moved the view {d:.2e}: {before:?} -> {after:?}"));
         }
-        if app.locator(Selector::id("ortho")).try_wait_checked(ortho).is_err() {
+        view_options::toggle(&app);
+        if app.locator(view_options::tile("Orthographic")).try_wait_checked(ortho).is_err() {
             failed.push("the View menu's Orthographic left the bar's toggle as it was".into());
         }
 
+        view_options::toggle(&app);
+
         // Force, then Normal again: the projection alone.
-        for (mode, segment) in [("Force", "rm_force"), ("Normal", "rm_normal")] {
-            app.locator(Selector::id(segment)).wait_visible().click();
-            app.locator(Selector::id(segment)).wait_checked(true);
+        for mode in ["Force", "Normal"] {
+            render_mode::pick(&app, mode);
             bar_holds(&app, mode, false, &mut failed);
         }
         finished_grab(&app, "5-normal-again", 0);

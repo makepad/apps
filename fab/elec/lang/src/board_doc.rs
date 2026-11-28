@@ -10,10 +10,10 @@ use fab_elec_board::{
 use fab_elec_circuit::{Circuit, ViaSize};
 use fab_elec_core::{
     metres, Angle, BoardId, Contour, Diag, DocId, FeatureRef, ItemId, LayerId, LayerSet,
-    NetId, Nm, Path, PolySet, Seg, Sel, Severity, Shape, Side, SolverId, P,
+    NetId, Nm, PadIx, Path, PolySet, Seg, Sel, Severity, Shape, Side, SolverId, P,
 };
 use fab_elec_design::Unit;
-use fab_elec_parts::{Forbid, Gfx, ThermalRule, ZoneConnect};
+use fab_elec_parts::{Footprint, Forbid, Gfx, ThermalRule, ZoneConnect};
 use makepad_script::syntax::{self, write::Value, Field, Kind, Node};
 use makepad_script::units::UnitTable;
 use std::cell::RefCell;
@@ -161,12 +161,39 @@ fn item_options(opts: &mut Vec<(&str, String)>, locked: bool, origin: &Origin, c
     if locked { opts.push(("locked", "true".into())); }
     provenance(opts, origin, c);
 }
+/// Endpoints count physical pads with the exact same number, in footprint order.
+fn pads_numbered<'a>(footprint: &'a Footprint, no: &'a str) -> impl Iterator<Item = usize> + 'a {
+    footprint.pads.iter().enumerate().filter_map(move |(i, pad)| (pad.no == no).then_some(i))
+}
+
+fn format_pad_end(placed: &Placed, pad: PadIx) -> Option<String> {
+    let no = &placed.footprint.pads.get(pad.ix())?.no;
+    let base = string(&format!("{}:{no}", placed.path));
+    let mut matches = pads_numbered(&placed.footprint, no);
+    let occurrence = matches.position(|i| i == pad.ix())?;
+    Some(if occurrence > 0 || matches.next().is_some() { format!("{base}[{occurrence}]") } else { base })
+}
+
+fn resolve_pad_end(placed: &Placed, no: &str, ordinal: &str) -> Result<PadIx, String> {
+    // A decimal too large for usize is past every occurrence; keep its spelling in the error.
+    let wanted = ordinal.parse::<usize>().ok();
+    let mut count = 0;
+    for i in pads_numbered(&placed.footprint, no) {
+        if Some(count) == wanted {
+            return u16::try_from(i).map(PadIx).map_err(|_| "footprint pad index is out of range".to_owned());
+        }
+        count += 1;
+    }
+    let name = &placed.path;
+    if count == 0 { return Err(format!("{name} has no pad {no}")); }
+    let noun = if count == 1 { "pad" } else { "pads" };
+    Err(format!("{name} has {count} {noun} numbered {no} (index {ordinal} is out of range)"))
+}
+
 fn pad_end(b: &Board, p: P, a: Anchor) -> String {
     if let Anchor::Pad { placed, pad } = a {
-        if let Some(placed) = b.placed_item(placed) {
-            if let Some(pad) = placed.footprint.pads.get(pad.ix()) {
-                return string(&format!("{}:{}", placed.path, pad.no));
-            }
+        if let Some(end) = b.placed_item(placed).and_then(|placed| format_pad_end(placed, pad)) {
+            return end;
         }
     }
     point(p)
@@ -694,16 +721,32 @@ impl Read<'_> {
         self.opt(opts, "locked", false, |n| self.boolean(n, "locked"))
     }
     fn endpoint(&self, n: &Node, board: Option<&Board>) -> Option<(P, Anchor)> {
-        if let (Kind::Str(s), Some(b)) = (&n.kind, board) {
-            let Some((name, no)) = s.rsplit_once(':') else { return self.error(n, format!("{}: expected a placed path and pad number", string(s))); };
-            if let Some(sites) = self.sites {
-                sites.borrow_mut().push(NameSite { span: self.span(n), name: Name::Pad { path: name.into(), pad: no.into() } });
+        let (b, base, index) = match (board, &n.kind) {
+            (Some(b), Kind::Str(_)) => (b, n, None),
+            (Some(b), Kind::Index { base, index, .. }) => (b, base.as_ref(), Some(index.as_ref())),
+            _ => return Some((self.point(n)?, Anchor::Free)),
+        };
+        let s = base.string().or_else(|| self.error(base, "pad endpoint must be a string"))?;
+        let token = n.text(self.text);
+        let Some((name, no)) = s.split_once(':') else { return self.error(n, format!("{token}: expected a placed path and pad number")); };
+        if let Some(sites) = self.sites {
+            sites.borrow_mut().push(NameSite { span: self.span(base), name: Name::Pad { path: name.into(), pad: no.into() } });
+        }
+        let ordinal = match index {
+            Some(index) => {
+                let digits = index.text(self.text);
+                if !digits.bytes().all(|c| c.is_ascii_digit()) { return self.error(index, "pad index must be a nonnegative decimal integer"); }
+                digits
             }
-            let Some(p) = b.placed.iter().find(|p| p.path == name) else { return self.error(n, format!("{}: {name} is not placed", string(s))); };
-            let Some(pad) = p.footprint.pad(no) else { return self.error(n, format!("{}: {name} has no pad {no}", string(s))); };
-            let pos = p.pad_at(pad).or_else(|| self.error(n, "pad has no position"))?;
-            Some((pos, Anchor::Pad { placed: p.id, pad }))
-        } else { Some((self.point(n)?, Anchor::Free)) }
+            None => "0",
+        };
+        let Some(p) = b.placed.iter().find(|p| p.path == name) else { return self.error(n, format!("{token}: {name} is not placed")); };
+        let pad = match resolve_pad_end(p, no, ordinal) {
+            Ok(pad) => pad,
+            Err(e) => return self.error(n, format!("{token}: {e}")),
+        };
+        let pos = p.pad_at(pad).or_else(|| self.error(n, "pad has no position"))?;
+        Some((pos, Anchor::Pad { placed: p.id, pad }))
     }
     fn path(&self, n: &Node, board: Option<&Board>) -> Option<(Path, [Anchor; 2])> {
         let ns = self.array(n, "path")?;

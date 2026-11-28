@@ -38,6 +38,9 @@ use makepad_widgets::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use makepad_fab_slice::piece;
 use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use fab_calibrate::apply::SlicerCalibration;
+use fab_calibrate::results::EffectiveResults;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -63,7 +66,8 @@ struct Entry {
 
 struct TwinProfile {
     printer: VirtualPrinter,
-    diameters: Vec<f64>,
+    machine: Arc<BoundMachine>,
+    binding: Arc<MachineBinding>,
 }
 
 /// The installed profiles: where they are and what they offer.
@@ -72,13 +76,14 @@ pub struct Catalog {
     entries: Vec<Entry>,
     /// Filament layouts resolved on the catalogue worker for the twin picker and restoration.
     twins: HashMap<String, TwinProfile>,
+    /// The installed selection when compatible, else the first preset in picker order, by reported model.
+    automatic: HashMap<String, Arc<MachineBinding>>,
+    resin: std::collections::HashSet<String>,
     selection: Option<Selection>,
     /// Slicer profiles are installed: the presets aren't only the ones Fab carries itself.
     installed: bool,
     /// Ignore a catalogue still in flight for a layout the person has since changed.
     layout_revision: u64,
-    /// Virtual-machine calibration values for the panel, read with the built-ins on the worker.
-    virtual_calibration: HashMap<String, HashMap<String, fab_calibrate::Results>>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -87,17 +92,39 @@ impl std::fmt::Debug for Catalog {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintOutcome { Unchanged, Target, RestoredTarget, JobRows, JobPreview, Calibration { setup_changed: bool, slice_changed: bool } }
+
+impl PrintOutcome {
+    fn completion(state: &mut PrintState, printer: &PrinterChoice) -> Self {
+        // The completing printer's history changed: recheck its stored report (it projects only when shown).
+        fab::print::follow::recheck_report(state, printer, Cx::time_now());
+        if printer == &state.links.picked {
+            Self::Target
+        } else {
+            Self::JobRows
+        }
+    }
+}
+
 /// What the slicing threads post.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub enum PrintEvent {
+    CalibrationResolved { seq: u64, effective: Arc<EffectiveCalibration> },
+    CalibrationWritten { outcome: CalWriteOutcome },
     Checked { id: u64, report: Arc<fab_printability::Report>, error: Option<String> },
     /// Configurations and original layouts for the printer and reset menus.
-    PrinterConfigs { names: Vec<String>, presets: Vec<VirtualPrinter>, loadout: Option<String> },
+    PrinterConfigs { names: Vec<String>, presets: Vec<VirtualPrinter>, loadouts: LoadoutFiles },
     /// Saved layouts arrive with the catalogue needed to construct their twins.
     VirtualPrinters { saved: Saved, catalog: Option<Arc<Catalog>>, kept_as: Option<String> },
     PrinterModesUnreadable(String),
     ReleaseTestPackages,
+    #[cfg(test)]
+    JobFilesRemoved(String),
     Catalog(Option<Arc<Catalog>>),
+    /// A first or changed model report can identify the target after the person picked it.
+    TargetModelChanged,
     Progress { gen: u64, progress: f32, stage: String },
     /// How far the engine's input `revision` is, 0..1 over all its stages, and its stage's words
     /// (see [`makepad_fab_slice::live::LiveEvent::Running`]).
@@ -133,7 +160,7 @@ pub enum PrintEvent {
     /// A job's preview, made from its package.
     JobPreview { id: String, result: Result<Arc<PrintPreview>, String> },
     /// A queued job's package, read back and checked against the installed profile for its start.
-    JobChecked { id: String, epoch: u64, destination: PrinterChoice, options: fab_printer_link::PrintOptions, result: Result<fab_printer_link::safety::ValidatedJob, String> },
+    JobChecked { id: String, attempt: u64, ticket: PrintTicket, options: fab_printer_link::PrintOptions, result: Result<fab_printer_link::safety::ValidatedJob, String> },
 }
 
 /// How a printer package made for a send or an export ended.
@@ -152,8 +179,7 @@ pub enum Packaged {
 #[derive(Clone, Debug, PartialEq)]
 struct ToPrinter {
     /// The link the person confirmed before the package worker started.
-    destination: PrinterChoice,
-    epoch: u64,
+    ticket: PrintTicket,
     /// The options confirmed when Start print was pressed.
     options: fab_printer_link::PrintOptions,
     meta: Arc<JobMeta>,
@@ -271,33 +297,139 @@ fn default_filament(material: Option<&str>) -> &'static str {
 use makepad_widgets::jobs::{JobHandle, JobId, JobSpec};
 use std::collections::HashMap;
 
-const SWITCHED: &str = "The printer was switched while this job was being prepared.";
+const STALE_TICKET: &str = "The printer confirmation changed. Reopen Print before starting.";
+const STALE_PREVIEW: &str = "The slice changed since this Start button was shown. Review the new slice before starting.";
+const STALE_DISPATCH: &str = "The printer changed since you confirmed: nothing was sent.";
 const WRONG_DESTINATION: &str = "Link the printer and mode this job was prepared for before starting it.";
 const SIMULATED_PRINTER: &str = "Simulated printer";
 
+struct Linked {
+    id: PrinterChoice,
+    link: fab_printer_link::PrinterLink,
+    virtual_mode: bool,
+    epoch: u64,
+    watched: Option<(String, usize)>,
+}
+
+impl Linked {
+    fn refresh_binding(&self, state: &mut PrintState, catalog: Option<&Catalog>, saved: Option<&Saved>) {
+        let binding = match catalog {
+            Some(cat) => {
+                let fixed = self.virtual_mode.then(|| Printing::virtual_record(saved?, &self.id)).flatten();
+                let explicit = saved.filter(|_| !self.virtual_mode).and_then(|s| s.bindings.get(&self.id.id()?));
+                let model = state.printer_of(&self.id).map_or("", |s| s.model.as_str());
+                cat.binding(model, fixed, explicit)
+            }
+            None => Arc::new(MachineBinding::NoCatalogue),
+        };
+        state.printers.set_binding(&self.id, binding);
+    }
+
+    fn bind_heads(&mut self, state: &PrintState, model: &str) {
+        let heads = state.printers.binding(&self.id).and_then(|b| b.machine()).map_or(0, |p| p.geometry.nozzles.len());
+        self.watch_heads(model, heads);
+    }
+
+    fn keep_background_loadout(&self, state: &PrintState, report: &fab_printer_link::Snapshot, files: &mut LoadoutFiles, worker: Option<&ProfilesWorker>) {
+        if report.virtual_printer { return; }
+        let Some(profile) = state.printers.binding(&self.id).and_then(|b| b.machine()) else { return };
+        // The optional local preset name is only for the picker. Retained trays use the reported material.
+        let mut layout = colours::layout(Some((&report.name, &report.state)), None, &profile.layout, &|_| None);
+        if layout.live && !colours::drop_missing_heads(&mut layout) {
+            remember_loadout(files, worker, &self.id, &loadout_text(&layout, &report.model));
+        }
+    }
+
+    fn watch_heads(&mut self, model: &str, heads: usize) {
+        if self.watched.as_ref().is_some_and(|(previous, count)| previous == model && *count == heads) { return; }
+        self.link.set_heads(model, heads);
+        self.watched = Some((model.to_owned(), heads));
+    }
+}
+
+#[derive(Default)]
+pub struct Polled {
+    pub target: bool,
+    pub shown: bool,
+    pub others: bool,
+}
+
+const LOADING_CALIBRATION: &str = "Loading calibration";
+const UPDATING_CALIBRATION_PLATE: &str = "Updating the plate for calibration";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RebuildFailureKind {
+    Joint { parts: Vec<String>, kind: Option<&'static str>, id: String, reason: String },
+    Solid { parts: Vec<String>, id: String, op: String, reason: String },
+    Program { file: Option<String>, line: u32, col: u32, reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProfileRebuildFailure {
+    measured: makepad_csg_mech::Measured,
+    layer: f64,
+    source: fab_model::eval::Failure,
+    kind: RebuildFailureKind,
+    message: String,
+    redacted_message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PlateGate {
+    Wait(&'static str),
+    MachineInvalid(MachineError),
+    CalibrationFailed(String),
+}
+
+struct PendingSend {
+    ticket: PrintTicket,
+    preview: u64,
+}
+
 pub struct Printing {
+    pub dirs: Arc<crate::dirs::FabDirs>,
+    profile_rebuild_error: Option<ProfileRebuildFailure>,
+    pending_send: Option<PendingSend>,
+    print_setup_seq: u64,
+    setup_deferred: bool,
     /// With the test prints chosen, the ticked ones: what slices in place of the whole plate.
     tests: Option<Arc<[piece::TestPrint]>>,
     /// The slice the person switched away from, whole plate or test prints: it shows again without
     /// slicing when they switch back. It goes when the plate changes, or at the next switch.
     kept: Option<KeptSlice>,
-    printer: Option<fab_printer_link::PrinterLink>,
-    held_virtual: bool,
-    epoch: u64,
+    fleet: Vec<Linked>,
+    /// Twin workers to restore if their required preset returns.
+    pending_twins: Vec<PrinterChoice>,
+    #[cfg(test)]
+    real_constructor: Option<Box<dyn Fn(&str) -> fab_printer_link::PrinterLink>>,
+    installed_epoch: u64,
+    polled_epoch: u64,
+    published: usize,
     simulator: Option<std::path::PathBuf>,
     /// The profiles worker serializes saves, imports and catalogue rebuilds.
     profiles_worker: Option<ProfilesWorker>,
+    job_writer: Option<JobWriter>,
     /// The saved choices and the original layouts for resetting a printer.
     virtuals: Option<Arc<Saved>>,
     factory: Vec<VirtualPrinter>,
     layout_revision: u64,
     catalog: Option<Arc<Catalog>>,
-    machine: Result<Machine, String>,
+    calibration_key: CalibrationKey,
+    // Compare a report against the last inputs without rebuilding the unique-filament list
+    // or following the same twin provenance again.
+    calibration_target: Option<(PrinterChoice, Option<Arc<Saved>>)>,
+    calibration_slots: Vec<String>,
+    calibration_seq: u64,
+    calibration_resolved: u64,
+    calibration: Arc<EffectiveCalibration>,
+    machine: Result<Arc<Machine>, MachineError>,
     /// The colour mapping used to resolve the Print editor's current materials.
     pub(super) mapping: Option<Arc<Mapped>>,
     gen: u64,
     /// Only a requested settle can answer; an edit withdraws it without a new generation.
     slice_gen: Option<u64>,
+    /// The settled slice generation whose preview owns incoming `PrintEvent::Issues`.
+    issues_gen: Option<u64>,
     /// The live input kept verbatim until Print, Export or Slice asks for a settle.
     live: Option<LiveJob>,
     live_key: Option<(u64, u64)>,
@@ -306,6 +438,8 @@ pub struct Printing {
     last: Option<Arc<Sliced>>,
     /// Export the requested slice when it arrives.
     export_waits: bool,
+    /// The active file packaging attempt whose result still applies to the plate.
+    export_attempt: Option<u64>,
     /// A slice that Slice, Export or Print was waiting for went with its plate or settings (and
     /// whether an Export waited on it): [`Self::resume_asked`] asks for it again on what stands now.
     reask: Option<bool>,
@@ -328,7 +462,9 @@ pub struct Printing {
     /// trays while it is not reporting. Read from `loadout_text` with the picked printer's
     /// toolheads.
     loadout: Option<colours::Layout>,
-    /// The loadout as last kept in [`loadout_path`]. It is read again when a printer profile with
+    /// Contents by loadout file, including edits the worker has yet to save.
+    loadouts: LoadoutFiles,
+    /// The target's retained text. It is read again when a printer profile with
     /// other toolheads is picked, so a loadout kept by a printer with other toolheads is not offered.
     loadout_text: Option<String>,
     /// The bed plate was picked (by hand, or the installed selection names it): no default
@@ -338,15 +474,15 @@ pub struct Printing {
     printer_plate: String,
     /// The selected printer profile's model ("" for Fab's defaults).
     machine_model: String,
-    /// The printer packages being made for sends and exports, and the last one's id.
+    /// Packages in flight and the last attempt issued for packaging or a queued recheck.
     packaging: Vec<Packaging>,
-    package_id: u64,
+    last_attempt: u64,
     /// Completions held by the simulator UI test until its mode-switch press has been handled.
     test_packages: Option<Vec<(u64, Packaged)>>,
     /// The plate's scripts by file, as the app has them: what Print commits with a job.
     pub plate_scripts: Arc<std::collections::BTreeMap<String, String>>,
     /// The queued job whose start is being checked.
-    starting: Option<(String, u64)>,
+    starting: Vec<(String, u64)>,
     /// Per job tool the heads it may print on, and per head the tools it has room for
     /// ([`colours::head_choices`]), from the last mapping.
     head_choices: (Vec<Vec<usize>>, Vec<usize>),
@@ -367,7 +503,7 @@ struct KeptSlice {
     last: Option<Arc<Sliced>>,
 }
 
-/// Only the held link publishes its snapshot; replacing the link clears that snapshot.
+/// Hand a control to the selected worker only while its rendered destination still matches.
 pub(super) fn send_filament_control(
     state: &PrintState, dest: &ControlDestination, control: PrinterControl, send: impl FnOnce(fab_printer_link::Command),
 ) {
@@ -388,19 +524,36 @@ pub(super) fn send_filament_control(
 impl Default for Printing {
     fn default() -> Self {
         Self {
-            printer: None,
-            held_virtual: false,
-            epoch: 0,
+            dirs: Arc::default(),
+            fleet: Vec::new(),
+            pending_twins: Vec::new(),
+            #[cfg(test)]
+            real_constructor: None,
+            installed_epoch: 0,
+            polled_epoch: 0,
+            published: 0,
             simulator: None,
             profiles_worker: None,
+            profile_rebuild_error: None,
+            pending_send: None,
+            print_setup_seq: 0,
+            setup_deferred: false,
+            job_writer: None,
             virtuals: None,
             factory: Vec::new(),
             layout_revision: 0,
             catalog: None,
-            machine: CheckSetup::fab_defaults().machine(),
+            calibration_key: CalibrationKey::default(),
+            calibration_target: None,
+            calibration_slots: Vec::new(),
+            calibration_seq: 0,
+            calibration_resolved: 0,
+            calibration: Arc::default(),
+            machine: CheckSetup::fab_defaults().machine_typed().map(Arc::new),
             mapping: None,
             gen: 0,
             slice_gen: None,
+            issues_gen: None,
             live: None,
             tests: None,
             kept: None,
@@ -408,6 +561,7 @@ impl Default for Printing {
             figures_of: None,
             last: None,
             export_waits: false,
+            export_attempt: None,
             reask: None,
             started: None,
             project_settings: Vec::new(),
@@ -415,16 +569,17 @@ impl Default for Printing {
             live_job: None,
             running: None,
             retries: HashMap::new(),
+            loadouts: LoadoutFiles::new(),
             loadout: None,
             loadout_text: None,
             plate_picked: false,
             printer_plate: String::new(),
             machine_model: String::new(),
             packaging: Vec::new(),
-            package_id: 0,
+            last_attempt: 0,
             test_packages: None,
             plate_scripts: Arc::default(),
-            starting: None,
+            starting: Vec::new(),
             head_choices: (Vec::new(), Vec::new()),
             reach: None,
         }
@@ -466,12 +621,132 @@ pub(crate) fn take_heads(state: &mut PrintState, tools: &[colours::Position], ch
     true
 }
 
+impl Catalog {
+    /// Select among the machines already resolved by the catalogue worker.
+    fn binding(&self, model: &str, fixed: Option<&VirtualPrinter>, explicit: Option<&String>) -> Arc<MachineBinding> {
+        if let Some(printer) = fixed {
+            let name = printer.machine_preset_name();
+            if let Some(profile) = self.twins.get(&name) { return profile.binding.clone(); }
+            if self.resin.contains(&name) { return Arc::new(MachineBinding::Resin); }
+            return Arc::new(MachineBinding::MissingPreset(name));
+        }
+        let model = model.trim().to_ascii_lowercase();
+        let Some(automatic) = self.automatic.get(&model) else {
+            if !model.is_empty() {
+                if let Some(pick) = explicit.filter(|n| !self.twins.contains_key(*n) && !self.resin.contains(*n)) {
+                    return Arc::new(MachineBinding::MissingPreset(pick.clone()));
+                }
+                if self.resin.contains(&model) { return Arc::new(MachineBinding::Resin); }
+            }
+            return Arc::new(MachineBinding::UnknownModel);
+        };
+        let (Some(pick), MachineBinding::Available { machine: first, choices, .. }) = (explicit, automatic.as_ref()) else { return automatic.clone() };
+        let machine = self.twins.get(pick).filter(|p| profile_heads(&model, &p.machine.model, &p.machine.geometry).is_some()).map_or(first, |p| &p.machine);
+        Arc::new(MachineBinding::Available { machine: machine.clone(), automatic: first.clone(), choices: choices.clone(), explicit: Some(pick.clone()) })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CalResolveRequest {
+    seq: u64,
+    key: CalibrationKey,
+}
+
+#[derive(Clone, Debug)]
+pub enum CalWrite {
+    Save {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        coupon: Arc<fab_calibrate::Coupon>,
+        answer: fab_calibrate::Answer,
+        today: String,
+    },
+    Clear {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        step: fab_calibrate::Step,
+    },
+}
+
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
+pub enum CalWriteOutcome {
+    Saved {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        step: fab_calibrate::Step,
+        values: Vec<(&'static str, f64)>,
+    },
+    Cleared {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        step: fab_calibrate::Step,
+        has_preset_fallback: bool,
+    },
+    Failed(String),
+}
+
+/// Apply all writes in arrival order before publishing the most recent requested snapshot.
+fn run_calibration_work(dir: &Path, writes: Vec<CalWrite>, resolve: Option<CalResolveRequest>, mut post: impl FnMut(PrintEvent)) {
+    use fab_calibrate::Results;
+    for write in writes {
+        let (owner, preset, filament) = write.destination();
+        let mut r = match owner {
+            Some(owner) => Results::load_owner_in(dir, &owner.id, filament),
+            None => Results::load_in(dir, preset, filament),
+        };
+        let save = |r: &Results| if owner.is_some() { r.save_owner_in(dir) } else { r.save_in(dir) };
+        let result = match &write {
+            CalWrite::Save { coupon, answer, today, .. } => r.record(coupon, answer, today).and_then(|values| {
+                save(&r)?;
+                Ok(CalWriteOutcome::Saved { owner: owner.clone(), preset: preset.into(), filament: filament.into(), step: coupon.step, values })
+            }),
+            CalWrite::Clear { step, .. } => {
+                r.clear_step(*step);
+                save(&r).map(|_| {
+                    let has_preset_fallback = owner.is_some() && {
+                        let fallback = Results::load_in(dir, preset, filament);
+                        fab_calibrate::results::step_names(*step).iter().any(|name| fallback.get(name).is_some())
+                    };
+                    CalWriteOutcome::Cleared { owner: owner.clone(), preset: preset.into(), step: *step, has_preset_fallback }
+                })
+            }
+        };
+        post(PrintEvent::CalibrationWritten { outcome: result.unwrap_or_else(CalWriteOutcome::Failed) });
+    }
+    if let Some(request) = resolve {
+        let effective = Arc::new(EffectiveCalibration::resolve_in(dir, &request.key));
+        post(PrintEvent::CalibrationResolved { seq: request.seq, effective });
+    }
+}
+
+impl CalWrite {
+    fn destination(&self) -> (&Option<CalibrationOwner>, &str, &str) {
+        match self {
+            Self::Save { owner, preset, filament, .. } | Self::Clear { owner, preset, filament, .. } => (owner, preset, filament),
+        }
+    }
+}
+
+fn write_affects_key(write: &CalWrite, key: &CalibrationKey) -> bool {
+    let (owner, preset, filament) = write.destination();
+    key.filaments.iter().any(|f| f == filament) && match owner {
+        Some(owner) => key.owner.as_ref() == Some(owner),
+        None => key.preset == preset,
+    }
+}
+
 /// Settings snapshots replace earlier pending writes. Imports each need an answer.
 #[derive(Default)]
 struct ProfileWork {
+    cal_writes: Vec<CalWrite>,
+    cal_resolve: Option<CalResolveRequest>,
     saved: Option<Arc<Saved>>,
     rebuild: Option<u64>,
-    loadout: Option<String>,
+    loadouts: LoadoutFiles,
     imports: Vec<(std::path::PathBuf, bool)>,
 }
 
@@ -490,6 +765,41 @@ impl ProfilesWorker {
             Err(std::sync::mpsc::TrySendError::Disconnected(())) => log!("fab: the profiles worker stopped"),
         }
         replaced
+    }
+}
+
+/// One writer owns the state-file renames. Each job keeps its newest pending state.
+struct JobWriter {
+    pending: Arc<std::sync::Mutex<HashMap<String, SavedState>>>,
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+impl JobWriter {
+    fn channel() -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (wake, wakes) = std::sync::mpsc::sync_channel(1);
+        (Self { pending: Default::default(), wake }, wakes)
+    }
+
+    fn save(&self, saves: Vec<(String, SavedState)>) {
+        if saves.is_empty() { return; }
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).extend(saves);
+        if let Err(std::sync::mpsc::TrySendError::Disconnected(())) = self.wake.try_send(()) {
+            log!("fab jobs: the job writer stopped");
+        }
+    }
+
+    fn spawn(&self, dir: PathBuf, wakes: std::sync::mpsc::Receiver<()>, on_error: fn(&str, std::io::Error))
+        -> std::io::Result<std::thread::JoinHandle<()>>
+    {
+        let pending = self.pending.clone();
+        std::thread::Builder::new().name("fab-jobs".into()).spawn(move || {
+            while wakes.recv().is_ok() {
+                let batch = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+                for (id, saved) in batch {
+                    if let Err(e) = jobs::save_state(&dir, &id, &saved) { on_error(&id, e); }
+                }
+            }
+        })
     }
 }
 
@@ -512,11 +822,14 @@ fn fresh_printer_modes(names: &[String]) -> Saved {
         disconnected: names.iter().cloned().collect(),
         ..Saved::default()
     };
-    let mut template = saved.printers[0].clone();
-    template.source = VirtualSource::Twin { preset: template.machine_preset_name(), model: template.model() };
+    let template = saved.printers[0].clone();
+    let preset = template.machine_preset_name();
+    let model = template.model();
     for (index, config) in names.iter().enumerate() {
         saved.printers.push(VirtualPrinter {
-            name: format!("twin-{}", index + 1), configured_for: Some(config.clone()), ..template.clone()
+            name: format!("twin-{}", index + 1), configured_for: Some(config.clone()),
+            source: VirtualSource::Twin { preset: preset.clone(), model: model.clone(), source: PrinterChoice::Real(config.clone()).id() },
+            ..template.clone()
         });
     }
     saved
@@ -597,7 +910,7 @@ fn virtual_heads(vp: &VirtualPrinter) -> Vec<String> {
 fn setup_of(vp: &VirtualPrinter, catalog: Option<&Catalog>) -> Option<fab_printer_link::VirtualSetup> {
     let nozzle_diameters = match &vp.source {
         VirtualSource::Generated => vec![0.4; vp.heads],
-        VirtualSource::Twin { preset, .. } => catalog?.twins.get(preset)?.diameters.clone(),
+        VirtualSource::Twin { preset, .. } => catalog?.twins.get(preset)?.machine.diameters.clone(),
     };
     let heads = virtual_heads(vp);
     let trays = vp.slots.iter().map(|slot| {
@@ -613,7 +926,7 @@ fn setup_of(vp: &VirtualPrinter, catalog: Option<&Catalog>) -> Option<fab_printe
 fn restore_twins(saved: &mut Saved, catalog: Option<&Catalog>) -> bool {
     let mut missing = false;
     for p in &mut saved.printers {
-        let VirtualSource::Twin { preset, .. } = &p.source else { continue };
+        let VirtualSource::Twin { preset, source, .. } = &p.source else { continue };
         let Some(template) = catalog.and_then(|c| c.twins.get(preset)) else {
             missing = true;
             if saved.picked.as_deref().and_then(|id| id.strip_prefix("virtual:")) == Some(p.name.as_str()) {
@@ -623,6 +936,8 @@ fn restore_twins(saved: &mut Saved, catalog: Option<&Catalog>) -> bool {
         };
         let mut twin = template.printer.clone();
         twin.name.clone_from(&p.name);
+        twin.title.clone_from(&p.title);
+        if let VirtualSource::Twin { source: origin, .. } = &mut twin.source { origin.clone_from(source); }
         twin.configured_for.clone_from(&p.configured_for);
         seed_twin(&mut twin, &p.slots);
         *p = twin;
@@ -671,16 +986,74 @@ fn seed_layout(twin: &mut VirtualPrinter, layout: &colours::Layout) {
     }
 }
 
+fn loadout_text(layout: &colours::Layout, model: &str) -> String {
+    let text = colours::loadout_text(layout);
+    if model.is_empty() || model.contains(['\r', '\n', '\t']) { text } else { format!("model\t{model}\n{text}") }
+}
+
 /// Older files only identify the loadout by its display name.
 fn loadout_model(text: &str) -> (Option<&str>, &str) {
     text.strip_prefix("model\t").and_then(|s| s.split_once('\n')).map_or((None, text), |(m, rest)| (Some(m), rest))
 }
 
-/// Where the last known tray loadout lives: `~/.makepad/fab/trays.txt`.
-fn loadout_path() -> std::path::PathBuf {
-    makepad_fab_settings::home::user_home().join(".makepad").join("fab").join("trays.txt")
+/// Keys are relative to Fab's data directory. Only the no-printer choice uses the legacy file.
+type LoadoutFiles = HashMap<PathBuf, String>;
+
+fn loadout_file(id: &PrinterChoice) -> PathBuf {
+    use std::fmt::Write;
+    let (prefix, name) = match id {
+        PrinterChoice::Real(name) => ("printer-", name),
+        PrinterChoice::Virtual(name) => ("virtual-", name),
+        PrinterChoice::None => return PathBuf::from("trays.txt"),
+    };
+    let mut file = String::from(prefix);
+    for b in name.bytes() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' { file.push(b as char); }
+        else { write!(file, "_{b:02x}").unwrap(); }
+    }
+    file.push_str(".txt");
+    Path::new("trays").join(file)
 }
 
+fn read_loadouts(dir: &Path) -> LoadoutFiles {
+    let legacy = loadout_file(&PrinterChoice::None);
+    let mut files = LoadoutFiles::new();
+    if let Ok(text) = std::fs::read_to_string(dir.join(&legacy)) { files.insert(legacy, text); }
+    if let Ok(entries) = std::fs::read_dir(dir.join("trays")) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) { continue; }
+            let file = Path::new("trays").join(entry.file_name());
+            if file.extension().is_some_and(|ext| ext == "txt") {
+                // An unreadable private file has no usable trays, but still rules out legacy adoption.
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_else(|e| {
+                    log!("fab: could not read tray loadout {}: {e}", file.display());
+                    String::new()
+                });
+                files.insert(file, text);
+            }
+        }
+    }
+    files
+}
+
+fn write_loadouts(dir: &Path, files: LoadoutFiles) {
+    if files.is_empty() { return; }
+    for (file, text) in files {
+        if let Err(e) = fab_model::project::write_atomic(&dir.join(file), text.as_bytes()) {
+            log!("fab: could not keep the tray loadout: {e}");
+        }
+    }
+}
+
+fn remember_loadout(files: &mut LoadoutFiles, worker: Option<&ProfilesWorker>, id: &PrinterChoice, text: &str) {
+    let file = loadout_file(id);
+    if files.get(&file).is_some_and(|was| was == text) { return; }
+    files.insert(file.clone(), text.to_owned());
+    if let Some(worker) = worker {
+        let text = text.to_owned();
+        worker.update(|w| w.loadouts.insert(file, text));
+    }
+}
 
 /// What a failed print job's Retry runs again.
 #[derive(Clone)]
@@ -755,7 +1128,8 @@ impl SliceJob {
         let make: makepad_fab_slice::live::MakeInput = Arc::new(move || built.get_or_init(|| match &source {
             SliceSource::Model(ev, swaps, moved) => {
                 let fields = crate::live_slice::edited_fields(ev, swaps);
-                let mut input = crate::live_slice::input_for(plate_id, &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames[..]), Some(&fields[..]));
+                let input = crate::live_slice::input_for(plate_id, &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames[..]), Some(&fields[..]));
+                let mut input = crate::live_slice::with_overlaps_of(input, ev);
                 if let Some((part, xf)) = moved {
                     input.place(*part, *xf);
                     let (resolve, plate, machine) = (setup.clone(), input.plate.clone(), input.machine.clone());
@@ -774,6 +1148,7 @@ impl SliceJob {
         } else {
             None
         };
+        let head_envelope = self.setup.head_envelope().to_path_buf();
         let catalog = self.setup.catalog;
         let objects: Arc<[String]> = match &self.source {
             SliceSource::Model(ev, ..) => ev.plate.parts.iter().map(|p| p.object.clone()).collect(),
@@ -784,7 +1159,7 @@ impl SliceJob {
             SliceSource::Model(ev, ..) => melt_steps(&ev.plate),
             SliceSource::Tests(..) => Vec::new(),
         };
-        let job = crate::live_slice::PrintJob { gen: self.gen, settings: self.setup.settings, colours: palettes.material, model_colours: palettes.model, shared_tools: palettes.shared_tools, machine, name: self.name, objects, check: self.check, fallback, catalog, tests, melts };
+        let job = crate::live_slice::PrintJob { gen: self.gen, head_envelope, settings: self.setup.settings, colours: palettes.material, model_colours: palettes.model, shared_tools: palettes.shared_tools, machine, name: self.name, objects, check: self.check, fallback, catalog, tests, melts };
         (job, crate::live_slice::SliceInput { plate_id, settings_id, parts, make })
     }
 
@@ -802,7 +1177,7 @@ impl SliceJob {
     fn mesh_report(&self) -> Arc<fab_printability::Report> {
         let ev = self.source.plate();
         let (plate, machine) = (&ev.plate, &ev.machine);
-        match resolve_setup(&self.setup.settings, self.setup.catalog.as_deref(), plate, machine) {
+        match resolve_tools(&self.setup.settings, self.setup.catalog.as_deref(), &self.setup.calibration, plate, machine, None) {
             Ok(setup) => {
                 let materials = fab_printability::Materials::from_job(&makepad_fab_settings::machine::Job::new(setup.build_config()));
                 Arc::new(ev.analyse(&materials))
@@ -812,25 +1187,445 @@ impl SliceJob {
     }
 }
 
+/// Maximum characters of a raw `fab_material_slots` entry shown on the person's local UI.
+const MAX_LOCAL_SLOT_CHARS: usize = 64;
+
+/// Structured failure from resolving or validating a printer machine preset
+/// (`CheckSetup::machine_typed` / `machine_of`), built by construction — never parsed from text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachineError {
+    /// `self.catalog` is `None` while `use_installed` is true.
+    CatalogUnavailable,
+    /// Virtual printer layout is rebuilding on `ProfilesWorker`.
+    UpdatingVirtualLayout,
+    /// `Store::resolve(&preset)` failed: missing preset, deleted/unreadable
+    /// file, malformed JSON, missing include, or deep inheritance. `detail` may contain a full
+    /// local file path and OS error (local UI only).
+    ResolvePreset {
+        preset: String,
+        detail: String,
+    },
+    /// `fab_sla::printer::resin_machine` rejected a resin preset.
+    ResinSpec {
+        preset: String,
+        detail: String,
+    },
+    /// Required filament machine geometry key is missing or invalid:
+    /// `printable_area`, `printable_height`, `nozzle_diameter`, `extruder_printable_area`,
+    /// `extruder_printable_height`, `bed_exclude_area`, or `wrapping_exclude_area`.
+    InvalidKey {
+        preset: String,
+        key: &'static str,
+    },
+    /// `family::of(values)` did not recognize the preset's printer family.
+    UnsupportedFamily {
+        preset: String,
+    },
+    /// One-spool-per-head printer has more toolheads than `fab_plate::machine::UNITS`.
+    TooManyHeads {
+        preset: String,
+    },
+    /// `Machine::parse_slots(&named, count)` rejected an entry in `fab_material_slots`.
+    /// `raw_entry` and `detail` carry raw preset text (local UI only; never cross boundaries).
+    InvalidMaterialSlots {
+        preset: String,
+        /// 1-based index of the first failing entry in `fab_material_slots`, when located.
+        slot_index: Option<usize>,
+        /// Trimmed offending raw entry (local display only).
+        raw_entry: Option<String>,
+        /// Full parser error from `Machine::parse_slots` (local display only).
+        detail: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetRole {
+    Printer,
+    Process,
+    Filament,
+}
+
+impl PresetRole {
+    fn label(self) -> &'static str {
+        match self {
+            PresetRole::Printer => "printer",
+            PresetRole::Process => "process",
+            PresetRole::Filament => "filament",
+        }
+    }
+}
+
+/// Structured failure from `CheckSetup::job_setup_of_typed` / `resolve_tools_with`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupError {
+    Machine(MachineError),
+    /// `Catalog::store.resolve(preset)` failed for a filament, printer, or process preset.
+    ResolvePreset {
+        role: PresetRole,
+        preset: String,
+        detail: String,
+    },
+    /// Non-path validation error (bed plate, nozzle count, unsupported family, etc.).
+    Validation(String),
+}
+
+fn first_line_or(text: &str, empty: &str) -> String {
+    text.lines().next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(empty).to_owned()
+}
+
+fn trim_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let mut head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() { head.push('…'); }
+    head
+}
+
+impl MachineError {
+    pub fn local_message(&self) -> String {
+        match self {
+            Self::CatalogUnavailable => "The installed printer profiles are unavailable".into(),
+            Self::ResolvePreset { preset, detail } => format!("{}: {}", preset_label(preset), first_line_or(detail, "preset could not be loaded")),
+            Self::ResinSpec { detail, .. } => first_line_or(detail, "invalid resin printer preset"),
+            Self::InvalidMaterialSlots { preset, slot_index, raw_entry, detail } => {
+                let mut shown = first_line_or(detail, "invalid fab_material_slots");
+                if let Some(raw) = raw_entry.as_ref().filter(|s| s.chars().count() > MAX_LOCAL_SLOT_CHARS) {
+                    shown = if shown.contains(raw) {
+                        shown.replacen(raw, &trim_chars(raw, MAX_LOCAL_SLOT_CHARS), 1)
+                    } else {
+                        trim_chars(&shown, 2 * MAX_LOCAL_SLOT_CHARS)
+                    };
+                }
+                let preset = preset_label(preset);
+                match slot_index {
+                    Some(n) => format!("{preset}: fab_material_slots entry {n} — {shown}"),
+                    None => format!("{preset}: {shown}"),
+                }
+            }
+            _ => self.redacted_message(),
+        }
+    }
+}
+
+fn joint_kind_label(proto: &str) -> Option<&'static str> {
+    match proto {
+        "Hinge" => Some("hinge"),
+        "Slider" => Some("slider"),
+        "Bearing" => Some("bearing"),
+        "Ball" | "BallJoint" => Some("ball joint"),
+        "Bond" => Some("bond"),
+        "Anchor" => Some("anchor"),
+        "String" => Some("string"),
+        _ => None,
+    }
+}
+
+
+fn script_basename(file: &str) -> String {
+    Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or(file).to_owned()
+}
+
+fn format_measured_summary(m: &makepad_csg_mech::Measured, layer: f64) -> String {
+    let mut values = Vec::new();
+    if let Some(n) = m.c_z_layers { values.push(format!("Z gap {n} layers ({:.2} mm)", n as f64 * layer)); }
+    if let Some(c) = m.c_xy { values.push(format!("Clearance {c:.2} mm")); }
+    if let Some(u) = m.mu { values.push(format!("Friction {u:.2}")); }
+    if values.is_empty() { "default calibration".into() } else { values.join(", ") }
+}
+
+fn classify_rebuild_failure(
+    f: &fab_model::eval::Failure, ev: Option<&Evaluated>, program: Option<&fab_model::program::Compiled>,
+) -> RebuildFailureKind {
+    let reason = first_line_or(&f.message, "model failed to build");
+    if f.id.is_empty() {
+        return RebuildFailureKind::Program { file: (!f.file.is_empty()).then(|| script_basename(&f.file)), line: f.line, col: f.col, reason };
+    }
+    let instances = || program.into_iter().flat_map(|p| p.instances.iter()).filter(|i| i.script.file == f.file);
+    let name_of = |object: &str| {
+        let ev = ev?;
+        ev.plate.parts.iter().find(|p| p.object == object).map(|p| &p.name)
+            .or_else(|| ev.plate.excluded.iter().find(|p| p.part.object == object).map(|p| &p.part.name))
+    };
+    let mut parts = Vec::<String>::new();
+    let mut solids = Vec::new();
+    let mut joint = None;
+    let mut solid_op = None;
+    for inst in instances() {
+        let p = &inst.script.program;
+        let call = p.joints.iter().filter(|c| c.id == f.id).max_by_key(|c| c.loc == Some((f.line, f.col)));
+        let mut add = |index: usize| {
+            let id = &p.solids[index].id;
+            let object = fab_model::program::part_id(&inst.name, id);
+            if let Some(name) = name_of(&object) {
+                if !parts.contains(name) { parts.push(name.clone()); }
+            }
+            if !solids.contains(id) { solids.push(id.clone()); }
+        };
+        if let Some(c) = call.filter(|_| f.op == "joint") {
+            joint = Some(joint_kind_label(c.proto));
+            for index in [Some(c.a), c.b, c.shoe].into_iter().flatten() { add(index); }
+        } else if let Some(index) = p.solids.iter().position(|solid| solid.id == f.id) {
+            solid_op = Some(p.solids[index].proto);
+            add(index);
+        }
+    }
+    if parts.is_empty() && f.op == "joint" && joint.is_none() && solid_op.is_none() {
+        for m in ev.into_iter().flat_map(|e| e.mech.iter()).filter(|m| m.file == f.file && m.joint_ids.contains(&f.id)) {
+            for object in &m.names {
+                if let Some(name) = name_of(object) { if !parts.contains(name) { parts.push(name.clone()); } }
+            }
+        }
+    }
+    if parts.is_empty() {
+        for inst in instances() {
+            for placed in &inst.placed {
+                let object = fab_model::program::part_id(&inst.name, &inst.script.program.solids[placed.solid].id);
+                if let Some(name) = name_of(&object) { if !parts.contains(name) { parts.push(name.clone()); } }
+            }
+        }
+        if parts.is_empty() { parts = solids; }
+    }
+    if f.op == "joint" && (joint.is_some() || solid_op.is_none()) {
+        RebuildFailureKind::Joint { parts, kind: joint.flatten(), id: f.id.clone(), reason }
+    } else {
+        let op = if f.op == "joint" { solid_op.unwrap_or(&f.op) } else { &f.op };
+        RebuildFailureKind::Solid { parts, id: f.id.clone(), op: op.into(), reason }
+    }
+}
+
+fn format_rebuild_failure(
+    kind: &RebuildFailureKind,
+    measured: &makepad_csg_mech::Measured,
+    layer: f64,
+) -> String {
+    let cal = format_measured_summary(measured, layer);
+    match kind {
+        RebuildFailureKind::Joint { parts, kind, id, reason } => {
+            let joint = match kind {
+                Some(k) => format!("{k} `{id}`"),
+                None => format!("joint `{id}`"),
+            };
+            let head = if parts.is_empty() { joint } else { format!("{} · {joint}", parts.join(", ")) };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+        RebuildFailureKind::Solid { parts, id, op, reason } => {
+            let subject = if op.is_empty() { format!("solid `{id}`") } else { format!("`{id}` ({op})") };
+            let head = if parts.is_empty() { subject } else { format!("{} · {subject}", parts.join(", ")) };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+        RebuildFailureKind::Program { file, line, col, reason } => {
+            let head = match file {
+                Some(file) if *line > 0 => format!("script `{file}`:{line}:{col}"),
+                Some(file) => format!("script `{file}`"),
+                None if *line > 1 || *col > 1 => format!("project:{line}:{col}"),
+                None => "project build".to_string(),
+            };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+    }
+}
+
+fn scrub_known_paths(text: &str, failure: &fab_model::eval::Failure, program: Option<&fab_model::program::Compiled>) -> String {
+    let mut out = text.to_string();
+    let files = std::iter::once(failure.file.as_str())
+        .chain(program.into_iter().flat_map(|p| p.instances.iter().map(|i| i.script.file.as_str())));
+    for full in files {
+        if full.is_empty() { continue; }
+        let base = script_basename(full);
+        if base != full && out.contains(full) {
+            out = out.replace(full, &base);
+        }
+    }
+    out
+}
+
+pub(crate) fn redacted_eval_failure(f: &fab_model::eval::Failure) -> String {
+    let file = if f.file.is_empty() { String::new() } else { format!("{}:", script_basename(&f.file)) };
+    let msg = scrub_known_paths(&first_line_or(&f.message, "model failed to build"), f, None);
+    if f.id.is_empty() {
+        format!("{file}{}:{}: {msg}", f.line, f.col)
+    } else {
+        format!("{file}{}:{}: {} ({}): {msg}", f.line, f.col, f.id, f.op)
+    }
+}
+
+fn redact_rebuild_kind(kind: &RebuildFailureKind, failure: &fab_model::eval::Failure, program: Option<&fab_model::program::Compiled>) -> RebuildFailureKind {
+    let mut redacted = kind.clone();
+    let reason = match &mut redacted {
+        RebuildFailureKind::Joint { reason, .. } | RebuildFailureKind::Solid { reason, .. } | RebuildFailureKind::Program { reason, .. } => reason,
+    };
+    *reason = scrub_known_paths(reason, failure, program);
+    redacted
+}
+
+fn preset_label(preset: &str) -> String {
+    let name = first_line_or(preset, "");
+    if name.is_empty() {
+        "the selected printer preset".to_string()
+    } else {
+        format!("the printer preset `{name}`")
+    }
+}
+
+impl MachineError {
+    /// Safe for any outbound boundary (cloud AI, MCP agents, `Done::text`, `PrintEvent::Checked`):
+    /// names only the failing step and preset name — never a local path, OS error, or raw value.
+    pub fn redacted_message(&self) -> String {
+        match self {
+            MachineError::CatalogUnavailable => "the installed printer profiles are unavailable".into(),
+            MachineError::UpdatingVirtualLayout => "Updating the virtual printer layout".into(),
+            MachineError::ResolvePreset { preset, .. } => {
+                format!("could not read {}", preset_label(preset))
+            }
+            MachineError::ResinSpec { preset, .. } => {
+                format!("{} has invalid resin printer settings", preset_label(preset))
+            }
+            MachineError::InvalidKey { preset, key } => {
+                format!("{}: missing or invalid {key}", preset_label(preset))
+            }
+            MachineError::UnsupportedFamily { preset } => {
+                format!("{}: {}", preset_label(preset), makepad_fab_settings::family::UNSUPPORTED)
+            }
+            MachineError::TooManyHeads { preset } => {
+                format!("{}: this printer has more heads than its trays can be numbered", preset_label(preset))
+            }
+            MachineError::InvalidMaterialSlots { preset, .. } => {
+                format!("{} has an invalid `fab_material_slots` entry", preset_label(preset))
+            }
+        }
+    }
+}
+
+impl SetupError {
+    pub fn redacted_message(&self) -> String {
+        match self {
+            SetupError::Machine(m) => m.redacted_message(),
+            SetupError::ResolvePreset { role, preset, .. } => {
+                let name = first_line_or(preset, "");
+                if name.is_empty() {
+                    format!("could not read the selected {} preset", role.label())
+                } else {
+                    format!("could not read the {} preset `{name}`", role.label())
+                }
+            }
+            SetupError::Validation(msg) => msg.clone(),
+        }
+    }
+}
+
+/// The configured printer that owns measurements, including those used by its twins.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CalibrationOwner {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationKey {
+    pub owner: Option<CalibrationOwner>,
+    pub preset: String,
+    pub filaments: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectiveCalibration {
+    pub owner: Option<CalibrationOwner>,
+    pub preset: String,
+    pub by_filament: std::collections::BTreeMap<String, EffectiveResults>,
+}
+
+impl EffectiveCalibration {
+    pub fn resolve_in(dir: &Path, key: &CalibrationKey) -> Self {
+        let owner_id = key.owner.as_ref().map(|owner| owner.id.as_str());
+        let by_filament = key.filaments.iter().map(|filament| {
+            let results = fab_calibrate::Results::load_effective_in(dir, owner_id, &key.preset, filament);
+            (filament.clone(), results)
+        }).collect();
+        Self { owner: key.owner.clone(), preset: key.preset.clone(), by_filament }
+    }
+
+    pub fn for_filament(&self, filament: &str) -> Option<&EffectiveResults> {
+        self.by_filament.get(filament)
+    }
+
+    pub fn first_for(&self, settings: &PrintSettings) -> Option<&EffectiveResults> {
+        self.for_filament(settings.materials.first().map_or("", |f| f.preset.as_str()))
+    }
+
+    fn mech_measured(&self, settings: &PrintSettings) -> makepad_csg_mech::Measured {
+        let fit = self.first_for(settings).map(fab_calibrate::MechFit::from_effective).unwrap_or_default();
+        makepad_csg_mech::Measured { c_xy: fit.c_xy, c_z_layers: fit.c_z_layers, mu: fit.mu }
+    }
+
+    pub fn slicer_for(&self, filament: &str) -> SlicerCalibration {
+        self.for_filament(filament).map(SlicerCalibration::from_effective).unwrap_or_default()
+    }
+
+    pub fn hash_slicer_values(&self, settings: &PrintSettings, seed: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hash);
+        if settings.materials.is_empty() {
+            self.slicer_for("").hash(&mut hash);
+        }
+        for filament in &settings.materials {
+            self.slicer_for(&filament.preset).hash(&mut hash);
+        }
+        hash.finish()
+    }
+}
+
 /// Immutable settings snapshot for the model worker; preset resolution is I/O.
 #[derive(Clone)]
 pub struct CheckSetup {
+    dirs: Arc<crate::dirs::FabDirs>,
+    calibration: Arc<EffectiveCalibration>,
     mapping: Option<Arc<Mapped>>,
     settings: PrintSettings,
     catalog: Option<Arc<Catalog>>,
 }
 
+fn waits_mapping(mapping: Option<&Arc<Mapped>>, ev: &Evaluated) -> Option<&'static str> {
+    let mapping = mapping?;
+    (!Arc::ptr_eq(mapping, &ev.mapped) && mapping != &ev.mapped)
+        .then_some("Updating the plate for the printer's colours")
+}
+
 impl CheckSetup {
+    pub fn head_envelope(&self) -> &Path {
+        &self.dirs.head_envelope
+    }
+
     /// Fab's own defaults (no installed profiles read yet).
     pub fn fab_defaults() -> Self {
-        CheckSetup { settings: defaults_settings(), catalog: None, mapping: None }
+        CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings: defaults_settings(), catalog: None, mapping: None }
     }
 
     /// A rebuilt plate must carry the mapping that assigned these materials to nozzles.
+    pub fn plate_waits_mapping(&self, ev: &Evaluated) -> Option<&'static str> {
+        waits_mapping(self.mapping.as_ref(), ev)
+    }
+
+    /// Authoritative profile-mismatch predicate: true when `ev` has printable parts built
+    /// with different calibrated mechanism fits (`c_xy`, `c_z_layers`, `mu`) than this setup.
+    /// Pure in-memory O(log F) lookup, zero disk I/O.
+    pub fn plate_profile_mismatch(&self, ev: &Evaluated) -> bool {
+        !ev.plate.parts.is_empty() && ev.profile.measured != self.mech_measured()
+    }
+
+    /// Worker-side guard (`model_job`, `live_slice::send_live_plate`): never slice an `ev`
+    /// whose colour mapping or calibrated mechanics profile lags behind this setup.
     pub fn plate_waits(&self, ev: &Evaluated) -> Option<&'static str> {
-        let mapping = self.mapping.as_ref()?;
-        (!Arc::ptr_eq(mapping, &ev.mapped) && mapping != &ev.mapped)
-            .then_some("Updating the plate for the printer's colours")
+        self.plate_waits_mapping(ev).or_else(|| {
+            self.plate_profile_mismatch(ev).then_some(UPDATING_CALIBRATION_PLATE)
+        })
+    }
+
+    pub fn mech_measured(&self) -> makepad_csg_mech::Measured {
+        self.calibration.mech_measured(&self.settings)
+    }
+
+    pub fn calibration_owner(&self) -> Option<&CalibrationOwner> {
+        self.calibration.owner.as_ref()
     }
 
     /// The selected print profile's name.
@@ -840,11 +1635,17 @@ impl CheckSetup {
 
     /// The selected printer's geometry (reads the inherited preset files).
     pub fn machine(&self) -> Result<Machine, String> {
+        self.machine_typed().map_err(|e| e.local_message())
+    }
+
+    pub fn machine_typed(&self) -> Result<Machine, MachineError> {
         if !self.settings.use_installed {
             return Ok(Machine::dual_nozzle_350());
         }
-        let catalog = self.catalog.as_ref().ok_or("The installed printer profiles are unavailable")?;
-        let preset = catalog.store.resolve(&self.settings.machine).map_err(|e| format!("the printer preset: {e}"))?;
+        let catalog = self.catalog.as_ref().ok_or(MachineError::CatalogUnavailable)?;
+        let preset = catalog.store.resolve(&self.settings.machine).map_err(|detail| MachineError::ResolvePreset {
+            preset: self.settings.machine.clone(), detail,
+        })?;
         machine_of(&preset.name, &preset.values)
     }
 
@@ -855,28 +1656,26 @@ impl CheckSetup {
     }
 
     pub fn id(&self) -> u64 {
-        // Stored calibration results change what slices (flow, temperature, PA): their revision counts.
-        let text = format!("{:?}|{:?}|{}", self.settings, self.catalog.as_ref().map(|c| Arc::as_ptr(c) as usize), crate::calibrate::revision());
-        text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+        let text = format!("{:?}|{:?}", self.settings, self.catalog.as_ref().map(|c| Arc::as_ptr(c) as usize));
+        let base = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        self.calibration.hash_slicer_values(&self.settings, base)
     }
 
     /// What a calibration test part is made for (reads preset files: call off the UI thread).
     pub fn coupon_setup(&self) -> fab_calibrate::CouponSetup {
-        coupon_setup(&self.settings, self.catalog.as_deref())
+        coupon_setup(&self.settings, self.catalog.as_deref(), self.calibration.first_for(&self.settings))
     }
 
     /// The mechanisms' print profile: nozzle, layer and filament type of the job, with the clearances and
-    /// friction measured on this printer and filament when it is calibrated (reads preset files and the
-    /// calibration folder: call off the UI thread).
+    /// friction measured on this printer and filament. Preset files are resolved on the worker;
+    /// the measurements come from its immutable calibration snapshot.
     pub fn mech_profile(&self) -> makepad_csg_mech::Profile {
         let cs = self.coupon_setup();
-        let (printer, filament) = self.calibration_names();
-        let fit = fab_calibrate::MechFit::load(&printer, &filament);
         makepad_csg_mech::Profile {
             nozzle: cs.nozzle,
             layer: cs.layer,
             material: makepad_csg_mech::Material::named(&cs.material),
-            measured: makepad_csg_mech::Measured { c_xy: fit.c_xy, c_z_layers: fit.c_z_layers, mu: fit.mu },
+            measured: self.mech_measured(),
             ..Default::default()
         }
     }
@@ -894,10 +1693,14 @@ impl CheckSetup {
     /// [`Self::job_setup`], with `kept` of only those of its tools (0-based, ascending): the ones
     /// a slice of it printed in.
     pub fn job_setup_of(&self, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, String> {
-        if !self.machine()?.same_volume(machine) {
-            return Err("Updating the plate for the selected printer".into());
+        self.job_setup_of_typed(plate, machine, kept).map_err(|e| e.redacted_message())
+    }
+
+    fn job_setup_of_typed(&self, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
+        if !self.machine_typed().map_err(SetupError::Machine)?.same_volume(machine) {
+            return Err(SetupError::Validation("Updating the plate for the selected printer".into()));
         }
-        resolve_tools(&self.settings, self.catalog.as_deref(), plate, machine, kept)
+        resolve_tools(&self.settings, self.catalog.as_deref(), &self.calibration, plate, machine, kept)
     }
 
     /// The job the app would slice a model with: setup, its paint streams (none: a model's
@@ -964,21 +1767,47 @@ fn rim_of(job: &makepad_fab_settings::machine::Job, objects: usize) -> fab_model
 
 impl Printing {
     pub fn machine(&self) -> Result<&Machine, String> {
-        self.machine.as_ref().map_err(Clone::clone)
+        self.machine.as_deref().map_err(MachineError::local_message)
+    }
+
+    pub fn machine_error(&self) -> Option<&MachineError> {
+        self.machine.as_ref().err()
     }
 
     /// Keep `l` as the loadout, and on disk for the next run (a few hundred bytes, written only
     /// when it changes).
-    fn keep_loadout(&mut self, l: colours::Layout, reported_model: Option<&str>) {
-        let model = reported_model.unwrap_or(&self.machine_model);
-        let layout = colours::loadout_text(&l);
-        let text = if model.is_empty() || model.contains(['\r', '\n', '\t']) { layout } else { format!("model\t{model}\n{layout}") };
-        if let Some(worker) = &self.profiles_worker {
-            let snapshot = text.clone();
-            worker.update(|w| w.loadout.replace(snapshot));
-        }
+    fn keep_loadout(&mut self, id: &PrinterChoice, l: colours::Layout, reported_model: Option<&str>) {
+        let text = loadout_text(&l, reported_model.unwrap_or(&self.machine_model));
+        remember_loadout(&mut self.loadouts, self.profiles_worker.as_ref(), id, &text);
         self.loadout_text = Some(text);
         self.loadout = Some(l);
+    }
+
+    fn select_loadout(&mut self, state: &PrintState) {
+        self.loadout_text = self.loadouts.get(&loadout_file(&state.links.picked)).cloned();
+        self.loadout = self.loadout_text.as_deref().and_then(|t| colours::parse_loadout(loadout_model(t).1, &self.offline().heads));
+        self.adopt_legacy_loadout(state);
+    }
+
+    /// Only the named real configuration can claim the legacy file. When it records a model,
+    /// wait for that printer to identify itself: the plate's selected profile can be any machine.
+    fn adopt_legacy_loadout(&mut self, state: &PrintState) {
+        if self.loadout_text.is_some() { return; }
+        let PrinterChoice::Real(name) = &state.links.picked else { return };
+        let Some(legacy) = self.loadouts.get(Path::new("trays.txt")) else { return };
+        let (model, text) = loadout_model(legacy);
+        if text.lines().next().and_then(|line| line.strip_prefix("printer\t")) != Some(name.as_str()) { return; }
+        let reported = state.target_printer().filter(|s| !s.virtual_printer);
+        if reported.is_some_and(|s| &s.name != name) { return; }
+        if let Some(model) = model {
+            let Some(report) = reported else { return };
+            if report.model.is_empty() || (report.model != model && !same_printer(&report.model, model)) { return; }
+        }
+        let Some(layout) = colours::parse_loadout(text, &self.offline().heads) else { return };
+        let text = legacy.clone();
+        remember_loadout(&mut self.loadouts, self.profiles_worker.as_ref(), &state.links.picked, &text);
+        self.loadout_text = Some(text);
+        self.loadout = Some(layout);
     }
 
     /// The printer the colours map onto with no reports: the selected printer's slots (none
@@ -990,13 +1819,198 @@ impl Printing {
         }
     }
 
-    /// The Print editor already has the resolved machine, so a bed check here needs no I/O.
-    pub(super) fn plate_waits(&self, state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
-        self.check_setup(state).plate_waits(ev).or_else(|| {
+    /// True when `ev` has printable parts whose `ev.profile.measured` differs from the active
+    /// target's resolved calibration. O(log F) in-memory lookup, zero disk I/O.
+    pub fn plate_profile_mismatch(&self, state: &PrintState, ev: &Evaluated) -> bool {
+        !ev.plate.parts.is_empty() && ev.profile.measured != self.calibration.mech_measured(&state.settings)
+    }
+
+    /// Active failure message if the current target's calibrated `Measured` already failed to
+    /// rebuild on `ModelHost`.
+    fn active_calibration_failure(&self, state: &PrintState) -> Option<&ProfileRebuildFailure> {
+        self.profile_rebuild_error.as_ref().filter(|f| f.measured == self.calibration.mech_measured(&state.settings))
+    }
+
+    /// Non-calibration geometry waits (colour mapping or printer bed volume). Never marks a
+    /// settled fixed box stale during Stage 2.
+    pub(super) fn plate_waits_geometry(&self, _state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
+        waits_mapping(self.mapping.as_ref(), ev).or_else(|| {
             let machine = self.machine.as_ref().ok()?;
             (!machine.same_volume(&ev.machine)).then_some("Updating the plate for the selected printer")
         })
     }
+
+    /// Single authoritative readiness gate for any non-empty `Evaluated`.
+    /// Checks the profile mismatch directly — never solely the `calibration_plate_pending` flag.
+    pub(super) fn plate_gate(&self, state: &PrintState, ev: &Evaluated) -> Option<PlateGate> {
+        if self.calibration_pending() {
+            return Some(PlateGate::Wait(LOADING_CALIBRATION));
+        }
+        if let Err(error) = &self.machine { return Some(PlateGate::MachineInvalid(error.clone())); }
+        if self.plate_profile_mismatch(state, ev) {
+            if let Some(msg) = self.active_calibration_failure(state).map(|f| f.message.as_str()) {
+                return Some(PlateGate::CalibrationFailed(msg.to_owned()));
+            }
+            if state.calibration_plate_pending {
+                return Some(PlateGate::Wait(UPDATING_CALIBRATION_PLATE));
+            }
+            // Defensive invariant: ev.profile.measured != expected with no rebuild in flight.
+            // Never fall through to slicing or packaging old geometry.
+            return Some(PlateGate::CalibrationFailed(self.default_mismatch_error(state, Some(ev))));
+        }
+        self.plate_waits_geometry(state, ev).map(PlateGate::Wait)
+    }
+
+    /// Non-empty when `plate` cannot be sliced or packaged due to a calibration profile mismatch
+    /// failure (never true during Stage 1 `ProfilesWorker` resolve).
+    pub(super) fn calibration_failure(&self, state: &PrintState, plate: Option<&Arc<Evaluated>>) -> Option<String> {
+        if self.calibration_pending() {
+            return None;
+        }
+        if let Some(ev) = plate {
+            return match self.plate_gate(state, ev) {
+                Some(PlateGate::CalibrationFailed(err)) => Some(err),
+                _ => None,
+            };
+        }
+        state.calibration_error.clone()
+    }
+
+    /// Keep `plate_waits` strictly for `Wait` states (callers that need wait-vs-fail use `plate_gate`).
+    pub(super) fn plate_waits(&self, state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
+        match self.plate_gate(state, ev) {
+            Some(PlateGate::Wait(why)) => Some(why),
+            _ => None,
+        }
+    }
+    /// Put the editor into the calibration-rebuild failure state without setting `reask` or
+    /// starting any slice or package.
+    pub(super) fn fail_for_calibration(&mut self, state: &mut PrintState, message: String, for_export: bool) {
+        let for_export = for_export || matches!(&state.export, ExportStatus::Failed(reason) if reason == &message);
+        self.stop_slice(state);
+        state.calibration_plate_pending = false;
+        state.calibration_error = Some(message.clone());
+        state.status = SliceStatus::Failed(message.clone());
+        if for_export {
+            state.export = ExportStatus::Failed(message);
+        }
+        state.bump();
+    }
+
+    /// Clear any active calibration rebuild failure (e.g. calibration corrected/cleared, model
+    /// rebuilt with matching `Measured`, printer retargeted, or plate emptied). Only clears
+    /// `status` / `export` / `print_blocked` entries that came from this calibration failure.
+    pub(super) fn clear_calibration_error(&mut self, state: &mut PrintState) -> bool {
+        let old = self.profile_rebuild_error.take().map(|f| f.message)
+            .or_else(|| state.calibration_error.clone());
+        let had_ui = state.calibration_error.take().is_some();
+        let Some(old) = old else { return had_ui };
+        if matches!(&state.status, SliceStatus::Failed(m) if *m == old) {
+            state.status = SliceStatus::Idle;
+        }
+        if matches!(&state.export, ExportStatus::Failed(m) if *m == old) {
+            state.export = ExportStatus::Idle;
+        }
+        if state.print_blocked.get(&state.links.picked).is_some_and(|m| m == old.as_str()) {
+            state.print_blocked.set(&state.links.picked, None);
+        }
+        state.bump();
+        true
+    }
+    pub fn sync_calibration_plate(&mut self, state: &mut PrintState, plate: Option<&Evaluated>, has_host: bool) -> bool {
+        let mismatch = plate.is_some_and(|ev| self.plate_profile_mismatch(state, ev));
+        let mut changed = false;
+        if !mismatch {
+            // Plate now matches the active target's calibration (or is empty): release any failure.
+            changed |= self.clear_calibration_error(state);
+        }
+        let failed_msg = if mismatch && !self.calibration_pending() {
+            self.active_calibration_failure(state).map(|f| f.message.as_str()).map(str::to_owned)
+        } else {
+            None
+        };
+        let pending = has_host && self.machine.is_ok() && !self.calibration_pending() && mismatch && failed_msg.is_none();
+        if state.calibration_plate_pending != pending {
+            state.calibration_plate_pending = pending;
+            changed = true;
+        }
+        if state.calibration_error != failed_msg {
+            state.calibration_error = failed_msg;
+            changed = true;
+        }
+        if !pending
+            && matches!(&state.status, SliceStatus::Running { stage, .. } if stage == UPDATING_CALIBRATION_PLATE)
+        {
+            state.status = SliceStatus::Idle;
+            changed = true;
+        }
+        if changed {
+            state.bump();
+        }
+        changed
+    }
+
+    pub fn calibration_waiting(&self, state: &PrintState) -> bool {
+        self.calibration_pending() || state.calibration_plate_pending
+    }
+
+    fn default_mismatch_error(&self, state: &PrintState, plate: Option<&Evaluated>) -> String {
+        let layer = if state.settings.layer_height > 0.0 { state.settings.layer_height } else { plate.map_or(0.2, |ev| ev.profile.layer) };
+        format!("plate does not match active calibration ({}) — edit the model or adjust/clear calibration.",
+            format_measured_summary(&self.check_setup(state).mech_measured(), layer))
+    }
+
+    pub fn external_slice_error(&self, state: &PrintState) -> Option<String> {
+        if let Err(e) = &self.machine { return Some(e.redacted_message()); }
+        if let Some(f) = self.active_calibration_failure(state) { return Some(f.redacted_message.clone()); }
+        match &state.status {
+            SliceStatus::Failed(error) => Some(first_line_or(error, "internal slicer error")),
+            _ => None,
+        }
+    }
+
+    pub fn profile_rebuild_failed(&mut self, state: &mut PrintState, plate: Option<&Evaluated>, program: Option<&fab_model::program::Compiled>, failure: &fab_model::eval::Failure) {
+        let measured = self.check_setup(state).mech_measured();
+        let layer = if state.settings.layer_height > 0.0 { state.settings.layer_height } else { plate.map_or(0.2, |e| e.profile.layer) };
+        let kind = classify_rebuild_failure(failure, plate, program);
+        let message = format_rebuild_failure(&kind, &measured, layer);
+        let redacted_message = format_rebuild_failure(&redact_rebuild_kind(&kind, failure, program), &measured, layer);
+        self.profile_rebuild_error = Some(ProfileRebuildFailure { measured, layer, source: failure.clone(), kind, message: message.clone(), redacted_message });
+        state.calibration_error = Some(message.clone());
+        self.reject_held_plate(state, message);
+    }
+
+    pub fn machine_preset_failed(&mut self, state: &mut PrintState, err: &MachineError) {
+        self.machine = Err(err.clone());
+        self.clear_calibration_error(state);
+        self.reject_held_plate(state, err.local_message());
+    }
+
+    fn reject_held_plate(&mut self, state: &mut PrintState, message: String) {
+        state.calibration_plate_pending = false;
+        let held = self.pending_send.take().is_some();
+        let exporting = self.reask.take() == Some(true) || self.export_waits;
+        self.stop_slice(state);
+        if held {
+            state.print_blocked.set(&state.links.picked, Some(message.clone()));
+            state.follow.closed = false;
+        }
+        if exporting { state.export = ExportStatus::Failed(message.clone()); }
+        state.status = SliceStatus::Failed(message);
+        state.bump();
+    }
+
+    pub fn print_setup_seq(&self) -> u64 { self.print_setup_seq }
+
+    pub fn next_print_setup(&mut self) -> Option<u64> {
+        self.setup_deferred = self.calibration_pending();
+        if self.setup_deferred { return None; }
+        self.print_setup_seq += 1;
+        Some(self.print_setup_seq)
+    }
+
+    pub fn setup_deferred(&self) -> bool { self.setup_deferred }
+
 
     /// Keep the previous slice visible while the plate rebuilds. Print must wait for its replacement.
     pub(super) fn mark_shown_slice_stale(state: &mut PrintState) {
@@ -1005,12 +2019,113 @@ impl Printing {
         }
     }
 
+    pub fn calibration_owner(&self, state: &PrintState) -> Option<CalibrationOwner> {
+        let configured = |name: &str| (!name.is_empty() && name != "No printer").then(|| CalibrationOwner { id: format!("printer:{name}"), title: name.into() });
+        let mut current = match &state.links.picked {
+            PrinterChoice::None => return None,
+            PrinterChoice::Real(name) => return configured(name),
+            PrinterChoice::Virtual(name) => name.as_str(),
+        };
+        let saved = self.virtuals.as_deref()?;
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(current) {
+            let printer = saved.printers.iter().find(|p| p.configured_for.is_none() && p.name == current)?;
+            let VirtualSource::Twin { source: Some(source), .. } = &printer.source else { return None };
+            if let Some(config) = source.strip_prefix("printer:") { return configured(config); }
+            current = source.strip_prefix("virtual:")?;
+        }
+        None
+    }
+
+    pub(super) fn requested_calibration_owner(&self) -> Option<&CalibrationOwner> { self.calibration_key.owner.as_ref() }
+
+    pub fn effective_calibration(&self) -> &Arc<EffectiveCalibration> { &self.calibration }
+
+    pub fn calibration_pending(&self) -> bool {
+        self.profiles_worker.is_some() && self.calibration_resolved < self.calibration_seq
+    }
+
+    fn sync_calibration_pending(&self, state: &mut PrintState) {
+        let pending = self.calibration_pending();
+        if state.calibration_pending != pending {
+            state.calibration_pending = pending;
+            state.bump();
+        }
+    }
+
+    pub fn sync_calibration(&mut self, state: &mut PrintState) -> bool {
+        let picked = &state.links.picked;
+        let records = match picked {
+            PrinterChoice::Virtual(_) => self.virtuals.as_ref(),
+            _ => None,
+        };
+        let same_target = self.calibration_target.as_ref().is_some_and(|(target, saved)| {
+            target == picked && saved.as_ref().map(Arc::as_ptr) == records.map(Arc::as_ptr)
+        });
+        let key = &self.calibration_key;
+        let materials = &state.settings.materials;
+        let already_requested = self.calibration_seq > 0 || self.profiles_worker.is_none();
+        if same_target && key.preset == state.settings.machine && already_requested
+            && self.calibration_slots.iter().eq(materials.iter().map(|m| &m.preset)) {
+            return false;
+        }
+        let owner = self.calibration_owner(state);
+        self.calibration_target = Some((picked.clone(), records.cloned()));
+        self.calibration_slots = materials.iter().map(|m| m.preset.clone()).collect();
+        let mut filaments = self.calibration_slots.clone();
+        if filaments.is_empty() { filaments.push(String::new()); }
+        filaments.sort();
+        filaments.dedup();
+        if already_requested && key.owner == owner && key.preset == state.settings.machine && key.filaments == filaments {
+            return false;
+        }
+        self.clear_calibration_error(state);
+        self.calibration_key = CalibrationKey { owner, preset: state.settings.machine.clone(), filaments };
+        let Some(worker) = &self.profiles_worker else { return false };
+        self.calibration_seq += 1;
+        worker.update(|work| work.cal_resolve = Some(CalResolveRequest { key: self.calibration_key.clone(), seq: self.calibration_seq }));
+        self.sync_calibration_pending(state);
+        true
+    }
+
+    fn queue_calibration_write(&mut self, state: &mut PrintState, write: CalWrite) {
+        let affects = write_affects_key(&write, &self.calibration_key);
+        if let Some(worker) = &self.profiles_worker {
+            if affects { self.calibration_seq += 1; }
+            worker.update(|work| {
+                work.cal_writes.push(write);
+                if affects {
+                    work.cal_resolve = Some(CalResolveRequest { key: self.calibration_key.clone(), seq: self.calibration_seq });
+                }
+            });
+            self.sync_calibration_pending(state);
+        }
+    }
+
+    pub fn save_calibration(&mut self, state: &mut PrintState, owner: Option<CalibrationOwner>, preset: String, filament: String,
+        coupon: Arc<fab_calibrate::Coupon>, answer: fab_calibrate::Answer, today: String) {
+        self.sync_calibration(state);
+        self.queue_calibration_write(state, CalWrite::Save { owner, preset, filament, coupon, answer, today })
+    }
+
+    pub fn clear_calibration(&mut self, state: &mut PrintState, step: fab_calibrate::Step) {
+        self.sync_calibration(state);
+        let (preset, filament) = self.check_setup(state).calibration_names();
+        self.queue_calibration_write(state, CalWrite::Clear { owner: self.calibration_key.owner.clone(), preset, filament, step })
+    }
+
     pub fn check_setup(&self, state: &PrintState) -> CheckSetup {
-        CheckSetup { settings: state.settings.clone(), catalog: if state.settings.use_installed { self.catalog.clone() } else { None }, mapping: self.mapping.clone() }
+        CheckSetup { dirs: self.dirs.clone(), calibration: self.calibration.clone(), settings: state.settings.clone(), catalog: if state.settings.use_installed { self.catalog.clone() } else { None }, mapping: self.mapping.clone() }
     }
 
     pub fn check_slice(&mut self, id: u64, state: &PrintState, ev: &Arc<Evaluated>) {
-        if let Some(error) = self.plate_waits(state, ev).map(str::to_owned).or_else(|| self.machine().err()) {
+        if let Some(gate) = self.plate_gate(state, ev) {
+            let error = match gate {
+                PlateGate::Wait(why) => why.into(),
+                PlateGate::MachineInvalid(err) => err.redacted_message(),
+                PlateGate::CalibrationFailed(_) => self.active_calibration_failure(state)
+                    .map(|f| f.redacted_message.clone()).unwrap_or_else(|| self.default_mismatch_error(state, Some(ev))),
+            };
             Cx::post_action(PrintEvent::Checked { id, report: ev.printability.clone(), error: Some(error) });
             return;
         }
@@ -1028,12 +2143,13 @@ impl Printing {
     /// The app shuts down: the printer link closes, so a relaunch under `makepad run` does not
     /// wait for it (slice jobs run on the shared worker, which ends with the process).
     pub fn stop(&mut self) {
-        if self.printer.take().is_some() { self.epoch += 1; }
-        self.held_virtual = false;
+        self.fleet.clear();
+        self.pending_twins.clear();
         self.profiles_worker = None;
+        self.job_writer = None;
     }
 
-    /// Start the worker that owns catalogue reads and preference writes.
+    /// Start the catalogue and job-state workers.
     pub fn start(&mut self, state: &mut PrintState) {
         // The issue markers wait to be asked for.
         state.hide_markers = true;
@@ -1064,21 +2180,27 @@ impl Printing {
             }
             self.simulator = Some(path);
         }
+        if self.job_writer.is_none() {
+            let (writer, wakes) = JobWriter::channel();
+            let started = writer.spawn(self.dirs.jobs.clone(), wakes, |id, e| log!("fab jobs: {id} could not be saved: {e}"));
+            if let Err(e) = started { log!("fab jobs: could not start the job writer: {e}"); }
+            self.job_writer = Some(writer);
+        }
         let (wake, rx) = std::sync::mpsc::sync_channel(1);
         let pending = Arc::new(std::sync::Mutex::new(ProfileWork::default()));
         self.profiles_worker = Some(ProfilesWorker { wake, pending: pending.clone() });
         let path = virtual_path();
+        let dirs = self.dirs.clone();
         let started = std::thread::Builder::new().name("fab-profiles".into()).spawn(move || {
             let names = fab_printer_link::secrets::config_names();
             Cx::post_action(PrintEvent::PrinterConfigs {
                 names: names.clone(), presets: virtual_printer::presets(),
-                loadout: std::fs::read_to_string(loadout_path()).ok(),
+                loadouts: read_loadouts(&dirs.app_data),
             });
-            let dirs = ProfileStore::default_data_dirs();
-            let imports = makepad_fab_settings::import::fab_profile_dir();
+            let data_dirs = ProfileStore::default_data_dirs();
             let mut saved = read_printer_profiles(path.as_deref(), &names, |printers| {
-                Cx::post_action(PrintEvent::JobsRead(jobs::read_all(&jobs::jobs_dir())));
-                catalog_in(&dirs, &imports, printers).map(Arc::new)
+                Cx::post_action(PrintEvent::JobsRead(jobs::read_all(&dirs.jobs)));
+                catalog_in(&data_dirs, &dirs.profiles, printers).map(Arc::new)
             }, Cx::post_action);
             let mut layout_revision = 0;
             while rx.recv().is_ok() {
@@ -1089,26 +2211,26 @@ impl Printing {
                         if let Err(e) = virtual_printer::save_to(path, &saved) { log!("fab: could not save virtual printers: {e}"); }
                     }
                 }
-                if let Some(text) = work.loadout {
-                    let path = loadout_path();
-                    if let Err(e) = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(path, text)) {
-                        log!("fab: could not keep the tray loadout: {e}");
-                    }
-                }
+                write_loadouts(&dirs.app_data, work.loadouts);
                 if let Some(revision) = work.rebuild {
                     layout_revision = revision;
-                    let catalog = catalog_in(&dirs, &imports, &saved.printers).map(|mut cat| {
+                    let catalog = catalog_in(&data_dirs, &dirs.profiles, &saved.printers).map(|mut cat| {
                         cat.layout_revision = revision;
                         Arc::new(cat)
                     });
                     Cx::post_action(PrintEvent::Catalog(catalog));
                 }
                 for (path, select) in work.imports {
-                    import_profiles(&path, select, &dirs, &imports, &saved.printers, layout_revision);
+                    import_profiles(&path, select, &data_dirs, &dirs.profiles, &saved.printers, layout_revision);
                 }
+                run_calibration_work(&dirs.calibration, work.cal_writes, work.cal_resolve, Cx::post_action);
             }
         });
-        if let Err(e) = started { log!("fab: could not start the profiles worker: {e}"); }
+        if let Err(e) = started {
+            self.profiles_worker = None;
+            self.sync_calibration_pending(state);
+            log!("fab: could not start the profiles worker: {e}");
+        }
     }
 
     /// The plate changed: the slice (if any) is now stale (its colours map again in
@@ -1117,7 +2239,8 @@ impl Printing {
         // The slice shown (or in flight) was made from this very plate and these settings: an
         // evaluation that lands after it, as a setting's second commit does, changes nothing it
         // depends on, and it does not go stale (in Normal nothing would slice it again).
-        let (plate, settings) = crate::live_slice::slice_key(ev);
+        let plate = crate::live_slice::plate_id(ev);
+        let settings = self.check_setup(state).id_for(&ev.plate);
         let whole = (plate, settings);
         if self.figures_of != Some(whole) {
             state.whole_figures = None;
@@ -1132,7 +2255,9 @@ impl Printing {
         };
         let same = key.is_some() && self.live_key == key;
         if !same {
+            let waiting_card = state.calibration_plate_pending && state.confirm_print.is_some();
             self.invalidate(state);
+            if waiting_card { self.reask.get_or_insert(false); }
         }
         state.printability = ev.printability.clone();
         if self.project_settings != ev.plate.settings {
@@ -1159,19 +2284,41 @@ impl Printing {
             state.stale = true;
         }
         if let Err(e) = &self.machine {
-            state.status = SliceStatus::Failed(e.clone());
+            state.status = SliceStatus::Failed(e.local_message());
         }
     }
 
-    /// A finished background step. Returns true when the view changed.
-    pub fn event(&mut self, state: &mut PrintState, ev: &PrintEvent) -> bool {
-        match ev {
+    /// A finished background step. Return which part of the app should handle the change.
+    pub fn event(&mut self, state: &mut PrintState, ev: &PrintEvent) -> PrintOutcome {
+        let changed = match ev {
+            PrintEvent::CalibrationWritten { .. } => return PrintOutcome::Unchanged,
+            PrintEvent::CalibrationResolved { seq, effective } => {
+                if *seq != self.calibration_seq { return PrintOutcome::Unchanged; }
+                let old = self.check_setup(state);
+                self.calibration = effective.clone();
+                self.calibration_resolved = *seq;
+                self.sync_calibration_pending(state);
+                let new = self.check_setup(state);
+                let slice_changed = old.id() != new.id();
+                let measured = new.mech_measured();
+                let setup_changed = slice_changed || old.mech_measured() != measured;
+                if self.profile_rebuild_error.as_ref().is_some_and(|f| f.measured != measured) {
+                    self.clear_calibration_error(state);
+                }
+                if slice_changed {
+                    if self.slice_gen.is_some() || self.live.is_some() { crate::live_slice::cancel(); }
+                    self.invalidate(state);
+                } else if matches!(&state.status, SliceStatus::Running { stage, .. } if stage == LOADING_CALIBRATION) {
+                    state.status = SliceStatus::Idle;
+                }
+                return PrintOutcome::Calibration { setup_changed, slice_changed };
+            }
             PrintEvent::Checked { .. } => false,
             PrintEvent::PrinterModesUnreadable(note) => {
                 state.links.note.clone_from(note);
                 true
             }
-            PrintEvent::PrinterConfigs { names, presets, loadout } => {
+            PrintEvent::PrinterConfigs { names, presets, loadouts } => {
                 let mut names = names.clone();
                 if self.simulator.is_some() && !names.iter().any(|n| n == SIMULATED_PRINTER) {
                     names.insert(0, SIMULATED_PRINTER.into());
@@ -1180,15 +2327,25 @@ impl Printing {
                 self.rebuild_virtual_choices(state);
                 state.links.presets = presets.iter().map(|p| (p.name.clone(), p.title.clone())).collect();
                 self.factory = presets.clone();
-                if self.loadout_text.is_none() { self.loadout_text = loadout.clone(); }
+                for (file, text) in loadouts {
+                    self.loadouts.entry(file.clone()).or_insert_with(|| text.clone());
+                }
+                self.select_loadout(state);
                 true
             }
             PrintEvent::VirtualPrinters { saved, catalog, kept_as } => {
-                if catalog.is_some() { self.catalog = catalog.clone(); }
                 self.virtuals = Some(Arc::new(saved.clone()));
+                if catalog.is_some() { self.set_catalog(state, catalog.clone()); }
                 self.rebuild_virtual_choices(state);
-                // Restore the pick only after the profiles worker has read its mode.
-                if self.printer.is_none() {
+                let restore_pick = self.linked(&state.links.picked).is_none();
+                if kept_as.is_none() {
+                    let configured: Vec<_> = state.links.choices.iter().filter(|(id, _)| matches!(id, PrinterChoice::Real(_)))
+                        .map(|(id, _)| id.clone()).collect();
+                    for id in configured { let _ = self.ensure_link(state, &id); }
+                }
+                // Installing a worker never selects it or applies its machine to the plate.
+                let mut target_changed = false;
+                if restore_pick {
                     let pick = if kept_as.is_some() {
                         PrinterChoice::None
                     } else if let Ok(name) = std::env::var("FAB_PRINTER_VIRTUAL") {
@@ -1200,17 +2357,29 @@ impl Printing {
                     } else {
                         state.links.choices.iter().find(|(p, _)| matches!(p, PrinterChoice::Real(_))).map(|(p, _)| p.clone()).unwrap_or_default()
                     };
+                    let previous = (state.links.picked.clone(), state.links.disconnected);
                     self.link_printer(state, &pick);
+                    target_changed = previous.0 != state.links.picked || previous.1 != state.links.disconnected;
+                    if target_changed { self.invalidate(state); }
                 }
                 if let Some(name) = kept_as {
                     state.links.note = format!("Fab could not read its saved printer settings, so it kept them as {name} and started fresh. No printer is linked, and your printers start in Virtual mode until you switch them to Connected.");
                 }
+                if target_changed { return PrintOutcome::RestoredTarget; }
                 true
             }
-            PrintEvent::Catalog(c) => {
-                if c.as_ref().is_some_and(|c| c.layout_revision != self.layout_revision) { return false; }
+            PrintEvent::TargetModelChanged => {
+                // A pick can precede this notification. Apply only the current target's setup.
+                if !Self::target_needs_bound(state) { return PrintOutcome::Unchanged; }
+                self.select_bound(state);
+                self.load_base_values(state);
                 self.invalidate(state);
-                self.catalog = c.clone();
+                return PrintOutcome::RestoredTarget;
+            }
+            PrintEvent::Catalog(c) => {
+                if c.as_ref().is_some_and(|c| c.layout_revision != self.layout_revision) { return PrintOutcome::Unchanged; }
+                self.invalidate(state);
+                self.set_catalog(state, c.clone());
                 self.twin_choices(state);
                 match c {
                     Some(cat) => {
@@ -1228,6 +2397,7 @@ impl Printing {
                         } else if !virtual_selected {
                             state.profiles.note = "No installed slicer profiles found: Fab defaults. Fab's built-in printers are under Installed profiles.".into();
                         }
+                        if !virtual_selected { self.select_bound(state); }
                         // with only Fab's own presets, Fab defaults keep their lists
                         if cat.installed || state.settings.use_installed {
                             self.refresh_lists(state);
@@ -1244,7 +2414,7 @@ impl Printing {
             PrintEvent::ProfilesImported { summary, select, catalog } => {
                 self.invalidate(state);
                 if catalog.as_ref().is_some_and(|c| c.layout_revision == self.layout_revision) {
-                    self.catalog = catalog.clone();
+                    self.set_catalog(state, catalog.clone());
                     self.twin_choices(state);
                     state.profiles.available = true;
                 }
@@ -1257,6 +2427,7 @@ impl Printing {
                         state.settings.process = process.clone();
                     }
                 }
+                self.select_bound(state);
                 self.load_base_values(state);
                 self.refresh_lists(state);
                 state.profiles.note = summary.clone();
@@ -1264,7 +2435,7 @@ impl Printing {
             }
             PrintEvent::Progress { gen, progress, stage } => {
                 if self.slice_gen != Some(*gen) || !matches!(state.status, SliceStatus::Running { .. }) {
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 // The board's job says what the print panel says.
                 if let Some(job) = &self.slice_job {
@@ -1286,7 +2457,7 @@ impl Printing {
             }
             PrintEvent::Streamed { gen, preview } => {
                 if self.slice_gen != Some(*gen) || !matches!(state.status, SliceStatus::Running { .. }) {
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 state.stream_preview(preview.clone());
                 true
@@ -1294,24 +2465,27 @@ impl Printing {
             PrintEvent::Sliced { gen, result, seconds } => {
                 if self.slice_gen != Some(*gen) {
                     log!("fab slice: the answer for gen {gen} is not awaited (awaiting {:?}, status {:?})", self.slice_gen, state.status);
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 log!("fab slice: gen {gen} answered ({})", if result.is_ok() { "sliced" } else { "failed" });
                 self.started = None;
+                self.slice_gen = None;
+                self.issues_gen = None;
                 let job = self.slice_job.take();
+                self.clear_export(state);
                 match result {
                     Ok(s) => {
                         if let Some(job) = job {
                             job.done();
                         }
                         state.status = SliceStatus::Done { seconds: *seconds };
-                        state.exported = None;
                         // The colours on job tools the slice prints nothing in (paint covers them all).
                         let printed = |name: &str| state.colors.tool_of(name).is_none_or(|(t, _)| s.settled.tools.contains(&(t as usize - 1)));
                         state.unprinted = state.colors.rows.iter().filter(|r| r.used && !printed(&r.name)).map(|r| r.name.clone()).collect();
                         state.set_preview(s.preview.clone());
                         state.print_check = Some(s.checked.as_ref().map(|c| format!("passed: first layer {:.2} mm, {} moves checked", c.facts.first_layer_z, c.facts.moves)).map_err(Clone::clone));
                         self.last = Some(s.clone());
+                        self.issues_gen = Some(*gen);
                         if std::mem::take(&mut self.export_waits) {
                             self.export(state, None);
                         }
@@ -1340,14 +2514,14 @@ impl Printing {
                 true
             }
             PrintEvent::Issues { gen, report, done, total } => {
-                if self.slice_gen != Some(*gen) || state.preview.is_none() {
-                    return false;
+                if self.issues_gen != Some(*gen) || state.preview.is_none() || state.stale {
+                    return PrintOutcome::Unchanged;
                 }
                 state.streamed = Some(fab::print::StreamedIssues::new(report.clone(), *done, *total));
                 true
             }
             PrintEvent::Estimated { revision, preview, changes } => {
-                let Some(live) = self.live.as_mut().filter(|l| l.revision == *revision && l.whole) else { return false };
+                let Some(live) = self.live.as_mut().filter(|l| l.revision == *revision && l.whole) else { return PrintOutcome::Unchanged };
                 live.timed = true;
                 state.time_preview(preview.clone());
                 // Other heads for the colours, weighed in the background when any could move.
@@ -1365,7 +2539,7 @@ impl Printing {
                 taken.store(true, Ordering::Release);
                 // Only while the plate's whole preview has not come.
                 if !self.live.as_ref().is_some_and(|l| l.revision == *revision && l.whole && !l.timed) {
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 state.grow_preview(preview.clone());
                 true
@@ -1373,7 +2547,7 @@ impl Printing {
             PrintEvent::Totals { revision, totals } => {
                 // Only while the plate's playing preview has not come: it brings its own.
                 if !self.live.as_ref().is_some_and(|l| l.revision == *revision && l.whole && !l.timed) {
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 state.estimate = Some(*totals);
                 state.bump();
@@ -1383,6 +2557,8 @@ impl Printing {
                 // Only for the plate still shown, as it was mapped then.
                 self.live.as_ref().is_some_and(|l| l.revision == *revision) && take_heads(state, tools, choice)
             }
+            #[cfg(test)]
+            PrintEvent::JobFilesRemoved(_) => false,
             PrintEvent::ReleaseTestPackages => {
                 for (id, result) in self.test_packages.take().into_iter().flatten() {
                     Cx::post_action(PrintEvent::Packaged { id, result });
@@ -1390,62 +2566,70 @@ impl Printing {
                 false
             }
             PrintEvent::Packaged { id, result } => {
-                let Some(at) = self.packaging.iter().position(|p| p.id == *id) else { return false };
+                let Some(at) = self.packaging.iter().position(|p| p.id == *id) else { return PrintOutcome::Unchanged };
                 if let Some(held) = self.test_packages.as_mut().filter(|_| matches!(self.packaging[at].to, PackageFor::Printer(_))) {
                     held.push((*id, result.clone()));
-                    return false;
+                    return PrintOutcome::Unchanged;
                 }
                 let p = self.packaging.remove(at);
+                if matches!(p.to, PackageFor::File(_)) {
+                    if self.export_attempt != Some(*id) { return PrintOutcome::Unchanged; }
+                    self.export_attempt = None;
+                }
                 // Cancelled by the person: said when it was pressed.
-                let waited = matches!(p.to, PackageFor::Printer(_)) && !p.stop.load(Ordering::Relaxed) && state.sending.take().is_some();
                 if let PackageFor::Printer(send) = &p.to {
-                    if send.epoch != self.epoch && waited {
-                        state.print_blocked = Some(SWITCHED.into());
+                    if p.stop.load(Ordering::Relaxed) || state.take_sending(&send.meta.id).is_none() {
+                        if matches!(result, Packaged::Checked(_)) { remove_job_files(self.dirs.jobs.clone(), send.meta.id.clone()); }
+                        return PrintOutcome::Unchanged;
+                    }
+                    if self.dispatch_entry(state, &send.ticket).is_err() {
+                        state.print_blocked.set(&send.ticket.printer, Some(STALE_DISPATCH.into()));
                         if matches!(result, Packaged::Checked(_)) {
-                            if let Some(job) = state.follow.job_of_mut(&send.meta.id) {
-                                job.state = JobState::Queued;
+                            if let Some(i) = state.follow.jobs.position(&send.meta.id) {
+                                state.follow.jobs.at_mut(i).state = JobState::Queued;
                                 state.follow.changed(&send.meta.id);
                             }
                         } else {
-                            state.follow.jobs.retain(|j| j.meta.id != send.meta.id);
+                            state.follow.jobs.remove(&send.meta.id);
                         }
-                        fab::print::follow::printer_changed(state, Cx::time_now());
-                        return true;
+                        return PrintOutcome::completion(state, &send.ticket.printer);
                     }
                 }
                 match (result, &p.to) {
-                    (Packaged::Written(path), _) => state.exported = Some(path.clone()),
-                    // Cancelled while its last steps ran: the job goes.
-                    (Packaged::Checked(_), PackageFor::Printer(send)) if !waited => remove_job_files(send.meta.id.clone()),
+                    (Packaged::Written(path), PackageFor::File(_)) => state.export = ExportStatus::Written(path.clone()),
+                    (Packaged::Failed(why), PackageFor::File(_)) => state.export = ExportStatus::Failed(why.clone()),
+                    (Packaged::Stopped, PackageFor::File(_)) => state.export = ExportStatus::Idle,
                     (Packaged::Checked(_), PackageFor::Printer(send)) if send.queue => {
                         log!("fab print: {} queued", p.sliced.name);
-                        if let Some(queued) = state.follow.job_of_mut(&send.meta.id) { queued.state = JobState::Queued; }
-                        state.print_blocked = None;
+                        if let Some(mut queued) = state.follow.job_of_mut(&send.meta.id) { queued.state = JobState::Queued; }
+                        state.print_blocked.set(&send.ticket.printer, None);
                     }
-                    (Packaged::Checked(job), PackageFor::Printer(send)) => match self.send_job(state, send.epoch, &send.destination, job.clone(), &send.meta, send.options) {
+                    (Packaged::Checked(job), PackageFor::Printer(send)) => match self.send_job(state, &send.ticket, job.clone(), &send.meta, send.options) {
                         Ok(()) => {
                             log!("fab print: {} handed to the printer link", p.sliced.name);
-                            state.print_blocked = None;
+                            state.print_blocked.set(&send.ticket.printer, None);
                         }
                         Err(why) => {
                             log!("fab print: the package is made, the print is refused: {why}");
-                            state.print_blocked = Some(why);
-                            state.follow.jobs.retain(|j| j.meta.id != send.meta.id);
-                            remove_job_files(send.meta.id.clone());
+                            state.print_blocked.set(&send.ticket.printer, Some(why));
+                            state.follow.jobs.remove(&send.meta.id);
+                            remove_job_files(self.dirs.jobs.clone(), send.meta.id.clone());
                         }
                     },
                     (Packaged::Failed(why), PackageFor::Printer(send)) => {
                         log!("fab print: packaging failed: {why}");
-                        state.print_blocked = Some(why.clone());
-                        state.follow.jobs.retain(|j| j.meta.id != send.meta.id);
+                        state.print_blocked.set(&send.ticket.printer, Some(why.clone()));
+                        state.follow.jobs.remove(&send.meta.id);
                     }
-                    (Packaged::Stopped, PackageFor::Printer(send)) if waited => {
+                    (Packaged::Stopped, PackageFor::Printer(send)) => {
                         log!("fab print: packaging stopped");
-                        state.print_blocked = Some("Stopped while it was being prepared: nothing went to the printer.".into());
-                        state.follow.jobs.retain(|j| j.meta.id != send.meta.id);
+                        state.print_blocked.set(&send.ticket.printer, Some("Stopped while it was being prepared: nothing went to the printer.".into()));
+                        state.follow.jobs.remove(&send.meta.id);
                     }
-                    (Packaged::Failed(why), PackageFor::File(_)) => state.status = SliceStatus::Failed(why.clone()),
                     _ => {}
+                }
+                if let PackageFor::Printer(send) = &p.to {
+                    return PrintOutcome::completion(state, &send.ticket.printer);
                 }
                 fab::print::follow::printer_changed(state, Cx::time_now());
                 true
@@ -1453,17 +2637,21 @@ impl Printing {
             PrintEvent::JobsRead(saved) => {
                 let (now, wall) = (Cx::time_now(), jobs::wall_now());
                 state.follow.jobs_read = true;
-                let known: Vec<String> = state.follow.jobs.iter().map(|j| j.meta.id.clone()).collect();
-                let read = saved.iter().filter(|(meta, _)| !known.contains(&meta.id)).map(|(meta, saved)| CommittedJob::restored(meta.clone(), saved.clone(), now, wall));
-                state.follow.jobs.extend(read.collect::<Vec<_>>());
-                state.follow.jobs.sort_by(|a, b| b.meta.created.total_cmp(&a.meta.created));
+                let read = saved.iter().filter(|(meta, _)| state.follow.jobs.position(&meta.id).is_none())
+                    .map(|(meta, saved)| CommittedJob::restored(meta.clone(), saved.clone(), now, wall)).collect();
+                state.follow.jobs.merge(read);
                 let read: Vec<String> = saved.iter().map(|(meta, s)| format!("{} {}{}", meta.id, s.state.label(), s.started.map_or(String::new(), |t| format!(" {:.0} s ago", wall - t)))).collect();
                 log!("fab jobs: {} read: {}", saved.len(), read.join(", "));
+                for entry in &self.fleet {
+                    if &entry.id != state.shown_choice() {
+                        fab::print::follow::recheck_report(state, &entry.id, now);
+                    }
+                }
                 fab::print::follow::printer_changed(state, now);
                 true
             }
             PrintEvent::JobPreview { id, result } => {
-                let Some(job) = state.follow.job_of_mut(id) else { return false };
+                let Some(mut job) = state.follow.job_of_mut(id) else { return PrintOutcome::Unchanged };
                 job.loading = false;
                 match result {
                     Ok(preview) => job.preview = Some(preview.clone()),
@@ -1472,62 +2660,60 @@ impl Printing {
                         job.unreadable = Some(format!("Fab's copy of this job can't be read: {why}."));
                     }
                 }
+                drop(job);
                 fab::print::follow::printer_changed(state, Cx::time_now());
-                true
+                return PrintOutcome::JobPreview;
             }
-            PrintEvent::JobChecked { id, epoch, destination, options, result } => {
-                if !self.starting.as_ref().is_some_and(|(waiting, admitted)| waiting == id && admitted == epoch) {
-                    return false;
-                }
-                self.starting = None;
-                state.sending = None;
-                let Some(meta) = state.follow.job_of(id).map(|j| j.meta.clone()) else { return false };
-                let sent = if *epoch != self.epoch { Err(SWITCHED.into()) } else {
-                    result.clone().and_then(|job| self.send_job(state, *epoch, destination, job, &meta, *options))
+            PrintEvent::JobChecked { id, attempt, ticket, options, result } => {
+                let Some(at) = self.starting.iter().position(|(waiting, admitted)| waiting == id && admitted == attempt) else {
+                    return PrintOutcome::Unchanged;
+                };
+                self.starting.remove(at);
+                state.take_sending(id);
+                let Some(meta) = state.follow.job_of(id).map(|j| j.meta.clone()) else { return PrintOutcome::Unchanged };
+                let sent = match result {
+                    Ok(job) => self.send_job(state, ticket, job.clone(), &meta, *options),
+                    Err(why) => Err(self.dispatch_entry(state, ticket).err().unwrap_or(why).to_owned()),
                 };
                 match sent {
                     Ok(()) => log!("fab print: queued job {} handed to the printer link", meta.name),
                     Err(why) => {
                         log!("fab print: queued job {} refused: {why}", meta.name);
-                        state.print_blocked = Some(why);
-                        if let Some(job) = state.follow.job_of_mut(id) { job.state = JobState::Queued; }
+                        state.print_blocked.set(&ticket.printer, Some(why));
+                        if let Some(mut job) = state.follow.job_of_mut(id) { job.state = JobState::Queued; }
                     }
                 }
-                fab::print::follow::printer_changed(state, Cx::time_now());
-                true
+                return PrintOutcome::completion(state, &ticket.printer);
             }
-        }
+        };
+        if changed { PrintOutcome::Target } else { PrintOutcome::Unchanged }
     }
 
-    /// What the jobs ask of the disk now: `state.txt` files behind, previews wanted and let go.
-    /// Workers do the work; with nothing to do this is one scan of a short list, no allocation.
+    /// Queue dirty job states and keep previews for the jobs being printed or shown.
     pub fn sync_jobs(&mut self, state: &mut PrintState) {
-        let dir = || jobs::jobs_dir();
-        if !state.follow.unsaved.is_empty() {
+        if let Some(writer) = self.job_writer.as_ref().filter(|_| !state.follow.unsaved.is_empty()) {
             let (now, wall) = (Cx::time_now(), jobs::wall_now());
             let unsaved = std::mem::take(&mut state.follow.unsaved);
-            let saves: Vec<(String, SavedState)> = unsaved.into_iter().filter_map(|id| state.follow.job_of(&id).filter(|j| j.state != JobState::Preparing).map(|j| (id, j.saved(now, wall)))).collect();
-            let dir = dir();
-            crate::live_slice::run_shown("fab job state", move || {
-                for (id, saved) in &saves {
-                    if let Err(e) = jobs::save_state(&dir, id, saved) { log!("fab jobs: {id} could not be saved: {e}"); }
-                }
-            });
+            let saves = unsaved.into_iter().filter_map(|id| state.follow.job_of(&id).filter(|j| j.state != JobState::Preparing).map(|j| (id, j.saved(now, wall)))).collect();
+            writer.save(saves);
         }
-        let f = &state.follow;
-        let index = |id: Option<&str>| id.and_then(|id| f.jobs.iter().position(|j| j.meta.id == id));
-        let printing = index(f.job.as_ref().and_then(|j| j.id.as_deref()));
-        let shown = index(f.shown().map(|j| j.meta.id.as_str()));
-        let monitor = f.monitor;
-        for (i, job) in state.follow.jobs.iter_mut().enumerate() {
-            let make = printing == Some(i) || (monitor && shown == Some(i));
-            let keep = make || shown == Some(i);
-            if job.preview.is_some() && !keep {
-                job.preview = None;
+        let f = &mut state.follow;
+        let printing = f.job.as_ref().and_then(|j| j.id.as_deref()).and_then(|id| f.jobs.position(id));
+        // The shown job keeps its preview in every workspace; only Monitor asks for one to be made.
+        let shown = f.shown().and_then(|j| f.jobs.position(&j.meta.id));
+        let make_shown = shown.filter(|i| f.monitor && Some(*i) != printing);
+        // Clearing a preview may swap the last previewed id into its slot. Visit that last id first.
+        for slot in (0..f.jobs.previewed().len()).rev() {
+            let i = f.jobs.position(&f.jobs.previewed()[slot]).unwrap();
+            if Some(i) != printing && Some(i) != shown && f.jobs[i].preview.is_some() {
+                f.jobs.at_mut(i).preview = None;
             }
-            if make && job.preview.is_none() && !job.loading && job.unreadable.is_none() && job.state != JobState::Preparing {
+        }
+        for i in printing.into_iter().chain(make_shown) {
+            let mut job = f.jobs.at_mut(i);
+            if job.preview.is_none() && !job.loading && job.unreadable.is_none() && job.state != JobState::Preparing {
                 job.loading = true;
-                let (id, meta, dir) = (job.meta.id.clone(), job.meta.clone(), dir());
+                let (id, meta, dir) = (job.meta.id.clone(), job.meta.clone(), self.dirs.jobs.clone());
                 crate::live_slice::run_shown("fab job preview", move || {
                     let began = std::time::Instant::now();
                     let result = jobs::read_package(&dir, &id).map_err(|e| e.to_string()).and_then(|package| preview_of_package(&package, &meta));
@@ -1540,21 +2726,30 @@ impl Printing {
         }
     }
 
-    /// The job goes to the linked printer now, if the printer can take it. It's on its way then.
-    fn send_job(&self, state: &mut PrintState, epoch: u64, destination: &PrinterChoice, job: fab_printer_link::safety::ValidatedJob, meta: &JobMeta, options: fab_printer_link::PrintOptions) -> Result<(), String> {
-        if epoch != self.epoch || &state.links.picked != destination { return Err(SWITCHED.into()); }
-        let printer = self.printer.as_ref().ok_or("No printer is linked.")?;
-        let snapshot = state.target_printer().ok_or("The printer has not reported yet.")?;
-        if !state.job_destination_matches(meta, snapshot) { return Err(WRONG_DESTINATION.into()); }
+    fn dispatch_entry(&self, state: &PrintState, ticket: &PrintTicket) -> Result<&Linked, &'static str> {
+        self.linked(&ticket.printer).filter(|entry| entry.virtual_mode == ticket.virtual_printer
+            && entry.epoch == ticket.epoch && state.printers.epoch_of(&ticket.printer) == Some(ticket.epoch))
+            .ok_or(STALE_DISPATCH)
+    }
+
+    /// Hand the admitted job to the incarnation whose report the person confirmed.
+    fn send_job(&self, state: &mut PrintState, ticket: &PrintTicket, job: fab_printer_link::safety::ValidatedJob, meta: &JobMeta, options: fab_printer_link::PrintOptions) -> Result<(), String> {
+        let entry = self.dispatch_entry(state, ticket)?;
+        let snapshot = state.printer_of(&ticket.printer).ok_or(STALE_DISPATCH)?;
+        if !state.job_destination_matches_for(&ticket.printer, meta, snapshot) { return Err(WRONG_DESTINATION.into()); }
+        if state.printers.handed(&ticket.printer).is_some() { return Err("A job is already on its way to the printer.".into()); }
         printer_can_start(snapshot, &options)?;
         trays_fit(snapshot, job.facts(), &meta.trays, &meta.used, &options)?;
         let link_send = snapshot.job_sends + 1;
         log!("fab print: {} goes to the printer link as its send {link_send}", meta.id);
-        printer.send(fab_printer_link::Command::Print(fab_printer_link::PrintJob { job, trays: meta.trays.clone(), used: meta.used.clone(), options }));
-        if let Some(sent) = state.follow.job_of_mut(&meta.id) {
+        entry.link.send(fab_printer_link::Command::Print(fab_printer_link::PrintJob { job, trays: meta.trays.clone(), used: meta.used.clone(), options }));
+        state.printers.hand_to(&ticket.printer, meta.id.clone(), link_send);
+        if let Some(i) = state.follow.jobs.position(&meta.id) {
+            let mut sent = state.follow.jobs.at_mut(i);
             sent.state = JobState::Sent;
             sent.restored = false;
             sent.link_send = link_send;
+            drop(sent);
             state.follow.changed(&meta.id);
         }
         Ok(())
@@ -1562,39 +2757,47 @@ impl Printing {
 
     /// A person pressed Start on a queued job: its package is read back and checked against the
     /// installed profile on a worker, then it goes.
-    fn start_job(&mut self, state: &mut PrintState, id: &str) -> Result<(), String> {
+    fn start_job(&mut self, state: &mut PrintState, id: &str, ticket: &PrintTicket) -> Result<(), String> {
         if !fab_printer_link::printing_supported() { return Err(fab_printer_link::UNSUPPORTED_PRINTING.into()); }
-        if self.printer.is_none() { return Err("No printer is linked.".into()); }
-        if state.sending.is_some() { return Err("A job is being prepared for the printer.".into()); }
+        self.dispatch_entry(state, ticket)?;
+        if state.sending_for(&ticket.printer).is_some() { return Err("A job is being prepared for the printer.".into()); }
         let meta = state.follow.job_of(id).filter(|j| j.state == JobState::Queued).map(|j| j.meta.clone()).ok_or("This job isn't queued any more.")?;
         let options = fab_printer_link::PrintOptions { flow_calibration: meta.flow_calibration, timelapse: meta.timelapse, plate_clear: true };
-        let snapshot = state.target_printer().ok_or("The printer has not reported yet.")?;
-        if !state.job_destination_matches(&meta, snapshot) { return Err(WRONG_DESTINATION.into()); }
+        let snapshot = state.printer_of(&ticket.printer).ok_or("The printer has not reported yet.")?;
+        if !state.job_destination_matches_for(&ticket.printer, &meta, snapshot) { return Err(WRONG_DESTINATION.into()); }
+        if state.printers.handed(&ticket.printer).is_some() { return Err("A job is already on its way to the printer.".into()); }
         printer_can_start(snapshot, &options)?;
         if !same_printer(&snapshot.model, &meta.printer_model) {
             return Err(format!("This job is for a {}, the linked printer is a {}.", meta.printer_model, snapshot.model.trim()));
         }
         let catalog = self.catalog.clone().ok_or("Fab is still reading the installed profiles: press Start again in a moment.")?;
         log!("fab print: queued job {} started", meta.name);
-        state.sending = Some(meta.name.clone());
-        let epoch = self.epoch;
-        self.starting = Some((id.to_string(), epoch));
-        let destination = state.links.picked.clone();
+        state.sending.push(Sending { job: id.to_owned(), printer: ticket.printer.clone() });
+        let ticket = ticket.clone();
+        let attempt = self.next_attempt();
+        self.starting.push((id.to_string(), attempt));
         let now = Cx::time_now();
-        if let Some(job) = state.follow.job_of_mut(id) {
+        if let Some(mut job) = state.follow.job_of_mut(id) {
             job.state = JobState::Preparing;
             job.sent_at = now;
         }
-        state.follow.picked = None;
-        state.follow.closed = false;
-        state.follow.on = true;
-        state.print_blocked = None;
-        let (id, dir) = (id.to_string(), jobs::jobs_dir());
+        if ticket.printer == state.links.picked {
+            state.follow.picked = None;
+            state.follow.closed = false;
+            state.follow.on = true;
+        }
+        state.print_blocked.set(&ticket.printer, None);
+        let id = id.to_string();
+        let dirs = self.dirs.clone();
         crate::live_slice::run_shown("fab job check", move || {
-            let result = job_check(&catalog, &dir, &id, &meta);
-            Cx::post_action(PrintEvent::JobChecked { id, epoch, destination, options, result });
+            let result = job_check(&catalog, &dirs.jobs, &id, &meta, &dirs.head_envelope);
+            Cx::post_action(PrintEvent::JobChecked { id, attempt, ticket, options, result });
         });
         Ok(())
+    }
+
+    fn configured_title(saved: &Saved, config: &str) -> String {
+        if saved.disconnected.contains(config) { format!("{config} (Virtual)") } else { config.to_string() }
     }
 
     fn rebuild_virtual_choices(&self, state: &mut PrintState) {
@@ -1603,7 +2806,7 @@ impl Printing {
         choices.retain(|(choice, _)| matches!(choice, PrinterChoice::Real(_)));
         for (choice, title) in choices.iter_mut() {
             if let PrinterChoice::Real(config) = choice {
-                *title = if saved.disconnected.contains(config) { format!("{config} (Virtual)") } else { config.clone() };
+                *title = Self::configured_title(saved, config);
             }
         }
         choices.extend(saved.printers.iter().filter(|p| p.configured_for.is_none() && available_virtual(p, self.catalog.as_deref()))
@@ -1621,33 +2824,60 @@ impl Printing {
                 log!("fab: skipped a virtual twin without a supported filament machine preset");
             }
         }
+        // Previously picked twins keep running in the background while their preset exists.
+        let mut missing = Vec::new();
+        for entry in self.fleet.iter().filter(|e| e.virtual_mode) {
+            let record = self.virtuals.as_ref().and_then(|s| Self::virtual_record(s, &entry.id));
+            if let Some(twin) = record.filter(|p| available_virtual(p, self.catalog.as_deref())) {
+                if twin.source != VirtualSource::Generated {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(setup) = setup_of(twin, self.catalog.as_deref()) { entry.link.set_virtual(setup); }
+                }
+            } else { missing.push(entry.id.clone()); }
+        }
+        for id in missing {
+            self.retire_link(state, &id, false);
+            if id != state.links.picked { self.pending_twins.push(id); }
+        }
+        for id in std::mem::take(&mut self.pending_twins) {
+            // The picked twin is restored below with its settings. A catalogue arrival can
+            // restore only a virtual worker, even if the user switched modes in the meantime.
+            if id == state.links.picked || !self.virtual_mode(&id) || self.linked(&id).is_some() { continue; }
+            if let Ok(link) = self.construct_link(&id) { self.install(state, &id, link, true); }
+            else { self.pending_twins.push(id); }
+        }
         self.rebuild_virtual_choices(state);
         if let PrinterChoice::Real(_) = &state.links.picked {
             if !self.virtual_mode(&state.links.picked) { return; }
-            if !self.held_virtual || self.linked_virtual(state).is_none() {
+            if !self.linked(&state.links.picked).is_some_and(|entry| entry.virtual_mode) || self.linked_virtual(state).is_none() {
                 self.link_printer(state, &state.links.picked.clone());
                 return;
             }
         } else if state.links.picked == PrinterChoice::None { return; }
-        let Some(twin) = self.linked_virtual(state) else {
-            self.link_printer(state, &PrinterChoice::None);
-            return;
-        };
-        if twin.source != VirtualSource::Generated {
-            #[cfg(not(target_arch = "wasm32"))]
-            if let (Some(link), Some(setup)) = (&self.printer, setup_of(twin, self.catalog.as_deref())) { link.set_virtual(setup); }
-        }
+        if self.linked_virtual(state).is_none() { self.link_printer(state, &PrinterChoice::None); }
     }
 
-    fn make_twin(&mut self, state: &mut PrintState, preset: &str) -> Option<PrinterChoice> {
+    fn make_twin(&mut self, state: &mut PrintState, source: &PrinterChoice, preset: &str) -> Option<PrinterChoice> {
         let template = self.catalog.as_ref()?.twins.get(preset)?;
         let saved = self.virtuals.as_mut()?;
-        if let Some(existing) = saved.printers.iter().find(|p| p.configured_for.is_none() && p.source == template.printer.source) {
+        let mut twin = template.printer.clone();
+        if let VirtualSource::Twin { source: origin, .. } = &mut twin.source { *origin = source.id(); }
+        if let Some(existing) = saved.printers.iter().find(|p| p.configured_for.is_none() && p.source == twin.source) {
             return Some(PrinterChoice::Virtual(existing.name.clone()));
         }
-        let mut twin = template.printer.clone();
         twin.name = twin_name(saved);
-        if let Some(text) = &self.loadout_text { seed_retained(&mut twin, text); }
+        let source_title = match source {
+            PrinterChoice::Real(config) => Some(Self::configured_title(saved, config)),
+            PrinterChoice::Virtual(_) => Self::virtual_record(saved, source).map(VirtualPrinter::picker_title),
+            PrinterChoice::None => None,
+        };
+        if let Some(title) = source_title { twin.title = format!("{preset} (virtual of {title})"); }
+        while saved.printers.iter().any(|p| p.configured_for.is_none() && p.title == twin.title) {
+            twin.title = format!("{} ({})", twin.title, twin.name);
+        }
+        if *source != PrinterChoice::None {
+            if let Some(text) = self.loadouts.get(&loadout_file(source)) { seed_retained(&mut twin, text); }
+        }
         let pick = PrinterChoice::Virtual(twin.name.clone());
         Arc::make_mut(saved).printers.push(twin);
         self.rebuild_virtual_choices(state);
@@ -1656,13 +2886,21 @@ impl Printing {
 
     /// The saved printer the card controls.
     fn linked_virtual(&self, state: &PrintState) -> Option<&VirtualPrinter> {
+        self.virtual_for(&state.links.picked)
+    }
+
+    fn virtual_for(&self, choice: &PrinterChoice) -> Option<&VirtualPrinter> {
         let saved = self.virtuals.as_ref()?;
-        let record = match &state.links.picked {
+        if !self.linked(choice).is_some_and(|entry| entry.virtual_mode) { return None; }
+        Self::virtual_record(saved, choice).filter(|p| available_virtual(p, self.catalog.as_deref()))
+    }
+
+    fn virtual_record<'a>(saved: &'a Saved, id: &PrinterChoice) -> Option<&'a VirtualPrinter> {
+        match id {
             PrinterChoice::Virtual(name) => saved.printers.iter().find(|p| p.configured_for.is_none() && &p.name == name),
-            PrinterChoice::Real(config) if self.held_virtual => saved.twin_for(config),
-            _ => None,
-        };
-        record.filter(|p| available_virtual(p, self.catalog.as_deref()))
+            PrinterChoice::Real(config) => saved.twin_for(config),
+            PrinterChoice::None => None,
+        }
     }
 
     /// Use the machine and process that describe the linked layout. Leave a picked plate alone.
@@ -1673,15 +2911,32 @@ impl Printing {
         if vp.source == VirtualSource::Generated {
             state.settings.process = virtual_printer::PROCESS.into();
         } else {
-            self.refresh_lists(state);
-            let fits = &state.profiles.processes;
-            if !fits.contains(&state.settings.process) {
-                state.settings.process = self.catalog.as_ref().and_then(|c| c.selection.as_ref())
-                    .map(|s| &s.process).filter(|p| fits.contains(*p))
-                    .or_else(|| fits.iter().find(|p| p.contains("0.20"))).or(fits.first()).cloned().unwrap_or_default();
-            }
+            self.select_process(state);
         }
         true
+    }
+
+    fn target_needs_bound(state: &PrintState) -> bool {
+        state.settings.use_installed && matches!(state.links.picked, PrinterChoice::Real(_)) && !state.links.disconnected
+            && state.printers.binding(&state.links.picked).and_then(|b| b.machine()).is_some_and(|p| p.geometry.name != state.settings.machine)
+    }
+
+    fn select_bound(&self, state: &mut PrintState) -> bool {
+        if !state.settings.use_installed { return false; }
+        let Some(machine) = state.printers.binding(&state.links.picked).and_then(|b| b.machine()) else { return false };
+        state.settings.machine.clone_from(&machine.geometry.name);
+        self.select_process(state);
+        true
+    }
+
+    fn select_process(&self, state: &mut PrintState) {
+        self.refresh_lists(state);
+        let fits = &state.profiles.processes;
+        if !fits.contains(&state.settings.process) {
+            state.settings.process = self.catalog.as_ref().and_then(|c| c.selection.as_ref())
+                .map(|s| &s.process).filter(|p| fits.contains(*p))
+                .or_else(|| fits.iter().find(|p| p.contains("0.20"))).or(fits.first()).cloned().unwrap_or_default();
+        }
     }
 
     fn switch_mode(&mut self, state: &mut PrintState, config: &str, disconnected: bool) -> Result<bool, &'static str> {
@@ -1689,11 +2944,8 @@ impl Printing {
         if state.links.picked != pick { return Err("The selected printer changed."); }
         let saved = self.virtuals.as_deref().ok_or("Fab has not read the saved printer modes yet.")?;
         if saved.disconnected.contains(config) == disconnected { return Ok(false); }
-        let sending_here = state.sending.as_ref().is_some_and(|name| state.follow.jobs.iter()
-            .find(|j| j.state == JobState::Preparing && &j.meta.name == name)
-            .is_none_or(|j| j.meta.for_printer(&pick)));
-        if sending_here || self.packaging.iter().any(|p| matches!(&p.to, PackageFor::Printer(s) if s.destination == pick))
-            || self.starting.as_ref().is_some_and(|(id, _)| state.follow.job_of(id).is_some_and(|j| j.meta.for_printer(&pick))) {
+        // Sending covers active packages and queued rechecks. A cancelled package may still be unwinding.
+        if state.sending_for(&pick).is_some() || self.packaging.iter().any(|p| matches!(&p.to, PackageFor::Printer(s) if s.ticket.printer == pick)) {
             return Err("A job is being prepared for this printer. Wait before switching modes.");
         }
         if !virtual_printer::valid_config(config) { return Err("Invalid printer choice."); }
@@ -1701,14 +2953,16 @@ impl Printing {
             if let Some(twin) = saved.twin_for(config) {
                 if !available_virtual(twin, self.catalog.as_deref()) { return Err("The saved twin's machine preset is unavailable."); }
             } else {
-                let template = self.catalog.as_ref().and_then(|c| c.twins.get(&state.settings.machine))
+                let preset = state.printers.binding(&pick).and_then(|b| b.machine()).map_or(&state.settings.machine, |p| &p.geometry.name);
+                let template = self.catalog.as_ref().and_then(|c| c.twins.get(preset))
                     .ok_or("Select a filament machine preset before switching to Virtual.")?;
                 let mut twin = template.printer.clone();
                 twin.configured_for = Some(config.into());
+                if let VirtualSource::Twin { source, .. } = &mut twin.source { *source = pick.id(); }
                 twin.name = twin_name(saved);
                 let layout = colours::layout(state.printer_of(&pick).map(|p| (p.name.as_str(), &*p.state)), None, &self.offline(), &|_| None);
                 if layout.live { seed_layout(&mut twin, &layout); }
-                else if let Some(text) = &self.loadout_text { seed_retained(&mut twin, text); }
+                else if let Some(text) = self.loadouts.get(&loadout_file(&pick)) { seed_retained(&mut twin, text); }
                 Arc::make_mut(self.virtuals.as_mut().unwrap()).printers.push(twin);
             }
         }
@@ -1729,81 +2983,123 @@ impl Printing {
         }
     }
 
-    fn construct_link(&self, choice: &PrinterChoice) -> Result<Option<fab_printer_link::PrinterLink>, &'static str> {
-        use fab_printer_link::PrinterLink;
-        if *choice == PrinterChoice::None { return Ok(None); }
+    fn construct_link(&self, choice: &PrinterChoice) -> Result<fab_printer_link::PrinterLink, &'static str> {
         let saved = self.virtuals.as_ref().ok_or("Fab has not read the saved printer modes yet.")?;
-        let record = match choice {
-            PrinterChoice::Real(name) => {
-                if !virtual_printer::valid_config(name) { return Err("Invalid printer choice."); }
-                if !saved.disconnected.contains(name) {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(path) = self.simulator.as_ref().filter(|_| name == SIMULATED_PRINTER) {
-                        return Ok(Some(PrinterLink::simulate(path.clone())));
-                    }
-                    return Ok(Some(PrinterLink::start(name)));
-                }
-                saved.twin_for(name)
-            }
-            PrinterChoice::Virtual(name) => saved.printers.iter().find(|p| p.configured_for.is_none() && &p.name == name),
-            PrinterChoice::None => unreachable!(),
-        }.ok_or("The virtual printer has no saved layout.")?;
+        if let PrinterChoice::Real(name) = choice {
+            if !virtual_printer::valid_config(name) { return Err("Invalid printer choice."); }
+            if !saved.disconnected.contains(name) { return Ok(self.real_link(name)); }
+        }
+        let record = Self::virtual_record(saved, choice).ok_or("The virtual printer has no saved layout.")?;
         let setup = setup_of(record, self.catalog.as_deref()).ok_or("The virtual printer's filament machine preset is unavailable.")?;
         #[cfg(not(target_arch = "wasm32"))]
-        { Ok(Some(PrinterLink::virtual_printer(setup))) }
+        { Ok(fab_printer_link::PrinterLink::virtual_printer(setup)) }
         #[cfg(target_arch = "wasm32")]
         { let _ = setup; Err("Virtual printing is unavailable on this platform.") }
     }
 
-    fn replace_link(&mut self, state: &mut PrintState, choice: &PrinterChoice, link: Option<fab_printer_link::PrinterLink>, virtual_mode: bool) {
-        state.camera.update_source(choice, false, None);
-        if self.printer.is_some() || link.is_some() {
-            self.epoch += 1;
-            state.print_options.plate_clear = false;
-            state.confirm_print = false;
-            state.confirm_stop = None;
-            state.follow.confirm_start = None;
-            let stopped = if self.held_virtual && matches!(state.links.picked, PrinterChoice::Real(_)) {
-                Some(if &state.links.picked == choice && link.is_some() && !virtual_mode {
-                    "The virtual print stopped when the printer switched back to Connected."
-                } else {
-                    "The virtual print stopped when its printer was unlinked."
-                })
-            } else { None };
-            fab::print::follow::unlink_printer(state, stopped, Cx::time_now());
+    fn real_link(&self, name: &str) -> fab_printer_link::PrinterLink {
+        #[cfg(test)]
+        if let Some(start) = &self.real_constructor { return start(name); }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self.simulator.as_ref().filter(|_| name == SIMULATED_PRINTER) {
+            return fab_printer_link::PrinterLink::simulate(path.clone());
         }
-        self.printer = link;
-        self.held_virtual = virtual_mode;
+        fab_printer_link::PrinterLink::start(name)
     }
 
-    /// Switch links immediately. The profiles worker remembers only an explicit pick.
-    fn link_printer(&mut self, state: &mut PrintState, choice: &PrinterChoice) -> bool {
-        // The pick, not availability: a twin whose preset vanished still leaves its settings behind.
-        let was_virtual = matches!(state.links.picked, PrinterChoice::Virtual(_));
-        let virtual_mode = self.virtual_mode(choice);
-        let link = match self.construct_link(choice) {
-            Ok(link) => link,
+    fn linked(&self, id: &PrinterChoice) -> Option<&Linked> {
+        self.fleet.iter().find(|entry| &entry.id == id)
+    }
+
+    fn control_entry(&self, dest: &ControlDestination) -> Option<&Linked> {
+        let ControlDestination::Filament { choice, virtual_printer, epoch, .. } = dest else { return None };
+        self.linked(choice).filter(|entry| entry.virtual_mode == *virtual_printer && entry.epoch == *epoch)
+    }
+
+    fn install(&mut self, state: &mut PrintState, id: &PrinterChoice, link: fab_printer_link::PrinterLink, virtual_mode: bool) {
+        self.fleet.retain(|entry| &entry.id != id);
+        self.installed_epoch += 1;
+        state.printers.install(id, self.installed_epoch, virtual_mode);
+        let entry = Linked { id: id.clone(), link, virtual_mode, epoch: self.installed_epoch, watched: None };
+        entry.refresh_binding(state, self.catalog.as_deref(), self.virtuals.as_deref());
+        self.fleet.push(entry);
+    }
+
+    fn retire_link(&mut self, state: &mut PrintState, id: &PrinterChoice, to_connected: bool) {
+        let Some(i) = self.fleet.iter().position(|entry| &entry.id == id) else { return };
+        let stopped = self.fleet.remove(i).virtual_mode.then_some(if to_connected {
+            "The virtual print stopped when the printer switched back to Connected."
+        } else {
+            "The virtual print stopped when its printer was unlinked."
+        });
+        fab::print::follow::unlink_printer(state, id, stopped, Cx::time_now());
+        if id == state.shown_choice() { self.update_camera(state); }
+    }
+
+    /// Install only this printer, in its saved mode, without changing the target.
+    fn ensure_link(&mut self, state: &mut PrintState, id: &PrinterChoice) -> Result<(), &'static str> {
+        let virtual_mode = self.virtual_mode(id);
+        if *id == PrinterChoice::None || self.linked(id).is_some_and(|e| e.virtual_mode == virtual_mode) { return Ok(()); }
+        match self.construct_link(id) {
+            Ok(link) => {
+                self.retire_link(state, id, !virtual_mode);
+                self.install(state, id, link, virtual_mode);
+                self.pending_twins.retain(|pending| pending != id);
+                Ok(())
+            }
             Err(why) => {
-                // A missing configured twin keeps its own disconnected choice, with no worker.
-                if virtual_mode && matches!(choice, PrinterChoice::Real(_)) {
-                    self.replace_link(state, choice, None, false);
-                    state.links.disconnected = true;
-                    state.links.picked = choice.clone();
-                    state.links.title = state.links.choices.iter().find(|(p, _)| p == choice).map(|(_, s)| s.clone()).unwrap_or_default();
-                    state.links.layout = None;
+                if virtual_mode && matches!(id, PrinterChoice::Real(_)) {
+                    self.retire_link(state, id, false);
+                    if !self.pending_twins.contains(id) { self.pending_twins.push(id.clone()); }
                 }
+                Err(why)
+            }
+        }
+    }
+
+    fn update_camera(&self, state: &mut PrintState) {
+        let shown = state.shown_choice().clone();
+        let held_real = self.linked(&shown).is_some_and(|e| !e.virtual_mode);
+        state.camera.update_source(&shown, held_real, state.printers.get(&shown).map(Arc::as_ref));
+    }
+
+    /// Select a target. Its worker and the old target's worker can both survive the pick.
+    fn link_printer(&mut self, state: &mut PrintState, choice: &PrinterChoice) -> bool {
+        let previous = state.links.picked.clone();
+        let was_virtual = matches!(previous, PrinterChoice::Virtual(_));
+        let virtual_mode = self.virtual_mode(choice);
+        let unavailable = self.ensure_link(state, choice).err();
+        if let Some(why) = unavailable {
+            if !(virtual_mode && matches!(choice, PrinterChoice::Real(_))) {
                 state.links.note = why.into();
                 state.bump();
                 return false;
             }
-        };
-        self.replace_link(state, choice, link, virtual_mode);
+        }
+        state.print_options.plate_clear = false;
+        state.confirm_print = None;
+        state.confirm_stop = None;
+        state.follow.confirm_start = None;
         state.head_moves.clear();
-        state.links.title = state.links.choices.iter().find(|(p, _)| p == choice).map(|(_, title)| title.clone()).unwrap_or_default();
+        self.pending_send = None;
         state.links.picked = choice.clone();
+        if &previous != choice {
+            state.shown = None;
+            if let Some(snapshot) = state.printer_of(&previous) {
+                if let Some(entry) = self.fleet.iter_mut().find(|e| e.id == previous) {
+                    entry.bind_heads(state, &snapshot.model);
+                    entry.keep_background_loadout(state, snapshot, &mut self.loadouts, self.profiles_worker.as_ref());
+                }
+            }
+        }
+        self.select_loadout(state);
+        state.links.title = state.links.choices.iter().find(|(p, _)| p == choice).map(|(_, title)| title.clone()).unwrap_or_default();
         state.links.disconnected = virtual_mode && matches!(choice, PrinterChoice::Real(_));
-        state.links.note.clear();
+        state.links.note = unavailable.unwrap_or_default().into();
         state.links.layout = self.linked_virtual(state).filter(|p| p.source == VirtualSource::Generated).map(virtual_controls);
+        self.update_camera(state);
+        fab::print::follow::printer_changed(state, Cx::time_now());
+        if unavailable.is_some() { state.bump(); return false; }
         if self.select_virtual(state) {
             // A job without mapped parts still needs a filament for its base values.
             let preset = if self.linked_virtual(state).is_some_and(|p| p.source == VirtualSource::Generated) {
@@ -1820,7 +3116,10 @@ impl Printing {
             if let Some(catalog) = self.catalog.clone() {
                 self.event(state, &PrintEvent::Catalog(Some(catalog)));
             } else { self.load_base_values(state); }
+        } else if self.select_bound(state) {
+            self.load_base_values(state);
         }
+        self.tell_printer_heads(state);
         true
     }
 
@@ -1835,19 +3134,25 @@ impl Printing {
     }
 
     /// Publish a slot or layout edit to the same report path as a physical printer.
-    fn update_virtual(&mut self, state: &mut PrintState, vp: VirtualPrinter, rebuild: bool) {
+    fn update_virtual(&mut self, state: &mut PrintState, choice: &PrinterChoice, vp: VirtualPrinter, rebuild: bool) {
         let Some(saved) = self.virtuals.as_mut() else { return };
-        let Some(stored) = Arc::make_mut(saved).printers.iter_mut().find(|p| p.name == vp.name) else { return };
+        let Some(stored) = Arc::make_mut(saved).printers.iter_mut().find(|p| match choice {
+            PrinterChoice::Virtual(name) => p.configured_for.is_none() && &p.name == name,
+            PrinterChoice::Real(name) => p.configured_for.as_ref() == Some(name),
+            PrinterChoice::None => false,
+        }) else { return };
         #[cfg(not(target_arch = "wasm32"))]
-        if let (Some(link), Some(setup)) = (&self.printer, setup_of(&vp, self.catalog.as_deref())) { link.set_virtual(setup); }
-        state.links.layout = (vp.source == VirtualSource::Generated).then(|| virtual_controls(&vp));
-        state.links.note.clear();
+        if let (Some(link), Some(setup)) = (self.fleet.iter().find(|entry| &entry.id == choice).map(|entry| &entry.link), setup_of(&vp, self.catalog.as_deref())) { link.set_virtual(setup); }
+        if &state.links.picked == choice {
+            state.links.layout = (vp.source == VirtualSource::Generated).then(|| virtual_controls(&vp));
+            state.links.note.clear();
+        }
         *stored = vp;
         if rebuild {
             self.layout_revision += 1;
-            self.catalog = None;
+            self.set_catalog(state, None);
             self.select_virtual(state);
-            self.machine = Err("Updating the virtual printer layout".into());
+            self.machine = Err(MachineError::UpdatingVirtualLayout);
         }
         self.save_virtual(rebuild);
     }
@@ -1855,10 +3160,26 @@ impl Printing {
     /// The settings half of the Print editor's actions (playback is
     /// `fab::print::apply`). Returns true when the view changed.
     pub fn action(&mut self, state: &mut PrintState, action: &PrintAction, plate: Option<&Arc<Evaluated>>) -> bool {
+        if matches!(action, PrintAction::AskPrint(false)) || matches!(action, PrintAction::AskStop(dest, true) if dest.matches(state)) {
+            self.pending_send = None;
+            if self.reask == Some(false) {
+                self.reask = None;
+            }
+        }
         match action {
+            PrintAction::ShowPrinter(choice) => {
+                state.shown = choice.as_ref().filter(|p| *p != &state.links.picked).cloned();
+                self.update_camera(state);
+                fab::print::follow::printer_changed(state, Cx::time_now());
+                return false;
+            }
             PrintAction::Slice => return self.slice(state, plate),
             PrintAction::Export => return self.export(state, plate),
             // A press while the asked slice runs waits for it; anything else slices now.
+            PrintAction::AskPrint(true) if self.calibration_waiting(state) => {
+                self.reask.get_or_insert(false);
+                return true;
+            }
             PrintAction::AskPrint(true) if !state.can_send() => {
                 if self.slice_gen.is_some() && matches!(state.status, SliceStatus::Running { .. }) {
                     log!("fab print: Print pressed, the slice is on its way");
@@ -1871,37 +3192,39 @@ impl Printing {
                 log!("fab print: Print pressed, the slice is ready");
                 return false;
             }
-            PrintAction::StartJob(id) => {
-                let result = if state.follow.confirm_start.as_ref() == Some(id) { self.start_job(state, id) } else { Err(SWITCHED.into()) };
+            PrintAction::StartJob { id, ticket } => {
+                let result = if state.follow.confirm_start.as_ref() == Some(id) { self.start_job(state, id, ticket) } else { Err(STALE_DISPATCH.into()) };
                 if let Err(why) = result {
                     log!("fab print: queued job refused: {why}");
-                    state.print_blocked = Some(why);
+                    state.print_blocked.set(&ticket.printer, Some(why));
                 }
                 return false;
             }
             PrintAction::RemoveJob(id) => {
                 if state.follow.job_of(id).is_some_and(|j| j.state == JobState::Queued) {
-                    state.follow.jobs.retain(|j| j.meta.id != *id);
+                    state.follow.jobs.remove(id);
                     if state.follow.picked.as_ref() == Some(id) { state.follow.picked = None; }
-                    remove_job_files(id.clone());
+                    remove_job_files(self.dirs.jobs.clone(), id.clone());
                 }
                 return false;
             }
-            PrintAction::CancelSend => {
-                for p in self.packaging.iter().filter(|p| matches!(p.to, PackageFor::Printer(_))) {
-                    p.stop.store(true, Ordering::Relaxed);
+            PrintAction::CancelSend(id) => {
+                let Some(send) = state.take_sending(id) else { return false };
+                for package in &self.packaging {
+                    if matches!(&package.to, PackageFor::Printer(s) if s.meta.id == *id) {
+                        package.stop.store(true, Ordering::Relaxed);
+                    }
                 }
-                log!("fab print: cancelled while the package was being made");
-                state.sending = None;
-                match self.starting.take() {
-                    // A queued job stays queued; a new one was never committed.
-                    Some((id, _)) => if let Some(job) = state.follow.job_of_mut(&id) { job.state = JobState::Queued; },
-                    None => state.follow.jobs.retain(|j| j.state != JobState::Preparing),
+                if let Some(at) = self.starting.iter().position(|(job, _)| job == id) {
+                    self.starting.remove(at);
+                    if let Some(mut job) = state.follow.job_of_mut(id) { job.state = JobState::Queued; }
+                } else if state.follow.jobs.get(id).is_some_and(|job| job.state == JobState::Preparing) {
+                    state.follow.jobs.remove(id);
                 }
-                state.print_blocked = Some("Cancelled: nothing went to the printer.".into());
+                state.print_blocked.set(&send.printer, Some("Cancelled: nothing went to the printer.".into()));
                 return false;
             }
-            PrintAction::UseInstalled(_) | PrintAction::SetMachine(_) if self.linked_virtual(state).is_some_and(|p| p.source != VirtualSource::Generated) => return false,
+            PrintAction::UseInstalled(_) if self.linked_virtual(state).is_some_and(|p| p.source != VirtualSource::Generated) => return false,
             PrintAction::UseInstalled(on) => {
                 let on = *on && self.catalog.is_some();
                 if on == state.settings.use_installed {
@@ -1914,6 +3237,7 @@ impl Printing {
                     state.settings.plate = sel.plate.clone();
                     self.plate_picked = !sel.plate.is_empty();
                     state.settings.process = sel.process.clone();
+                    self.select_bound(state);
                     self.load_base_values(state);
                     self.refresh_lists(state);
                 } else {
@@ -1927,17 +3251,6 @@ impl Printing {
                     state.profiles.filaments = vec![DEFAULT_FILAMENT.into()];
                 }
             }
-            PrintAction::SetMachine(n) => {
-                state.settings.machine = n.clone();
-                self.refresh_lists(state);
-                // A process or filament made for another printer gives way.
-                if !state.profiles.processes.contains(&state.settings.process) {
-                    if let Some(p) = state.profiles.processes.iter().find(|p| p.contains("0.20")).or(state.profiles.processes.first()) {
-                        state.settings.process = p.clone();
-                    }
-                }
-                self.load_base_values(state);
-            }
             PrintAction::SetProcess(n) => {
                 state.settings.process = n.clone();
                 self.load_base_values(state);
@@ -1947,50 +3260,101 @@ impl Printing {
                 self.plate_picked = true;
                 self.load_base_values(state);
             }
-            PrintAction::SendToPrinter => {
-                if !state.confirm_print { state.print_blocked = Some(SWITCHED.into()); return false; }
-                // Its package is made now; it goes to the printer when made and checked. A bond
-                // whose bends are known not to measure refuses it at once.
-                let mechs = plate.map_or(&[][..], |ev| &ev.mech[..]);
-                match self.send_checks(state, &state.print_options).cloned().and_then(|s| bends_refusal(mechs, false).map_or(Ok(s), Err)) {
-                    Ok(sliced) => {
-                        let queue = state.printer_busy();
-                        log!("fab print: Start print pressed, {} {}", if queue { "queueing" } else { "packaging" }, sliced.name);
-                        state.sending = Some(sliced.name.clone());
-                        // Monitor shows this very slice from now on, and follows it.
-                        let destination = state.links.picked.clone();
-                        let meta = Arc::new(job_meta(&sliced, &destination, state.target_printer().map(Arc::as_ref), &state.print_options, state.accepted_errors()));
-                        if !meta.accepted.is_empty() {
-                            log!("fab print: printed anyway: {}", jobs::accepted_line(&meta.accepted));
-                        }
-                        state.follow.jobs.insert(0, CommittedJob { meta: meta.clone(), preview: Some(sliced.preview.clone()), sent_at: Cx::time_now(), ..Default::default() });
-                        state.follow.picked = None;
-                        state.follow.closed = false;
-                        state.follow.on = true;
-                        self.package(sliced, PackageFor::Printer(ToPrinter { destination, epoch: self.epoch, options: state.print_options, meta, scripts: self.plate_scripts.clone(), queue }), mechs.to_vec());
-                        state.print_blocked = None;
-                    }
-                    Err(why) => {
-                        log!("fab print: Start print refused: {why}");
-                        state.print_blocked = Some(why);
-                        state.follow.closed = false;
-                    }
+            PrintAction::SendToPrinter { ticket, preview } => {
+                if !matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if card == ticket) || !self.ticket_current(state, ticket) {
+                    state.print_blocked.set(&state.links.picked, Some(STALE_TICKET.into()));
+                    return false;
                 }
+                if self.calibration_waiting(state) {
+                    if !self.settled_slice_reusable(state) || !state.preview.as_ref().is_some_and(|p| p.id == *preview) {
+                        self.pending_send = None;
+                        state.confirm_print = None;
+                        state.print_options.plate_clear = false;
+                        let why = if self.settled_slice_reusable(state) { STALE_PREVIEW } else { SLICE_NOT_READY };
+                        state.print_blocked.set(&state.links.picked, Some(why.into()));
+                        state.follow.closed = false;
+                    } else {
+                        self.pending_send = Some(PendingSend { ticket: ticket.clone(), preview: *preview });
+                        state.print_blocked.set(&state.links.picked, None);
+                    }
+                    return false;
+                }
+                self.pending_send = None;
+                if let Some(err) = self.calibration_failure(state, plate) {
+                    state.print_blocked.set(&state.links.picked, Some(err));
+                    state.follow.closed = false;
+                    return false;
+                }
+                self.admit_send_to_printer(state, ticket, *preview, state.print_options, plate);
                 return false;
             }
-            PrintAction::PrinterMode(config, disconnected) => match self.switch_mode(state, config, *disconnected) {
-                Ok(true) => {}
-                Ok(false) => return false,
-                Err(why) => { state.links.note = why.into(); state.bump(); return false; }
-            },
-            PrintAction::MakeTwin(preset) => {
-                let Some(pick) = self.make_twin(state, preset) else { return false };
-                return self.action(state, &PrintAction::LinkPrinter(pick), plate);
+            PrintAction::SetMachine(owner, _) | PrintAction::EditTray(owner, ..) | PrintAction::VirtualLayout { owner, .. } |
+            PrintAction::ResetVirtual(owner, _) | PrintAction::MakeTwin(owner, _) |
+            PrintAction::LinkPrinter(owner, _) | PrintAction::PrinterMode(owner, _) if !owner.matches(state) => {
+                let why = "The printer changed since this edit was opened. Nothing was changed.";
+                if owner.scope == PrinterScope::Target || owner.choice == state.links.picked { state.links.note = why.into(); }
+                else { log!("fab: {why}"); }
+                state.bump();
+                return false;
             }
-            PrintAction::LinkPrinter(pick) => {
+            PrintAction::SetMachine(owner, preset) => {
+                if self.virtual_mode(&owner.choice) && self.virtual_for(&owner.choice).is_none_or(|p| p.source != VirtualSource::Generated) {
+                    return false;
+                }
+                if let PrinterChoice::Real(_) = &owner.choice {
+                    let Some(saved) = self.virtuals.as_mut() else { return false };
+                    let id = owner.choice.id().unwrap();
+                    if preset.as_deref().is_some_and(|n| !virtual_printer::valid_config(n)) { return false; }
+                    if saved.bindings.get(&id) == preset.as_ref() { return false; }
+                    let saved = Arc::make_mut(saved);
+                    match preset {
+                        Some(name) => { saved.bindings.insert(id, name.clone()); }
+                        None => { saved.bindings.remove(&id); }
+                    }
+                    self.save_virtual(false);
+                    if let Some(entry) = self.fleet.iter_mut().find(|e| e.id == owner.choice) {
+                        entry.refresh_binding(state, self.catalog.as_deref(), self.virtuals.as_deref());
+                        if let Some(snapshot) = state.printer_of(&owner.choice) {
+                            entry.bind_heads(state, &snapshot.model);
+                            if owner.choice != state.links.picked {
+                                entry.keep_background_loadout(state, snapshot, &mut self.loadouts, self.profiles_worker.as_ref());
+                            }
+                        }
+                    }
+                    if owner.choice != state.links.picked || !self.select_bound(state) { return false; }
+                } else {
+                    if owner.choice != state.links.picked { return false; }
+                    let Some(name) = preset else { return false };
+                    state.settings.machine.clone_from(name);
+                    self.select_process(state);
+                }
+                self.load_base_values(state);
+            }
+            PrintAction::PrinterMode(owner, disconnected) => {
+                let PrinterChoice::Real(config) = &owner.choice else { return false };
+                match self.switch_mode(state, config, *disconnected) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(why) => { state.links.note = why.into(); state.bump(); return false; }
+                }
+            }
+            PrintAction::MakeTwin(owner, preset) => {
+                let Some(pick) = self.make_twin(state, &owner.choice, preset) else { return false };
+                return self.action(state, &PrintAction::LinkPrinter(owner.clone(), pick), plate);
+            }
+            PrintAction::LinkPrinter(_, pick) => {
                 let wants_link = *pick != PrinterChoice::None;
-                let changed = state.links.picked != *pick || self.held_virtual != self.virtual_mode(pick) || self.printer.is_some() != wants_link;
-                if changed && !self.link_printer(state, pick) { return false; }
+                let switching = state.links.picked != *pick;
+                let was_disconnected = state.links.disconnected;
+                let changed = switching || self.linked(&state.links.picked).is_some_and(|entry| entry.virtual_mode) != self.virtual_mode(pick) || self.linked(&state.links.picked).is_some() != wants_link;
+                if changed && !self.link_printer(state, pick) {
+                    // A configured Virtual printer stays picked even when its preset is missing.
+                    if state.links.picked == *pick && (switching || was_disconnected != state.links.disconnected) {
+                        self.invalidate(state);
+                        return true;
+                    }
+                    return false;
+                }
                 // A space is outside the real configuration filename alphabet.
                 let picked = pick.id().unwrap_or_else(|| "printer:No printer".into());
                 if let Some(saved) = self.virtuals.as_mut().filter(|s| s.picked.as_ref() != Some(&picked)) {
@@ -1999,22 +3363,22 @@ impl Printing {
                 }
                 if !changed { return false; }
             }
-            PrintAction::VirtualLayout { kind, heads, trays, tpu } => {
-                let Some(vp) = self.linked_virtual(state) else { return false };
+            PrintAction::VirtualLayout { owner, kind, heads, trays, tpu } => {
+                let Some(vp) = self.virtual_for(&owner.choice) else { return false };
                 match vp.layout(*kind, *heads, *trays, *tpu) {
-                    Ok(layout) => self.update_virtual(state, layout, true),
+                    Ok(layout) => self.update_virtual(state, &owner.choice, layout, true),
                     Err(why) => { state.links.note = why; state.bump(); return false; }
                 }
             }
-            PrintAction::ResetVirtual(name) => {
-                let Some(vp) = self.linked_virtual(state) else { return false };
+            PrintAction::ResetVirtual(owner, name) => {
+                let Some(vp) = self.virtual_for(&owner.choice) else { return false };
                 if vp.source != VirtualSource::Generated { return false; }
                 let Some(preset) = self.factory.iter().find(|p| &p.name == name) else { return false };
                 let layout = VirtualPrinter { name: vp.name.clone(), title: vp.title.clone(), ..preset.clone() };
-                self.update_virtual(state, layout, true);
+                self.update_virtual(state, &owner.choice, layout, true);
             }
-            PrintAction::EditTray(pos, edit) if self.linked_virtual(state).is_some() => {
-                let mut vp = self.linked_virtual(state).unwrap().clone();
+            PrintAction::EditTray(owner, pos, edit) if self.virtual_for(&owner.choice).is_some() => {
+                let mut vp = self.virtual_for(&owner.choice).unwrap().clone();
                 let label = pos.tray_text();
                 let Some(slot) = vp.slots.iter_mut().find(|s| s.head == pos.head && s.tray == label) else { return false };
                 match edit {
@@ -2025,29 +3389,33 @@ impl Printing {
                     }
                     colours::TrayEdit::Empty => { slot.material = None; slot.colour = None; }
                 }
-                self.update_virtual(state, vp, false);
+                self.update_virtual(state, &owner.choice, vp, false);
                 return false;
             }
-            PrintAction::EditTray(pos, edit) => {
+            PrintAction::EditTray(owner, pos, edit) => {
                 // A reporting printer's trays are its reports.
-                if state.colors.layout.live {
+                if owner.scope != PrinterScope::Target || state.colors.layout.live {
                     return false;
                 }
                 let mut l = self.loadout.clone().unwrap_or_else(|| colours::layout(None, None, &self.offline(), &|_| None));
                 if !colours::edit_tray(&mut l, *pos, edit) {
                     return false;
                 }
-                self.keep_loadout(l, None);
+                self.keep_loadout(&owner.choice, l, None);
             }
-            PrintAction::SetVirtualSpeed(speed) => {
-                if let Some(printer) = &self.printer { printer.set_virtual_speed(*speed); }
+            PrintAction::SetVirtualSpeed(dest, speed) => {
+                if let Some(entry) = self.control_entry(dest).filter(|entry| entry.virtual_mode && dest.matches(state)) {
+                    entry.link.set_virtual_speed(*speed);
+                } else {
+                    log!("fab: ignored a printer speed whose destination changed");
+                }
                 return false;
             }
             PrintAction::PrinterControl(dest, control) => {
-                if let Some(printer) = &self.printer {
-                    send_filament_control(state, dest, *control, |command| printer.send(command));
+                if let Some(entry) = self.control_entry(dest) {
+                    send_filament_control(state, dest, *control, |command| entry.link.send(command));
                 } else {
-                    log!("fab: ignored a printer control without a link");
+                    log!("fab: ignored a printer control whose destination changed");
                 }
                 return false;
             }
@@ -2058,11 +3426,21 @@ impl Printing {
     }
 
     fn invalidate(&mut self, state: &mut PrintState) {
+        if let Some(held) = self.pending_send.take() {
+            if held.ticket.printer == state.links.picked && state.confirm_print.is_some() {
+                state.print_blocked.set(&state.links.picked, Some(STALE_PREVIEW.into()));
+                state.follow.closed = false;
+                self.reask.get_or_insert(false);
+            }
+        }
         // a settled slice still awaited (`started` is set from its start to its answer)
         if self.slice_gen.is_some() && self.started.is_some() {
-            self.reask = Some(self.export_waits);
+            self.reask = Some(self.export_waits || self.reask == Some(true));
         }
+        self.clear_export(state);
+        if self.reask == Some(true) { state.export = ExportStatus::Exporting; }
         self.slice_gen = None;
+        self.issues_gen = None;
         self.export_waits = false;
         self.live = None;
         self.live_key = None;
@@ -2131,14 +3509,51 @@ impl Printing {
         }
     }
 
-    /// The confirmed Print may go: the shown, current slice, checked for the linked printer,
-    /// with each used job tool on a loaded tray. Asked when Start print is pressed and again
-    /// when its package is made.
+    /// Check the current plate for admission. Dispatch later checks this job's own report and trays.
+    fn settled_slice_reusable(&self, state: &PrintState) -> bool {
+        state.preview.is_some() && !state.stale && state.settled && !matches!(state.status, SliceStatus::Running { .. })
+            && self.last.as_ref().is_some_and(|s| state.preview.as_ref().is_some_and(|p| p.id == s.preview.id))
+    }
+
+    fn admit_send_to_printer(&mut self, state: &mut PrintState, ticket: &PrintTicket, preview: u64, options: fab_printer_link::PrintOptions, plate: Option<&Arc<Evaluated>>) {
+        // Its package is made now; it goes to the printer when made and checked. A bond
+        // whose bends are known not to measure refuses it at once.
+        let mechs = plate.map_or(&[][..], |ev| &ev.mech[..]);
+        match self.send_checks(state, &options).and_then(|s| {
+            if s.preview.id != preview { return Err(STALE_PREVIEW.into()); }
+            bends_refusal(mechs, false).map_or_else(|| Ok(s.clone()), Err)
+        }) {
+            Ok(sliced) => {
+                let queue = state.printer_busy();
+                log!("fab print: Start print pressed, {} {}", if queue { "queueing" } else { "packaging" }, sliced.name);
+                // Monitor shows this very slice from now on, and follows it.
+                let meta = Arc::new(job_meta(&sliced, &ticket.printer, state.target_printer().map(Arc::as_ref), &options, state.accepted_errors()));
+                state.sending.push(Sending { job: meta.id.clone(), printer: ticket.printer.clone() });
+                if !meta.accepted.is_empty() {
+                    log!("fab print: printed anyway: {}", jobs::accepted_line(&meta.accepted));
+                }
+                state.follow.jobs.insert_newest(CommittedJob { meta: meta.clone(), preview: Some(sliced.preview.clone()), sent_at: Cx::time_now(), ..Default::default() });
+                state.follow.picked = None;
+                state.follow.closed = false;
+                state.follow.on = true;
+                self.package(sliced, PackageFor::Printer(ToPrinter { ticket: ticket.clone(), options, meta, scripts: self.plate_scripts.clone(), queue }), mechs.to_vec());
+                state.print_blocked.set(&state.links.picked, None);
+            }
+            Err(why) => {
+                log!("fab print: Start print refused: {why}");
+                state.print_blocked.set(&state.links.picked, Some(why));
+                state.follow.closed = false;
+            }
+        }
+    }
+
     fn send_checks(&self, state: &PrintState, options: &fab_printer_link::PrintOptions) -> Result<&Arc<Sliced>, String> {
         if !fab_printer_link::printing_supported() { return Err(fab_printer_link::UNSUPPORTED_PRINTING.into()); }
+        if self.linked(&state.links.picked).is_none() { return Err("No printer is linked.".into()); }
+        if self.calibration_waiting(state) { return Err(SLICE_NOT_READY.into()); }
+        if let Some(err) = &state.calibration_error { return Err(err.clone()); }
         if let Some(why) = state.print_blocker() { return Err(why); }
-        if self.printer.is_none() { return Err("No printer is linked.".into()); }
-        if state.sending.is_some() { return Err("A job is being prepared for the printer.".into()); }
+        if state.sending_for(&state.links.picked).is_some() { return Err("A job is being prepared for the printer.".into()); }
         let snapshot = state.target_printer().ok_or("The printer has not reported yet.")?;
         // A busy printer takes the job into the queue; what its start asks of the printer waits.
         let busy = state.printer_busy();
@@ -2175,29 +3590,42 @@ impl Printing {
     /// needs a settled one. A failed slice waits for the next press or change. True when asked.
     pub fn confirm_slice(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
         let coming = self.slice_gen.is_some() && matches!(state.status, SliceStatus::Running { .. });
-        if state.can_send() || coming || matches!(state.status, SliceStatus::Failed(_)) || plate.is_none_or(|ev| ev.plate.parts.is_empty()) {
+        if self.calibration_waiting(state) || state.calibration_error.is_some() || state.can_send() || coming || matches!(state.status, SliceStatus::Failed(_)) || plate.is_none_or(|ev| ev.plate.parts.is_empty()) {
             return false;
         }
         log!("fab print: the plate changed under the confirm card, slicing it");
         self.slice(state, plate)
     }
 
+    fn ticket_current(&self, state: &PrintState, ticket: &PrintTicket) -> bool {
+        state.resin.is_none() && state.links.picked == ticket.printer && self.linked(&ticket.printer).is_some_and(|entry|
+            entry.epoch == ticket.epoch && entry.virtual_mode == ticket.virtual_printer)
+    }
+
     /// What stops Start print now, for the confirm card; the slice still coming is its question,
     /// not a refusal.
     pub fn send_blocked(&self, state: &PrintState) -> Option<String> {
+        if matches!(&state.confirm_print, Some(PrintConfirm::Filament(ticket)) if !self.ticket_current(state, ticket)) {
+            return Some(STALE_TICKET.into());
+        }
         self.send_checks(state, &state.print_options).err().filter(|why| state.can_send() || why != SLICE_NOT_READY)
+    }
+
+    fn next_attempt(&mut self) -> u64 {
+        self.last_attempt += 1;
+        self.last_attempt
     }
 
     /// Make the printer package of `sliced` on a pool worker, its progress on the job board, for
     /// `to`: checked for the printer (then sent, [`PrintEvent::Packaged`]) or written to a file.
     /// One at a time per destination and slice. For the printer it first waits for the bends of
     /// the plate's flexing pieces (`bends`) and refuses one that can't be measured.
-    fn package(&mut self, sliced: Arc<Sliced>, to: PackageFor, bends: Vec<Arc<fab_model::mech::Mech>>) {
-        if self.packaging.iter().any(|p| p.to == to && Arc::ptr_eq(&p.sliced, &sliced)) {
-            return;
+    fn package(&mut self, sliced: Arc<Sliced>, to: PackageFor, bends: Vec<Arc<fab_model::mech::Mech>>) -> u64 {
+        if let Some(p) = self.packaging.iter().find(|p| p.to == to && Arc::ptr_eq(&p.sliced, &sliced)
+            && !(matches!(to, PackageFor::File(_)) && p.stop.load(Ordering::Relaxed))) {
+            return p.id;
         }
-        self.package_id += 1;
-        let id = self.package_id;
+        let id = self.next_attempt();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let title = match &to {
             PackageFor::Printer(_) => format!("Packaging {} for the printer", sliced.name),
@@ -2205,6 +3633,7 @@ impl Printing {
         };
         let job = JobSpec::new(title).stage("the printer package").start();
         self.packaging.push(Packaging { id, sliced: sliced.clone(), to: to.clone(), stop: stop.clone() });
+        let jobs_dir = self.dirs.jobs.clone();
         crate::live_slice::run_shown("fab package", move || {
             let reporter = job.reporter();
             let stopped = || stop.load(Ordering::Relaxed) || reporter.is_cancelled();
@@ -2225,7 +3654,7 @@ impl Printing {
                                 // Committed before anything goes to the printer.
                                 Ok(job) => {
                                     let saved = SavedState { state: if send.queue { JobState::Queued } else { JobState::Sent }, started: (!send.queue).then_some(send.meta.created), ..Default::default() };
-                                    match jobs::commit(&jobs::jobs_dir(), &send.meta, &saved, job.bytes(), &send.scripts) {
+                                    match jobs::commit(&jobs_dir, &send.meta, &saved, job.bytes(), &send.scripts) {
                                         Ok(()) => {
                                             log!("fab jobs: {} committed: {} bytes, {} layers, planned {:.0} s, {}", send.meta.id, job.bytes().len(), send.meta.layers, send.meta.planned, if send.queue { "queued" } else { "goes to the printer now" });
                                             Packaged::Checked(job)
@@ -2238,6 +3667,7 @@ impl Printing {
                             Err(e) => Packaged::Failed(e.clone()),
                         }
                     }
+                    PackageFor::File(_) if stopped() => Packaged::Stopped,
                     PackageFor::File(path) => match std::fs::write(&path, &package) {
                         Ok(()) => Packaged::Written(path),
                         Err(e) => Packaged::Failed(format!("{}: {e}", path.display())),
@@ -2251,29 +3681,67 @@ impl Printing {
             }
             Cx::post_action(PrintEvent::Packaged { id, result });
         });
+        id
     }
 
-    /// Polling is an atomic check; mapping work runs only on a publication or edit.
-    /// The caller maps the colours again (`refresh_printer`) on a new report.
-    pub fn poll_printer(&mut self, state: &mut PrintState) -> bool {
-        let Some(snapshot) = self.printer.as_mut().and_then(|p| p.poll()) else { return false };
-        log_printer_change(state.printer_of(&state.links.picked).map(Arc::as_ref), &snapshot);
-        if let Some(line) = fab::print::follow::layer_line(state, &snapshot, Cx::time_now()) {
-            log!("fab printer: {line}");
+    /// On a quiet event only the global publication counter is read. A new entry also has an unread slot.
+    pub fn poll_printer(&mut self, state: &mut PrintState) -> Polled {
+        let published = fab_printer_link::published();
+        let changed = published != self.published;
+        let mut polled = Polled::default();
+        if !changed && self.polled_epoch == self.installed_epoch { return polled; }
+        self.published = published;
+        let previous_epoch = std::mem::replace(&mut self.polled_epoch, self.installed_epoch);
+        for entry in &mut self.fleet {
+            if !changed && entry.epoch <= previous_epoch { continue; }
+            let Some(snapshot) = entry.link.poll() else { continue };
+            let id = &entry.id;
+            let now = Cx::time_now();
+            log_printer_change(state.printer_of(id).map(Arc::as_ref), &snapshot);
+            if let Some(line) = fab::print::follow::layer_line(state, id, &snapshot, now) {
+                log!("fab printer: {line}");
+            }
+            let target = *id == state.links.picked;
+            state.printers.set(id, entry.epoch, snapshot.clone());
+            if entry.watched.as_ref().is_none_or(|(model, _)| model != &snapshot.model) {
+                entry.refresh_binding(state, self.catalog.as_deref(), self.virtuals.as_deref());
+                entry.bind_heads(state, &snapshot.model);
+                if target && Self::target_needs_bound(state) { Cx::post_action(PrintEvent::TargetModelChanged); }
+            }
+            let id = &entry.id;
+            fab::print::follow::reported(state, id, now);
+            if id == state.shown_choice() {
+                state.camera.update_source(id, !entry.virtual_mode, Some(&snapshot));
+                polled.shown = true;
+            }
+            if target {
+                polled.target = true;
+            } else {
+                entry.keep_background_loadout(state, &snapshot, &mut self.loadouts, self.profiles_worker.as_ref());
+                polled.others = true;
+            }
         }
-        state.camera.update_source(&state.links.picked, !self.held_virtual, Some(&snapshot));
-        state.printers.set(&state.links.picked, snapshot);
-        self.tell_printer_heads(state);
-        fab::print::follow::printer_changed(state, Cx::time_now());
-        true
+        polled
     }
 
-    /// The linked printer is watched for as many heads as its printer profile has: the
-    /// selected profile, when it is that printer's, else none.
-    fn tell_printer_heads(&self, state: &PrintState) {
-        let (Some(link), Some(snapshot)) = (&self.printer, state.printer_of(&state.links.picked)) else { return };
-        let heads = self.machine.as_ref().ok().and_then(|machine| profile_heads(&snapshot.model, &self.machine_model, machine));
-        link.set_heads(&snapshot.model, heads.unwrap_or(0));
+    /// A change of the plate's profile can change only its target's subscription.
+    fn tell_printer_heads(&mut self, state: &PrintState) {
+        let Some(snapshot) = state.target_printer() else { return };
+        if let Some(entry) = self.fleet.iter_mut().find(|entry| entry.id == state.links.picked) {
+            entry.bind_heads(state, &snapshot.model);
+        }
+    }
+
+    fn set_catalog(&mut self, state: &mut PrintState, catalog: Option<Arc<Catalog>>) {
+        self.catalog = catalog;
+        for entry in &mut self.fleet {
+            entry.refresh_binding(state, self.catalog.as_deref(), self.virtuals.as_deref());
+            if entry.id == state.links.picked { continue; }
+            if let Some(snapshot) = state.printer_of(&entry.id) {
+                entry.bind_heads(state, &snapshot.model);
+                entry.keep_background_loadout(state, snapshot, &mut self.loadouts, self.profiles_worker.as_ref());
+            }
+        }
     }
 
     /// Map the print colours onto the printer's trays (the linked printer's reports, else the
@@ -2283,6 +3751,7 @@ impl Printing {
     /// it differs from the one it was built with (the model worker applies it).
     /// O(colours * trays).
     pub fn refresh_printer(&mut self, state: &mut PrintState, evaluated: Option<&Arc<Evaluated>>) -> Option<Arc<Mapped>> {
+        self.adopt_legacy_loadout(state);
         let installed = state.settings.use_installed.then_some(()).and(self.catalog.as_deref());
         let name_of = |idx: &str| installed.and_then(|c| preset_of_id(c, &state.settings.machine, idx));
         let snapshot = state.target_printer();
@@ -2291,7 +3760,7 @@ impl Printing {
         // A report with a toolhead the picked profile lacks is another printer's: not kept.
         let foreign = colours::drop_missing_heads(&mut layout);
         if layout.live && !foreign && !snapshot.is_some_and(|p| p.virtual_printer) && self.loadout.as_ref().is_none_or(|k| !colours::same_loadout(k, &layout)) {
-            self.keep_loadout(layout.clone(), snapshot.map(|p| p.model.as_str()));
+            self.keep_loadout(&state.links.picked, layout.clone(), snapshot.map(|p| p.model.as_str()));
         }
         let want = self.wanted_material(state);
         let Some(ev) = evaluated else {
@@ -2341,8 +3810,8 @@ impl Printing {
             JobMaterial { preset: self.preset_for(state, tray, i, material), color: colour, nozzle: pos.head, tray: Some(pos.tray), dedicated: tray.is_some_and(|t| t.dedicated()) }
         }).collect();
         if swaps_on_a_nozzle(&map_of(&state.settings.materials)) != had_swaps {
-            // The tower row shows what these materials need.
-            self.load_base_values(state);
+            // Only the tower row changed. A tray report uses the already loaded machine.
+            self.refresh_panel_values(state);
         }
         self.refresh_plates(state);
         let mapped = mapped_of(&mapping);
@@ -2396,16 +3865,35 @@ impl Printing {
     /// project sets nothing), and the global layer height they resolve to.
     fn load_base_values(&mut self, state: &mut PrintState) {
         let was_invalid = self.machine.is_err();
-        self.machine = self.check_setup(state).machine();
+        let profile = state.settings.use_installed.then(|| {
+            state.printers.binding(&state.links.picked).and_then(|b| b.machine())
+                .filter(|p| p.geometry.name == state.settings.machine).cloned()
+                .or_else(|| self.catalog.as_ref()?.twins.get(&state.settings.machine).map(|p| p.machine.clone()))
+        }).flatten();
+        self.machine = match &profile {
+            Some(p) => Ok(p.geometry.clone()),
+            None => self.check_setup(state).machine_typed().map(Arc::new),
+        };
+        self.adopt_legacy_loadout(state);
         // Read again only for other toolheads: the kept text rounds a reported colour.
         let heads = self.offline().heads;
         if self.loadout.as_ref().is_none_or(|l| l.heads != heads) {
             self.loadout = self.loadout_text.as_deref().and_then(|t| colours::parse_loadout(loadout_model(t).1, &heads));
         }
         // An unpicked plate starts as the printer's own (a settings change, not per frame).
-        self.printer_plate = self.catalog.as_deref().filter(|_| state.settings.use_installed).and_then(|c| c.printer_plate(&state.settings.machine)).unwrap_or_default();
-        self.machine_model = self.catalog.as_deref().filter(|_| state.settings.use_installed).and_then(|c| c.store.resolve(&state.settings.machine).ok()).map(|p| p.values.str("printer_model").to_string()).unwrap_or_default();
+        if let Some(p) = profile {
+            self.printer_plate.clone_from(&p.default_plate);
+            self.machine_model.clone_from(&p.model);
+        } else {
+            self.printer_plate = self.catalog.as_deref().filter(|_| state.settings.use_installed).and_then(|c| c.printer_plate(&state.settings.machine)).unwrap_or_default();
+            self.machine_model = self.catalog.as_deref().filter(|_| state.settings.use_installed).and_then(|c| c.store.resolve(&state.settings.machine).ok()).map(|p| p.values.str("printer_model").to_string()).unwrap_or_default();
+        }
         self.tell_printer_heads(state);
+        if was_invalid && self.machine.is_ok() { state.status = SliceStatus::Idle; }
+        self.refresh_panel_values(state);
+    }
+
+    fn refresh_panel_values(&self, state: &mut PrintState) {
         let machine = match self.machine() {
             Ok(machine) => machine,
             Err(e) => {
@@ -2413,9 +3901,6 @@ impl Printing {
                 return;
             }
         };
-        if was_invalid {
-            state.status = SliceStatus::Idle;
-        }
         self.refresh_plates(state);
         let catalog = if state.settings.use_installed { self.catalog.as_deref() } else { None };
         // A resin printer has no bed plate or filament to resolve: its process is the values,
@@ -2436,7 +3921,7 @@ impl Printing {
                 state.base_values = values;
                 state.base_revision += 1;
             }
-        } else if let Ok(setup) = resolve_tools_with(&state.settings, catalog, &Plate::default(), machine, None, true) {
+        } else if let Ok(setup) = resolve_tools_with(&state.settings, catalog, None, &Plate::default(), machine, None) {
             let cfg = setup.build_config();
             state.base_values = fab_plate::PRINT_SETTINGS.iter().map(|s| s.key).chain(["nozzle_diameter"]).map(|k| (k.to_string(), cfg.raw(k, 0).to_string())).collect();
             state.base_revision += 1;
@@ -2492,7 +3977,7 @@ impl Printing {
 
     /// What would slice now, as it would.
     fn next_input(&self, state: &PrintState, plate: Option<&Arc<Evaluated>>) -> Option<(crate::live_slice::PrintJob, crate::live_slice::SliceInput)> {
-        if self.plate_waits(state, plate?).is_some() { return None; }
+        if self.plate_gate(state, plate?).is_some() { return None; }
         let (source, name) = self.source(plate, Arc::from([]), None).ok()?;
         Some(self.job(state, source, name).prepare())
     }
@@ -2521,6 +4006,12 @@ impl Printing {
 
     /// The plate and settings of a live edit, kept until Print, Export or Slice asks to settle.
     pub fn live_input(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>, swaps: Arc<[crate::live_slice::FieldSwap]>, moved: Option<(usize, crate::live_slice::PartTransform)>) {
+        if self.calibration_waiting(state) { return; }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, false);
+            return;
+        }
+        if self.machine.is_err() { return; }
         if self.wait_for_plate(state, plate) {
             return;
         }
@@ -2694,7 +4185,7 @@ impl Printing {
         match crate::live_slice::latest_sliced() {
             Some((gen, result, seconds)) if self.slice_gen == Some(gen) => {
                 log!("fab slice: gen {gen}'s answer never reached the editor: taken from the engine");
-                self.event(state, &PrintEvent::Sliced { gen, result, seconds })
+                self.event(state, &PrintEvent::Sliced { gen, result, seconds }) == PrintOutcome::Target
             }
             _ => false,
         }
@@ -2755,6 +4246,14 @@ impl Printing {
     }
 
     fn slice(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        if self.calibration_waiting(state) {
+            self.reask.get_or_insert(false);
+            return true;
+        }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, false);
+            return true;
+        }
         self.reask = None;
         if self.wait_for_plate(state, plate) {
             // The rebuilt or fully grown plate resumes this request.
@@ -2781,23 +4280,43 @@ impl Printing {
         self.start_slice(state, job, input)
     }
 
+    fn resume_pending_send(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        let Some(held) = self.pending_send.take() else { return false };
+        if matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if card == &held.ticket) && self.ticket_current(state, &held.ticket) {
+            let options = state.print_options;
+            state.confirm_print = None;
+            state.print_options.plate_clear = false;
+            self.admit_send_to_printer(state, &held.ticket, held.preview, options, plate);
+            return true;
+        }
+        if state.confirm_print.take().is_some() {
+            state.print_options.plate_clear = false;
+            state.print_blocked.set(&state.links.picked, Some(STALE_TICKET.into()));
+            return true;
+        }
+        false
+    }
+
     /// A slice Print, Export or Slice was waiting for went with an edit (the plate or the settings
     /// changed under it): it goes on with what stands now, and an Export waiting on it writes the
     /// newer slice. True when the view changed.
     pub fn resume_asked(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
-        let Some(export) = self.reask.take() else { return false };
-        if self.slice_gen.is_some() {
-            return false;
+        if self.calibration_waiting(state) || self.slice_gen.is_some() { return false; }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, self.reask == Some(true));
+            return true;
         }
+        let resumed = self.resume_pending_send(state, plate);
+        let Some(export) = self.reask.take() else { return resumed };
+        if state.can_send() { return (export && self.export(state, plate)) || resumed; }
         let changed = self.slice(state, plate);
-        self.export_waits = export && self.slice_gen.is_some();
-        if let Some(waiting) = &mut self.reask { *waiting |= export; }
+        if export { self.await_export(state); }
         changed
     }
 
     /// Print, Export or Slice awaits the slice in progress: it finishes whatever the view does.
     pub fn slice_asked(&self) -> bool {
-        self.slice_gen.is_some()
+        self.slice_gen.is_some() || self.reask.is_some() || self.pending_send.is_some()
     }
 
     /// Hold the editor's slice until the model worker has applied the printer settings and
@@ -2840,7 +4359,7 @@ impl Printing {
         // Only this editor's own slice stops: a headset's live slice (or nothing) runs on.
         let own = self.slice_gen.is_some() || self.live.is_some();
         self.invalidate(state);
-        self.reask = None;
+        if self.reask.take() == Some(true) { state.export = ExportStatus::Idle; }
         state.streamed = None;
         if own {
             crate::live_slice::cancel();
@@ -2849,12 +4368,14 @@ impl Printing {
 
     fn start_slice(&mut self, state: &mut PrintState, mut job: crate::live_slice::PrintJob, input: crate::live_slice::SliceInput) -> bool {
         mark_test_slice("fab.test_print.slice.start", &job, input.plate_id);
+        self.live_key = Some((input.plate_id, input.settings_id));
         if self.tests.is_none() {
             self.figures_of = Some((input.plate_id, input.settings_id));
         }
         self.export_waits = false;
         self.gen += 1;
         self.slice_gen = Some(self.gen);
+        self.issues_gen = None;
         job.gen = self.gen;
         // The settled slice has its own job (with a cancel) on the board.
         if let Some(job) = self.live_job.take() {
@@ -2872,24 +4393,59 @@ impl Printing {
         true
     }
 
+    fn clear_export(&mut self, state: &mut PrintState) {
+        for p in &self.packaging {
+            if matches!(p.to, PackageFor::File(_)) { p.stop.store(true, Ordering::Relaxed); }
+        }
+        self.export_attempt = None;
+        state.export = ExportStatus::Idle;
+    }
+
+    fn await_export(&mut self, state: &mut PrintState) {
+        self.export_waits = self.slice_gen.is_some();
+        if let Some(waiting) = &mut self.reask { *waiting = true; }
+        state.export = if self.export_waits || self.reask.is_some() {
+            ExportStatus::Exporting
+        } else if matches!(state.status, SliceStatus::Failed(_)) {
+            ExportStatus::Idle
+        } else {
+            ExportStatus::Failed("no printable parts on the plate".into())
+        };
+    }
+
     fn export(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        if self.calibration_waiting(state) {
+            self.reask = Some(true);
+            state.export = ExportStatus::Exporting;
+            return true;
+        }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, true);
+            return true;
+        }
+        if let Err(err) = &self.machine {
+            state.export = ExportStatus::Failed(err.local_message());
+            return true;
+        }
         if !state.can_send() {
+            self.clear_export(state);
             let changed = self.slice(state, plate);
-            self.export_waits = self.slice_gen.is_some();
-            // An export waiting for the plate writes the file once its slice is in.
-            if self.reask.is_some() {
-                self.reask = Some(true);
-            }
+            self.await_export(state);
             return changed;
         }
         let Some(last) = self.last.clone() else {
-            state.status = SliceStatus::Failed("slice the plate first: Export writes the sliced plate".into());
+            self.clear_export(state);
+            state.export = ExportStatus::Failed("slice the plate first: Export writes the sliced plate".into());
             return true;
         };
-        let path = export_path(&last.name, "gcode.3mf");
-        // Written when its package is made ([`PrintEvent::Packaged`]).
-        state.exported = None;
-        self.package(last, PackageFor::File(path), Vec::new());
+        let to = PackageFor::File(export_path_in(&self.dirs.documents, &last.name, "gcode.3mf"));
+        for p in &self.packaging {
+            if matches!(p.to, PackageFor::File(_)) && (p.to != to || !Arc::ptr_eq(&p.sliced, &last)) {
+                p.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        self.export_attempt = Some(self.package(last, to, Vec::new()));
+        state.export = ExportStatus::Exporting;
         true
     }
 }
@@ -2897,8 +4453,11 @@ impl Printing {
 /// Where Export writes the plate `name`'s `ext` (in `~/Documents/Fab`, made if need be): the name
 /// with anything but letters, digits, `-` and `_` turned into `-`.
 pub(crate) fn export_path(name: &str, ext: &str) -> std::path::PathBuf {
-    let dir = crate::model_host::documents_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    export_path_in(&crate::model_host::documents_dir(), name, ext)
+}
+
+fn export_path_in(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    let _ = std::fs::create_dir_all(dir);
     let stem: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
     dir.join(format!("{}.{ext}", if stem.trim_matches('-').is_empty() { "plate" } else { stem.trim_matches('-') }))
 }
@@ -2968,7 +4527,7 @@ fn import_profiles(path: &std::path::Path, select: bool, dirs: &[std::path::Path
 }
 
 /// Build the virtual stock from the same offline positions the colour picker offers.
-fn twin_profile(preset: &Preset) -> Option<TwinProfile> {
+fn twin_profile(preset: &Preset, store: &ProfileStore) -> Option<TwinProfile> {
     use makepad_fab_settings::family::{of_profile, Package};
     if fab_sla::printer::is_resin(&preset.values) { return None; }
     match of_profile(&preset.values).ok()?.package { Package::GcodeThreeMf { .. } | Package::PlainGcode => {} }
@@ -2985,7 +4544,11 @@ fn twin_profile(preset: &Preset) -> Option<TwinProfile> {
     let diameters = (0..offline.heads.len()).map(|i| parse_num(preset.values.raw("nozzle_diameter", i))
         .filter(|d| d.is_finite() && *d > 0.0)).collect::<Option<Vec<_>>>()?;
     let printer = VirtualPrinter::twin(String::new(), &preset.name, preset.values.str("printer_model"), offline.heads.len(), slots, Vec::new()).ok()?;
-    Some(TwinProfile { printer, diameters })
+    let model = printer.model();
+    let default_plate = store.resolve(&model).ok().map(|p| p.values.str("default_bed_type").to_owned()).unwrap_or_default();
+    let machine = Arc::new(BoundMachine { geometry: Arc::new(machine), layout: offline, model, diameters, default_plate });
+    let binding = Arc::new(MachineBinding::Available { machine: machine.clone(), automatic: machine.clone(), choices: Arc::default(), explicit: None });
+    Some(TwinProfile { printer, machine, binding })
 }
 
 /// The catalogue of installed and imported files and Fab's built-in machines.
@@ -2996,6 +4559,7 @@ fn catalog_in(dirs: &[std::path::PathBuf], imports: &std::path::Path, printers: 
     let store = if printers.is_empty() { store } else { store.with_builtin(virtual_printer::builtin_presets(printers)) };
     let mut entries = Vec::new();
     let mut twins = HashMap::new();
+    let mut resin = std::collections::HashSet::new();
     let mut names: Vec<&String> = store.names().collect();
     names.sort();
     for name in names {
@@ -3018,8 +4582,13 @@ fn catalog_in(dirs: &[std::path::PathBuf], imports: &std::path::Path, printers: 
             continue;
         }
         if kind == Kind::Machine {
-            if let Some(twin) = store.resolve(name).ok().and_then(|preset| twin_profile(&preset)) {
-                twins.insert(name.clone(), twin);
+            if let Ok(preset) = store.resolve(name) {
+                if fab_sla::printer::is_resin(&preset.values) {
+                    resin.insert(name.clone());
+                    resin.insert(preset.values.str("printer_model").trim().to_ascii_lowercase());
+                } else if let Some(twin) = twin_profile(&preset, &store) {
+                    twins.insert(name.clone(), twin);
+                }
             }
         }
         let compat = match raw.values.get("compatible_printers") {
@@ -3027,24 +4596,31 @@ fn catalog_in(dirs: &[std::path::PathBuf], imports: &std::path::Path, printers: 
             None => Vec::new(),
         };
         // Resolve inherited material once on the catalogue worker, never on the UI.
-        let resolved = if kind == Kind::Filament { store.resolve(name).ok() } else { None };
-        let material = resolved.as_ref().map(|p| p.values.raw("filament_type", 0).to_string()).filter(|s| !s.is_empty());
-        let plates = PLATES.iter().filter(|(_, key)| resolved.as_ref().is_some_and(|p| makepad_fab_settings::machine::filament_suits_plate(p.values.bool("fab_bed_unheated"), p.values.f64(key)))).map(|(name, _)| name.to_string()).collect();
-        let filament_id = resolved.map(|p| p.filament_id).filter(|s| !s.is_empty());
+        let resolved = (kind == Kind::Filament).then(|| store.resolve(name).ok()).flatten();
+        let filament = resolved.as_ref();
+        let material = filament.map(|p| p.values.raw("filament_type", 0).to_string()).filter(|s| !s.is_empty());
+        let plates = PLATES.iter().filter(|(_, key)| filament.is_some_and(|p| makepad_fab_settings::machine::filament_suits_plate(p.values.bool("fab_bed_unheated"), p.values.f64(key)))).map(|(name, _)| name.to_string()).collect();
+        let filament_id = filament.map(|p| p.filament_id.clone()).filter(|s| !s.is_empty());
         entries.push(Entry { name: name.clone(), kind, user, compat, material, filament_id, plates });
     }
     // Keep picker order here so a printer pick only filters the list on the UI thread.
     entries.sort_by_cached_key(|e| (!e.user, e.name.to_lowercase()));
-    let virtual_calibration = printers.iter().filter(|p| p.source == VirtualSource::Generated).map(|vp| {
-        let machine = vp.machine_preset_name();
-        let results = colours::MATERIALS.iter().map(|m| {
-            let name = virtual_printer::filament_preset(m);
-            let result = fab_calibrate::Results::load(&machine, &name);
-            (name, result)
-        }).collect();
-        (machine, results)
+    let mut models = HashMap::<String, Vec<String>>::new();
+    for profile in entries.iter().filter_map(|e| twins.get(&e.name)) {
+        let model = &profile.machine.model;
+        let family = makepad_fab_settings::family::of_model(model).expect("validated filament model");
+        for alias in std::iter::once(model.as_str()).chain(model.strip_prefix(family.maker)) {
+            models.entry(alias.to_ascii_lowercase()).or_default().push(profile.machine.geometry.name.clone());
+        }
+    }
+    let selection = dirs.iter().find_map(|dir| installed_selection(dir));
+    let automatic = models.into_iter().map(|(model, names)| {
+        let name = selection.as_ref().map(|s| &s.machine).filter(|name| names.contains(name)).unwrap_or(&names[0]);
+        let machine = twins[name].machine.clone();
+        let binding = MachineBinding::Available { machine: machine.clone(), automatic: machine, choices: names.into(), explicit: None };
+        (model, Arc::new(binding))
     }).collect();
-    Some(Catalog { layout_revision: 0, virtual_calibration, selection: dirs.iter().find_map(|dir| installed_selection(dir)), store: Arc::new(store), entries, twins, installed })
+    Some(Catalog { layout_revision: 0, selection, store: Arc::new(store), entries, twins, automatic, resin, installed })
 }
 
 impl Catalog {
@@ -3064,12 +4640,12 @@ fn default_plate(fits: &[String], printer_default: &str) -> String {
 
 /// The build volume and nozzle reaches described by a printer preset; a resin printer's
 /// screen and height.
-fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
+fn machine_of(name: &str, values: &Config) -> Result<Machine, MachineError> {
     if fab_sla::printer::is_resin(values) {
-        return fab_sla::printer::resin_machine(name, values);
+        return fab_sla::printer::resin_machine(name, values).map_err(|detail| MachineError::ResinSpec { preset: name.into(), detail });
     }
-    let invalid = |key: &str| format!("the printer preset {name}: missing or invalid {key}");
-    let bounds = |points: &[(f64, f64)], key: &str| -> Result<Rect, String> {
+    let invalid = |key| MachineError::InvalidKey { preset: name.into(), key };
+    let bounds = |points: &[(f64, f64)], key: &'static str| -> Result<Rect, MachineError> {
         if points.len() < 3 || points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
             return Err(invalid(key));
         }
@@ -3133,11 +4709,11 @@ fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
     };
     // The places filaments feed the nozzles from: the profile's, else the family's layout.
     use makepad_fab_settings::family::{self, Spools};
-    let spools = family::of(values).ok_or(family::UNSUPPORTED)?.spools;
+    let spools = family::of(values).ok_or_else(|| MachineError::UnsupportedFamily { preset: name.into() })?.spools;
     // A head's own spool is labelled by its unit's letters (A1, B1, … Z1, AA1): the trays'
     // numbering has letters for `UNITS` units.
     if spools == Spools::OnePerHead && count > fab_plate::machine::UNITS {
-        return Err(format!("the printer preset {name}: this printer has more heads than its trays can be numbered"));
+        return Err(MachineError::TooManyHeads { preset: name.into() });
     }
     let named = values.get("fab_material_slots").map(|v| v.as_vec()).unwrap_or_default();
     let slots = if named.iter().all(|s| s.trim().is_empty() || s.trim() == "nil") {
@@ -3153,7 +4729,15 @@ fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
             }
         }
     } else {
-        Machine::parse_slots(&named, count).map_err(|e| format!("the printer preset {name}: {e}"))?
+        Machine::parse_slots(&named, count).map_err(|detail| {
+            // A prefix fails from the first bad entry onward, including a duplicate tray.
+            let (mut lo, mut hi) = (1, named.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if Machine::parse_slots(&named[..mid], count).is_ok() { lo = mid + 1; } else { hi = mid; }
+            }
+            MachineError::InvalidMaterialSlots { preset: name.into(), slot_index: Some(lo), raw_entry: Some(named[lo - 1].trim().into()), detail }
+        })?
     };
     Ok(Machine { name: name.into(), technology: fab_plate::machine::Technology::Filament, bed, max_height, nozzles, keep_out, clearance, slots })
 }
@@ -3302,7 +4886,7 @@ fn tower_spot(plate: &Plate, machine: &Machine, size: f64) -> [f64; 2] {
 /// What a calibration test part is made for: the job's nozzle and layer height, and the first
 /// filament as it prints now (its preset with any stored calibration). Reads preset files:
 /// call off the UI thread.
-pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>) -> fab_calibrate::CouponSetup {
+pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>, effective: Option<&EffectiveResults>) -> fab_calibrate::CouponSetup {
     let mut cs = fab_calibrate::CouponSetup { layer: s.layer_height.max(0.05), ..Default::default() };
     let filament = s.materials.first().map(|f| f.preset.clone()).unwrap_or_default();
     if let Some(cat) = catalog {
@@ -3318,11 +4902,11 @@ pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>) -> fab_calibra
             cs.nozzle_temp = parse_num(v.raw("nozzle_temperature", 0)).filter(|t| *t > 0.0).unwrap_or(cs.nozzle_temp);
         }
     }
-    let r = fab_calibrate::Results::load(&s.machine, &filament);
+    let measured = |name| effective.and_then(|r| r.get(name));
     use fab_calibrate::results::names;
-    cs.flow_ratio = r.get(names::FLOW_RATIO).unwrap_or(cs.flow_ratio);
-    cs.nozzle_temp = r.get(names::NOZZLE_TEMP).unwrap_or(cs.nozzle_temp);
-    cs.c_xy = r.get(names::C_XY).unwrap_or((0.875 * cs.nozzle).max(0.2));
+    cs.flow_ratio = measured(names::FLOW_RATIO).unwrap_or(cs.flow_ratio);
+    cs.nozzle_temp = measured(names::NOZZLE_TEMP).unwrap_or(cs.nozzle_temp);
+    cs.c_xy = measured(names::C_XY).unwrap_or((0.875 * cs.nozzle).max(0.2));
     cs
 }
 
@@ -3429,45 +5013,46 @@ fn swaps_on_a_nozzle(map: &[u32]) -> bool {
     map.iter().enumerate().any(|(i, n)| map[..i].contains(n))
 }
 
+#[cfg(test)]
 fn resolve_setup(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine) -> Result<JobSetup, String> {
-    resolve_tools(s, catalog, plate, machine, None)
+    resolve_tools_with(s, catalog, None, plate, machine, None).map_err(|e| e.redacted_message())
 }
 
 /// [`resolve_setup`], with `kept` of only those of the job's tools (0-based, ascending), each on
 /// its own nozzle: the ones a slice printed in.
-fn resolve_tools(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, String> {
-    resolve_tools_with(s, catalog, plate, machine, kept, false)
+fn resolve_tools(s: &PrintSettings, catalog: Option<&Catalog>, calibration: &EffectiveCalibration, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
+    resolve_tools_with(s, catalog, Some(calibration), plate, machine, kept)
 }
 
-/// The virtual card reads its cached calibration. A job takes the latest measurements.
-fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>, panel: bool) -> Result<JobSetup, String> {
+/// A job takes the latest calibration measurements. The settings panel uses the preset values.
+fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, calibration: Option<&EffectiveCalibration>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
     if s.use_installed && catalog.is_none() {
-        return Err("The installed printer profiles are unavailable".into());
+        return Err(SetupError::Machine(MachineError::CatalogUnavailable));
     }
     if s.plate.is_empty() {
-        return Err(NO_PLATE_FITS.into());
+        return Err(SetupError::Validation(NO_PLATE_FITS.into()));
     }
-    let (_, bed_temp_key) = PLATES.iter().find(|(name, _)| *name == s.plate).ok_or_else(|| format!("Unknown bed plate {}", s.plate))?;
+    let (_, bed_temp_key) = PLATES.iter().find(|(name, _)| *name == s.plate).ok_or_else(|| SetupError::Validation(format!("Unknown bed plate {}", s.plate)))?;
     // The job's tools: its materials, and any a plate part or its paint asks for beyond them.
     let painted = plate.parts.iter().flat_map(|p| p.paint.iter().flat_map(|sp| sp.colors.iter().filter_map(|c| c.filament))).max().unwrap_or(0) as usize;
     let nf = plate.parts.iter().map(|p| p.filament as usize).max().unwrap_or(1).max(painted).max(s.materials.len()).max(1);
     let mut setup = match catalog {
         Some(cat) => {
-            let resolve = |n: &str, what: &str| cat.store.resolve(n).map_err(|e| format!("the {what} preset: {e}"));
+            let resolve = |n: &str, role| cat.store.resolve(n).map_err(|detail| SetupError::ResolvePreset { role, preset: n.into(), detail });
             let mut filaments = Vec::new();
             for i in 0..nf {
                 let f = s.materials.get(i).map(|f| f.preset.clone()).unwrap_or_default();
                 if f.is_empty() {
-                    return Err(format!("material {} has no filament preset: its tray reports none, and the installed profiles select none", i + 1));
+                    return Err(SetupError::Validation(format!("material {} has no filament preset: its tray reports none, and the installed profiles select none", i + 1)));
                 }
-                filaments.push(resolve(&f, "filament")?);
+                filaments.push(resolve(&f, PresetRole::Filament)?);
             }
-            let machine = resolve(&s.machine, "printer")?;
-            makepad_fab_settings::family::of_profile(&machine.values)?;
+            let machine = resolve(&s.machine, PresetRole::Printer)?;
+            makepad_fab_settings::family::of_profile(&machine.values).map_err(|msg| SetupError::Validation(msg.into()))?;
             let nozzle_volume_type = makepad_fab_settings::profiles::nozzle_flow_types(&machine, cat.selection.as_ref());
             JobSetup {
                 machine,
-                process: resolve(&s.process, "process")?,
+                process: resolve(&s.process, PresetRole::Process)?,
                 filaments,
                 filament_map: vec![1; nf],
                 nozzle_volume_type,
@@ -3486,7 +5071,7 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
             .or_else(|| plate.parts.iter().find(|p| p.filament as usize == i + 1).and_then(|p| p.nozzle))
             .unwrap_or(0);
         if nozzle >= nozzles {
-            return Err(format!("material {} prints on the {} nozzle, but the printer has {nozzles}", i + 1, if nozzle == 1 { "right" } else { "left" }));
+            return Err(SetupError::Validation(format!("material {} prints on the {} nozzle, but the printer has {nozzles}", i + 1, if nozzle == 1 { "right" } else { "left" })));
         }
         setup.filament_map[i] = nozzle as u32 + 1;
         setup.filament_colours[i] = s.materials.get(i).map(|f| colour_hex(f.color));
@@ -3495,13 +5080,14 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
             setup.filaments[i].values.set_str("fab_dedicated_path", "1");
         }
     }
-    // The measured flow ratio, temperature and pressure advance of each printer and filament.
-    for (i, f) in setup.filaments.iter_mut().enumerate() {
-        let preset = s.materials.get(i).map(|f| f.preset.as_str()).unwrap_or("");
-        if let Some(cal) = catalog.filter(|_| panel).and_then(|c| c.virtual_calibration.get(&s.machine)).and_then(|fs| fs.get(preset)) {
-            fab_calibrate::apply::apply_filament(cal, &mut f.values);
-        } else {
-            fab_calibrate::apply::apply_filament(&fab_calibrate::Results::load(&s.machine, preset), &mut f.values);
+    // The panel takes only PRINT_SETTINGS and nozzle_diameter. The measured temperature,
+    // flow and pressure advance belong to the slice, which still reads its current results.
+    if let Some(calibration) = calibration {
+        for (i, f) in setup.filaments.iter_mut().enumerate() {
+            let preset = s.materials.get(i).map(|f| f.preset.as_str()).unwrap_or("");
+            if let Some(results) = calibration.for_filament(preset) {
+                fab_calibrate::apply::apply_filament_effective(results, &mut f.values);
+            }
         }
     }
     // The project's global settings on top of the process. A filament's own value is
@@ -3518,7 +5104,7 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
     // Every material suits the plate: it sets a bed temperature for it (0: it does not).
     for (i, f) in setup.filaments.iter().enumerate() {
         if !makepad_fab_settings::machine::filament_suits_plate(f.values.bool("fab_bed_unheated"), f.values.f64(bed_temp_key)) {
-            return Err(format!("Material {} ({}) has no bed temperature for the {}: pick another plate", i + 1, f.name, s.plate));
+            return Err(SetupError::Validation(format!("Material {} ({}) has no bed temperature for the {}: pick another plate", i + 1, f.name, s.plate)));
         }
     }
     let p = &mut setup.process.values;
@@ -3568,7 +5154,7 @@ pub fn finish_sliced(job: &crate::live_slice::PrintJob, r: &Arc<makepad_fab_slic
     // The slice's tools are the job's that print.
     let trays = r.tools.iter().map(|&t| s.materials.get(t).and_then(|m| m.tray)).collect();
     let checked = match &job.catalog {
-        Some(cat) => gate_profile(cat, setup).and_then(|profile| match fab_printer_link::safety::check_gcode(&r.gcode.text()?, &profile) {
+        Some(cat) => gate_profile(cat, setup, &job.head_envelope).and_then(|profile| match fab_printer_link::safety::check_gcode(&r.gcode.text()?, &profile) {
             Ok(facts) => Ok(Checked { facts, profile }),
             Err(e) => Err(e.message()),
         }),
@@ -3590,8 +5176,8 @@ pub fn finish_sliced(job: &crate::live_slice::PrintJob, r: &Arc<makepad_fab_slic
 /// preset the job's machine preset descends from (never a user preset's edits or the
 /// project's overrides). Keys the machine does not have (filament_diameter, volumetric
 /// speeds, temperatures) come one per job filament, in filament order, from its presets.
-fn gate_profile(cat: &Catalog, setup: &JobSetup) -> Result<fab_printer_link::safety::MachineProfile, String> {
-    gate_profile_of(cat, system_machine(setup), &setup.filaments)
+fn gate_profile(cat: &Catalog, setup: &JobSetup, head_envelope: &Path) -> Result<fab_printer_link::safety::MachineProfile, String> {
+    gate_profile_of(cat, system_machine(setup), &setup.filaments, head_envelope)
 }
 
 /// The system preset a job's machine preset descends from.
@@ -3599,7 +5185,7 @@ fn system_machine(setup: &JobSetup) -> &str {
     if setup.machine.system_parent.is_empty() { &setup.machine.name } else { &setup.machine.system_parent }
 }
 
-fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset]) -> Result<fab_printer_link::safety::MachineProfile, String> {
+fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset], head_envelope: &Path) -> Result<fab_printer_link::safety::MachineProfile, String> {
     let system = cat.store.resolve(name).map_err(|e| format!("the printer's system profile {name}: {e}"))?;
     let get = |k: &str| {
         let m = system.values.get(k).map(|v| v.as_vec()).unwrap_or_default();
@@ -3609,7 +5195,7 @@ fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset]) -> Result<fa
     let templates = filaments.iter().flat_map(|f| ["filament_start_gcode", "filament_end_gcode"].into_iter().map(move |k| (k.to_string(), f.values.raw(k, 0).to_string()))).collect();
     let mut profile = fab_printer_link::safety::MachineProfile::from_settings(&get, templates).map_err(|e| e.message())?;
     // The user's measured head, if installed (the check decides whether it may allow non-planar moves).
-    profile.head = crate::head::installed();
+    profile.head = crate::head::installed_from(head_envelope);
     Ok(profile)
 }
 
@@ -3719,7 +5305,7 @@ fn mark_test_slice(what: &str, job: &crate::live_slice::PrintJob, at: u64) {
 fn run_slice(gen: u64, s: &PrintSettings, catalog: Option<&Arc<Catalog>>, plate: &Plate, machine: &Machine, name: &str) -> Result<Sliced, String> {
     let setup = resolve_setup(s, catalog.map(|c| &**c), plate, machine)?;
     let res = makepad_fab_slice::plate::slice_plate_painted_with(&setup, plate, &[], &|_, _| {})?;
-    let job = crate::live_slice::PrintJob { gen, settings: s.clone(), colours: s.materials.iter().map(|m| m.color).collect(), model_colours: Vec::new(), shared_tools: Vec::new(), machine: machine.clone(), name: name.to_string(), objects: plate.parts.iter().map(|p| p.object.clone()).collect(), check: None, fallback: None, catalog: catalog.filter(|_| s.use_installed).cloned(), tests: None, melts: melt_steps(plate) };
+    let job = crate::live_slice::PrintJob { gen, head_envelope: crate::dirs::FabDirs::system().head_envelope, settings: s.clone(), colours: s.materials.iter().map(|m| m.color).collect(), model_colours: Vec::new(), shared_tools: Vec::new(), machine: machine.clone(), name: name.to_string(), objects: plate.parts.iter().map(|p| p.object.clone()).collect(), check: None, fallback: None, catalog: catalog.filter(|_| s.use_installed).cloned(), tests: None, melts: melt_steps(plate) };
     Ok(finish_test_slice(job, setup, res, plate))
 }
 
@@ -4113,17 +5699,18 @@ fn preview_of_package(package: &[u8], meta: &JobMeta) -> Result<Arc<PrintPreview
 }
 
 /// A queued job's package from the disk, checked against the printer's installed profile.
-fn job_check(catalog: &Catalog, dir: &std::path::Path, id: &str, meta: &JobMeta) -> Result<fab_printer_link::safety::ValidatedJob, String> {
+fn job_check(catalog: &Catalog, dir: &Path, id: &str, meta: &JobMeta, head_envelope: &Path) -> Result<fab_printer_link::safety::ValidatedJob, String> {
     let package = jobs::read_package(dir, id).map_err(|e| format!("Fab's copy of this job can't be read: {e}"))?;
     let filaments = meta.filament_presets.iter().map(|name| catalog.store.resolve(name)).collect::<Result<Vec<_>, _>>()?;
-    let mut profile = gate_profile_of(catalog, &meta.machine_preset, &filaments)?;
-    profile.head = crate::head::installed();
+    let profile = gate_profile_of(catalog, &meta.machine_preset, &filaments, head_envelope)?;
     fab_printer_link::safety::validate_job(package, &profile, &meta.name).map_err(|e| e.message())
 }
 
-fn remove_job_files(id: String) {
+fn remove_job_files(dir: PathBuf, id: String) {
     crate::live_slice::run_shown("fab job remove", move || {
-        if let Err(e) = jobs::remove(&jobs::jobs_dir(), &id) { log!("fab jobs: {id} could not be removed: {e}"); }
+        if let Err(e) = jobs::remove(&dir, &id) { log!("fab jobs: {id} could not be removed: {e}"); }
+        #[cfg(test)]
+        Cx::post_action(PrintEvent::JobFilesRemoved(id));
     });
 }
 
@@ -5187,9 +6774,86 @@ pub fn nonplanar_preview(pv: &mut PrintPreview, plans: &[(usize, Arc<makepad_fab
 }
 
 #[cfg(test)]
+#[path = "../tests/common/second_family_profiles.rs"]
+mod second_family_profiles;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use fab_plate::{Part, PartMesh};
+
+    #[test]
+    fn export_attempts_preserve_the_settled_slice_and_ignore_stale_completions() {
+        let mut printing = Printing::default();
+        let plate = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &defaults_settings(), None, &plate.plate, &plate.machine, "cube").unwrap());
+        let mut state = PrintState::default();
+        let done = SliceStatus::Done { seconds: 0.1 };
+        state.set_preview(sliced.preview.clone());
+        state.status = done.clone();
+        assert_eq!(state.export, ExportStatus::Idle);
+        assert!(printing.export(&mut state, None));
+        assert!(matches!(state.export, ExportStatus::Failed(_)), "missing package source is an export failure");
+        assert_eq!(state.status, done);
+
+        // The matching file job is already in flight. Export adopts its id on a repeated press.
+        let path = crate::model_host::documents_dir().join("cube.gcode.3mf");
+        printing.last = Some(sliced.clone());
+        let pending = |id| Packaging { id, sliced: sliced.clone(), to: PackageFor::File(path.clone()), stop: Arc::default() };
+        for (id, result, expected) in [
+            (1, Packaged::Written(path.clone()), ExportStatus::Written(path.clone())),
+            (2, Packaged::Failed("write refused".into()), ExportStatus::Failed("write refused".into())),
+            (3, Packaged::Stopped, ExportStatus::Idle),
+        ] {
+            printing.packaging.push(pending(id));
+            assert!(printing.export(&mut state, None));
+            assert_eq!(state.export, ExportStatus::Exporting);
+            assert_eq!(printing.export_attempt, Some(id), "the same slice and path share an attempt");
+            assert_eq!(printing.event(&mut state, &PrintEvent::Packaged { id, result }), PrintOutcome::Target);
+            assert_eq!(state.export, expected);
+            assert_eq!(state.status, done);
+            assert_eq!(state.slice_state(), ("Sliced", 1.0));
+            assert!(state.can_send(), "the settled plate can be exported again");
+        }
+        for previous in [ExportStatus::Written(path.clone()), ExportStatus::Failed("write refused".into())] {
+            state.export = previous;
+            printing.invalidate(&mut state);
+            assert_eq!(state.export, ExportStatus::Idle, "edits clear the previous outcome");
+        }
+        let old = pending(4);
+        let stop = old.stop.clone();
+        printing.packaging.push(old);
+        printing.export_attempt = Some(4);
+        printing.reask = Some(true);
+        printing.invalidate(&mut state);
+        assert!(stop.load(Ordering::Relaxed), "a replaced file job gets a stop request");
+        assert_eq!(printing.export_attempt, None);
+        assert_eq!(state.export, ExportStatus::Exporting, "an export waiting for the rebuilt plate stays in progress");
+        let late = PrintEvent::Packaged { id: 4, result: Packaged::Written(path) };
+        assert_eq!(printing.event(&mut state, &late), PrintOutcome::Unchanged);
+        assert_eq!(state.export, ExportStatus::Exporting, "the superseded write cannot change the waiting export");
+    }
+
+    #[test]
+    fn export_of_an_all_excluded_plate_reports_the_refusal() {
+        let mut printing = Printing::default();
+        let mut state = PrintState::default();
+        let mut model = fab_model::FabModel::with_script("cube", "cube.cad.splash",
+            "use mod.fab.*\nobject(mod.model.box({size: [1mm 1mm 1mm]}))");
+        let mut evaluator = fab_model::eval::Evaluator::new(printing.machine().unwrap().clone());
+        let (compiled, plate) = model.evaluate(&mut evaluator, None).unwrap();
+        let action = fab::api::PartAction::SetPrint { objects: vec![plate.plate.parts[0].object.clone()], print: false };
+        let edits = crate::plate_edit::edits(&compiled, &plate, &action).unwrap();
+        let (_, update) = model.apply(&mut evaluator, "exclude", model.head(), &edits, None).unwrap();
+        let plate = Arc::new(update.unwrap().1);
+        assert!(plate.plate.parts.is_empty() && !plate.plate.excluded.is_empty());
+        assert!(printing.export(&mut state, Some(&plate)));
+        assert_eq!(state.export, ExportStatus::Failed("no printable parts on the plate".into()));
+        assert_eq!(state.status, SliceStatus::Idle);
+        printing.reask = Some(true);
+        assert!(printing.resume_asked(&mut state, Some(&plate)));
+        assert_eq!(state.export, ExportStatus::Failed("no printable parts on the plate".into()));
+    }
 
     /// A live slice's supports are a stage of its one bar: no job of their own on the board. The
     /// status follows the engine's progress of the live revision by the whole percent, and says
@@ -5233,7 +6897,7 @@ mod tests {
             let presets = [printer, setup.process.clone(), setup.filaments[0].clone()].into_iter().map(|p| RawPreset {
                 name: p.name, kind: p.kind, values: p.values, from: "system".into(), ..Default::default()
             }).collect();
-            let cat = Catalog { twins: HashMap::new(), layout_revision: 0, virtual_calibration: HashMap::new(), store: Arc::new(ProfileStore::open(&[], &[]).with_builtin(presets)), selection: None, entries: Vec::new(), installed: true };
+            let cat = Catalog { twins: HashMap::new(), automatic: HashMap::new(), resin: Default::default(), layout_revision: 0, store: Arc::new(ProfileStore::open(&[], &[]).with_builtin(presets)), selection: None, entries: Vec::new(), installed: true };
             assert_eq!(resolve_setup(&settings, Some(&cat), &plate, &machine).err().as_deref(), Some(reason));
             assert!(!same_printer(model, model));
             if !model.is_empty() {
@@ -5263,8 +6927,9 @@ mod tests {
         let presets = [printer, single.process.clone(), pla.clone()].into_iter().map(|p| RawPreset {
             name: p.name, kind: p.kind, values: p.values, from: "system".into(), ..Default::default()
         }).collect();
-        let cat = Catalog { twins: HashMap::new(), layout_revision: 0, virtual_calibration: HashMap::new(), store: Arc::new(ProfileStore::open(&[], &[]).with_builtin(presets)), selection: None, entries: Vec::new(), installed: true };
-        let gate = gate_profile_of(&cat, &single.machine.name, std::slice::from_ref(&pla)).expect("the single-nozzle printer's gate profile");
+        let cat = Catalog { twins: HashMap::new(), automatic: HashMap::new(), resin: Default::default(), layout_revision: 0, store: Arc::new(ProfileStore::open(&[], &[]).with_builtin(presets)), selection: None, entries: Vec::new(), installed: true };
+        let head_envelope = crate::dirs::FabDirs::system().head_envelope;
+        let gate = gate_profile_of(&cat, &single.machine.name, std::slice::from_ref(&pla), &head_envelope).expect("the single-nozzle printer's gate profile");
         assert_eq!(gate.extruder_areas, vec![gate.printable_area.clone()], "a single nozzle without an area of its own reaches the whole bed");
         settings.materials = vec![JobMaterial { preset: single.filaments[0].name.clone(), color: [0.9, 0.9, 0.9, 1.0], nozzle: 0, tray: None, dedicated: false }];
         let setup = resolve_setup(&settings, Some(&cat), &plate, &one).expect("the single-nozzle printer's job");
@@ -5272,7 +6937,7 @@ mod tests {
         // The check takes its machine: no refusal of its areas, nozzles or build volume. (The
         // fixture starts with Fab's own default sequence, not a printer's, so the check still
         // refuses its moves; an installed profile carries the printer's own sequence.)
-        if let Err(refusal) = fab_printer_link::safety::check_gcode(&sliced.gcode, &gate_profile(&cat, &setup).unwrap()) {
+        if let Err(refusal) = fab_printer_link::safety::check_gcode(&sliced.gcode, &gate_profile(&cat, &setup, &head_envelope).unwrap()) {
             let machine: Vec<_> = refusal.0.iter().filter(|v| matches!(v.rule, "machine" | "build volume" | "nozzle offset" | "nozzle diameter" | "nozzle map" | "filament")).collect();
             assert!(machine.is_empty(), "the safety check refuses a single-nozzle printer's machine: {machine:?}");
         }
@@ -5306,7 +6971,7 @@ mod tests {
             values.set_vec("extruder_printable_area", Vec::new());
             values.set_vec("extruder_printable_height", Vec::new());
             if let Some(slots) = slots { values.set_vec("fab_material_slots", vec![slots.into()]); }
-            machine_of("second", &values)
+            machine_of("second", &values).map_err(|e| e.local_message())
         };
         let own = |labels: &[&str]| labels.iter().enumerate().map(|(h, t)| Slot { nozzle: h, tray: t.to_string(), path: SlotPath::Own }).collect::<Vec<_>>();
         assert_eq!(heads(4, None).unwrap().slots, own(&["A1", "B1", "C1", "D1"]));
@@ -5366,6 +7031,2650 @@ mod tests {
         }
     }
 
+    fn remap(printing: &mut Printing, state: &mut PrintState, ev: &mut Evaluated) {
+        if let Some(mapped) = printing.refresh_printer(state, Some(&Arc::new(ev.clone()))) {
+            ev.set_mapped(mapped);
+        }
+    }
+
+    // Waits on progress, never on the clock: each round waits for the next publication from
+    // any link, so a report that never comes leaves a hung job rather than a timing flake.
+    // The counter is read before the check, so a publication during it is never missed.
+    fn wait_for(property: &str, mut ready: impl FnMut() -> bool) {
+        let mut said = false;
+        loop {
+            let seen = fab_printer_link::published();
+            if ready() { return; }
+            if !std::mem::replace(&mut said, true) { eprintln!("fleet test: waiting until {property}"); }
+            while fab_printer_link::published() == seen { std::thread::sleep(std::time::Duration::from_millis(2)); }
+        }
+    }
+
+    #[test]
+    fn finished_job_state_survives_a_pending_sent_save() {
+        let id = JobMeta::new_id("block", jobs::wall_now());
+        let dir = std::env::temp_dir().join(format!("fab-job-writer-{}-{id}", std::process::id()));
+        let meta = Arc::new(JobMeta { id: id.clone(), name: "block".into(), ..Default::default() });
+        jobs::commit(&dir, &meta, &SavedState { state: JobState::Queued, ..Default::default() }, b"package", &Default::default()).unwrap();
+
+        let (writer, wakes) = JobWriter::channel();
+        let mut printing = Printing { job_writer: Some(writer), ..Default::default() };
+        let mut state = PrintState::default();
+        state.follow.jobs.push(CommittedJob { meta, ..Default::default() });
+        // Deliver two UI events before the writer takes its first wake.
+        for stage in [JobState::Sent, JobState::Finished] {
+            state.follow.jobs.at_mut(0).state = stage;
+            state.follow.changed(&id);
+            printing.sync_jobs(&mut state);
+        }
+        let writer = printing.job_writer.take().unwrap();
+        let thread = writer.spawn(dir.clone(), wakes, |id, e| panic!("save failed for {id}: {e}")).unwrap();
+        drop(writer);
+        let drained = thread.join();
+        let rows = jobs::read_all(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+        drained.expect("the job writer must drain without a save error");
+        assert_eq!(rows.first().map(|(_, saved)| &saved.state), Some(&JobState::Finished),
+            "the saved job must read back Finished after a pending Sent save");
+    }
+
+    #[test]
+    fn loadout_filenames_preserve_printer_identity() {
+        let real = |name: &str| loadout_file(&PrinterChoice::Real(name.into()));
+        assert_ne!(real("A"), real("a"), "upper- and lower-case printers must have distinct loadout files");
+        assert_ne!(real("x"), loadout_file(&PrinterChoice::Virtual("x".into())), "real and virtual names must be distinct");
+        for (name, encoded) in [("a", "a"), ("A", "_41"), ("a/b", "a_2fb"), ("..", "_2e_2e"),
+            ("a b", "a_20b"), ("a-b0", "a-b0"), ("_41", "_5f41"), ("é", "_c3_a9")] {
+            assert_eq!(real(name), Path::new("trays").join(format!("printer-{encoded}.txt")), "{name} must form one escaped filename");
+        }
+        assert_eq!(loadout_file(&PrinterChoice::None), Path::new("trays.txt"), "no printer keeps the original hand-edit file");
+    }
+
+    #[test]
+    fn loadouts_survive_one_drain_and_restart() {
+        use std::fs;
+        const CHILD: &str = "FAB_TEST_LOADOUTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-loadouts-{}", std::process::id()));
+            fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::loadouts_survive_one_drain_and_restart", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).status().unwrap();
+            fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "isolated loadout persistence case failed");
+            return;
+        }
+
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let dir = home.join(".makepad/fab");
+        // Hold the worker at its wake until all pending updates have arrived.
+        let (wake, wakes) = std::sync::mpsc::sync_channel(1);
+        let pending = Arc::new(std::sync::Mutex::new(ProfileWork::default()));
+        let drain = || {
+            wakes.recv().unwrap();
+            let work = std::mem::take(&mut *pending.lock().unwrap());
+            write_loadouts(&dir, work.loadouts);
+        };
+        let (a, b) = (PrinterChoice::Real("A".into()), PrinterChoice::Real("B".into()));
+        let presets = virtual_printer::presets();
+        let single = presets.iter().find(|p| p.name == "two-materials").unwrap();
+        second_family_profiles::install(&home);
+        let catalog = Arc::new(catalog_in(&ProfileStore::default_data_dirs(), &home.join("imports"), std::slice::from_ref(single)).unwrap());
+        let restart = || {
+            let worker = ProfilesWorker { pending: pending.clone(), wake: wake.clone() };
+            let mut printing = Printing { profiles_worker: Some(worker), catalog: Some(catalog.clone()), ..Default::default() };
+            let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+            state.settings.use_installed = true;
+            state.settings.machine = single.machine_preset_name();
+            state.settings.process = virtual_printer::PROCESS.into();
+            printing.load_base_values(&mut state);
+            printing.event(&mut state, &PrintEvent::PrinterConfigs {
+                names: vec!["A".into(), "B".into()], presets: vec![single.clone()], loadouts: read_loadouts(&dir),
+            });
+            (printing, state)
+        };
+
+        // Both real configurations can report the same model. Only A owns this old file.
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = format!("model\t{}\nprinter\tA\nnozzle\tA1\tAMS A\tloaded\tABS\t-\n", single.model());
+        fs::write(dir.join("trays.txt"), &legacy).unwrap();
+        let (mut printing, mut state) = restart();
+        assert_eq!(printing.loadout_text.as_ref(), Some(&legacy), "no printer must keep the legacy loadout");
+        let identify = |state: &mut PrintState, name: &str, model: String| {
+            state.printers.set(&state.links.picked, 1, Arc::new(fab_printer_link::Snapshot {
+                name: name.into(), model, ..Default::default()
+            }));
+        };
+        state.links.picked = a.clone();
+        identify(&mut state, "A", second_family_profiles::model());
+        printing.select_loadout(&state);
+        assert!(printing.loadout.is_none(), "a mismatched reported model must not adopt legacy trays");
+        identify(&mut state, "other display name", single.model());
+        printing.refresh_printer(&mut state, None);
+        assert!(printing.loadout.is_none(), "a different reported display name must not adopt legacy trays");
+        identify(&mut state, "A", single.model());
+        printing.refresh_printer(&mut state, None);
+        assert_eq!(printing.loadout_text.as_ref(), Some(&legacy), "A must adopt the legacy loadout when its model matches");
+        drain();
+        assert_eq!(fs::read(dir.join(loadout_file(&a))).unwrap(), legacy.as_bytes(), "adoption must save A's own copy");
+        state.links.picked = b.clone();
+        identify(&mut state, "B", single.model());
+        printing.select_loadout(&state);
+        assert!(printing.loadout_text.is_none() && printing.loadout.is_none(), "B must never inherit A's legacy trays");
+        assert_eq!(fs::read(dir.join("trays.txt")).unwrap(), legacy.as_bytes(), "adoption must preserve every byte of trays.txt");
+
+        // A's hand edits and B's changed report arrive before one profiles-worker drain.
+        state.links.picked = a.clone();
+        printing.select_loadout(&state);
+        let pos = printing.loadout.as_ref().unwrap().trays[0].pos;
+        let edit = |owner, material: &str| PrintAction::EditTray(owner, pos, colours::TrayEdit::Material(material.into()));
+        let owner = EditOwner::new(PrinterScope::Target, &state);
+        printing.action(&mut state, &edit(owner.clone(), "PETG"), None);
+        printing.action(&mut state, &edit(owner, "PLA"), None);
+        let model = fab_model::FabModel::with_script("cube", "cube.cad.splash",
+            "use mod.fab.*\nobject(mod.model.box({size: [1.2mm 0.2mm 1.2mm]}))");
+        let mut evaluator = fab_model::eval::Evaluator::new(printing.machine().unwrap().clone());
+        let (_, mut plate) = model.evaluate(&mut evaluator, None).unwrap();
+        remap(&mut printing, &mut state, &mut plate);
+        let a_text = printing.loadout_text.clone().unwrap();
+        let (layout, mapping, materials) = (printing.loadout.clone(), state.colors.clone(), state.settings.materials.clone());
+        assert!(mapping.rows.iter().any(|r| r.used && r.pos == Some(pos)) && !materials.is_empty(), "A's edited tray must map the plate's material");
+
+        let b_file = home.join("background.jsonl");
+        fs::write(&b_file, "@head 0 1 PETG EF120AFF\n@head 3 1 TPU 16CF51FF\n").unwrap();
+        let b_model = second_family_profiles::model();
+        let older = format!("model\t{b_model}\nprinter\tB\ntool_1\tA1\tAMS A\tloaded\tABS\t-\n");
+        remember_loadout(&mut printing.loadouts, printing.profiles_worker.as_ref(), &b, &older);
+        printing.install(&mut state, &b, fab_printer_link::PrinterLink::simulate_moonraker(b_file, &b_model), false);
+        wait_for("B must report its own fourth head", || {
+            let flags = printing.poll_printer(&mut state);
+            assert!(!flags.target, "B's trays must be routed as a background report");
+            state.printer_of(&b).is_some_and(|s| s.state.tray(TrayId { ams: 3, slot: 0 }).is_some_and(|t| t.material.as_deref() == Some("TPU")))
+        });
+        assert_eq!(printing.loadout, layout, "B's report must leave A's kept layout unchanged");
+        assert_eq!(state.colors, mapping, "B's report must leave A's colour mapping unchanged");
+        assert_eq!(state.settings.materials, materials, "B's report must leave A's material settings unchanged");
+        let b_text = printing.loadouts[&loadout_file(&b)].clone();
+        drain();
+        let saved = read_loadouts(&dir);
+        assert!(saved.get(&loadout_file(&a)) == Some(&a_text) && saved.get(&loadout_file(&b)) == Some(&b_text),
+            "one drain must write both printers' own latest trays");
+        assert!(a_text.contains("\tPLA\t") && b_text.contains("tool_4\tD1\t") && b_text.contains("\tTPU\t"),
+            "each file must contain its own material and B's fourth head");
+        drop(printing);
+
+        // Exercise the picker with configured twins so a restart and both picks stay offline.
+        let (mut printing, mut state) = restart();
+        let mut modes = Saved::default();
+        for (config, preset) in [("A", single.machine_preset_name()), ("B", second_family_profiles::MACHINE.into())] {
+            let mut twin = catalog.twins[&preset].printer.clone();
+            twin.name = format!("twin-{config}");
+            twin.configured_for = Some(config.into());
+            modes.disconnected.insert(config.into());
+            modes.printers.push(twin);
+        }
+        printing.virtuals = Some(Arc::new(modes));
+        for (pick, expected) in [(&a, &a_text), (&b, &b_text), (&a, &a_text)] {
+            assert!(printing.link_printer(&mut state, pick), "the configured pick must succeed offline");
+            assert_eq!(printing.loadout_text.as_ref(), Some(expected), "a restarted pick must restore that printer's own text");
+            let parsed = colours::parse_loadout(loadout_model(expected).1, &printing.offline().heads).unwrap();
+            assert_eq!(printing.loadout.as_ref(), Some(&parsed), "the restored trays must use the picked profile's heads");
+            if pick == &b {
+                let twin = printing.make_twin(&mut state, &b, second_family_profiles::MACHINE).unwrap();
+                let PrinterChoice::Virtual(name) = twin else { panic!("a standalone twin has a virtual id") };
+                let stock = &printing.virtuals.as_ref().unwrap().printers.iter().find(|p| p.name == name).unwrap().slots;
+                assert!(stock.iter().any(|s| s.head == 3 && s.material.as_deref() == Some("TPU")), "B's standalone twin must seed its fourth head from B");
+            }
+        }
+        printing.link_printer(&mut state, &PrinterChoice::None);
+        let owner = EditOwner::new(PrinterScope::Target, &state);
+        printing.action(&mut state, &edit(owner, "PETG"), None);
+        drain();
+        let saved = read_loadouts(&dir);
+        assert!(saved[Path::new("trays.txt")].contains("\tPETG\t"), "hand editing with no printer must update trays.txt");
+        assert_eq!((&saved[&loadout_file(&a)], &saved[&loadout_file(&b)]), (&a_text, &b_text), "no-printer edits must preserve both printers' trays");
+    }
+
+    fn owner(name: &str) -> CalibrationOwner {
+        CalibrationOwner { id: format!("printer:{name}"), title: name.into() }
+    }
+
+    fn test_calibration_setup() -> CheckSetup {
+        let mut setup = CheckSetup::fab_defaults();
+        setup.settings = settings(1);
+        setup.settings.materials[0].preset = "PLA".into();
+        setup
+    }
+
+    fn calibration_dir(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fab-cal-{case}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn calibration_owner_by_target_kind() {
+        let mut printing = Printing::default();
+        let mut state = PrintState::default();
+        let base = virtual_printer::presets().remove(0);
+        let twin = |name: &str, source: Option<&str>| VirtualPrinter {
+            name: name.into(), source: VirtualSource::Twin { preset: base.machine_preset_name(), model: base.model(), source: source.map(str::to_owned) },
+            ..base.clone()
+        };
+        let mut saved = Saved::default();
+        saved.printers = vec![base.clone(), twin("from-p", Some("printer:P")), twin("nested", Some("virtual:from-p")),
+            twin("catalogue", None), twin("from-generated", Some(&format!("virtual:{}", base.name))),
+            twin("a", Some("virtual:b")), twin("b", Some("virtual:a"))];
+        let mut configured = twin("paired", Some("printer:P"));
+        configured.configured_for = Some("P".into());
+        saved.printers.push(configured);
+        printing.virtuals = Some(Arc::new(saved));
+        state.links.picked = PrinterChoice::Real("P".into());
+        for disconnected in [false, true] {
+            state.links.disconnected = disconnected;
+            assert_eq!(printing.calibration_owner(&state), Some(owner("P")), "configured P owns both modes");
+        }
+        let saved = Arc::make_mut(printing.virtuals.as_mut().unwrap());
+        if let VirtualSource::Twin { source, .. } = &mut saved.printers.last_mut().unwrap().source { *source = None; }
+        assert_eq!(printing.calibration_owner(&state), Some(owner("P")), "legacy configured twin keeps its printer owner");
+        for (name, expected) in [("from-p", Some(owner("P"))), ("nested", Some(owner("P"))), ("catalogue", None),
+            (&base.name, None), ("from-generated", None), ("a", None)] {
+            state.links.picked = PrinterChoice::Virtual(name.into());
+            assert_eq!(printing.calibration_owner(&state), expected, "provenance of {name}");
+        }
+        state.links.picked = PrinterChoice::None;
+        assert_eq!(printing.calibration_owner(&state), None, "unlinked uses the preset store");
+    }
+
+    #[test]
+    fn check_setup_id_hashes_effective_slicer_values() {
+        use fab_calibrate::{results::names, Results};
+        let dir = calibration_dir("id");
+        let mut setup = test_calibration_setup();
+        let preset = setup.settings.machine.clone();
+        let key = |p| CalibrationKey { owner: Some(owner(p)), preset: preset.clone(), filaments: vec!["PLA".into()] };
+        let write = |name: &str, flow: f64, owned: bool| {
+            let mut r = Results { printer: name.into(), filament: "PLA".into(), ..Default::default() };
+            r.values.insert(names::FLOW_RATIO.into(), flow);
+            if owned { r.save_owner_in(&dir) } else { r.save_in(&dir) }.unwrap();
+        };
+        write("printer:P", 0.91, true);
+        write("printer:Q", 1.07, true);
+        write(&preset, 0.91, false);
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P")));
+        let id = setup.id();
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("Q")));
+        assert_ne!(id, setup.id(), "different effective flow gives different toolpaths");
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P2")));
+        assert_eq!(id, setup.id(), "equal flow hashes identically through preset fallback");
+        write("printer:Q", 0.85, true);
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P")));
+        assert_eq!(id, setup.id(), "saving Q does not change P's slice key");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn check_setup_serves_job_mech_and_coupon_from_effective_arc() {
+        use fab_calibrate::results::{names, EffectiveValue, ValueSource};
+        let mut setup = test_calibration_setup();
+        let mut r = EffectiveResults::default();
+        for (name, value) in [(names::FLOW_RATIO, 0.91), (names::C_XY, 0.35), (names::NOZZLE_TEMP, 215.0)] {
+            r.values.insert(name.into(), EffectiveValue { value, source: ValueSource::Owner });
+        }
+        Arc::make_mut(&mut setup.calibration).by_filament.insert("PLA".into(), r);
+        let job = setup.job_setup(&Plate::default(), &Machine::dual_nozzle_350()).unwrap();
+        assert_eq!(job.filaments[0].values.raw("filament_flow_ratio", 0), "0.910", "the print job consumes effective flow");
+        assert_eq!(job.filaments[0].values.raw("nozzle_temperature", 0), "215", "the print job consumes effective temperature");
+        assert_eq!(setup.mech_profile().measured.c_xy, Some(0.35), "joint sizing consumes effective clearance");
+        let coupon = setup.coupon_setup();
+        assert_eq!((coupon.flow_ratio, coupon.nozzle_temp, coupon.c_xy), (0.91, 215.0, 0.35), "coupon generation consumes the same snapshot");
+    }
+
+    fn manual_profiles(printing: &mut Printing) -> std::sync::mpsc::Receiver<()> {
+        let (wake, rx) = std::sync::mpsc::sync_channel(1);
+        printing.profiles_worker = Some(ProfilesWorker { pending: Default::default(), wake });
+        rx
+    }
+
+    fn drain_cal(printing: &Printing, dir: &Path) -> Vec<PrintEvent> {
+        let work = std::mem::take(&mut *printing.profiles_worker.as_ref().unwrap().pending.lock().unwrap());
+        let mut events = Vec::new();
+        run_calibration_work(dir, work.cal_writes, work.cal_resolve, |e| events.push(e));
+        events
+    }
+
+    #[test]
+    fn calibration_writes_preserve_fifo_order_and_stale_resolves_drop() {
+        use fab_calibrate::{Answer, CouponSetup, Step, results::names};
+        let dir = calibration_dir("fifo");
+        let mut printing = Printing::default();
+        let wakes = manual_profiles(&mut printing);
+        let mut state = PrintState { settings: test_calibration_setup().settings, ..Default::default() };
+        state.links.picked = PrinterChoice::Real("P".into());
+        let preset = state.settings.machine.clone();
+        let mut steps = Vec::new();
+        for (step, n) in [(Step::Clearance, 5), (Step::Flow, 1)] {
+            let cs = CouponSetup { flow_ratio: 0.91 / 0.90, ..Default::default() };
+            let coupon = Arc::new(fab_calibrate::make(step, &cs).unwrap());
+            printing.save_calibration(&mut state, Some(owner("P")), preset.clone(), "PLA".into(), coupon, Answer::Number(n), "2026-01-01".into());
+            steps.push(step);
+        }
+        assert!(wakes.try_recv().is_ok(), "batched writes wake the worker");
+        let events = drain_cal(&printing, &dir);
+        let saved: Vec<_> = events.iter().filter_map(|e| match e {
+            PrintEvent::CalibrationWritten { outcome: CalWriteOutcome::Saved { step, .. } } => Some(*step), _ => None
+        }).collect();
+        assert_eq!(saved, steps, "every write is acknowledged once, in FIFO order");
+        let stale = events.last().unwrap();
+        printing.event(&mut state, stale);
+        let r = printing.effective_calibration().for_filament("PLA").unwrap();
+        assert_eq!(r.get(names::C_XY), Some(0.3), "clearance survives the subsequent flow save");
+        assert!((r.get(names::FLOW_RATIO).unwrap() - 0.91).abs() < 1e-9, "flow persisted with clearance");
+        state.links.picked = PrinterChoice::Real("Q".into());
+        printing.sync_calibration(&mut state);
+        for event in drain_cal(&printing, &dir) { printing.event(&mut state, &event); }
+        let q = printing.effective_calibration().clone();
+        assert_eq!(printing.event(&mut state, stale), PrintOutcome::Unchanged, "stale resolve is discarded");
+        assert!(Arc::ptr_eq(&q, printing.effective_calibration()), "Q keeps its resolved snapshot");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn late_answer_after_retarget_writes_captured_owner_and_leaves_active_target_alone() {
+        use crate::calibrate::{CalEvent, Calibrate};
+        use fab::print::calibrate::CalibrateAction;
+        use fab_calibrate::{Results, Step};
+        let dir = calibration_dir("late-answer");
+        let base = virtual_printer::presets().remove(0);
+        let cat = Arc::new(catalog_in(&[], &dir, std::slice::from_ref(&base)).unwrap());
+        let mut saved = Saved::default();
+        for name in ["P", "Q"] {
+            let mut vp = cat.twins[&base.machine_preset_name()].printer.clone();
+            vp.configured_for = Some(name.into());
+            vp.name = format!("coupon-{name}");
+            saved.printers.push(vp);
+            saved.disconnected.insert(name.into());
+        }
+        let mut printing = Printing { catalog: Some(cat), virtuals: Some(Arc::new(saved)), ..Default::default() };
+        let _wake = manual_profiles(&mut printing);
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        assert!(printing.link_printer(&mut state, &PrinterChoice::Real("P".into())));
+        printing.sync_calibration(&mut state);
+        for e in drain_cal(&printing, &dir) { printing.event(&mut state, &e); }
+        let mut panel = Calibrate::default();
+        let setup = printing.check_setup(&state);
+        let (preset, filament) = setup.calibration_names();
+        assert!(!filament.is_empty(), "the captured coupon needs a selected filament");
+        let CalEvent::Made(made) = CalEvent::make(Step::Clearance, &setup, [1.0; 4]);
+        panel.made(&mut state.calibrate, &made);
+        assert!(printing.link_printer(&mut state, &PrinterChoice::Real("Q".into())));
+        printing.sync_calibration(&mut state);
+        for e in drain_cal(&printing, &dir) { printing.event(&mut state, &e); }
+        let cube = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &state.settings, printing.catalog.as_ref(), &cube.plate, &cube.machine, "cube").unwrap());
+        state.set_preview(sliced.preview.clone());
+        state.status = SliceStatus::Done { seconds: 0.0 };
+        state.settled = true;
+        printing.last = Some(sliced);
+        let before = printing.check_setup(&state);
+        assert_eq!(before.calibration_names(), (preset.clone(), filament.clone()), "P and Q share a preset and filament");
+        let seq = printing.calibration_seq;
+        let a = CalibrateAction::Answer { a: 5, b: 0, angle: 0.0 };
+        assert!(panel.action(&mut state, &a, &mut printing, [1.0; 4], None));
+        for e in drain_cal(&printing, &dir) {
+            printing.event(&mut state, &e);
+            if let PrintEvent::CalibrationWritten { outcome, .. } = e {
+                panel.written(&mut state.calibrate, &outcome, printing.requested_calibration_owner(), &preset, &filament);
+            }
+        }
+        let after = printing.check_setup(&state);
+        assert_eq!(Results::load_owner_in(&dir, "printer:P", &filament).values.get("c_xy"), Some(&0.30), "P owns its coupon's answer");
+        assert!(!Results::owner_path_in(&dir, "printer:Q", &filament).exists(), "the active printer gets no write");
+        assert!(!Results::path_in(&dir, &preset, &filament).exists(), "a captured printer's result leaves the preset alone");
+        assert_eq!((after.id(), printing.calibration_seq), (before.id(), seq), "Q keeps its settled key and resolution");
+        assert!(state.can_send() && Arc::ptr_eq(&before.calibration, &after.calibration), "Q stays ready on the same calibration");
+        assert!(state.calibrate.status.contains("Saved to P"), "the completion identifies the saved coupon's printer: {}", state.calibrate.status);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rebuild_failure_formats_every_typed_kind_without_parsing() {
+        let path = std::env::temp_dir().join("fixture_home/project/hinge.cad.splash");
+        let full = path.to_str().unwrap();
+        let reason = format!("'{full}' is not open in the project");
+        let measured = makepad_csg_mech::Measured { c_z_layers: Some(4), ..Default::default() };
+        for (file, line, col, id, op, message, prefix) in [
+            (full, 6, 3, "", "", reason.as_str(), "script `hinge.cad.splash`:6:3 ("),
+            ("", 1, 1, "", "", "cancelled", "project build ("),
+            ("", 4, 2, "", "", "bad expression", "project:4:2 ("),
+            ("part.cad.splash", 2, 4, "pa", "BrepFillet", "radius is too large", "`pa` (BrepFillet)"),
+            ("part.cad.splash", 3, 5, "h", "joint", "eye too thin", "joint `h`"),
+        ] {
+            let failure = fab_model::eval::Failure { file: file.into(), line, col, id: id.into(), op: op.into(), lost: None, message: message.into() };
+            let kind = classify_rebuild_failure(&failure, None, None);
+            let expected = match (id, op) {
+                ("", _) => RebuildFailureKind::Program { file: (!file.is_empty()).then(|| "hinge.cad.splash".into()), line, col, reason: message.into() },
+                (_, "joint") => RebuildFailureKind::Joint { parts: vec![], kind: None, id: id.into(), reason: message.into() },
+                _ => RebuildFailureKind::Solid { parts: vec![], id: id.into(), op: op.into(), reason: message.into() },
+            };
+            assert_eq!(kind, expected, "structured diagnostic for {prefix}");
+            let shown = format_rebuild_failure(&redact_rebuild_kind(&kind, &failure, None), &measured, 0.2);
+            assert!(shown.starts_with(prefix), "{prefix} must identify the failed step: {shown}");
+            for error in [shown, redacted_eval_failure(&failure)] {
+                assert!(!error.contains("fixture_home") && !error.contains(full), "external diagnostic must scrub the script path: {error}");
+                if file == full { assert!(error.contains("'hinge.cad.splash' is not open in the project")); }
+            }
+        }
+    }
+
+    #[test]
+    fn sliced_printability_issues_block_confirm_card_after_slice_gen_clears() {
+        let vp = virtual_printer::presets().remove(0);
+        let choice = PrinterChoice::Virtual(vp.name.clone());
+        let mut printing = Printing::default();
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        state.links.picked = choice.clone();
+        printing.install(&mut state, &choice, fab_printer_link::PrinterLink::virtual_printer(setup_of(&vp, None).unwrap()), true);
+        state.printers.set(&choice, printing.installed_epoch, Arc::new(fab_printer_link::Snapshot {
+            name: vp.title.clone(),
+            model: vp.model(),
+            status: fab_printer_link::ConnectionStatus::Connected,
+            virtual_printer: true,
+            state: Arc::new(fab_printer_link::PrinterState {
+                storage: Some(true),
+                gcode_state: Some("IDLE".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        state.confirm_print = Some(PrintConfirm::Filament(PrintTicket {
+            printer: choice,
+            virtual_printer: true,
+            epoch: printing.installed_epoch,
+        }));
+
+        let plate = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &state.settings, None, &plate.plate, &plate.machine, "cube").unwrap());
+        let island = Arc::new(fab_printability::Report {
+            sliced: true,
+            issues: vec![fab_printability::Issue {
+                kind: "mid_air",
+                severity: fab_printability::Severity::Error,
+                object: Some("cube".into()),
+                at_mm: [0.0; 3],
+                footprint: fab_printability::Footprint { min: [0.0; 2], max: [1.0; 2] },
+                layer: Some(11),
+                layer_to: None,
+                measure: 100.0,
+                message: "floating island (100.0 mm²)".into(),
+                hint: "Add supports or place it on the bed.".into(),
+                fix: None,
+                area_mm2: 100.0,
+                lowest_z: 2.2,
+                highest_z: 2.4,
+                flags: 0,
+            }],
+            ..Default::default()
+        });
+
+        // 1. Successful Sliced(1) clears slice_gen (so held Export resumes) and arms issues_gen.
+        printing.gen = 1;
+        printing.slice_gen = Some(1);
+        state.status = SliceStatus::Running { progress: 0.5, stage: "Slicing".into() };
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 1, result: Ok(sliced.clone()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None, "Sliced clears slice_gen so held Export can resume");
+        assert_eq!(printing.issues_gen, Some(1), "Sliced arms issues_gen for streaming printability");
+        assert!(state.can_send() && state.print_blocker().is_none());
+
+        // 2. In-progress Issues(1) holds the card while slice_gen is None.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: Arc::default(), done: 3, total: 12 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None);
+        assert_eq!(state.print_blocker().as_deref(), Some("Checking printability: layer 3 of 12"));
+        assert_eq!(printing.send_blocked(&state).as_deref(), Some("Checking printability: layer 3 of 12"));
+
+        // 3. Completed Issues(1) with mid_air blocks the confirm card while slice_gen is None.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None);
+        let blocked = printing.send_blocked(&state).expect("floating island must block the confirm card");
+        assert!(blocked.starts_with("Not printable: floating island") && blocked.contains("on layer 12"), "{blocked}");
+        assert_eq!(printing.send_checks(&state, &state.print_options).err().as_deref(), Some(blocked.as_str()));
+
+        // 4. Another generation's Issues is ignored.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 2, report: Arc::default(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert_eq!(printing.send_blocked(&state).as_deref(), Some(blocked.as_str()));
+
+        // 5. Plate change invalidates and drops late Issues(1).
+        printing.plate_changed(&mut state, &plate);
+        state.streamed = None;
+        assert_eq!(printing.issues_gen, None);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "late Issues after plate change must be discarded");
+
+        // 6. Replacement slice gen 2 ignores late Issues(1), and stop_slice clears issues_gen.
+        printing.gen = 2;
+        printing.slice_gen = Some(2);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 2, result: Ok(sliced.clone()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!((printing.slice_gen, printing.issues_gen), (None, Some(2)));
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none() && state.print_blocker().is_none(), "gen 1 report cannot poison gen 2");
+        printing.stop_slice(&mut state);
+        assert_eq!(printing.issues_gen, None);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 2, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "late Issues after stop_slice must be discarded");
+
+        // 7. Marking the preview stale or a failed Sliced(4) rejects subsequent Issues.
+        printing.gen = 3;
+        printing.slice_gen = Some(3);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 3, result: Ok(sliced), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        Printing::mark_shown_slice_stale(&mut state);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 3, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "stale preview ignores late Issues");
+
+        printing.gen = 4;
+        printing.slice_gen = Some(4);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 4, result: Err("slice failed".into()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!((printing.slice_gen, printing.issues_gen), (None, None));
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 4, report: island, done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none());
+    }
+
+    #[test]
+    fn confirm_card_precedence_prefers_calibration_error_over_stale_overlap_and_respects_hold() {
+        let vp = virtual_printer::presets().remove(0);
+        let choice = PrinterChoice::Virtual(vp.name.clone());
+        let snapshot = fab_printer_link::Snapshot { name: vp.title.clone(), virtual_printer: true, ..Default::default() };
+        let mut printing = Printing::default();
+        let mut p = PrintState::default();
+        p.links.picked = choice.clone();
+        printing.install(&mut p, &choice, fab_printer_link::PrinterLink::virtual_printer(setup_of(&vp, None).unwrap()), true);
+        p.confirm_print = Some(PrintConfirm::Filament(PrintTicket { printer: choice, virtual_printer: true, epoch: printing.installed_epoch }));
+        p.stale = true;
+        Arc::make_mut(&mut p.printability).issues.push(fab_printability::Issue {
+            kind: "overlap", severity: fab_printability::Severity::Error, object: None, at_mm: [0.0; 3],
+            footprint: fab_printability::Footprint { min: [0.0; 2], max: [1.0; 2] },
+            layer: Some(1), layer_to: None, measure: 1.0, message: "Two bodies overlap".into(),
+            hint: "Move them apart.".into(), fix: None, area_mm2: 1.0, lowest_z: 0.0, highest_z: 0.2, flags: 0,
+        });
+        assert!(p.print_blocker().unwrap().contains("overlap"), "the stale plate has its own refusal");
+        let failed = "The hinge cannot rebuild at the measured Z gap.";
+        p.calibration_error = Some(failed.into());
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some(failed), "admission gives the current rebuild failure");
+        assert_eq!(printing.send_blocked(&p).as_deref(), Some(failed), "the card shows the same failure");
+        assert!(panel::confirm_question(&p, &snapshot, false).0.contains("failed to rebuild"), "the question identifies calibration");
+        assert!(panel::slice_status(&p).0.contains(failed), "the status explains how the rebuild failed");
+        let _wake = manual_profiles(&mut printing);
+        printing.sync_calibration(&mut p);
+        p.calibration_error = Some(failed.into());
+        assert!(p.calibration_pending, "recovery waits on a real profiles request");
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some(SLICE_NOT_READY), "admission waits for recovery");
+        assert_eq!(printing.send_blocked(&p), None, "the card has no refusal during recovery");
+        for text in [panel::confirm_question(&p, &snapshot, false).0, panel::slice_status(&p).0] {
+            assert!(text.contains(LOADING_CALIBRATION) && !text.contains(failed) && !text.contains("overlap"), "the hold has one reason: {text}");
+        }
+        printing.action(&mut p, &PrintAction::AskPrint(true), None);
+        assert!(printing.reask == Some(false) && printing.slice_asked(), "held Print survives leaving Sliced view");
+        printing.action(&mut p, &PrintAction::AskPrint(false), None);
+        assert!(printing.reask.is_none() && !printing.slice_asked(), "closing the Print card releases a held Print wait");
+        printing.action(&mut p, &PrintAction::Export, None);
+        printing.action(&mut p, &PrintAction::AskPrint(false), None);
+        assert!(printing.reask == Some(true) && printing.slice_asked(), "closing the Print card keeps an independent held Export");
+        printing.fleet.clear();
+        assert_eq!(printing.send_blocked(&p).as_deref(), Some(STALE_TICKET), "a retired ticket is stale");
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some("No printer is linked."), "a direct admission needs a linked printer");
+    }
+
+    const COMPACT_HINGE: &str = r#"use mod.model.*
+use mod.fab.*
+let m = mod.model
+let a = m.box({size: [6mm 2.6mm 6mm] at: [0 1.3mm 0]})
+let b = m.box({size: [6mm 2.6mm 6mm] at: [10mm 1.3mm 0]})
+let pa = m.union(a, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let pb = m.union(b, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let h = m.hinge(pa, pb, {at: [5mm 0 0] plate: 0.4mm})
+object(pa, name: "Probe")
+"#;
+
+    fn copy_done(d: &crate::model_host::Done) -> crate::model_host::Done {
+        crate::model_host::Done {
+            print_setup_seq: d.print_setup_seq, print_setup_failure: d.print_setup_failure.clone(),
+            person: d.person.clone(), id: d.id, ok: d.ok, text: d.text.clone(), images: d.images.clone(),
+            review: Default::default(), update: d.update.clone(), status: d.status.clone(), model_changed: d.model_changed,
+            check_slice: d.check_slice.clone(), source_files: d.source_files.clone(), source_problem: d.source_problem.clone(),
+            capped: d.capped.clone(),
+        }
+    }
+
+    struct CalibrationFleet {
+        app: crate::App,
+        fleet: FleetRuntime,
+        done: std::sync::mpsc::Receiver<crate::model_host::Done>,
+        _wake: std::sync::mpsc::Receiver<()>,
+        dir: PathBuf,
+        dirs: Arc<crate::dirs::FabDirs>,
+        last_setup_seq: Option<u64>,
+        coupons: Vec<(fab_calibrate::Step, fab_calibrate::CouponSetup, Arc<fab_calibrate::Coupon>)>,
+    }
+
+    impl CalibrationFleet {
+        fn new(dir: PathBuf) -> Self {
+            let (host_tx, done) = std::sync::mpsc::channel();
+            let (tx, events) = std::sync::mpsc::channel();
+            // Initialise the process-wide slice pool before the real Cx owns worker actions.
+            crate::live_slice::init_for_tests();
+            let mut runtime = super::slice_bench::SliceRuntime::with_events(move |event| {
+                if let Event::Actions(actions) = event {
+                    for a in actions {
+                        if let Some(crate::model_host::HostAction::Done(d)) = a.downcast_ref() {
+                            host_tx.send(copy_done(d)).unwrap();
+                        }
+                        if let Some(e) = a.downcast_ref::<PrintEvent>() { tx.send(e.clone()).unwrap(); }
+                    }
+                }
+            });
+            runtime.withhold_paint();
+            let dirs = Arc::new(crate::dirs::FabDirs::under(&dir));
+            let mut app = runtime.cx.with_vm(crate::App::script_new);
+            app.dirs = dirs.clone();
+            app.host = Some(crate::model_host::ModelHost::start_in(&runtime.cx, false, &dirs));
+            let base = virtual_printer::presets().remove(0);
+            let cat = Arc::new(catalog_in(&[], &dir, std::slice::from_ref(&base)).unwrap());
+            let mut saved = Saved::default();
+            for name in ["P", "Q"] {
+                let mut twin = cat.twins[&base.machine_preset_name()].printer.clone();
+                twin.name = format!("fixture-{name}");
+                twin.configured_for = Some(name.into());
+                saved.disconnected.insert(name.into());
+                saved.printers.push(twin);
+            }
+            app.printing = Printing { dirs: dirs.clone(), catalog: Some(cat), virtuals: Some(Arc::new(saved)), ..Default::default() };
+            app.state.print.settings = defaults_settings();
+            let _wake = manual_profiles(&mut app.printing);
+            let p = PrinterChoice::Real("P".into());
+            let q = PrinterChoice::Real("Q".into());
+            assert!(app.printing.link_printer(&mut app.state.print, &p));
+            app.printing.ensure_link(&mut app.state.print, &q).unwrap();
+            wait_for("both configured printers' stock", || {
+                app.printing.poll_printer(&mut app.state.print);
+                [&p, &q].into_iter().all(|id| app.state.print.printer_of(id)
+                    .is_some_and(|report| report.state.trays().next().is_some()))
+            });
+            app.printing.sync_calibration(&mut app.state.print);
+            for e in drain_cal(&app.printing, &dirs.calibration) { app.printing.event(&mut app.state.print, &e); }
+            let mut f = Self { app, fleet: FleetRuntime { runtime, events }, done, _wake, dir, dirs, last_setup_seq: None, coupons: Vec::new() };
+            f.app.push_print_setup();
+            f
+        }
+
+        #[track_caller]
+        fn deliver(&mut self, wanted: impl Fn(&crate::model_host::Done) -> bool) -> crate::model_host::Done {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                while let Ok(d) = self.done.try_recv() {
+                    if d.print_setup_seq.is_some() {
+                        self.last_setup_seq = d.print_setup_seq;
+                    }
+                    let hit = wanted(&d);
+                    self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(crate::model_host::HostAction::Done(Box::new(copy_done(&d))))]);
+                    if hit { return d; }
+                }
+                assert!(std::time::Instant::now() < deadline, "model worker did not deliver the requested completion (seq {}, waiting {}, gate {:?})", self.app.printing.print_setup_seq(), self.app.printing.calibration_pending(), self.app.plate.as_ref().and_then(|p|self.app.printing.plate_gate(&self.app.state.print, p)));
+                self.fleet.runtime.turn();
+            }
+        }
+
+        #[track_caller]
+        fn take_setup(&mut self) -> crate::model_host::Done {
+            let seq = self.app.printing.print_setup_seq();
+            self.deliver(|d| d.print_setup_seq == Some(seq))
+        }
+
+        fn open(&mut self, path: PathBuf) -> crate::model_host::Done {
+            let id = self.app.host.as_mut().unwrap().open(path, None);
+            self.deliver(|d| d.id == id)
+        }
+
+        fn resolve(&mut self) {
+            for e in drain_cal(&self.app.printing, &self.dirs.calibration) {
+                if let PrintEvent::CalibrationWritten { outcome, .. } = &e {
+                    match outcome {
+                        CalWriteOutcome::Saved { owner, preset, filament, step, values } => {
+                            assert!(!preset.is_empty() && !filament.is_empty() && !values.is_empty(), "saved {} under {:?} / {preset} / {filament}", step.title(), owner);
+                        }
+                        CalWriteOutcome::Cleared { owner, preset, step, has_preset_fallback } => {
+                            assert!(!preset.is_empty() && (owner.is_some() || !has_preset_fallback), "cleared {} from the captured target", step.title());
+                        }
+                        CalWriteOutcome::Failed(error) => panic!("calibration write failed: {error}"),
+                    }
+                }
+                self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(e)]);
+            }
+        }
+
+        fn save(&mut self, target: &str, step: fab_calibrate::Step, n: usize) {
+            let setup = self.app.printing.check_setup(&self.app.state.print);
+            let (preset, filament) = setup.calibration_names();
+            let cs = setup.coupon_setup();
+            let coupon = match self.coupons.iter().find(|(s, c, _)| *s == step && *c == cs) {
+                Some((_, _, coupon)) => coupon.clone(),
+                None => {
+                    let coupon = Arc::new(fab_calibrate::make(step, &cs).unwrap());
+                    self.coupons.push((step, cs, coupon.clone()));
+                    coupon
+                }
+            };
+            self.app.printing.save_calibration(&mut self.app.state.print, Some(owner(target)), preset, filament, coupon,
+                fab_calibrate::Answer::Number(n), "2026-01-01".into());
+        }
+
+        fn press(&mut self, action: PrintAction) {
+            self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(action)]);
+        }
+
+        fn card(&mut self) -> PrintAction {
+            self.press(PrintAction::AskPrint(true));
+            let p = &mut self.app.state.print;
+            p.print_options.plate_clear = true;
+            let Some(PrintConfirm::Filament(ticket)) = &p.confirm_print else { panic!("Print opens the target filament card") };
+            PrintAction::SendToPrinter { ticket: ticket.clone(), preview: p.preview.as_ref().unwrap().id }
+        }
+
+        fn check_hold(&mut self, start: &PrintAction, attempts: u64, gen: u64, stage: &str) {
+            self.press(PrintAction::AskPrint(true));
+            self.press(start.clone());
+            self.press(PrintAction::Export);
+            let app = &mut self.app;
+            let state = &mut app.state.print;
+            assert!(app.printing.last_attempt == attempts && app.printing.packaging.is_empty() && state.sending.is_empty() && app.printing.gen == gen,
+                "no old package started while {stage}");
+            assert!(!state.can_send(), "the settled plate cannot send while {stage}");
+            assert!(state.settled && !state.stale && state.confirm_print.is_some(), "waiting preserves the reviewed slice and card");
+            assert_eq!(state.calibration_pending, stage == LOADING_CALIBRATION, "profiles worker stage");
+            assert_eq!(state.calibration_plate_pending, stage == UPDATING_CALIBRATION_PLATE, "model worker stage");
+            assert!(!app.printing.confirm_slice(state, app.plate.as_ref()), "confirm waits without reslicing");
+            assert_eq!(app.printing.send_blocked(state), None, "waiting is not a refusal");
+            assert_eq!(state.export, ExportStatus::Exporting, "export stays held");
+            let snap = state.printer_of(&state.links.picked).unwrap();
+            assert!(panel::confirm_question(state, snap, false).0.contains(stage), "card names {stage}");
+            assert_eq!(panel::export_line(state), Some((format!("Exporting · {stage}…"), false)), "export names {stage}");
+        }
+        fn clear(&mut self, step: fab_calibrate::Step) {
+            self.app.printing.clear_calibration(&mut self.app.state.print, step);
+            self.resolve();
+        }
+
+        fn receive_slice(&mut self) -> Arc<Sliced> {
+            let gen = self.app.printing.slice_gen.expect("a fresh slice must have started");
+            let event = self.fleet.next(|e| matches!(e, PrintEvent::Sliced { gen: g, .. } if *g == gen));
+            self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(event)]);
+            assert!(self.app.state.print.can_send(), "the new slice must settle: {:?}", self.app.state.print.status);
+            self.app.printing.last.clone().unwrap()
+        }
+
+        fn finish_packages(&mut self) {
+            while !self.app.printing.packaging.is_empty() {
+                let event = self.fleet.next(|e| matches!(e, PrintEvent::Packaged { .. }));
+                self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(event)]);
+            }
+        }
+
+        fn exported(&mut self, slice: &Arc<Sliced>) -> PathBuf {
+            assert!(self.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::File(_)) && Arc::ptr_eq(&p.sliced, slice)),
+                "Export packages the expected settled geometry");
+            self.finish_packages();
+            let ExportStatus::Written(path) = &self.app.state.print.export else { panic!("Export did not finish: {:?}", self.app.state.print.export) };
+            assert!(path.metadata().unwrap().len() > 0, "Export wrote a nonempty package");
+            path.clone()
+        }
+
+        fn fresh_export(&mut self) -> Arc<Sliced> {
+            self.press(PrintAction::Export);
+            let slice = if self.app.printing.slice_gen.is_some() { self.receive_slice() } else { self.app.printing.last.clone().unwrap() };
+            self.exported(&slice);
+            slice
+        }
+
+        fn cancel_printer(&mut self) {
+            let id = self.app.state.print.sending.first().expect("Start print admitted a package").job.clone();
+            self.press(PrintAction::CancelSend(id));
+            self.finish_packages();
+        }
+
+        fn settle(&mut self) {
+            // Opening a plate discovers its colours, resolves its filament and submits its mapping.
+            // Dispatch those real worker completions before asking for the first print.
+            self.resolve();
+            while self.app.printing.plate_gate(&self.app.state.print, self.app.plate.as_deref().unwrap()).is_some() {
+                self.deliver(|d| d.update.is_some());
+                self.resolve();
+            }
+            // Wait for any in-flight PrintSetup on the same strand before recording a settled baseline.
+            if self.last_setup_seq != Some(self.app.printing.print_setup_seq()) {
+                let setup = self.take_setup();
+                assert!(setup.ok, "baseline model setup succeeds: {}", setup.text);
+            }
+            let ev = self.app.plate.clone().unwrap();
+            self.fleet.settle(&mut self.app.printing, &mut self.app.state.print, &ev);
+        }
+    }
+
+    #[test]
+    fn calibration_end_to_end_guards() {
+        let home = calibration_dir("calibration_end_to_end_guards");
+        {
+            let mut f = CalibrationFleet::new(home.clone());
+            phase_1_saved_plate(&mut f);
+            phase_2_hinge_clearance(&mut f);
+            phase_3_hinge_failure_and_recovery(&mut f);
+            phase_4_navigation_and_box(&mut f);
+            phase_5_machine_failures(&mut f);
+            f.finish_packages();
+            crate::live_slice::wait_idle();
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn assert_hinge_size(ev: &Evaluated, expected_layers: u32, expected_eye: f64, phase: &str) {
+        let makepad_csg_mech::JointGeom::Hinge { s0, s1, t_plate, c_z, .. } = &ev.mech[0].plan.joints[0] else {
+            panic!("{phase}: expected the calibrated hinge");
+        };
+        let thickness = s1 - s0;
+        let eye = thickness - 2.0 * (t_plate + c_z);
+        assert!((eye - expected_eye).abs() < 1e-6 && (thickness / ev.profile.layer - f64::from(expected_layers)).abs() < 1e-5,
+            "{phase}: thickness {thickness:.2} mm, plates {t_plate:.2} mm, axial gap {c_z:.2} mm, eye {eye:.2} mm, layer height {:.2} mm", ev.profile.layer);
+    }
+
+    fn phase_1_saved_plate(f: &mut CalibrationFleet) {
+        let model = fab_model::FabModel::with_script("hinge", "hinge.cad.splash", COMPACT_HINGE);
+        let path = f.dir.join("hinge.fab.splash");
+        fab_model::project::save(&model, &path).unwrap();
+        let open = f.open(path);
+        assert!(open.ok, "Phase 1: saved hinge opens: {}", open.text);
+        f.settle();
+        assert!(f.app.state.print.errors_text().is_none(), "Phase 1: compact hinge has no baseline printability error: {:?}", f.app.state.print.errors_text());
+        let app = &mut f.app;
+        let gen = app.printing.gen;
+        let before = app.plate.clone().unwrap();
+        assert_hinge_size(&before, 13, 1.00, "Phase 1 default geometry");
+        let slice = app.printing.last.clone().unwrap();
+        let revisions = crate::live_slice::revisions();
+        assert_eq!(gen, 1, "Phase 1: the first open creates one slice");
+        assert!(app.state.print.can_send(), "Phase 1: first open settles");
+        let original_parts: Vec<_> = before.plate.parts.iter().map(|p| (&p.object, &p.name)).collect();
+        let id = app.host.as_mut().unwrap().reload();
+        let reload = f.deliver(|d| d.id == id);
+        assert!(reload.ok, "Phase 1: saved hinge reloads: {}", reload.text);
+        let after = f.app.plate.as_ref().unwrap();
+        assert_eq!((after.content, crate::live_slice::plate_id(after)), (before.content, crate::live_slice::plate_id(&before)), "Phase 1: disk rebuild preserves printable geometry: profiles {:?} -> {:?}, parts {:?} -> {:?}, mapping equal {}", before.profile, after.profile, original_parts,
+            after.plate.parts.iter().map(|p| (&p.object, &p.name)).collect::<Vec<_>>(), before.mapped == after.mapped);
+        assert_eq!(f.app.printing.gen, gen, "Phase 1: identical disk rebuild starts zero slices");
+        assert!(f.app.state.print.can_send() && Arc::ptr_eq(f.app.printing.last.as_ref().unwrap(), &slice), "Phase 1: the settled package remains usable");
+        assert_eq!(crate::live_slice::revisions(), revisions, "Phase 1: no-op rebuild leaves the engine revisions unchanged");
+        f.app.push_print_setup();
+        assert!(f.take_setup().ok, "Phase 1: no-op setup completes");
+        assert_eq!(f.app.printing.gen, gen, "Phase 1: no-op setup starts zero slices");
+        assert!(f.app.state.print.can_send(), "Phase 1: no-op setup preserves the settled plate");
+    }
+
+    fn phase_2_hinge_clearance(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        let old = f.app.plate.clone().unwrap();
+        assert_eq!(old.profile.measured.c_xy, None, "Phase 2: hinge starts with default radial clearance");
+        let old_slice = f.app.printing.last.clone().unwrap();
+        let start = f.card();
+        let attempts = f.app.printing.last_attempt;
+        let gen = f.app.printing.gen;
+        f.save("P", Step::Clearance, 5);
+        f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+        f.resolve();
+        f.check_hold(&start, attempts, gen, UPDATING_CALIBRATION_PLATE);
+        assert!(f.take_setup().ok, "Phase 2: hinge rebuild completes");
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_eq!(ev.profile.measured.c_xy, Some(0.30), "Phase 2: rebuilt hinge uses the measured radial clearance");
+        assert_ne!(ev.content, old.content, "Phase 2: post-joint node keys distinguish the new hinge");
+        assert_ne!(crate::live_slice::plate_id(ev), crate::live_slice::plate_id(&old), "Phase 2: changed geometry changes the plate id");
+        assert_eq!(f.app.printing.last_attempt, attempts, "Phase 2: changed geometry drops the held start and export waits for the new slice");
+        assert!(f.app.state.print.sending.is_empty() && f.app.printing.gen > gen && f.app.printing.export_waits, "Phase 2: Export waits for the new generation and Start stays held back");
+        assert_eq!(f.app.state.print.print_blocked.get(&f.app.state.print.links.picked), Some(STALE_PREVIEW), "Phase 2: old preview is refused");
+        let new = f.receive_slice();
+        assert_ne!(new.preview.id, old_slice.preview.id, "Phase 2: replacement preview has a new id");
+        assert_ne!(new.settled.gcode.text().unwrap(), old_slice.settled.gcode.text().unwrap(), "Phase 2: joint clearance changes the sliced hinge");
+        f.exported(&new);
+        f.app.sync_confirm_card();
+        assert!(f.app.state.print.send_blocked.is_none(), "Phase 2: replacement slice enables Start print");
+        f.press(start);
+        assert!(f.app.state.print.sending.is_empty() && f.app.printing.packaging.is_empty(), "Phase 2: a press carrying the old hinge preview cannot package");
+        let start = f.card();
+        f.press(start);
+        assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &new)), "Phase 2: the fresh Start packages the new hinge");
+        f.cancel_printer();
+    }
+
+    fn phase_3_hinge_failure_and_recovery(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        assert!(f.app.state.print.can_send(), "Phase 3: Phase 2's settled hinge is ready");
+        let start = f.card();
+        let gen = f.app.printing.gen;
+        let attempt = f.app.printing.last_attempt;
+        let before = f.app.plate.clone().unwrap();
+        let old_slice = f.app.printing.last.clone().unwrap();
+        assert_eq!(before.profile.measured.c_z_layers, None, "Phase 3: baseline hinge uses the default Z gap");
+        f.save("P", Step::ZGap, 4);
+        f.check_hold(&start, attempt, gen, LOADING_CALIBRATION);
+        f.resolve();
+        assert!(f.app.state.print.calibration_plate_pending, "Phase 3: Z gap must reach the model worker before releasing held operations");
+        let d = f.take_setup();
+        f.app.sync_confirm_card();
+        assert!(!d.ok && d.update.is_none() && d.print_setup_seq == Some(f.app.printing.print_setup_seq()), "Phase 3: the active rebuild failed without replacing the plate");
+        let Some(crate::model_host::PrintSetupFailure::Eval(raw)) = &d.print_setup_failure else {
+            panic!("expected typed hinge failure, got {:?}: {}", d.print_setup_failure, d.text);
+        };
+        assert_eq!((&*raw.id, &*raw.op), ("h", "joint"), "Phase 3: the model worker identifies the failed joint");
+        assert!(raw.message.contains("2.60 mm along the pin leaves an eye of 0.20 mm (plates 0.40, gaps 0.80)"), "Phase 3: the four-layer gap leaves a 0.20 mm eye: {}", raw.message);
+        let recorded = f.app.printing.profile_rebuild_error.as_ref().expect("the app retains the typed failure");
+        assert_eq!(recorded.kind, RebuildFailureKind::Joint { parts: vec!["Probe pa".into(), "Probe pb".into()], kind: Some("hinge"), id: "h".into(),
+            reason: raw.message.lines().next().unwrap().trim().into() }, "Phase 3: typed failure identifies the affected printed part");
+        assert_eq!(recorded.source, raw.clone(), "Phase 3: typed failure retains the evaluator diagnostic");
+        assert_eq!(recorded.measured.c_z_layers, Some(4), "Phase 3: the typed failure retains the four-layer gap");
+        assert!((recorded.layer - 0.20).abs() < 1e-6, "Phase 3: the diagnostic uses the active layer height");
+        let state = &f.app.state.print;
+        let err = state.calibration_error.as_ref().expect("the person can see why the rebuild failed");
+        assert!(err.contains("Z gap 4 layers") && err.contains("0.80 mm") && !err.contains('\n'), "Phase 3: the diagnostic includes the axial gap on a single line");
+        assert_eq!(state.send_blocked.as_ref(), Some(err), "Phase 3: the confirm card explains the failed rebuild");
+        assert!(panel::confirm_question(state, state.target_printer().unwrap(), false).0.contains("failed to rebuild for this calibration"), "Phase 3: the question explains the failed rebuild");
+        let status = panel::slice_status(state).0;
+        assert!(status.starts_with("Export failed — calibration rebuild failed:") && status.contains("Probe pa") && status.contains("Z gap 4 layers"), "Phase 3: {status}");
+        assert!(panel::export_line(state).is_some_and(|(s, error)| error && s.starts_with("Export failed:") && s.contains("Probe pb") && s.contains("Z gap 4 layers")), "Phase 3: Export shows the affected part and gap");
+        let blocked = |app: &crate::App| {
+            assert_eq!(app.printing.gen, gen, "Phase 3: a failed profile may never slice the old hinge");
+            assert_eq!(app.printing.last_attempt, attempt, "Phase 3: a failed profile may never package the old hinge");
+            let p = &app.state.print;
+            assert!(p.sending.is_empty() && !p.can_send() && p.calibration_error.is_some() && !p.calibration_plate_pending, "Phase 3: failed geometry blocks admission with no work in flight");
+            assert!(matches!(p.status, SliceStatus::Failed(_)) && matches!(p.export, ExportStatus::Failed(_)), "Phase 3: slice and export retain the failure");
+        };
+        blocked(&f.app);
+        f.app.slice_view_follow(&mut f.fleet.runtime.cx);
+        blocked(&f.app);
+        for action in [PrintAction::Export, PrintAction::Slice, PrintAction::AskPrint(true), start] {
+            f.press(action);
+            blocked(&f.app);
+        }
+        f.app.request_reslice();
+        blocked(&f.app);
+        f.app.printing.live_input(&mut f.app.state.print, f.app.plate.as_ref(), Arc::from([]), None);
+        blocked(&f.app);
+        f.app.printing.confirm_slice(&mut f.app.state.print, f.app.plate.as_ref());
+        blocked(&f.app);
+        f.press(PrintAction::SetPlate("High Temp Plate".into()));
+        let retry = f.take_setup();
+        assert!(!retry.ok && retry.update.is_none(), "Phase 3: retry must rebuild even though its profile already matches");
+        assert!(matches!(&retry.print_setup_failure, Some(crate::model_host::PrintSetupFailure::Eval(e)) if e.id == "h" && e.op == "joint"), "Phase 3: the retry preserves the typed joint failure");
+        f.save("P", Step::Flow, 1);
+        f.resolve();
+        assert!(f.app.state.print.calibration_error.is_some() && !f.app.state.print.calibration_plate_pending, "Phase 3: Flow alone cannot repair hinge geometry");
+        assert_eq!(f.app.printing.gen, gen, "Phase 3: a Flow-only write starts no slice");
+
+        f.save("P", Step::ZGap, 1);
+        f.resolve();
+        f.app.handle_actions(&mut f.fleet.runtime.cx, &[Box::new(crate::model_host::HostAction::Done(Box::new(copy_done(&retry))))]);
+        assert!(f.app.state.print.calibration_error.is_none() && f.app.state.print.calibration_plate_pending, "Phase 3: an older failed completion cannot poison the corrected gap");
+        let corrected_setup = f.take_setup();
+        assert!(corrected_setup.ok, "Phase 3: one gap layer rebuilds the hinge: {}", corrected_setup.text);
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_hinge_size(ev, 13, 1.40, "Phase 3 corrected Z gap");
+        assert_eq!(ev.profile.measured.c_z_layers, Some(1), "Phase 3: the corrected profile uses one layer");
+        assert_ne!(ev.content, before.content, "Phase 3: the corrected gap changes the geometry");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: correcting the gap releases the typed failure");
+        let corrected = f.fresh_export();
+        assert_ne!(old_slice.settled.gcode.text().unwrap(), corrected.settled.gcode.text().unwrap(), "Phase 3: the corrected eye changes the exported G-code");
+        let assert_recovered = |f: &CalibrationFleet| {
+            let p = &f.app.state.print;
+            assert!(p.calibration_error.is_none() && !p.calibration_plate_pending && f.app.printing.profile_rebuild_error.is_none()
+                && f.app.printing.plate_gate(p, f.app.plate.as_ref().unwrap()).is_none(), "Phase 3: the rebuilt plate is ready");
+        };
+        let fail_again = |f: &mut CalibrationFleet| {
+            f.save("P", Step::ZGap, 4);
+            f.resolve();
+            assert!(!f.take_setup().ok && f.app.state.print.calibration_error.is_some(), "Phase 3: four gap layers fail on the thin hinge");
+        };
+        fail_again(f);
+        f.clear(Step::ZGap);
+        assert!(f.take_setup().ok && f.app.plate.as_ref().unwrap().profile.measured.c_z_layers.is_none(), "Phase 3: clearing the gap restores defaults");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: clearing the gap releases the typed failure");
+        assert_recovered(f);
+
+        // Recovery D: retarget to Q while P's four-layer gap fails on the 2.6 mm hinge.
+        fail_again(f);
+        let owner = EditOwner::new(PrinterScope::Target, &f.app.state.print);
+        f.press(PrintAction::LinkPrinter(owner, PrinterChoice::Real("Q".into())));
+        assert!(f.app.state.print.calibration_pending && f.app.state.print.calibration_error.is_none(), "Phase 3: Q starts with its own calibration");
+        f.resolve();
+        let q_setup = f.take_setup();
+        assert!(q_setup.ok && f.app.plate.as_ref().unwrap().profile.measured == Default::default(), "Phase 3: Q builds with its own default profile: {}", q_setup.text);
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: retarget releases P's failed calibration");
+        assert_recovered(f);
+        f.press(PrintAction::Export);
+        assert!(f.app.printing.slice_gen.is_some(), "Phase 3: Q can start exporting its recovered plate");
+        f.app.printing.stop_slice(&mut f.app.state.print);
+
+        // Returning to P reproduces P's persisted four-layer gap failure without rebuilding a throwaway baseline.
+        let owner = EditOwner::new(PrinterScope::Target, &f.app.state.print);
+        f.press(PrintAction::LinkPrinter(owner, PrinterChoice::Real("P".into())));
+        f.resolve();
+        assert!(!f.take_setup().ok && f.app.state.print.calibration_error.is_some(), "Phase 3: returning to P reproduces its four-layer failure");
+
+        // Recovery C: editing the model to 3.2 mm recovers under P's four-layer gap.
+        let id = f.app.host.as_mut().unwrap().set_source("hinge.cad.splash".into(), COMPACT_HINGE.replace("2.6mm", "3.2mm").replace("1.3mm", "1.6mm"));
+        let thick = f.deliver(|d| d.id == id);
+        assert!(thick.ok && f.app.plate.as_ref().unwrap().profile.measured.c_z_layers == Some(4), "Phase 3: a thicker part builds at four layers: {}", thick.text);
+        assert_hinge_size(f.app.plate.as_ref().unwrap(), 16, 0.80, "Phase 3 thicker edit");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: editing the model recovers without changing calibration");
+        assert_recovered(f);
+
+        // Plate switch under P's four-layer gap: beta builds cleanly and stays on the bed when reopening the 2.6 mm hinge fails.
+        let beta = f.dir.join("beta.cad.splash");
+        std::fs::write(&beta, "use mod.fab.*\nobject(mod.model.box({size: [1.2mm 0.2mm 1.2mm]}))").unwrap();
+        assert!(f.open(beta).ok && f.app.state.print.calibration_error.is_none(), "Phase 3: another plate builds under the failed hinge's calibration");
+        let path = f.dir.join("hinge.fab.splash");
+        assert!(!f.open(path).ok, "Phase 3: opening the thin hinge at four layers refuses its old geometry");
+    }
+
+    fn phase_4_navigation_and_box(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        while f.fleet.events.try_recv().is_ok() {}
+        for step in [Step::Clearance, Step::ZGap, Step::Flow] {
+            f.app.printing.clear_calibration(&mut f.app.state.print, step);
+        }
+        f.resolve();
+        f.press(PrintAction::SetPlate("Textured PEI Plate".into()));
+        f.settle();
+        let seq = f.app.printing.calibration_seq;
+        let original = f.app.printing.check_setup(&f.app.state.print);
+        for shown in [Some(PrinterChoice::Real("Q".into())), None] {
+            f.press(PrintAction::ShowPrinter(shown));
+            let p = f.app.state.print.links.picked.clone();
+            fab::print::follow::reported(&mut f.app.state.print, &p, 5.0);
+            let app = &mut f.app;
+            assert!(!app.printing.sync_calibration(&mut app.state.print), "Phase 4: an unchanged target report requires no resolution");
+            assert_eq!(app.printing.calibration_seq, seq, "Phase 4: navigation and reports never queue a calibration read");
+            let current = app.printing.check_setup(&app.state.print);
+            assert_eq!(current.calibration_owner(), Some(&owner("P")), "Phase 4: the target owns the calibration");
+            assert_eq!(app.state.print.calibrate.owner_id.as_deref(), Some("printer:P"), "Phase 4: the calibration panel stays on the target");
+            assert_eq!(current.id(), original.id(), "Phase 4: showing another printer preserves the settled setup");
+            assert!(Arc::ptr_eq(&current.calibration, &original.calibration), "Phase 4: the immutable snapshot is retained");
+        }
+        let start = f.card();
+        let id = f.app.printing.check_setup(&f.app.state.print).id();
+        let seq = f.app.printing.calibration_seq;
+        let original_gen = f.app.printing.gen;
+        let original_slice = f.app.printing.last.clone().unwrap();
+        f.save("Q", fab_calibrate::Step::Flow, 1);
+        assert!(!f.app.state.print.calibration_pending && f.app.state.print.can_send(), "Phase 4: Q's save leaves P ready immediately");
+        f.press(PrintAction::AskPrint(true));
+        assert_eq!(f.app.printing.send_blocked(&f.app.state.print), None, "Phase 4: Q's queued write leaves P's card ready");
+        f.press(PrintAction::Export);
+        f.exported(&original_slice);
+        f.press(start);
+        assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &original_slice)),
+            "Phase 4: P starts the reviewed package while Q's write is queued");
+        f.cancel_printer();
+        f.resolve();
+        let (_, filament) = f.app.printing.check_setup(&f.app.state.print).calibration_names();
+        assert_eq!(fab_calibrate::Results::load_owner_in(&f.dirs.calibration, &owner("Q").id, &filament).get(fab_calibrate::results::names::FLOW_RATIO), Some(0.90), "Phase 4: Q owns its flow answer");
+        assert_eq!(f.app.printing.gen, original_gen, "Phase 4: P's slice stays settled through Q's write");
+        let start = f.card();
+        assert_eq!(f.app.printing.calibration_seq, seq, "Phase 4: Q's save never resolves P again");
+        assert_eq!(f.app.printing.check_setup(&f.app.state.print).id(), id, "Phase 4: Q's flow leaves P's slice key unchanged");
+        let attempts = f.app.printing.last_attempt;
+        let gen = f.app.printing.gen;
+        let sliced = f.app.printing.last.as_ref().unwrap().clone();
+        let plate_id = crate::live_slice::plate_id(f.app.plate.as_ref().unwrap());
+        f.save("P", fab_calibrate::Step::Clearance, 5);
+        f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+        f.resolve();
+        f.check_hold(&start, attempts, gen, UPDATING_CALIBRATION_PLATE);
+        let done = f.take_setup();
+        assert!(done.ok, "Phase 4: the box rebuilds: {}", done.text);
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_eq!(ev.profile.measured.c_xy, Some(0.3), "Phase 4: box is rebuilt under P's clearance");
+        assert_eq!(crate::live_slice::plate_id(ev), plate_id, "Phase 4: fixed box geometry is unchanged");
+        assert_eq!(f.app.printing.gen, gen, "Phase 4: fixed box reuses the Normal mode slice");
+        assert!(f.app.state.print.can_send() && !f.app.state.print.calibration_plate_pending, "Phase 4: matching rebuild releases the card");
+        assert_eq!(f.app.state.print.sending.len(), 1, "Phase 4: the held start resumes exactly once");
+        let packages = &f.app.printing.packaging;
+        assert!(packages.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &sliced)), "Phase 4: Start uses the settled box");
+        assert!(packages.iter().any(|p| matches!(p.to, PackageFor::File(_)) && Arc::ptr_eq(&p.sliced, &sliced)), "Phase 4: Export uses the settled box");
+        use fab_calibrate::Answer;
+        f.cancel_printer();
+        for (step, target) in [(Step::Flow, Some(owner("P"))), (Step::PressureAdvance, None)] {
+            let setup = f.app.printing.check_setup(&f.app.state.print);
+            let before = setup.id();
+            let (preset, filament) = setup.calibration_names();
+            let coupon = Arc::new(fab_calibrate::make(step, &setup.coupon_setup()).unwrap());
+            let n = 2;
+            let start = f.card();
+            let attempts = f.app.printing.last_attempt;
+            let gen = f.app.printing.gen;
+            if target.is_none() {
+                f.app.printing.save_calibration(&mut f.app.state.print, None, "Unrelated preset".into(), filament.clone(),
+                    coupon.clone(), Answer::Number(n), "2026-01-01".into());
+                assert!(!f.app.state.print.calibration_pending && f.app.state.print.can_send(), "Phase 4: unrelated preset leaves P usable");
+                f.resolve();
+                assert_eq!(f.app.printing.check_setup(&f.app.state.print).id(), before, "Phase 4: the unrelated preset preserves the key");
+            }
+            f.app.printing.save_calibration(&mut f.app.state.print, target, preset, filament, coupon.clone(), Answer::Number(n), "2026-01-01".into());
+            f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+            f.resolve();
+            assert_ne!(f.app.printing.check_setup(&f.app.state.print).id(), before, "Phase 4: a changed slicer value changes the input key for {step:?}");
+            assert_eq!(f.app.printing.last_attempt, attempts, "Phase 4: the old package is rejected before {step:?} reslices");
+            assert!(f.app.state.print.sending.is_empty() && f.app.state.print.confirm_print.is_some(), "Phase 4: the superseded Start leaves its confirm card open");
+            let p = &f.app.state.print.links.picked;
+            assert_eq!(f.app.state.print.print_blocked.get(p), Some(STALE_PREVIEW), "Phase 4: the changed settings require a fresh Start press");
+            assert!(f.app.printing.gen > gen && f.app.printing.export_waits, "Phase 4: Export waits for the new calibrated slice");
+            let new = f.receive_slice();
+            let path = f.exported(&new);
+            let mut file = std::fs::File::open(path).unwrap();
+            let zip = makepad_zip_file::zip_read_central_directory(&mut file).unwrap();
+            let entry = zip.file_headers.iter().find(|e| e.file_name == "Metadata/project_settings.config").unwrap().extract(&mut file).unwrap();
+            let config = makepad_strict_json::parse(&entry).unwrap();
+            let (key, expected) = match step {
+                Step::Flow => ("filament_flow_ratio", format!("{:.3}", coupon.variant(n).unwrap().value)),
+                _ => ("pressure_advance", format!("{:.4}", coupon.variant(n).unwrap().value)),
+            };
+            assert_eq!(config.get(key).and_then(|v| v.as_arr()).and_then(|a| a.first()).and_then(|v| v.as_str()), Some(expected.as_str()), "Phase 4: the exported package uses the resolved {key}");
+            if step == Step::Flow {
+                f.app.sync_confirm_card();
+                assert!(f.app.state.print.send_blocked.is_none(), "Phase 4: the new flow preview is ready to start");
+                let new_start = f.card();
+                f.press(new_start);
+                assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &new)), "Phase 4: Start packages the new flow slice");
+                f.cancel_printer();
+            }
+        }
+    }
+
+    fn phase_5_machine_failures(f: &mut CalibrationFleet) {
+        use crate::model_host::{reason, PrintSetupFailure};
+        f.press(PrintAction::AskPrint(false));
+        f.clear(fab_calibrate::Step::Clearance);
+        assert!(f.take_setup().ok, "Phase 5: clear the box clearance before checking machine failures");
+        let ev = f.app.plate.clone().unwrap();
+        assert_eq!(ev.profile.measured, Default::default(), "Phase 5: the box uses default mechanics");
+        let imports = f.dir.join("fixture_home/presets");
+        let machines = imports.join("machine");
+        let filaments = imports.join("filament");
+        std::fs::create_dir_all(&machines).unwrap();
+        std::fs::create_dir_all(&filaments).unwrap();
+        let base = virtual_printer::presets().remove(0);
+        let long = format!("192.0.2.7-{}", "x".repeat(100));
+        let cases = [
+            ("Home Lab Printer", "home_lab.json", None),
+            ("Workshop Short", "workshop_short.json", Some("192.0.2.7")),
+            ("Workshop Long", "workshop_long.json", Some(long.as_str())),
+        ];
+        let write_machine = |name: &str, filename: &str, slot: Option<&str>| {
+            let slots = slot.map(|raw| format!(r#","fab_material_slots":["1:A1","{raw}"]"#)).unwrap_or_default();
+            std::fs::write(machines.join(filename), format!(r#"{{"type":"machine","name":"{name}","inherits":"{}"{slots}}}"#, base.machine_preset_name())).unwrap();
+        };
+        for (name, file, slot) in cases { write_machine(name, file, slot); }
+        write_machine("Live Preset", "live_preset.json", None);
+        std::fs::write(filaments.join("pla.json"), format!(r#"{{"type":"filament","name":"Fab PLA","inherits":"{}"}}"#, virtual_printer::filament_preset("PLA"))).unwrap();
+        f.app.printing.catalog = Some(Arc::new(catalog_in(&[], &imports, std::slice::from_ref(&base)).unwrap()));
+        std::fs::remove_file(machines.join("home_lab.json")).unwrap();
+        let snapshot = f.app.state.print.target_printer().unwrap().clone();
+        for (name, filename, slot) in cases {
+            let file = machines.join(filename);
+            f.app.state.print.settings.use_installed = true;
+            f.app.state.print.settings.machine = name.to_owned();
+            f.app.printing.sync_calibration(&mut f.app.state.print);
+            f.resolve();
+            let setup = f.app.printing.check_setup(&f.app.state.print);
+            let err = setup.machine_typed().expect_err("invalid installed machine must have a typed reason");
+            let expected = if let Some(raw) = slot {
+                assert!(matches!(&err, MachineError::InvalidMaterialSlots { preset, slot_index: Some(2), raw_entry: Some(value), .. } if preset == name && value == raw), "Phase 5: {err:?}");
+                format!("the printer preset `{name}` has an invalid `fab_material_slots` entry")
+            } else {
+                assert!(matches!(&err, MachineError::ResolvePreset { preset, detail } if preset == name && detail.contains(file.to_str().unwrap())), "Phase 5: {err:?}");
+                format!("could not read the printer preset `{name}`")
+            };
+            f.app.push_print_setup();
+            let d = f.take_setup();
+            assert!(matches!(&d.print_setup_failure, Some(PrintSetupFailure::Machine(e)) if e == &err), "Phase 5: worker preserves typed machine error");
+            let state = &f.app.state.print;
+            assert!(state.calibration_error.is_none() && !state.calibration_plate_pending && !state.can_send(), "Phase 5: machine failure appears on the printer's slice status");
+            for local in [err.local_message(), panel::slice_status(state).0, panel::confirm_question(state, &snapshot, false).0] {
+                assert!(local.contains(name) && !local.contains('\n'), "Phase 5: the local reason names its preset on one line: {local}");
+                if slot.is_none() { assert!(local.contains(file.to_str().unwrap()), "Phase 5: the local reason identifies the missing file: {local}"); }
+                else {
+                    assert!(local.contains("entry 2") && local.contains("192.0.2.7"), "Phase 5: the local reason identifies the failing slot: {local}");
+                    if slot == Some(&*long) { assert!(local.contains('…') && !local.contains(&"x".repeat(80)), "Phase 5: clip only the long slot: {local}"); }
+                }
+            }
+            f.app.printing.check_slice(31, state, &ev);
+            let PrintEvent::Checked { error: Some(checked), .. } = f.fleet.next(|e| matches!(e, PrintEvent::Checked { id: 31, .. })) else { panic!("checked error") };
+            let external = f.app.printing.external_slice_error(state).unwrap();
+            let read = makepad_strict_json::parse(br#"{"action":"read"}"#).unwrap();
+            let test_print = f.app.test_print_answer(&mut f.fleet.runtime.cx, &read);
+            let node = makepad_script::syntax::parse_value(&test_print.text).unwrap();
+            let read_error = node.field("error").unwrap().value.string().unwrap();
+            for (exit, result) in [
+                ("host completion", reason(&d.text)), ("check", checked), ("slice", external),
+                ("test_print read", read_error.into()), ("model job", setup.model_job(&ev).err().unwrap()),
+                ("job setup", setup.job_setup_of(&ev.plate, &ev.machine, None).err().unwrap()),
+            ] {
+                assert_eq!(result, expected, "Phase 5: {exit} carries the failing step and preset");
+            }
+            for text in std::iter::once(&*test_print.text).chain(f.app.state.ui.notices.iter().map(|n| n.text.as_str())) {
+                assert!(!["fixture_home", "home_lab.json", "192.0.2.7", "xxxx"].iter().any(|v| text.contains(v)), "Phase 5: private machine details in outbound context");
+            }
+        }
+        // The preset can disappear between the worker resolving calibration and rebuilding
+        // the plate. Exercise the failure with a settled preview already on the card.
+        let name = "Live Preset";
+        let file = machines.join("live_preset.json");
+        f.app.state.print.settings.machine = name.into();
+        f.app.state.print.settings.process = virtual_printer::PROCESS.into();
+        f.app.printing.load_base_values(&mut f.app.state.print);
+        // Apply the installed profile's tray mapping before capturing the coupon's filament.
+        f.app.remap();
+        f.app.printing.sync_calibration(&mut f.app.state.print);
+        f.settle();
+        let start = f.card();
+        let (gen, attempts) = (f.app.printing.gen, f.app.printing.last_attempt);
+        f.save("P", fab_calibrate::Step::Clearance, 5);
+        std::fs::remove_file(&file).unwrap();
+        f.resolve();
+        assert!(f.app.state.print.calibration_plate_pending, "Phase 5: the plate awaits its new clearance");
+        let failed = f.take_setup();
+        assert!(matches!(failed.print_setup_failure, Some(PrintSetupFailure::Machine(_))), "Phase 5: the worker reports a typed machine failure");
+        for action in [PrintAction::Slice, PrintAction::Export, PrintAction::AskPrint(true), start] {
+            f.press(action);
+            let state = &f.app.state.print;
+            assert!(!state.calibration_plate_pending && state.calibration_error.is_none() && !state.can_send(), "Phase 5: the invalid machine blocks the old plate");
+            assert_eq!((f.app.printing.gen, f.app.printing.last_attempt), (gen, attempts), "Phase 5: machine failure must never slice or package old geometry");
+        }
+        std::fs::write(&file, format!(r#"{{"type":"machine","name":"{name}","inherits":"{}"}}"#, base.machine_preset_name())).unwrap();
+        f.app.printing.load_base_values(&mut f.app.state.print);
+        f.app.remap();
+        f.resolve();
+        f.app.push_print_setup();
+        f.app.printing.sync_calibration_plate(&mut f.app.state.print, f.app.plate.as_deref(), true);
+        assert!(f.app.printing.machine_error().is_none() && f.app.state.print.calibration_plate_pending, "Phase 5: restored machine resumes the mismatched plate: error {:?}, phase one {}, plate {:?}, effective {:?}, settings {:?}", f.app.printing.machine_error(), f.app.state.print.calibration_pending, f.app.plate.as_ref().map(|p| &p.profile.measured), f.app.printing.check_setup(&f.app.state.print).mech_measured(), f.app.state.print.settings.machine);
+        assert!(f.take_setup().ok, "Phase 5: restored machine can rebuild the new clearance");
+        assert_eq!(f.app.plate.as_ref().unwrap().profile.measured.c_xy, Some(0.30), "Phase 5: restoring the machine applies the new clearance");
+    }
+
+    fn fleet_plate(printing: &Printing) -> Evaluated {
+        // One mesh layer in the plate's first colour is enough to map and settle a print.
+        let model = fab_model::FabModel::with_script("cube", "cube.cad.splash",
+            "use mod.fab.*\nobject(mod.model.box({size: [1.2mm 0.2mm 1.2mm]}))");
+        let mut evaluator = fab_model::eval::Evaluator::new(printing.machine().unwrap().clone());
+        model.evaluate(&mut evaluator, None).unwrap().1
+    }
+
+    fn poll_fleet(printing: &mut Printing, state: &mut PrintState, plate: &mut Evaluated) -> Polled {
+        let polled = printing.poll_printer(state);
+        if polled.target {
+            state.bump();
+            remap(printing, state, plate);
+            crate::live_slice::set_print_setup(printing.check_setup(state));
+        }
+        polled
+    }
+
+    struct FleetRuntime {
+        runtime: super::slice_bench::SliceRuntime,
+        events: std::sync::mpsc::Receiver<PrintEvent>,
+    }
+
+    impl FleetRuntime {
+        fn next(&mut self, wanted: impl Fn(&PrintEvent) -> bool) -> PrintEvent {
+            loop {
+                while let Ok(event) = self.events.try_recv() {
+                    if wanted(&event) { return event; }
+                }
+                self.runtime.turn();
+            }
+        }
+
+        fn settle(&mut self, printing: &mut Printing, state: &mut PrintState, plate: &Evaluated) {
+            printing.slice(state, Some(&Arc::new(plate.clone())));
+            assert!(printing.slice_job.is_some(), "the mapped plate must reach the slicer: {:?}, gate {:?}", state.status, printing.plate_gate(state, plate));
+            while printing.slice_gen.is_some() && !state.settled {
+                while let Ok(event) = self.events.try_recv() {
+                    if matches!(event, PrintEvent::Sliced { .. }) { printing.event(state, &event); }
+                }
+                if !state.settled && !printing.reconcile(state) { self.runtime.turn(); }
+            }
+            assert!(state.settled && matches!(state.status, SliceStatus::Done { .. }), "the plate must have a settled slice: {:?}", state.status);
+            crate::live_slice::wait_idle();
+            let (input, served) = crate::live_slice::revisions().unwrap();
+            assert_eq!(served, input, "the settled input must be the served one once the engine rests");
+        }
+    }
+
+    fn settle_fleet_plate(printing: &mut Printing, state: &mut PrintState, plate: &Evaluated) -> FleetRuntime {
+        crate::live_slice::init_for_tests();
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut runtime = super::slice_bench::SliceRuntime::with_events(move |event| {
+            if let Event::Actions(actions) = event {
+                for action in actions {
+                    if let Some(event @ (PrintEvent::TargetModelChanged | PrintEvent::Sliced { .. } | PrintEvent::Packaged { .. } |
+                        PrintEvent::JobChecked { .. } | PrintEvent::JobFilesRemoved(_) | PrintEvent::JobPreview { .. })) = action.downcast_ref::<PrintEvent>() {
+                        tx.send(event.clone()).unwrap();
+                    }
+                }
+            }
+        });
+        runtime.withhold_paint();
+        let mut fleet = FleetRuntime { runtime, events };
+        fleet.settle(printing, state, plate);
+        fleet
+    }
+
+    const WIDE_MACHINE: &str = "Wide bed";
+
+    fn write_wide_machine(imports: &Path, parent: &VirtualPrinter, width: u32, nozzle: f64) {
+        let machines = imports.join("machine");
+        std::fs::create_dir_all(&machines).unwrap();
+        std::fs::write(machines.join("wide.json"), format!(
+            r#"{{"type":"machine","name":"{WIDE_MACHINE}","inherits":"{}","printable_area":["0x0","{width}x0","{width}x320","0x320"],"nozzle_diameter":["{nozzle}"]}}"#,
+            parent.machine_preset_name())).unwrap();
+    }
+
+    fn check_installed_machine_selection(fleet: &mut FleetRuntime, home: &Path, parent: &VirtualPrinter) {
+        use makepad_fab_settings::profiles::SLICER_APPS;
+        let dir = home.join("selected");
+        std::fs::create_dir(&dir).unwrap();
+        let conf = dir.join(format!("{}.conf", SLICER_APPS[0]));
+        std::fs::write(&conf, format!(r#"{{"presets":{{"machine":"{WIDE_MACHINE}","process":"{}","filaments":["{}"]}}}}"#,
+            virtual_printer::PROCESS, virtual_printer::filament_preset("PLA"))).unwrap();
+        let catalog = || PrintEvent::Catalog(Some(Arc::new(catalog_in(std::slice::from_ref(&dir), &home.join("imports"), std::slice::from_ref(parent)).unwrap())));
+        let selected = catalog();
+        let model = parent.model();
+        let first = parent.machine_preset_name();
+        let report = dir.join("a.jsonl");
+        std::fs::write(&report, "@head 0 1 PLA 1969D4FF\n").unwrap();
+        let a = PrinterChoice::Real("A".into());
+        let mut printing = Printing { virtuals: Some(Default::default()), ..Default::default() };
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        state.set_configured_printers(&["A".into()]);
+        printing.install(&mut state, &a, fab_printer_link::PrinterLink::simulate_moonraker(report, &model), false);
+        printing.link_printer(&mut state, &a);
+        printing.event(&mut state, &selected);
+        assert_eq!(state.settings.machine, WIDE_MACHINE, "startup must adopt the installed machine before A identifies itself");
+        state.settled = true;
+        wait_for("A's first model report", || {
+            printing.poll_printer(&mut state);
+            state.target_printer().is_some_and(|s| s.model == model)
+        });
+        let bound = state.printers.binding(&a).unwrap().machine().unwrap();
+        assert_eq!((bound.geometry.name.as_str(), bound.diameters.as_slice()), (WIDE_MACHINE, &[0.6][..]),
+            "automatic must use the installed second preset and its 0.6 mm nozzle");
+        fleet.runtime.cx.handle_action_receiver();
+        assert!(!fleet.events.try_iter().any(|ev| matches!(ev, PrintEvent::TargetModelChanged)), "A's first report must not request a machine switch");
+        assert!(state.settled && state.settings.machine == WIDE_MACHINE, "A's first binding must preserve the settled plate and the installed selection");
+        printing.event(&mut state, &selected);
+        assert_eq!(state.settings.machine, WIDE_MACHINE, "a catalogue delivered after A's report must also keep the installed selection");
+
+        let (items, names) = panel::machine_menu(&state);
+        assert_eq!(&*names, &[first.clone(), WIDE_MACHINE.into()], "the selected second preset must keep its place in the picker");
+        let automatic = items.into_iter().find(|item| item.id == live_id!(automatic_machine)).unwrap();
+        assert_eq!((automatic.label, automatic.icon), (format!("Automatic ({WIDE_MACHINE})"), fab::ui::popover::MenuIcon::Check),
+            "the checked Automatic item must name the installed selection");
+        let owner = EditOwner::new(PrinterScope::Target, &state);
+        printing.action(&mut state, &PrintAction::SetMachine(owner.clone(), Some(first.clone())), None);
+        assert_eq!(state.settings.machine, first, "an explicit pick must override the slicer's compatible selection");
+        printing.action(&mut state, &PrintAction::SetMachine(owner, None), None);
+        assert_eq!(state.settings.machine, WIDE_MACHINE, "clearing the explicit pick must restore the slicer's selection");
+        std::fs::remove_file(conf).unwrap();
+        printing.event(&mut state, &catalog());
+        assert_eq!(state.settings.machine, first, "without a slicer selection automatic must return to the first compatible preset");
+    }
+
+    /// Continue the settled fleet case with two configured printers of A's model.
+    fn check_machine_bindings(printing: &mut Printing, state: &mut PrintState, plate: &mut Evaluated, home: &Path, parent: &VirtualPrinter) {
+        use fab_printer_link::PrinterLink;
+        use std::{fs, io::Write};
+        let imports = home.join("imports");
+        let catalog = || Arc::new(catalog_in(&[], &imports, std::slice::from_ref(parent)).unwrap());
+        let first_name = parent.machine_preset_name();
+        let (wake, _wakes) = std::sync::mpsc::sync_channel(1);
+        let pending = Arc::new(std::sync::Mutex::new(ProfileWork::default()));
+        let path = home.join("virtual_printers.txt");
+        let drain = || {
+            if let Some(saved) = pending.lock().unwrap().saved.take() { virtual_printer::save_to(&path, &saved).unwrap(); }
+        };
+        printing.profiles_worker = Some(ProfilesWorker { pending: pending.clone(), wake });
+        printing.virtuals = Some(Default::default());
+        let [a, b] = ["A", "B"].map(|n| PrinterChoice::Real(n.into()));
+        state.set_configured_printers(&["A".into(), "B".into()]);
+        printing.rebuild_virtual_choices(state);
+        let pick = |p: &mut Printing, s: &mut PrintState, id: &PrinterChoice| {
+            let owner = EditOwner::new(PrinterScope::Target, s);
+            assert!(p.action(s, &PrintAction::LinkPrinter(owner, id.clone()), None), "the target pick must apply");
+        };
+        printing.retire_link(state, &b, false);
+        let report = home.join("same-model.jsonl");
+        fs::write(&report, "@head 0 1 PLA 1969D4FF\n").unwrap();
+        printing.install(state, &b, PrinterLink::simulate_moonraker(report.clone(), &parent.model()), false);
+        wait_for("B's same-model report", || {
+            printing.poll_printer(state);
+            state.printer_of(&b).is_some_and(|s| s.state.trays().next().is_some())
+        });
+        let bound = |s: &PrintState, id: &PrinterChoice| s.printers.binding(id).unwrap().machine().unwrap().clone();
+        let first = bound(state, &a);
+        assert_eq!(first.geometry.name, first_name, "automatic must use the first imported preset in case-insensitive picker order");
+        assert!(Arc::ptr_eq(&first, &bound(state, &b)), "B must expose the same automatic machine before it is targeted");
+        let before = (state.colors.clone(), state.settings.clone(), crate::live_slice::revisions(), crate::live_slice::slice_key(plate), printing.gen);
+        let old_preview = state.preview.clone().unwrap();
+        let check_plate = |label: &str, p: &Printing, s: &PrintState, plate: &Evaluated| {
+            assert_eq!((s.colors.clone(), s.settings.clone(), crate::live_slice::revisions(), crate::live_slice::slice_key(plate), p.gen),
+                before, "{label} must preserve A's mapping, materials, live revisions, slice key and generation");
+            assert!(s.settled && Arc::ptr_eq(&old_preview, s.preview.as_ref().unwrap()), "{label} must preserve A's settled preview");
+        };
+        let stale_a = EditOwner::new(PrinterScope::Target, state);
+        state.shown = Some(b.clone());
+        let edit_b = PrintAction::SetMachine(EditOwner::new(PrinterScope::Shown, state), Some(WIDE_MACHINE.into()));
+        assert!(!printing.action(state, &edit_b, None), "a pick owned by B must not request A's remap or slice");
+        check_plate("B's explicit pick", printing, state, plate);
+        let wide = bound(state, &b);
+        assert_eq!((&wide.geometry.name[..], wide.geometry.bed.max[0], &wide.diameters[..]), (WIDE_MACHINE, 380.0, &[0.6][..]), "B must publish its explicit bed and nozzle");
+        assert!(Arc::ptr_eq(&first, &bound(state, &a)), "B's explicit pick must change B alone");
+
+        let previous = state.printer_of(&b).unwrap().clone();
+        writeln!(fs::OpenOptions::new().append(true).open(&report).unwrap(),
+            r#"{{"print_stats":{{"state":"printing","filename":"b.gcode","info":{{"current_layer":3}}}}}}"#).unwrap();
+        wait_for("a new report from B", || {
+            poll_fleet(printing, state, plate);
+            !Arc::ptr_eq(&previous, state.printer_of(&b).unwrap())
+        });
+        check_plate("B's background report", printing, state, plate);
+
+        pick(printing, state, &b);
+        assert_eq!(state.settings.machine, WIDE_MACHINE, "retargeting to B must apply B's explicit preset");
+        printing.action(state, &PrintAction::SetMachine(stale_a, Some(WIDE_MACHINE.into())), None);
+        assert!(Arc::ptr_eq(&first, &bound(state, &a)) && Arc::ptr_eq(&wide, &bound(state, &b)) && printing.virtuals.as_ref().unwrap().bindings.len() == 1,
+            "a stale A menu must leave both bindings untouched after retargeting to B");
+        pick(printing, state, &a);
+        assert_eq!(state.settings.machine, first_name, "retargeting to A must restore A's automatic preset");
+
+        drain();
+        let reload = virtual_printer::load_from(&path).unwrap();
+        assert_eq!(reload.bindings, [(b.id().unwrap(), WIDE_MACHINE.to_owned())].into(), "restart must restore B's pick and keep A automatic");
+        printing.event(state, &PrintEvent::VirtualPrinters { saved: reload, catalog: printing.catalog.clone(), kept_as: None });
+        assert_eq!(bound(state, &b).geometry.name, WIDE_MACHINE, "the loaded record must bind B again");
+
+        let installed_plate = printing.catalog.as_ref().unwrap().selection.as_ref().unwrap().plate.clone();
+        pick(printing, state, &PrinterChoice::Virtual(parent.name.clone()));
+        printing.action(state, &PrintAction::SetPlate("Cool Plate".into()), None);
+        assert_eq!(state.settings.materials[0].preset, virtual_printer::filament_preset("PLA"), "the generated printer must start with its built-in PLA");
+        assert_ne!(state.settings.plate, installed_plate, "the generated printer must have its own picked plate");
+        pick(printing, state, &b);
+        assert_eq!((&state.settings.machine[..], &state.settings.materials, &state.settings.plate), (WIDE_MACHINE, &defaults_settings().materials, &installed_plate),
+            "leaving a generated printer must reset materials and plate and apply B's preset");
+
+        let owner = EditOwner::new(PrinterScope::Target, state);
+        assert!(printing.action(state, &PrintAction::SetMachine(owner.clone(), None), None)
+            && state.settings.machine == first_name, "a target Automatic pick must apply before the action returns");
+        assert!(printing.action(state, &PrintAction::SetMachine(owner, Some(WIDE_MACHINE.into())), None)
+            && state.settings.machine == WIDE_MACHINE && printing.machine().unwrap().bed.max[0] == 380.0,
+            "an explicit target pick must apply its machine before the action returns");
+        pick(printing, state, &a);
+
+        let replace = |p: &mut Printing, s: &mut PrintState| {
+            p.event(s, &PrintEvent::Catalog(Some(catalog())));
+        };
+        write_wide_machine(&imports, parent, 410, 0.8);
+        replace(printing, state);
+        assert_eq!((bound(state, &b).geometry.bed.max[0], bound(state, &b).diameters[0]), (410.0, 0.8), "catalogue replacement must resolve the same pick's new bed and nozzle");
+        fs::remove_file(imports.join("machine/wide.json")).unwrap();
+        replace(printing, state);
+        assert!(matches!(state.printers.binding(&b).unwrap().as_ref(), MachineBinding::Available { machine, explicit: Some(n), .. } if machine.geometry.name == first_name && n == WIDE_MACHINE),
+            "a missing explicit preset must keep its name and publish the automatic machine");
+        write_wide_machine(&imports, parent, 410, 0.8);
+        replace(printing, state);
+        assert_eq!(bound(state, &b).geometry.name, WIDE_MACHINE, "the returning explicit preset must take over again");
+        state.shown = Some(b.clone());
+        let automatic = PrintAction::SetMachine(EditOwner::new(PrinterScope::Shown, state), None);
+        printing.action(state, &automatic, None);
+        drain();
+        assert!(virtual_printer::load_from(&path).unwrap().bindings.is_empty() && bound(state, &b).geometry.name == first_name,
+            "Automatic must remove the record and restore the first compatible preset");
+
+        let twins = [&a, &b].map(|id| printing.make_twin(state, id, &first_name).unwrap());
+        assert_ne!(twins[0], twins[1], "twins of same-preset printers must be distinct by source");
+        for ((id, title), twin) in [(&a, "A"), (&b, "B")].into_iter().zip(twins) {
+            assert!(state.links.choices.contains(&(twin.clone(), format!("{first_name} (virtual of {title})"))), "a printer twin must name its source in the picker");
+            let record = Printing::virtual_record(printing.virtuals.as_ref().unwrap(), &twin).unwrap();
+            assert!(matches!(&record.source, VirtualSource::Twin { source, .. } if *source == id.id()), "each twin must retain its source printer");
+        }
+        let catalogue_twin = printing.make_twin(state, &PrinterChoice::None, &first_name).unwrap();
+        assert!(state.links.choices.contains(&(catalogue_twin, format!("{first_name} (virtual)"))), "a catalogue twin must keep the preset-only title");
+    }
+
+    #[test]
+    fn preview_delivery_and_target_switches_protect_the_plate() {
+        const CHILD: &str = "FAB_TEST_PREVIEW_TARGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-preview-target-{}", std::process::id()));
+            std::fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::preview_delivery_and_target_switches_protect_the_plate", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).env_remove("FAB_PRINTER_VIRTUAL").status().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "the isolated preview and target switch cases must pass");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let presets = virtual_printer::presets();
+        let catalog = Arc::new(catalog_in(&[], &home, &presets).unwrap());
+        let mut twin = catalog.twins[&presets[0].machine_preset_name()].printer.clone();
+        twin.name = "watch".into();
+        let a = PrinterChoice::Virtual(twin.name.clone());
+        let b = PrinterChoice::Real("missing".into());
+        let mut missing = twin.clone();
+        missing.name = "offline".into();
+        missing.configured_for = Some("missing".into());
+        missing.source = VirtualSource::Twin { preset: "missing preset".into(), model: twin.model(), source: None };
+        let saved = Saved { printers: vec![twin, missing], picked: a.id(), disconnected: ["missing".into()].into(), bindings: Default::default() };
+        let mut printing = Printing { virtuals: Some(Arc::new(saved.clone())), catalog: Some(catalog.clone()), ..Default::default() };
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        assert!(printing.link_printer(&mut state, &a), "A must hold its standalone twin");
+        let mut plate = fleet_plate(&printing);
+        wait_for("A's virtual tray report", || poll_fleet(&mut printing, &mut state, &mut plate).target);
+        let mut fleet = settle_fleet_plate(&mut printing, &mut state, &plate);
+        let cx = &mut fleet.runtime.cx;
+        let mut app = cx.with_vm(crate::App::script_new);
+        app.printing = printing;
+        app.state.print = state;
+        app.plate = Some(Arc::new(plate));
+        app.state.apply_core(&fab::ShellAction::SetWorkspace(fab::api::Workspace::Monitor));
+        let preview = app.state.print.preview.clone().unwrap();
+        let meta = Arc::new(JobMeta { id: "saved-job".into(), printer: a.id(), virtual_printer: true, ..Default::default() });
+        app.state.print.follow.picked = Some(meta.id.clone());
+        app.state.print.follow.jobs.push(CommittedJob { meta: meta.clone(), loading: true, state: JobState::Finished, ..Default::default() });
+        assert!(!app.slice_wanted(), "waiting for a saved job preview must not ask for the plate's slice");
+        let state = &app.state.print;
+        let rows = state.colors.rows.clone();
+        let materials = state.settings.materials.clone();
+        let unprinted = state.unprinted.clone();
+        let status = state.status.clone();
+        let revisions = crate::live_slice::revisions();
+        let key = crate::live_slice::slice_key(app.plate.as_ref().unwrap());
+        let gen = app.printing.gen;
+        assert!(!rows.is_empty() && !materials.is_empty(), "the settled plate must have a colour mapping to protect");
+        // A remap would populate this even if it happened to choose exactly the same trays.
+        app.printing.reach = None;
+        app.handle_actions(cx, &[Box::new(PrintEvent::JobPreview { id: meta.id.clone(), result: Ok(preview.clone()) })]);
+        assert!(app.printing.reach.is_none(), "a saved job preview must never remap the target plate");
+        let state = &app.state.print;
+        assert!(state.monitor_preview().is_some_and(|p| Arc::ptr_eq(p, &preview)), "Monitor must display the delivered preview");
+        assert_eq!(state.colors.rows, rows, "preview delivery must preserve mapping rows and positions");
+        assert_eq!(state.settings.materials, materials, "preview delivery must preserve plate materials");
+        assert_eq!(state.unprinted, unprinted, "preview delivery must preserve unprinted colours");
+        assert_eq!(crate::live_slice::revisions(), revisions, "preview delivery must preserve both live revisions");
+        assert_eq!(crate::live_slice::slice_key(app.plate.as_ref().unwrap()), key, "preview delivery must preserve the plate and settings key");
+        assert_eq!(app.printing.gen, gen, "preview delivery must preserve the slice generation");
+        assert_eq!(state.status, status, "preview delivery must preserve the slice status");
+        assert!(state.settled && app.printing.slice_job.is_none() && app.printing.live_job.is_none(), "the plate must stay settled with no slice or live job");
+
+        for catalogue in [false, true] {
+            let path = if catalogue { "catalogue removal" } else { "missing-preset pick" };
+            let state = &mut app.state.print;
+            if catalogue {
+                let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, state), a.clone());
+                assert!(app.printing.action(state, &pick_action, None), "A must be picked again before catalogue removal");
+            }
+            app.printing.slice(state, app.plate.as_ref());
+            let old = app.printing.slice_gen.expect("A's slice must be in flight");
+            // Let the engine finish, keeping its result out of the editor until the switch.
+            let answer = fleet.next(|ev| matches!(ev, PrintEvent::Sliced { gen, .. } if *gen == old));
+            crate::live_slice::wait_idle();
+            let revision = crate::live_slice::revisions().unwrap().0;
+            if catalogue {
+                assert_eq!(app.printing.event(state, &PrintEvent::Catalog(None)), PrintOutcome::Target, "catalogue removal must refresh the setup");
+                assert_eq!(state.links.picked, PrinterChoice::None, "a vanished standalone twin must leave no printer picked");
+                assert_eq!(state.settings.machine, defaults_settings().machine, "losing A's preset must restore the default machine");
+            } else {
+                let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, state), b.clone());
+                assert!(app.printing.action(state, &pick_action, None), "an applied missing-preset pick must request the picker refresh");
+                assert_eq!(state.links.picked, b, "the unavailable configured printer must stay picked");
+            }
+            assert_eq!(app.printing.event(state, &answer), PrintOutcome::Unchanged, "{path} must reject the old target's settled slice");
+            assert!(!app.printing.live_toolpaths(state, revision), "{path} must reject the old target's live result");
+            assert!(!state.settled && app.printing.reask.is_some(), "{path} must leave the interrupted slice awaiting a fresh request");
+            app.request_reslice();
+            if catalogue {
+                // The model host would now deliver the rebuilt plate for the default bed.
+                let mut rebuilt = fleet_plate(&app.printing);
+                remap(&mut app.printing, &mut app.state.print, &mut rebuilt);
+                app.plate = Some(Arc::new(rebuilt));
+                app.request_reslice();
+            }
+            assert!(app.printing.slice_gen.is_some_and(|fresh| fresh > old), "{path} must start the requested slice with a fresh generation");
+            assert_eq!(app.printing.event(&mut app.state.print, &answer), PrintOutcome::Unchanged, "{path} must also reject A's answer after the fresh request");
+        }
+        let last = app.printing.slice_gen.unwrap();
+        let answer = fleet.next(|ev| matches!(ev, PrintEvent::Sliced { gen, .. } if *gen == last));
+        crate::live_slice::wait_idle();
+        // The profiles worker can finish restoring the saved target after a slice was requested.
+        let state = &mut app.state.print;
+        let restore = PrintEvent::VirtualPrinters { saved, catalog: Some(catalog), kept_as: None };
+        assert_eq!(app.printing.event(state, &restore), PrintOutcome::RestoredTarget, "a late restore of A must request its setup");
+        assert_eq!(state.links.picked, a, "the late startup restore must pick A");
+        assert_eq!(app.printing.event(state, &answer), PrintOutcome::Unchanged, "a late startup restore must discard the previous target's slice");
+        assert!(app.printing.reask.is_some(), "a late startup restore must keep the interrupted slice request");
+
+        // Every event runs sync_jobs: the shown job keeps its loaded preview in every workspace,
+        // and only Monitor starts a preview load.
+        let held = |app: &crate::App, id: &str| app.state.print.follow.job_of(id).and_then(|j| j.preview.clone());
+        app.state.print.follow.picked = Some(meta.id.clone());
+        app.printing.sync_jobs(&mut app.state.print);
+        assert!(app.state.print.follow.monitor && held(&app, &meta.id).is_some_and(|p| Arc::ptr_eq(&p, &preview)), "Monitor must keep the shown job's loaded preview");
+        app.state.apply_core(&fab::ShellAction::SetWorkspace(fab::api::Workspace::Design));
+        app.printing.sync_jobs(&mut app.state.print);
+        assert!(held(&app, &meta.id).is_some_and(|p| Arc::ptr_eq(&p, &preview)), "the shown job must keep its loaded preview after leaving Monitor");
+        let unloaded = Arc::new(JobMeta { id: JobMeta::new_id("unloaded", jobs::wall_now()), printer: a.id(), virtual_printer: true, ..Default::default() });
+        app.state.print.follow.jobs.push(CommittedJob { meta: unloaded.clone(), state: JobState::Finished, ..Default::default() });
+        app.state.print.follow.picked = Some(unloaded.id.clone());
+        app.printing.sync_jobs(&mut app.state.print);
+        assert!(app.state.print.follow.job_of(&unloaded.id).is_some_and(|j| !j.loading && j.preview.is_none()), "outside Monitor no preview load may start");
+        assert!(held(&app, &meta.id).is_none(), "a job neither shown nor printing must drop its preview");
+        app.state.apply_core(&fab::ShellAction::SetWorkspace(fab::api::Workspace::Monitor));
+        app.printing.sync_jobs(&mut app.state.print);
+        assert!(app.state.print.follow.job_of(&unloaded.id).is_some_and(|j| j.loading), "Monitor must start the shown job's preview load");
+        // This job has no package: the load ends unreadable, with nothing left loading.
+        let answer = fleet.next(|ev| matches!(ev, PrintEvent::JobPreview { id, .. } if *id == unloaded.id));
+        assert_eq!(app.printing.event(&mut app.state.print, &answer), PrintOutcome::JobPreview, "the load's answer must reach its job");
+        assert!(app.state.print.follow.job_of(&unloaded.id).is_some_and(|j| !j.loading && j.unreadable.is_some()), "a missing package must end the load as unreadable");
+    }
+
+    #[test]
+    fn showing_a_held_printer_moves_the_camera_and_follower_only() {
+        use fab::ui::camera::FabPrinterCamera;
+        use fab_printer_link::Command;
+        const CHILD: &str = "FAB_TEST_SHOW_PRINTER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-show-printer-{}", std::process::id()));
+            std::fs::create_dir(&home).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::showing_a_held_printer_moves_the_camera_and_follower_only", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).env_remove("FAB_PRINTER_VIRTUAL").status().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            assert!(result.success(), "shown navigation must leave the target plate alone");
+            return;
+        }
+
+        let presets = virtual_printer::presets();
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let catalog = Arc::new(catalog_in(&[], &home, &presets).unwrap());
+        let twin = catalog.twins[&presets[0].machine_preset_name()].printer.clone();
+        let mut second = twin.clone();
+        second.name = "watch".into();
+        let (a, b) = (PrinterChoice::Virtual(twin.name.clone()), PrinterChoice::Virtual(second.name.clone()));
+        let saved = Saved { printers: vec![twin, second], ..Default::default() };
+        let mut printing = Printing { virtuals: Some(Arc::new(saved)), catalog: Some(catalog), ..Default::default() };
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        assert!(printing.link_printer(&mut state, &a));
+        printing.ensure_link(&mut state, &b).unwrap();
+        let mut plate = fleet_plate(&printing);
+        wait_for("both virtual printers' stock", || {
+            poll_fleet(&mut printing, &mut state, &mut plate);
+            [&a, &b].iter().all(|id| state.printer_of(id).is_some_and(|r| r.state.trays().next().is_some()))
+        });
+        let mut fleet = settle_fleet_plate(&mut printing, &mut state, &plate);
+        // Both links hold the same model. B can run the one-layer package A just sliced.
+        let slice = printing.last.as_ref().unwrap();
+        let job = std::thread::scope(|s| s.spawn(|| {
+            let bytes = slice.settled.package_with(&|_| {}, &|| false).unwrap();
+            fab_printer_link::safety::validate_job(bytes, &slice.checked.as_ref().unwrap().profile, &slice.name).unwrap()
+        }).join().unwrap());
+        let ticket = state.ticket_for(&b).unwrap();
+        let options = state.print_options;
+        let meta = job_meta(slice, &b, state.printer_of(&b).map(Arc::as_ref), &options, Vec::new());
+        printing.send_job(&mut state, &ticket, job, &meta, options).unwrap();
+        wait_for("B's busy report before opening it", || {
+            printing.poll_printer(&mut state);
+            state.printer_of(&b).unwrap().state.busy()
+        });
+
+        let cx = &mut fleet.runtime.cx;
+        let mut app = cx.with_vm(crate::App::script_new);
+        app.printing = printing;
+        app.state.print = state;
+        app.plate = Some(Arc::new(plate));
+        app.state.apply_core(&fab::ShellAction::SetWorkspace(fab::api::Workspace::Monitor));
+        app.printing.reach = None;
+        let p = &app.state.print;
+        let (rows, materials, unprinted, status) = (p.colors.rows.clone(), p.settings.materials.clone(), p.unprinted.clone(), p.status.clone());
+        let (revisions, key, gen) = (crate::live_slice::revisions(), crate::live_slice::slice_key(app.plate.as_ref().unwrap()), app.printing.gen);
+
+        // Camera semantics holds a weak reference to its displayed view. It expires on a
+        // source change, even when both printers are virtual and neither widget has redrawn.
+        let camera = cx.with_vm(|vm| {
+            fab::theme::script_mod(vm);
+            fab::ui::script_mod_kit(vm);
+            fab::viewport::print::script_mod(vm);
+            fab::ui::camera::script_mod(vm);
+            vm.capture_errors();
+            let value = vm.eval(script! { use mod.prelude.widgets_internal.* use mod.widgets.* FabPrinterCamera{width: Fill height: Fill} });
+            let camera = WidgetRef::script_from_value(vm, value);
+            assert!(vm.take_errors().is_empty(), "the camera widget must instantiate");
+            camera
+        });
+        let pass = DrawPass::new(cx);
+        let mut list = DrawList2d::new(cx);
+        let mut draw = |cx: &mut Cx, state: &mut fab::AppState| {
+            let size = dvec2(120.0, 80.0);
+            pass.set_size(cx, size);
+            cx.redraw_all();
+            let event = std::mem::take(&mut cx.new_draw_event);
+            let mut draw = CxDraw::new(cx, &event);
+            let mut frame = Cx2d::new(&mut draw);
+            frame.begin_pass(&pass, Some(1.0));
+            list.begin_always(&mut frame);
+            frame.begin_root_turtle(size, Layout::default());
+            camera.draw_all(&mut frame, &mut Scope::with_data(state));
+            frame.end_pass_sized_turtle();
+            list.end(&mut frame);
+            frame.end_pass(&pass);
+        };
+        let cached = |cx: &Cx| {
+            let mut node = makepad_widgets::makepad_platform::a11y_tree::Node::default();
+            camera.borrow::<FabPrinterCamera>().unwrap().semantics(cx, &mut node);
+            !node.value.is_empty()
+        };
+        let assert_source = |cx: &Cx, p: &mut PrintState, expected: &PrinterChoice| {
+            p.camera.update_source(expected, false, p.printers.get(expected).map(Arc::as_ref));
+            assert!(cached(cx), "reapplying the expected virtual source {expected:?} must preserve its cached view");
+        };
+        draw(cx, &mut app.state);
+        assert_source(cx, &mut app.state.print, &a);
+        let b_layer = app.state.print.printer_of(&b).unwrap().state.layer.unwrap_or(0);
+        app.handle_actions(cx, &[Box::new(PrintAction::ShowPrinter(Some(b.clone())))]);
+        assert_eq!(app.state.print.follow.reporting_printer.as_ref(), Some(&b), "navigation projects B's held report immediately");
+        assert_eq!(app.state.print.follow.job.as_ref().unwrap().layer, b_layer, "B's already running job projects its reported layer");
+        assert!(!cached(cx), "switching to B drops A's cached camera view before drawing");
+        draw(cx, &mut app.state);
+        assert_source(cx, &mut app.state.print, &b);
+        app.printing.linked(&a).unwrap().link.send(Command::CheckStorage);
+        app.printing.linked(&b).unwrap().link.send(Command::CheckStorage);
+        wait_for("both printers to publish again while watching B", || {
+            app.printing.poll_printer(&mut app.state.print);
+            [&a, &b].iter().all(|id| app.state.print.printer_of(id).unwrap().storage_files.is_some())
+        });
+        assert!(cached(cx), "polling A and B while B is shown must preserve B's cached camera");
+        assert_source(cx, &mut app.state.print, &b);
+        app.handle_actions(cx, &[Box::new(PrintAction::ShowPrinter(None))]);
+        assert_eq!(app.state.print.follow.reporting_printer.as_ref(), Some(&a), "returning projects A");
+        assert!(!cached(cx), "returning to A drops B's cached camera before drawing");
+        draw(cx, &mut app.state);
+        assert_source(cx, &mut app.state.print, &a);
+        let p = &app.state.print;
+        assert_eq!(p.colors.rows, rows, "navigation preserves the target's mapping");
+        assert_eq!(p.settings.materials, materials, "navigation preserves the target's materials");
+        assert_eq!(p.unprinted, unprinted, "navigation preserves unprinted colours");
+        assert_eq!(crate::live_slice::revisions(), revisions, "navigation preserves both live revisions");
+        assert_eq!(crate::live_slice::slice_key(app.plate.as_ref().unwrap()), key, "navigation preserves the slice key");
+        assert_eq!(app.printing.gen, gen, "navigation preserves the generation");
+        assert_eq!(p.status, status, "navigation preserves the slice status");
+        assert!(p.settled && app.printing.slice_job.is_none() && app.printing.live_job.is_none(), "navigation leaves the settled plate without a slice or live job");
+        assert!(app.printing.reach.is_none(), "navigation never remaps");
+    }
+
+    #[test]
+    fn split_printer_cards_and_tray_edits_reach_their_drawn_links() {
+        use fab::print::job_card::{confirm_speed, job_view};
+        use fab_printer_link::{Command, Speed};
+        const CHILD: &str = "FAB_TEST_SPLIT_PRINTER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-split-controls-{}", std::process::id()));
+            std::fs::create_dir(&home).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::split_printer_cards_and_tray_edits_reach_their_drawn_links", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).env_remove("FAB_PRINTER_VIRTUAL").status().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            assert!(result.success(), "target and shown actions must reach their own virtual workers");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let presets = virtual_printer::presets();
+        let catalog = Arc::new(catalog_in(&[], &home, &presets).unwrap());
+        let target = presets.iter().find(|p| p.name == "two-materials").unwrap().clone();
+        let mut twin = catalog.twins[&target.machine_preset_name()].printer.clone();
+        twin.name = "watch".into();
+        let (a, b) = (PrinterChoice::Virtual(target.name.clone()), PrinterChoice::Virtual(twin.name.clone()));
+        let saved = Saved { printers: vec![target, twin], ..Default::default() };
+        let mut printing = Printing { virtuals: Some(Arc::new(saved)), catalog: Some(catalog), ..Default::default() };
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        assert!(printing.link_printer(&mut state, &a), "A is the plate target");
+        printing.ensure_link(&mut state, &b).unwrap();
+        let mut plate = fleet_plate(&printing);
+        wait_for("both virtual workers' tray reports", || {
+            poll_fleet(&mut printing, &mut state, &mut plate);
+            [&a, &b].iter().all(|id| state.printer_of(id).is_some_and(|r| r.state.trays().next().is_some()))
+        });
+        let _runtime = settle_fleet_plate(&mut printing, &mut state, &plate);
+        apply(&mut state, &PrintAction::AskPrint(true));
+        state.shown = Some(b.clone());
+        let slot = state.colors.layout.trays[0].pos;
+        let mut owner = EditOwner::default();
+        colour_map::capture_tray_owner(&mut owner, &state);
+        let b_stock = printing.virtual_for(&b).unwrap().slots.clone();
+        let (dest, _) = confirm_speed(&state).expect("A's open Print card offers speed while B is shown");
+        printing.action(&mut state, &PrintAction::SetVirtualSpeed(dest, Speed::Times(60.0)), None);
+        let id = "queued-b".to_string();
+        let meta = JobMeta { id: id.clone(), printer: b.id(), virtual_printer: true, ..Default::default() };
+        state.follow.jobs.insert_newest(CommittedJob { meta: Arc::new(meta), state: JobState::Queued, ..Default::default() });
+        state.follow.picked = Some(id);
+        let dest = job_view(&state, 0.0).unwrap().control_destination(&state).expect("B's job card offers speed");
+        printing.action(&mut state, &PrintAction::SetVirtualSpeed(dest, Speed::Times(10.0)), None);
+        printing.action(&mut state, &PrintAction::EditTray(owner, slot, colours::TrayEdit::Material("PETG".into())), None);
+        // Both storage replies fence the preceding speed and stock commands, including a misrouted one.
+        for id in [&a, &b] { printing.linked(id).unwrap().link.send(Command::CheckStorage); }
+        wait_for("both workers' storage replies after the presses", || {
+            printing.poll_printer(&mut state);
+            [&a, &b].iter().all(|id| state.printer_of(id).unwrap().storage_files.is_some())
+        });
+        assert_eq!(state.printer_of(&a).unwrap().virtual_speed, Speed::Times(60.0), "the Print-card speed reaches A");
+        assert_eq!(state.printer_of(&b).unwrap().virtual_speed, Speed::Times(10.0), "the job-card speed reaches B");
+        assert_eq!(printing.virtual_for(&a).unwrap().slots.iter().find(|s| s.head == slot.head && s.tray == slot.tray_text()).unwrap().material.as_deref(),
+            Some("PETG"), "the colour-map tray edit changes A's saved stock");
+        assert_eq!(state.printer_of(&a).unwrap().state.tray(slot.tray).unwrap().material.as_deref(), Some("PETG"), "A's worker reports the edited stock");
+        assert_eq!(printing.virtual_for(&b).unwrap().slots, b_stock, "the colour-map edit preserves B's stock");
+
+        let grid_owner = EditOwner::new(PrinterScope::Shown, &state);
+        state.links.note = "target link note".into();
+        printing.action(&mut state, &PrintAction::EditTray(grid_owner, slot, colours::TrayEdit::Empty), None);
+        assert!(printing.virtual_for(&b).unwrap().slots.iter().find(|s| s.head == slot.head && s.tray == slot.tray_text()).unwrap().material.is_none(),
+            "editing B's virtual grid changes B's saved stock");
+        assert!(state.links.layout.is_some() && state.links.note == "target link note", "B's stock edit preserves A's generated layout controls and link note");
+    }
+
+    #[test]
+    fn rendered_controls_only_reach_their_own_link() {
+        use fab::print::job_card::{confirm_speed, job_view};
+        use fab_printer_link::{Command, CommandState, PrinterLink, Speed};
+        use std::{fs, io::Write};
+
+        const CHILD: &str = "FAB_TEST_RENDERED_CONTROLS";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-controls-{}", std::process::id()));
+            fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::rendered_controls_only_reach_their_own_link", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).status().unwrap();
+            fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "the isolated rendered-control cases must pass");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let [a, b] = ["A", "B"].map(|n| PrinterChoice::Real(n.into()));
+        let mut printing = Printing { virtuals: Some(Arc::new(Saved::default())), ..Default::default() };
+        let mut state = PrintState::default();
+        let model = second_family_profiles::model();
+        for (choice, name) in [(&a, "a"), (&b, "b")] {
+            let file = home.join(name);
+            writeln!(fs::File::create(&file).unwrap(), "{}", r#"{"print_stats":{"state":"printing","filename":"block.gcode"}}"#).unwrap();
+            printing.install(&mut state, choice, PrinterLink::simulate_moonraker(file, &model), false);
+        }
+        let replacement = PrinterLink::simulate_moonraker(home.join("a"), &model);
+        let running = |s: &PrintState, id: &PrinterChoice| s.printer_of(id).is_some_and(|p| p.state.gcode_state.as_deref() == Some("RUNNING"));
+        let desktop = |s: &PrintState| {
+            let card = job_view(s, 0.0).expect("the desktop must draw the running job");
+            let dest = card.control_destination(s).expect("the desktop must draw filament controls");
+            let paused = card.pause.expect("the desktop must offer Pause or Resume");
+            dest.pause_or_resume(paused)
+        };
+        let wrist = |s: &PrintState| crate::xr::monitor_pause_press(s).expect("the wrist must draw a Pause or Resume");
+        assert!(printing.link_printer(&mut state, &a), "A must be picked");
+        wait_for("both simulators to report their running jobs", || {
+            printing.poll_printer(&mut state);
+            running(&state, &a) && running(&state, &b)
+        });
+
+        // Both presses survive in the UI while the link with the same name and mode is replaced.
+        let stale = [desktop(&state), wrist(&state)];
+        printing.install(&mut state, &a, replacement, false);
+        wait_for("the replacement A to report its running job", || {
+            printing.poll_printer(&mut state);
+            running(&state, &a)
+        });
+        let counts = |s: &PrintState| [&a, &b].map(|id| s.printer_of(id).unwrap().job_sends);
+        let sends = counts(&state);
+        for action in stale { printing.action(&mut state, &action, None); }
+
+        // CheckStorage is dequeued after the presses, but the HTTP requests can finish out of
+        // order. Drain them, then append a layer marker after every possible Pause notification.
+        let fence = |p: &mut Printing, s: &mut PrintState, ids: &[(&PrinterChoice, &str)], layer: u32| {
+            for (id, _) in ids { p.linked(id).unwrap().link.send(Command::CheckStorage); }
+            wait_for("each storage reply and all earlier control requests to finish", || {
+                p.poll_printer(s);
+                ids.iter().all(|(id, _)| s.printer_of(id).is_some_and(|report|
+                    matches!(report.command, Some(("check_storage", CommandState::Done)))
+                    && !report.state.details.iter().any(|(key, _)| key == "Waiting")))
+            });
+            for (_, file) in ids {
+                let mut out = fs::OpenOptions::new().append(true).open(home.join(file)).unwrap();
+                writeln!(out, "{{\"print_stats\":{{\"info\":{{\"current_layer\":{layer}}}}}}}").unwrap();
+            }
+            wait_for("the status stream after the storage replies", || {
+                p.poll_printer(s);
+                ids.iter().all(|(id, _)| s.printer_of(id).unwrap().state.layer == Some(layer))
+            });
+        };
+        fence(&mut printing, &mut state, &[(&a, "a"), (&b, "b")], 1);
+        assert!(running(&state, &a), "a desktop or XR Pause drawn for old A reached replacement A");
+        assert!(running(&state, &b), "a stale Pause on A reached B");
+        assert_eq!(counts(&state), sends, "stale controls must preserve both send counters");
+
+        // Each surface pauses and resumes B. A has its own later status after every press.
+        assert!(printing.link_printer(&mut state, &b), "B must be picked for its live controls");
+        for (round, draw) in [desktop as fn(&PrintState) -> PrintAction, wrist].into_iter().enumerate() {
+            for (i, (command, gcode)) in [("pause", "PAUSE"), ("resume", "RUNNING")].into_iter().enumerate() {
+                // Make the next storage reply distinguishable from the preceding one.
+                printing.linked(&a).unwrap().link.send(Command::ClearError);
+                wait_for("A to acknowledge its new command before the next press", || {
+                    printing.poll_printer(&mut state);
+                    matches!(state.printer_of(&a).unwrap().command, Some(("clean_print_error", CommandState::Failed(_))))
+                });
+                let action = draw(&state);
+                printing.action(&mut state, &action, None);
+                wait_for("B's live Pause or Resume reply and state", || {
+                    printing.poll_printer(&mut state);
+                    let report = state.printer_of(&b).unwrap();
+                    matches!(&report.command, Some((name, CommandState::Done)) if *name == command)
+                        && report.state.gcode_state.as_deref() == Some(gcode)
+                });
+                fence(&mut printing, &mut state, &[(&a, "a")], 2 + (2 * round + i) as u32);
+                assert!(running(&state, &a), "a live control drawn for B must leave A printing");
+            }
+        }
+
+        // The same two configured IDs now hold editable virtual stock. A queued row and an
+        // idle Print card both offer speed, so both cached presses can outlive the retarget.
+        for name in ["A", "B"] {
+            let saved = Arc::make_mut(printing.virtuals.as_mut().unwrap());
+            let mut twin = virtual_printer::presets().into_iter().find(|v| v.name == "two-materials").unwrap();
+            twin.name = format!("twin-{}", name.to_lowercase());
+            twin.configured_for = Some(name.into());
+            saved.printers.push(twin);
+            saved.disconnected.insert(name.into());
+        }
+        printing.ensure_link(&mut state, &b).unwrap();
+        assert!(printing.link_printer(&mut state, &a), "A must be selected in Virtual mode");
+        wait_for("both virtual workers to report their editable stock", || {
+            printing.poll_printer(&mut state);
+            [&a, &b].iter().all(|id| state.printer_of(id).is_some_and(|p| p.virtual_printer && p.state.trays().next().is_some()))
+        });
+        let id = "queued-a".to_string();
+        state.follow.jobs.push(CommittedJob { meta: Arc::new(JobMeta { id: id.clone(), printer: a.id(), virtual_printer: true, ..Default::default() }), state: JobState::Queued, ..Default::default() });
+        state.follow.picked = Some(id);
+        let card = job_view(&state, 0.0).expect("A's queued job must draw its card");
+        assert!(card.virtual_speed.is_some(), "A's queued card must offer speed");
+        let job_speed = PrintAction::SetVirtualSpeed(card.control_destination(&state).unwrap(), Speed::Times(10.0));
+        apply(&mut state, &PrintAction::AskPrint(true));
+        let (dest, _) = confirm_speed(&state).expect("A's Print card must offer speed");
+        let print_speed = PrintAction::SetVirtualSpeed(dest, Speed::Times(60.0));
+        let owner = EditOwner::new(PrinterScope::Target, &state);
+        let stock = |p: &Printing, id: &PrinterChoice| p.virtual_for(id).unwrap().slots.clone();
+        let printer = printing.virtual_for(&a).unwrap();
+        let tray = &printer.slots[0];
+        let heads = virtual_heads(printer);
+        let pos = colours::Position::parse(&heads, &colours::head_word(&heads, tray.head), &tray.tray).unwrap();
+        let edit = PrintAction::EditTray(owner, pos, colours::TrayEdit::Material("changed-material".into()));
+        let stocks = [&a, &b].map(|id| stock(&printing, id));
+        let trays = |s: &PrintState| [&a, &b].map(|id| s.printer_of(id).unwrap().state.trays()
+            .map(|(side, t)| (side, t.clone())).collect::<Vec<_>>());
+        let before_trays = trays(&state);
+        let speeds = |s: &PrintState| [&a, &b].map(|id| s.printer_of(id).unwrap().virtual_speed);
+        let before = speeds(&state);
+        assert!(printing.link_printer(&mut state, &b), "B must be shown before A's old edits arrive");
+        for action in [job_speed, print_speed, edit] { printing.action(&mut state, &action, None); }
+        for id in [&a, &b] { printing.linked(id).unwrap().link.send(Command::CheckStorage); }
+        wait_for("both virtual workers to answer after A's stale edits", || {
+            printing.poll_printer(&mut state);
+            [&a, &b].iter().all(|id| state.printer_of(id).unwrap().storage_files.is_some())
+        });
+        assert_eq!(speeds(&state), before, "stale job-card and Print-card speeds must leave both printers' speeds unchanged");
+        assert_eq!([&a, &b].map(|id| stock(&printing, id)), stocks, "a stale tray edit must leave both printers' stock unchanged");
+        assert_eq!(trays(&state), before_trays, "both virtual reports must keep their original trays");
+        assert!(state.links.note.contains("printer changed"), "a stale tray edit must explain why it was refused");
+
+        apply(&mut state, &PrintAction::AskPrint(true));
+        let (current, _) = confirm_speed(&state).expect("B's current Print card must offer speed");
+        printing.action(&mut state, &PrintAction::SetVirtualSpeed(current, Speed::Times(60.0)), None);
+        wait_for("B's own virtual speed press to reach B", || {
+            printing.poll_printer(&mut state);
+            state.printer_of(&b).unwrap().virtual_speed == Speed::Times(60.0)
+        });
+        assert_eq!(speeds(&state), [before[0], Speed::Times(60.0)], "a live speed edit must change only the shown virtual printer");
+    }
+
+    #[test]
+    fn admission_tickets_keep_completions_and_cancel_with_their_jobs() {
+        use fab_printer_link::{Command, PrinterLink};
+        use std::fs;
+
+        const CHILD: &str = "FAB_TEST_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-admission-{}", std::process::id()));
+            fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::admission_tickets_keep_completions_and_cancel_with_their_jobs", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).status().unwrap();
+            fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "the isolated admission case must pass");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        second_family_profiles::install(&home);
+        let dirs = [makepad_fab_settings::home::vendor_data_dir_in(&home, makepad_fab_settings::profiles::SLICER_APPS[1])];
+        let catalog = Arc::new(catalog_in(&dirs, &home.join("imports"), &[]).unwrap());
+        let model = second_family_profiles::model();
+        let [a, b] = ["A", "B"].map(|n| PrinterChoice::Real(n.into()));
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        let mut printing = Printing { virtuals: Some(Arc::new(Saved::default())), ..Default::default() };
+        printing.event(&mut state, &PrintEvent::Catalog(Some(catalog)));
+        for (id, file, spool) in [(&a, "a", "1969D4FF"), (&b, "b", "EF120AFF")] {
+            let path = home.join(file);
+            fs::write(&path, format!("@head 0 1 PLA {spool}\n")).unwrap();
+            printing.install(&mut state, id, PrinterLink::simulate_moonraker(path, &model), false);
+        }
+        // Warm the replacement in parallel with the two installed links.
+        let replacement = PrinterLink::simulate_moonraker(home.join("a"), &model);
+        replacement.set_heads(&model, 4);
+        printing.link_printer(&mut state, &a);
+        apply(&mut state, &PrintAction::AskPrint(true));
+        assert!(matches!(&state.confirm_print, Some(PrintConfirm::AwaitingReport(id)) if id == &a),
+            "a card opened before A reports must wait for A");
+        let mut plate = fleet_plate(&printing);
+        let ready = |state: &PrintState, id: &PrinterChoice| state.printer_of(id).is_some_and(|s|
+            s.state.storage == Some(true) && s.state.trays().any(|(_, t)| t.present == Some(true) && t.material.as_deref() == Some("PLA")));
+        wait_for("both printers' spools and storage", || {
+            poll_fleet(&mut printing, &mut state, &mut plate);
+            ready(&state, &a) && ready(&state, &b)
+        });
+        state.bind_print_ticket();
+        assert_eq!(state.confirm_print, state.ticket_for(&a).map(PrintConfirm::Filament), "the first report must bind A's open card");
+        let mut runtime = settle_fleet_plate(&mut printing, &mut state, &plate);
+
+        let open = |s: &mut PrintState| {
+            apply(s, &PrintAction::AskPrint(true));
+            apply(s, &PrintAction::AcceptErrors(true));
+            apply(s, &PrintAction::SetPrintOption(PrintOption::PlateClear, true));
+            let Some(PrintConfirm::Filament(ticket)) = &s.confirm_print else { panic!("the card must show its bound printer") };
+            PrintAction::SendToPrinter { ticket: ticket.clone(), preview: s.preview.as_ref().unwrap().id }
+        };
+        let hold = |p: &mut Printing, s: &mut PrintState, r: &mut FleetRuntime| {
+            let press = open(s);
+            p.test_packages = Some(Vec::new());
+            p.action(s, &press, None);
+            apply(s, &press);
+            let id = s.sending_for(&s.links.picked).unwrap_or_else(|| panic!("the confirmed job must be admitted: {:?}", s.print_blocked.get(&s.links.picked))).job.clone();
+            let done = r.next(|ev| matches!(ev, PrintEvent::Packaged { .. }));
+            p.event(s, &done);
+            let (attempt, result) = p.test_packages.take().unwrap().pop().expect("a held package result");
+            assert!(matches!(result, Packaged::Checked(_)), "the held package must pass validation: {result:?}");
+            (id, PrintEvent::Packaged { id: attempt, result })
+        };
+        let retarget = |p: &mut Printing, s: &mut PrintState, plate: &mut Evaluated, id: &PrinterChoice| {
+            let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, s), id.clone());
+            assert!(p.action(s, &pick_action, None), "retargeting must select the other held link");
+            remap(p, s, plate);
+            crate::live_slice::set_print_setup(p.check_setup(s));
+        };
+
+        let remember_plate = |p: &Printing, s: &PrintState, plate: &Evaluated| {
+            let rows = s.colors.rows.clone();
+            let materials = s.settings.materials.clone();
+            let unprinted = s.unprinted.clone();
+            let moves = s.head_moves.clone();
+            let revisions = crate::live_slice::revisions();
+            let key = crate::live_slice::slice_key(plate);
+            let gen = p.gen;
+            let status = s.status.clone();
+            assert!(s.settled && p.slice_job.is_none() && p.live_job.is_none(), "B must start settled with no slice or live job");
+            move |p: &Printing, s: &PrintState, plate: &Evaluated| {
+                assert_eq!(s.colors.rows, rows, "A's job must preserve B's mapping rows and positions");
+                assert_eq!(s.settings.materials, materials, "A's job must preserve B's materials");
+                assert_eq!(s.unprinted, unprinted, "A's job must preserve B's unprinted colours");
+                assert_eq!(s.head_moves, moves, "A's job must preserve B's head moves");
+                assert_eq!(crate::live_slice::revisions(), revisions, "A's job must preserve B's live revisions");
+                assert_eq!(crate::live_slice::slice_key(plate), key, "A's job must preserve B's plate and settings key");
+                assert_eq!(p.gen, gen, "A's job must preserve B's slice generation");
+                assert_eq!(s.status, status, "A's job must preserve B's slice status");
+                assert!(s.settled && p.slice_job.is_none() && p.live_job.is_none(), "B must stay settled without a slice or live job");
+            }
+        };
+        let starts = |file: &str| fs::read_to_string(fab_printer_link::sim::started_path(&home.join(file))).unwrap_or_default();
+        let last_start_is = |file: &str, job: &JobMeta| {
+            let filename = fab_printer_link::job::plain_file_name(&job.name);
+            starts(file).lines().last().is_some_and(|line| line.contains(&format!("FILENAME=\"{filename}\"")))
+        };
+        let report = |file: &str, text: &str| {
+            use std::io::Write;
+            writeln!(fs::OpenOptions::new().append(true).open(home.join(file)).unwrap(), "{text}").unwrap();
+        };
+        let stop_flag = |p: &Printing, id: &str| p.packaging.iter().find_map(|pack|
+            matches!(&pack.to, PackageFor::Printer(send) if send.meta.id == id).then(|| pack.stop.clone())).unwrap();
+
+        // Release both held packages in reverse order. Give each plate a distinct uploaded name.
+        let (a_job, a_done) = hold(&mut printing, &mut state, &mut runtime);
+        retarget(&mut printing, &mut state, &mut plate, &b);
+        plate.plate.parts[0].object = "second-plate".into();
+        runtime.settle(&mut printing, &mut state, &plate);
+        let (b_job, b_done) = hold(&mut printing, &mut state, &mut runtime);
+        assert_eq!(state.sending.len(), 2, "each printer must admit its own package");
+        let a_before = state.printer_of(&a).unwrap().job_sends;
+        let b_before = state.printer_of(&b).unwrap().job_sends;
+        // Target B completes while Monitor shows A, and B's stored report predates the hand-off.
+        printing.action(&mut state, &PrintAction::ShowPrinter(Some(a.clone())), None);
+        assert_eq!(state.follow.reporting_printer.as_ref(), Some(&a), "Monitor must show A before B's completion");
+        let (rows, revisions, key, gen) = (state.colors.rows.clone(), crate::live_slice::revisions(), crate::live_slice::slice_key(&plate), printing.gen);
+        assert_eq!(printing.event(&mut state, &b_done), PrintOutcome::Target, "B's completion must reach its target");
+        assert_eq!(state.follow.reporting_printer.as_ref(), Some(&a), "B's completion must leave Monitor on A");
+        assert_eq!(state.follow.job_of(&b_job).map(|j| &j.state), Some(&JobState::Sent), "rechecking B's older stored report must not end the job just handed to B");
+        assert!(state.colors.rows == rows && crate::live_slice::revisions() == revisions && crate::live_slice::slice_key(&plate) == key && printing.gen == gen,
+            "B's completion while A is shown must leave the plate's mapping, live revisions, key and generation alone");
+        printing.action(&mut state, &PrintAction::ShowPrinter(None), None);
+        let before_a = remember_plate(&printing, &state, &plate);
+        assert_eq!(printing.event(&mut state, &a_done), PrintOutcome::JobRows, "A's background completion must redraw job rows only");
+        before_a(&printing, &state, &plate);
+        assert_eq!(state.print_blocked.get(&b), None, "B must have no refusal from A");
+        for id in [&a_job, &b_job] {
+            assert_eq!(state.follow.job_of(id).map(|j| &j.state), Some(&JobState::Sent), "both reverse-order packages must be handed to their confirmed printers");
+        }
+        assert_ne!(state.follow.job_of(&a_job).unwrap().meta.name, state.follow.job_of(&b_job).unwrap().meta.name, "the simulators must be able to distinguish the two package names");
+
+        // Withhold the UI poll of A's acknowledgement. Even a fast worker cannot close this test window.
+        retarget(&mut printing, &mut state, &mut plate, &a);
+        runtime.settle(&mut printing, &mut state, &plate);
+        assert_eq!(state.printer_of(&a).unwrap().job_sends, a_before, "A's stored report must still predate the hand-off");
+        assert!(state.printers.handed(&a).is_some(), "A must hold its unacknowledged hand-off");
+        let (quick, quick_done) = hold(&mut printing, &mut state, &mut runtime);
+        printing.event(&mut state, &quick_done);
+        assert_eq!(state.follow.job_of(&quick).map(|j| &j.state), Some(&JobState::Queued), "a quick second Start must queue behind A's hand-off");
+        printing.linked(&a).unwrap().link.send(Command::CheckStorage);
+        printing.linked(&b).unwrap().link.send(Command::CheckStorage);
+        wait_for("both ordered storage replies after the reverse hand-offs", || {
+            printing.poll_printer(&mut state);
+            state.printer_of(&a).unwrap().storage_files.is_some() && state.printer_of(&b).unwrap().storage_files.is_some()
+        });
+        assert_eq!(state.printer_of(&a).unwrap().job_sends, a_before + 1, "A must receive exactly its own reverse-order package");
+        assert_eq!(state.printer_of(&b).unwrap().job_sends, b_before + 1, "B must receive exactly its own job");
+        wait_for("the simulator starts to reach both report files", || !starts("a").is_empty() && !starts("b").is_empty());
+        assert!(last_start_is("a", &state.follow.job_of(&a_job).unwrap().meta), "A must start A's package");
+        assert!(last_start_is("b", &state.follow.job_of(&b_job).unwrap().meta), "B must start B's package");
+        assert!(state.printers.handed(&a).is_none() && state.printers.handed(&b).is_none(), "reports acknowledging both sends must release both reservations");
+        for file in ["a", "b"] { report(file, r#"{"print_stats":{"state":"complete"}}"#); }
+        wait_for("both completed printers to accept their next jobs", || {
+            printing.poll_printer(&mut state);
+            [&a, &b].iter().all(|id| state.printer_of(id).unwrap().state.gcode_state.as_deref() == Some("FINISH") && !state.printer_busy_for(id))
+        });
+
+        // Retire a link with a checked package held and a second confirmation still open.
+        let (queued, stale_package) = hold(&mut printing, &mut state, &mut runtime);
+        let stale = open(&mut state);
+        printing.retire_link(&mut state, &a, false);
+        printing.install(&mut state, &a, replacement, false);
+        wait_for("A's replacement to report its own spools", || {
+            printing.poll_printer(&mut state);
+            ready(&state, &a)
+        });
+        let stale_sends = state.printer_of(&a).unwrap().job_sends;
+        printing.event(&mut state, &stale_package);
+        assert_eq!(state.print_blocked.get(&a), Some(STALE_DISPATCH), "a package confirmed for a retired epoch must be refused");
+        assert!(jobs::read_package(&jobs::jobs_dir(), &queued).is_ok(), "a stale dispatch must retain its checked files");
+        assert_eq!(state.follow.job_of(&queued).unwrap().state, JobState::Queued, "the replaced link must retain its queued job");
+        state.bind_print_ticket();
+        assert!(printing.send_checks(&state, &state.print_options).is_ok(), "A's replacement must otherwise accept the settled slice");
+        let before = printing.last_attempt;
+        printing.action(&mut state, &stale, None);
+        assert_eq!(printing.last_attempt, before, "Start from a replaced link epoch must package nothing");
+        assert_eq!(state.print_blocked.get(&a), Some(STALE_TICKET), "a replaced link must explain the stale confirmation");
+        apply(&mut state, &PrintAction::AskPrint(false));
+        let PrintAction::SendToPrinter { ticket, preview } = open(&mut state) else { unreachable!() };
+        printing.action(&mut state, &PrintAction::SendToPrinter { ticket, preview: preview.wrapping_add(1) }, None);
+        assert_eq!(printing.last_attempt, before, "Start for a different preview must package nothing");
+        assert_eq!(state.print_blocked.get(&a), Some(STALE_PREVIEW), "a different preview must explain the stale slice");
+        apply(&mut state, &PrintAction::AskPrint(false));
+
+        let initial_a = state.printer_of(&a).unwrap().job_sends;
+        assert_eq!(initial_a, stale_sends, "releasing the stale package must preserve the new link's count");
+        fs::remove_file(fab_printer_link::sim::started_path(&home.join("a"))).unwrap();
+        let dir = jobs::jobs_dir();
+        let epoch = state.printers.epoch_of(&a);
+        let (spool, spool_done) = hold(&mut printing, &mut state, &mut runtime);
+        let sliced = printing.last.as_ref().unwrap();
+        let used_tray = sliced.trays[sliced.used[0]].expect("the admitted job must use a loaded tray");
+        let material_reported = |s: &PrintState, material: &str| s.printer_of(&a).unwrap().state.trays()
+            .any(|(_, t)| t.id == Some(used_tray) && t.material.as_deref() == Some(material) && t.present == Some(true));
+        report("a", "@head 0 1 PETG 1969D4FF");
+        wait_for("A's used head to report PETG", || { printing.poll_printer(&mut state); material_reported(&state, "PETG") });
+        let spool_sends = state.printer_of(&a).unwrap().job_sends;
+        assert_eq!(state.printers.epoch_of(&a), epoch, "a spool edit must leave A's incarnation intact");
+        printing.event(&mut state, &spool_done);
+        let refusal = state.print_blocked.get(&a).unwrap_or_default();
+        assert!(refusal.contains("PETG") && refusal.contains("PLA"), "the spool refusal must name the reported and required materials: {refusal}");
+        assert!(state.follow.job_of(&spool).is_none(), "a tray mismatch must discard the refused package");
+        runtime.next(|ev| matches!(ev, PrintEvent::JobFilesRemoved(id) if id == &spool));
+        report("a", "@head 0 1 PLA 1969D4FF");
+        wait_for("A's used head to report PLA again", || { printing.poll_printer(&mut state); material_reported(&state, "PLA") });
+
+        // Cancel B while A holds both a package and a genuine refusal. Keep that same A for the opposite cancel.
+        let (cancel_a, cancel_a_done) = hold(&mut printing, &mut state, &mut runtime);
+        let stop_a = stop_flag(&printing, &cancel_a);
+        printing.action(&mut state, &stale, None);
+        assert_eq!(state.print_blocked.get(&a), Some(STALE_TICKET), "A must own a real refused press before B cancels");
+        retarget(&mut printing, &mut state, &mut plate, &b);
+        runtime.settle(&mut printing, &mut state, &plate);
+        let (cancel_b, cancel_b_done) = hold(&mut printing, &mut state, &mut runtime);
+        printing.action(&mut state, &PrintAction::CancelSend(cancel_b.clone()), None);
+        assert!(!stop_a.load(Ordering::Relaxed), "cancelling B must leave A's sibling package running");
+        assert!(state.follow.job_of(&cancel_b).is_none() && state.sending_for(&b).is_none(), "B's cancelled row and admission must go");
+        assert_eq!(state.follow.job_of(&cancel_a).unwrap().state, JobState::Preparing, "A's sibling row must stay Preparing");
+        assert_eq!(state.sending_for(&a).unwrap().job, cancel_a, "A's sibling must keep its admission");
+        assert_eq!(state.print_blocked.get(&b), Some("Cancelled: nothing went to the printer."), "B must own its cancellation");
+        assert_eq!(state.print_blocked.get(&a), Some(STALE_TICKET), "B's cancel must preserve A's refusal");
+        printing.event(&mut state, &cancel_b_done);
+        runtime.next(|ev| matches!(ev, PrintEvent::JobFilesRemoved(id) if id == &cancel_b));
+        assert!(!dir.join(&cancel_b).exists() && jobs::read_package(&dir, &cancel_a).is_ok(), "only the cancelled package's files must go");
+
+        let (survivor, survivor_done) = hold(&mut printing, &mut state, &mut runtime);
+        let cancelled_sends = state.printer_of(&a).unwrap().job_sends;
+        let b_before = state.printer_of(&b).unwrap().job_sends;
+        printing.action(&mut state, &PrintAction::CancelSend(cancel_a.clone()), None);
+        printing.event(&mut state, &cancel_a_done);
+        runtime.next(|ev| matches!(ev, PrintEvent::JobFilesRemoved(id) if id == &cancel_a));
+        printing.event(&mut state, &survivor_done);
+        assert_eq!(state.follow.job_of(&survivor).unwrap().state, JobState::Sent, "B's held package must go out after cancelling A");
+        wait_for("B to receive its surviving job", || { printing.poll_printer(&mut state); state.printer_of(&b).unwrap().job_sends > b_before });
+        assert!(state.follow.job_of(&cancel_a).is_none() && !dir.join(&cancel_a).exists(), "the cancelled A row and files must go");
+        // All negative dispatches on the replacement A precede the same ordered storage reply below.
+        let start_queued = |p: &mut Printing, s: &mut PrintState| {
+            apply(s, &PrintAction::PickJob(Some(queued.clone())));
+            apply(s, &PrintAction::AskStartJob(Some(queued.clone())));
+            let press = PrintAction::StartJob { id: queued.clone(), ticket: s.queued_ticket(&s.follow.shown().unwrap().meta).expect("the queued row must resolve its own printer") };
+            p.action(s, &press, None);
+            apply(s, &press);
+            p.starting.last().cloned().expect("the queued job must have a live recheck")
+        };
+        let before_row_start = remember_plate(&printing, &state, &plate);
+        let b_sends = state.printer_of(&b).unwrap().job_sends;
+        let first = start_queued(&mut printing, &mut state);
+        let old = runtime.next(|ev| matches!(ev, PrintEvent::JobChecked { attempt, .. } if *attempt == first.1));
+        assert!(matches!(&old, PrintEvent::JobChecked { result: Ok(_), .. }), "attempt one must have a checked package");
+        printing.action(&mut state, &PrintAction::CancelSend(queued.clone()), None);
+        assert_eq!(state.follow.job_of(&queued).unwrap().state, JobState::Queued, "cancelling a recheck must keep its queued row");
+        let second = start_queued(&mut printing, &mut state);
+        assert_ne!(first.1, second.1, "restarting the same job must allocate a new attempt");
+        let current = runtime.next(|ev| matches!(ev, PrintEvent::JobChecked { attempt, .. } if *attempt == second.1));
+        let sends = state.printer_of(&a).unwrap().job_sends;
+        assert_eq!(sends, initial_a, "no rejected or cancelled package may have reached A");
+        assert!(state.printer_of(&a).unwrap().storage_files.is_none(), "A must still be waiting for its first storage listing");
+        printing.event(&mut state, &old);
+        // A same-link command behind any erroneous Print proves the worker processed the queue.
+        printing.linked(&a).unwrap().link.send(Command::CheckStorage);
+        wait_for("A's storage reply after the old recheck", || {
+            printing.poll_printer(&mut state);
+            state.printer_of(&a).unwrap().storage_files.is_some()
+        });
+        let observed = state.printer_of(&a).unwrap().job_sends;
+        assert_eq!(observed, stale_sends, "replacing A must send nothing to the new incarnation");
+        assert_eq!(observed, spool_sends, "a changed spool must receive no Print");
+        assert_eq!(observed, cancelled_sends, "cancelling A must send nothing on A's link");
+        assert_eq!(observed, sends, "a cancelled recheck must never hand a job to the link");
+        assert_eq!(state.follow.job_of(&queued).unwrap().state, JobState::Preparing, "the old recheck must leave the new row Preparing");
+        assert_eq!(printing.starting.last(), Some(&second), "the old recheck must leave attempt two live");
+        assert_eq!(state.sending_for(&a).unwrap().job, queued, "the old recheck must preserve attempt two's admission");
+        assert_eq!(state.print_blocked.get(&a), None, "the old recheck must leave attempt two's refusal alone");
+        assert_eq!(printing.event(&mut state, &current), PrintOutcome::JobRows, "the queued A start from B must update only the rows");
+        assert_eq!(state.follow.job_of(&queued).unwrap().state, JobState::Sent, "attempt two must hand off its checked job");
+        before_row_start(&printing, &state, &plate);
+        wait_for("A to receive attempt two", || {
+            printing.poll_printer(&mut state);
+            state.printer_of(&a).unwrap().job_sends == sends + 1 && !starts("a").is_empty()
+        });
+        assert!(last_start_is("a", &state.follow.job_of(&queued).unwrap().meta), "queued A must start its own file on A");
+        assert_eq!(state.printer_of(&b).unwrap().job_sends, b_sends, "queued A must send nothing to B");
+    }
+
+    #[test]
+    fn background_reports_leave_the_target_plate_and_slice_alone() {
+        use fab_printer_link::{model::Colour, PrinterLink};
+        use std::{fs, io::Write};
+
+        // Both the publication counter and the live slicer belong to the process.
+        const CHILD: &str = "FAB_TEST_FLEET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-fleet-{}", std::process::id()));
+            fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::background_reports_leave_the_target_plate_and_slice_alone", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).status().unwrap();
+            fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "isolated two-printer case failed");
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let (a_file, b_file) = (home.join("a.jsonl"), home.join("b.jsonl"));
+        fs::write(&a_file, "@head 0 1 PLA 1969D4FF\n").unwrap();
+        fs::write(&b_file, "@head 0 1 PETG EF120AFF\n@head 3 1 TPU 16CF51FF\n").unwrap();
+        let (a, b) = (PrinterChoice::Real("A".into()), PrinterChoice::Real("B".into()));
+        let presets = virtual_printer::presets();
+        let single = presets.iter().find(|p| p.name == "two-materials").unwrap();
+        second_family_profiles::install(&home);
+        // Two imported machines of A's model. The parent's preset still slices the reference plate.
+        let imports = home.join("imports");
+        write_wide_machine(&imports, single, 380, 0.6);
+        let raw = virtual_printer::builtin_presets(std::slice::from_ref(single)).remove(0);
+        fs::write(imports.join("machine/standard.json"), makepad_fab_settings::import::preset_json(&raw)).unwrap();
+        let catalog = catalog_in(&ProfileStore::default_data_dirs(), &home.join("imports"), std::slice::from_ref(single)).unwrap();
+        let mut printing = Printing { catalog: Some(Arc::new(catalog)), ..Default::default() };
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        state.links.picked = a.clone();
+        state.settings.use_installed = true;
+        state.settings.machine = single.machine_preset_name();
+        state.settings.process = virtual_printer::PROCESS.into();
+        printing.load_base_values(&mut state);
+        printing.install(&mut state, &a, PrinterLink::simulate_moonraker(a_file, &single.model()), false);
+
+        let mut plate = fleet_plate(&printing);
+        let low = TrayId { ams: 0, slot: 0 };
+        let high = TrayId { ams: 3, slot: 0 };
+        wait_for("A must report its blue spool through its one watched head", || {
+            poll_fleet(&mut printing, &mut state, &mut plate);
+            state.target_printer().is_some_and(|s| s.state.extruders.len() == 1
+                && s.state.tray(low).is_some_and(|t| t.colour == Colour::parse("1969D4FF")))
+        });
+        assert!(state.colors.rows.iter().any(|r| r.used && r.pos.is_some() && r.spool().is_some()), "A must have a mapped print colour");
+
+        let mut fleet = settle_fleet_plate(&mut printing, &mut state, &plate);
+        let status = state.status.clone();
+        let generation = printing.gen;
+        let revisions = crate::live_slice::revisions().unwrap();
+        let input_key = crate::live_slice::slice_key(&plate);
+        assert_eq!(printing.figures_of, Some(input_key), "the saved input key must identify A's settled plate and settings");
+        let rows = state.colors.rows.clone();
+        let materials = state.settings.materials.clone();
+        let unprinted = state.unprinted.clone();
+        let moves = state.head_moves.clone();
+        let a_report = state.target_printer().unwrap().clone();
+        assert!(printing.slice_job.is_none() && printing.live_job.is_none(), "A's settled plate must have no slice jobs on the board");
+
+        // Keep B outside the fleet until it has an unread IDLE publication. A consumes the
+        // global change before install, so only a fresh entry can deliver B on the next event.
+        let b_model = second_family_profiles::model();
+        let mut link = PrinterLink::simulate_moonraker(b_file.clone(), &b_model);
+        // The pending report already has a different spool. Only the fleet can widen this watch to head four.
+        link.set_heads(&b_model, 1);
+        wait_for("B must report its one watched red spool before install", || {
+            link.poll().is_some_and(|s| s.state.gcode_state.as_deref() == Some("IDLE") && s.state.extruders.len() == 1
+                && s.state.tray(low).is_some_and(|t| t.colour == Colour::parse("EF120AFF")))
+        });
+        let published = fab_printer_link::published();
+        let mut file = fs::OpenOptions::new().append(true).open(b_file).unwrap();
+        writeln!(file, r#"{{"print_stats":{{"state":"standby","filename":"cube.gcode","info":{{"total_layer":3}}}}}}"#).unwrap();
+        wait_for("B must publish its pending IDLE report before install", || fab_printer_link::published() != published);
+        poll_fleet(&mut printing, &mut state, &mut plate);
+
+        let sent = |id: &str, pick: &PrinterChoice| CommittedJob::restored(
+            JobMeta { id: id.into(), name: "cube".into(), printer: pick.id(), layers: 3, ..Default::default() },
+            SavedState { state: JobState::Sent, ..Default::default() }, 0.0, 0.0);
+        state.follow.jobs.push(sent("a-job", &a));
+        printing.install(&mut state, &b, link, false);
+        let first = poll_fleet(&mut printing, &mut state, &mut plate);
+        let check_materials = |state: &PrintState| {
+            assert_eq!(state.colors.rows, rows, "B's report must leave A's mapped colour rows and positions unchanged");
+            assert_eq!(state.settings.materials, materials, "B's report must leave A's material settings unchanged");
+            assert_eq!(state.unprinted, unprinted, "B's report must leave A's unprinted colours unchanged");
+            assert_eq!(state.head_moves, moves, "B's report must leave A's head moves unchanged");
+        };
+        check_materials(&state);
+        assert!(first.others && !first.target, "freshly installed B must deliver its pending report without a new publication or a target remap");
+        assert_eq!(state.printer_of(&b).unwrap().state.gcode_state.as_deref(), Some("IDLE"), "B's first fleet report must be IDLE");
+        assert_eq!(state.follow.job_of("a-job").unwrap().state, JobState::Sent, "B's IDLE must leave A's job Sent");
+        wait_for("B's profile must subscribe its link to the fourth head and its green spool", || {
+            let flags = poll_fleet(&mut printing, &mut state, &mut plate);
+            check_materials(&state);
+            assert!(!flags.target, "B's subscribed-head report must only redraw");
+            state.printer_of(&b).is_some_and(|s| s.model == b_model && s.state.extruders.len() == 4
+                && s.state.tray(high).is_some_and(|t| t.colour == Colour::parse("16CF51FF")))
+        });
+        state.follow.jobs.push(sent("b-job", &b));
+        writeln!(file, r#"{{"print_stats":{{"state":"complete","filename":"cube.gcode","info":{{"total_layer":3}}}}}}"#).unwrap();
+        wait_for("B must report FINISH for the same named job", || {
+            let flags = poll_fleet(&mut printing, &mut state, &mut plate);
+            check_materials(&state);
+            assert!(!flags.target, "B's terminal report must only redraw");
+            state.printer_of(&b).unwrap().state.gcode_state.as_deref() == Some("FINISH")
+        });
+        assert_eq!(state.follow.job_of("a-job").unwrap().state, JobState::Sent, "B's same-named FINISH must leave A's job Sent");
+        assert_eq!(state.follow.job_of("b-job").unwrap().state, JobState::Finished, "B's FINISH must reconcile B's own job");
+        assert!(Arc::ptr_eq(state.target_printer().unwrap(), &a_report), "A must keep its own snapshot");
+        assert_eq!(crate::live_slice::revisions(), Some(revisions), "B must leave A's live input and served revisions unchanged");
+        assert_eq!(crate::live_slice::slice_key(&plate), input_key, "B must leave A's plate and settings input key unchanged");
+        assert_eq!(printing.gen, generation, "B must not ask for a new slice generation");
+        assert_eq!(state.status, status, "B must leave A's settled slice status unchanged");
+        assert!(state.settled && !state.stale && printing.slice_job.is_none() && printing.live_job.is_none(), "B must neither request nor start a slice for A");
+        check_installed_machine_selection(&mut fleet, &home, single);
+        check_machine_bindings(&mut printing, &mut state, &mut plate, &home, single);
+    }
+
+    #[test]
+    fn configured_fleet_starts_in_saved_modes_and_keeps_the_target_isolated() {
+        use fab_printer_link::{ConnectionStatus, PrinterLink};
+        use std::{cell::RefCell, fs, io::Write, rc::Rc};
+
+        const CHILD: &str = "FAB_TEST_FLEET_STARTUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("fab-fleet-startup-{}", std::process::id()));
+            fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "print::tests::configured_fleet_starts_in_saved_modes_and_keeps_the_target_isolated", "--nocapture"])
+                .env(CHILD, "1").env("MAKEPAD_TEST_HOME", &home).env_remove("FAB_PRINTER_VIRTUAL").status().unwrap();
+            fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "isolated configured fleet case failed");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let presets = virtual_printer::presets();
+        let single = presets.iter().find(|p| p.name == "two-materials").unwrap();
+        let four = presets.iter().find(|p| p.name == "four-tools").unwrap();
+        let imports = home.join("imports");
+        let catalog = Arc::new(catalog_in(&[], &imports, &[single.clone(), four.clone()]).unwrap());
+        let missing = Arc::new(catalog_in(&[], &imports, std::slice::from_ref(single)).unwrap());
+        let [a, b, c] = ["A", "B", "C"].map(|name| PrinterChoice::Real(name.into()));
+        let startup = |names: &[&str], catalog: &Arc<Catalog>| {
+            fs::write(home.join("A"), "@head 0 1 PLA 1969D4FF\n").unwrap();
+            fs::write(home.join("C"), "@head 0 1 PETG EF120AFF\n").unwrap();
+            let mut twin = four.clone();
+            twin.name = "b-twin".into();
+            twin.configured_for = Some("B".into());
+            twin.source = VirtualSource::Twin { preset: four.machine_preset_name(), model: four.model(), source: None };
+            let saved = Saved { picked: a.id(), printers: vec![twin], disconnected: ["B".into()].into(), bindings: Default::default() };
+            // An in-memory Moonraker session enters the protocol counters too. Establish
+            // the fixture connections before measuring anything Fab does with their handles.
+            let model = single.model();
+            // Start every simulator before waiting on any: they connect side by side, so their
+            // server-info rounds overlap instead of adding up.
+            let mut prepared: HashMap<String, PrinterLink> = names.iter().filter(|n| matches!(**n, "A" | "C"))
+                .map(|&name| (name.to_string(), PrinterLink::simulate_moonraker(home.join(name), &model))).collect();
+            for link in prepared.values_mut() {
+                wait_for("both the simulator status socket and its server-info request", || {
+                    link.poll().is_some_and(|s| s.status == ConnectionStatus::Connected
+                        && !s.state.details.iter().any(|(key, _)| key == "Waiting"))
+                });
+                link.set_heads(&model, 1); // Publish the subscribed state for the newly installed handle.
+            }
+            let counts = fab_printer_link::entry_counts();
+            let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+            let (record, dir, prepared) = (calls.clone(), home.clone(), RefCell::new(prepared));
+            let mut printing = Printing { real_constructor: Some(Box::new(move |name| {
+                record.borrow_mut().push(name.into());
+                prepared.borrow_mut().remove(name).unwrap_or_else(|| PrinterLink::simulate_moonraker(dir.join(name), &model))
+            })), ..Default::default() };
+            let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+            state.settings.machine = single.machine_preset_name();
+            state.settings.process = virtual_printer::PROCESS.into();
+            state.settings.use_installed = true;
+            printing.event(&mut state, &PrintEvent::PrinterConfigs {
+                names: names.iter().map(|n| n.to_string()).collect(), presets: vec![], loadouts: LoadoutFiles::new(),
+            });
+            assert!(printing.fleet.is_empty() && calls.borrow().is_empty(), "no worker may start before modes are known");
+            printing.event(&mut state, &PrintEvent::VirtualPrinters { saved, catalog: Some(catalog.clone()), kept_as: None });
+            printing.event(&mut state, &PrintEvent::Catalog(Some(catalog.clone())));
+            (printing, state, calls, counts)
+        };
+        let (_, baseline, _, baseline_counts) = startup(&["A"], &catalog);
+        assert_eq!(fab_printer_link::entry_counts(), baseline_counts, "single-printer startup must reuse its injected worker");
+        let (mut printing, mut state, calls, counts) = startup(&["A", "B", "C"], &catalog);
+        assert_eq!(calls.borrow().as_slice(), ["A", "C"], "only Connected A and C may reach the real constructor");
+        assert_eq!(state.links.picked, a, "startup must restore A as the target");
+        assert_eq!(printing.fleet.len(), 3, "startup must install exactly the three configured printers");
+        assert!(!printing.linked(&a).unwrap().virtual_mode && !printing.linked(&c).unwrap().virtual_mode
+            && printing.linked(&b).unwrap().virtual_mode, "A and C must hold Connected workers and B a virtual worker");
+        assert_ne!(baseline.settings.machine, four.machine_preset_name(), "the single-printer baseline must distinguish B's machine");
+        assert_eq!(state.settings, baseline.settings, "the target machine and materials must match startup with A alone");
+        let epoch = |p: &Printing, id: &PrinterChoice| p.linked(id).map(|e| e.epoch);
+        let epochs = |p: &Printing| [epoch(p, &a), epoch(p, &b), epoch(p, &c)];
+        let initial = epochs(&printing);
+        let connected = |p: &PrintState, id: &PrinterChoice| p.printer_of(id).is_some_and(|s| s.status == ConnectionStatus::Connected);
+        wait_for("the three workers to report", || {
+            printing.poll_printer(&mut state);
+            [&a, &b, &c].into_iter().all(|id| connected(&state, id))
+        });
+        let twin = state.printer_of(&b).unwrap();
+        assert!(twin.virtual_printer && twin.name == "B" && twin.model == four.model(), "B must report its own configured twin");
+        assert_eq!(fab_printer_link::entry_counts(), counts, "startup must avoid all real network and credential boundaries");
+
+        state.print_options.plate_clear = true;
+        state.confirm_print = Some(PrintConfirm::AwaitingReport(state.links.picked.clone()));
+        state.confirm_stop = ControlDestination::filament(PrinterScope::Shown, &state);
+        assert!(state.confirm_stop.is_some(), "A must have a stop confirmation before the retarget");
+        state.follow.confirm_start = Some("a-job".into());
+        let pick = |p: &mut Printing, s: &mut PrintState, id: &PrinterChoice| {
+            let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, s), id.clone());
+            assert!(p.action(s, &pick_action, None), "the requested retarget must take effect");
+        };
+        pick(&mut printing, &mut state, &c);
+        assert_eq!(epoch(&printing, &a), initial[0], "A stays in the fleet with its original epoch after picking C");
+        assert!(state.confirm_print.is_none() && state.confirm_stop.is_none() && state.follow.confirm_start.is_none()
+            && !state.print_options.plate_clear, "retargeting must clear A's confirmations and plate clearance");
+        assert_eq!(state.follow.reporting_printer.as_ref(), Some(&c), "Monitor must immediately use C's stored report");
+        pick(&mut printing, &mut state, &a);
+        assert_eq!(epochs(&printing), initial, "picking A again must preserve every link epoch");
+        pick(&mut printing, &mut state, &PrinterChoice::None);
+        assert_eq!(epochs(&printing), initial, "No printer must leave the whole fleet linked");
+        assert!(state.target_printer().is_none(), "No printer must leave the plate without a target");
+        pick(&mut printing, &mut state, &a);
+        assert_eq!(calls.borrow().as_slice(), ["A", "C"], "retargeting must never reopen a held link");
+
+        // Consume all of A's subscription changes before testing C's failure.
+        let mut plate = fleet_plate(&printing);
+        let mut a_file = fs::OpenOptions::new().append(true).open(home.join("A")).unwrap();
+        writeln!(a_file, "@head 0 1 PLA 3456ABFF").unwrap();
+        wait_for("A's mapped spool after retargeting", || {
+            poll_fleet(&mut printing, &mut state, &mut plate);
+            state.target_printer().is_some_and(|s| s.state.tray(TrayId { ams: 0, slot: 0 })
+                .is_some_and(|t| t.colour == fab_printer_link::model::Colour::parse("3456ABFF")))
+        });
+        assert!(state.colors.rows.iter().any(|r| r.used && r.spool().is_some()), "A's settled plate must use its reported spool");
+        let _runtime = settle_fleet_plate(&mut printing, &mut state, &plate);
+        let a_job = JobMeta { id: "a-job".into(), name: "cube".into(), printer: a.id(), ..Default::default() };
+        state.follow.jobs.push(CommittedJob::restored(a_job, SavedState { state: JobState::Sent, ..Default::default() }, 0.0, 0.0));
+        let snapshot = state.target_printer().unwrap().clone();
+        let (mapping, materials) = (state.colors.clone(), state.settings.materials.clone());
+        let (unprinted, moves) = (state.unprinted.clone(), state.head_moves.clone());
+        let revisions = crate::live_slice::revisions().unwrap();
+        let key = crate::live_slice::slice_key(&plate);
+        let (generation, status) = (printing.gen, state.status.clone());
+        assert_eq!(printing.figures_of, Some(key), "A's settled figures must identify the tested input");
+        let mut c_file = fs::OpenOptions::new().append(true).open(home.join("C")).unwrap();
+        writeln!(c_file, r#"{{"webhooks":{{"state":"shutdown","state_message":"fixture shutdown"}}}}"#).unwrap();
+        wait_for("C's reported firmware shutdown", || {
+            let flags = poll_fleet(&mut printing, &mut state, &mut plate);
+            assert!(Arc::ptr_eq(state.target_printer().unwrap(), &snapshot), "C's failure must leave A's target snapshot unchanged");
+            assert!(!flags.target, "C's failure must not request a target remap");
+            flags.others && state.printer_of(&c).is_some_and(|s| matches!(s.status, ConnectionStatus::Offline(_))
+                && s.state.errors.iter().any(|(_, text)| text == "fixture shutdown"))
+        });
+        assert_eq!(state.colors, mapping, "C's failure must preserve A's mapped colours and positions");
+        assert_eq!(state.settings.materials, materials, "C's failure must preserve A's materials");
+        assert_eq!(state.unprinted, unprinted, "C's failure must preserve A's unprinted colours");
+        assert_eq!(state.head_moves, moves, "C's failure must preserve A's head moves");
+        assert_eq!(crate::live_slice::revisions(), Some(revisions), "C's failure must preserve the live slice revisions");
+        assert_eq!(crate::live_slice::slice_key(&plate), key, "C's failure must preserve the plate and settings input key");
+        assert_eq!(printing.gen, generation, "C's failure must preserve the slice generation");
+        assert_eq!(state.status, status, "C's failure must preserve A's slice status");
+        assert!(state.settled && !state.stale && printing.slice_job.is_none() && printing.live_job.is_none(),
+            "C's failure must leave A settled with neither slice job on the board");
+        assert_eq!(state.follow.job_of("a-job").unwrap().state, JobState::Sent, "C's failure must leave A's job Sent");
+
+        let b_job = JobMeta { id: "b-job".into(), printer: b.id(), virtual_printer: true, ..Default::default() };
+        state.follow.jobs.push(CommittedJob { meta: Arc::new(b_job), state: JobState::Sent, ..Default::default() });
+        printing.event(&mut state, &PrintEvent::Catalog(Some(missing.clone())));
+        assert_eq!(epochs(&printing), [initial[0], None, initial[2]], "losing B's preset must retire only B");
+        assert_eq!(state.links.picked, a, "losing a background preset must preserve the target");
+        let stopped = state.follow.job_of("b-job").unwrap();
+        assert!(stopped.state == JobState::Stopped && stopped.stopped_reason.as_deref() == Some("The virtual print stopped when its printer was unlinked."),
+            "retiring background B must stop B's own virtual job with the unlink reason");
+        printing.event(&mut state, &PrintEvent::Catalog(Some(catalog.clone())));
+        assert!(epoch(&printing, &b) > initial[1] && printing.linked(&b).unwrap().virtual_mode, "the returning preset must restore B's twin in a new epoch");
+        assert_eq!([epoch(&printing, &a), epoch(&printing, &c)], [initial[0], initial[2]], "restoring B must preserve A's and C's workers");
+        assert_eq!(calls.borrow().as_slice(), ["A", "C"], "losing and restoring a preset must never reach the real constructor");
+
+        assert_eq!(fab_printer_link::entry_counts(), counts, "retargeting, failure and preset recovery must leave the boundary counters unchanged");
+
+        drop(printing);
+        let (mut delayed, mut delayed_state, requests, delayed_counts) = startup(&["A", "B", "C"], &missing);
+        let before = epochs(&delayed);
+        assert!(before[0].is_some() && before[1].is_none() && before[2].is_some(), "startup without B's preset must leave only B without a worker");
+        delayed.event(&mut delayed_state, &PrintEvent::Catalog(Some(catalog)));
+        assert!(delayed.linked(&b).is_some_and(|e| e.virtual_mode), "catalogue arrival must install the missing configured twin");
+        assert_eq!([epoch(&delayed, &a), epoch(&delayed, &c)], [before[0], before[2]], "late catalogue arrival must preserve both Connected epochs");
+        assert_eq!(requests.borrow().as_slice(), ["A", "C"], "waiting for a preset must never fall back to the real constructor");
+        assert_eq!(fab_printer_link::entry_counts(), delayed_counts, "starting with a missing preset and restoring it must leave the boundary counters unchanged");
+    }
+
     #[test]
     fn unavailable_configured_twin_never_starts_a_real_link() {
         const CHILD: &str = "FAB_TEST_DISCONNECTED_CHILD";
@@ -5387,13 +9696,13 @@ mod tests {
         saved.picked = pick.id();
         printing.event(&mut p, &PrintEvent::VirtualPrinters { saved: saved.clone(), catalog: None, kept_as: None });
         assert_eq!(p.links.picked, pick);
-        assert!(printing.printer.is_none() && p.links.note.contains("no saved layout"));
+        assert!(printing.fleet.is_empty() && p.links.note.contains("no saved layout"));
         let mut twin = saved.printers[0].clone();
         twin.configured_for = Some(config.into());
-        twin.source = VirtualSource::Twin { preset: "unavailable".into(), model: twin.model() };
+        twin.source = VirtualSource::Twin { preset: "unavailable".into(), model: twin.model(), source: None };
         saved.printers = vec![twin];
         printing.event(&mut p, &PrintEvent::VirtualPrinters { saved, catalog: None, kept_as: None });
-        assert!(printing.printer.is_none() && p.links.note.contains("preset is unavailable"));
+        assert!(printing.fleet.is_empty() && p.links.note.contains("preset is unavailable"));
         assert_eq!(fab_printer_link::entry_counts(), before);
     }
 
@@ -5432,13 +9741,14 @@ mod tests {
         assert_eq!(persisted.disconnected, saved.disconnected, "keep all printers disconnected across restarts");
         assert_eq!(persisted.picked, saved.picked, "keep the no-printer pick across restarts");
         assert_eq!(state.links.picked, PrinterChoice::None, "startup restores no printer");
-        assert!(printing.printer.is_none(), "handling the published modes must leave the link empty");
+        assert!(printing.fleet.is_empty(), "handling the published modes must leave the link empty");
         assert_eq!(state.links.note, "Fab could not read its saved printer settings, so it kept them as virtual_printers.txt.unreadable.2 and started fresh. No printer is linked, and your printers start in Virtual mode until you switch them to Connected.",
             "the startup note identifies the actual backup by filename");
         let pick = PrinterChoice::Real(names[1].clone());
-        assert!(printing.action(&mut state, &PrintAction::LinkPrinter(pick.clone()), None), "accept an explicit configured pick");
+        let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, &state), pick.clone());
+        assert!(printing.action(&mut state, &pick_action, None), "accept an explicit configured pick");
         assert_eq!(state.links.picked, pick, "link the chosen configuration");
-        let snapshot = printing.printer.as_mut().and_then(|link| link.poll()).expect("the pick creates a printer link");
+        let snapshot = printing.fleet.iter_mut().find(|entry| entry.id == pick).and_then(|entry| entry.link.poll()).expect("the pick creates a printer link");
         assert!(snapshot.virtual_printer, "the chosen link reports a virtual printer");
         assert_eq!(fab_printer_link::entry_counts(), before, "startup and the explicit pick avoid every real printer boundary");
         std::fs::remove_dir_all(dir).unwrap();
@@ -5459,10 +9769,11 @@ mod tests {
         state.set_configured_printers(&names);
         read_printer_profiles(Some(&path), &names, |_| None, |event| { printing.event(&mut state, &event); });
         assert!(printing.virtuals.is_none(), "a failed set-aside must not publish fresh modes");
-        assert!(printing.printer.is_none(), "a failed set-aside must leave startup unlinked");
+        assert!(printing.fleet.is_empty(), "a failed set-aside must leave startup unlinked");
         assert_eq!(state.links.note, format!("Fab could not read the saved printer modes. No printer was linked. The file could not be kept aside ({kind})."),
             "explain the set-aside failure with only its I/O error kind");
-        assert!(!printing.action(&mut state, &PrintAction::LinkPrinter(PrinterChoice::Real(names[0].clone())), None),
+        let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, &state), PrinterChoice::Real(names[0].clone()));
+        assert!(!printing.action(&mut state, &pick_action, None),
             "a manual pick is still blocked while the modes are unknown");
         assert_eq!(std::fs::read(original).unwrap(), b"untouched", "preserve the original contents");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "leave no backup or fresh settings beside the original");
@@ -5489,20 +9800,23 @@ mod tests {
         loaded.slots[0].material = Some("PETG".into());
         loaded.slots[0].colour = Some(0x136D8A);
         let report = fab_printer_link::virtual_link::report(&setup_of(&loaded, None).unwrap());
-        p.printers.set(&p.links.picked, Arc::new(fab_printer_link::Snapshot { state: Arc::new(report), ..Default::default() }));
-        p.sending = Some("block".into());
+        p.printers.set(&p.links.picked, 1, Arc::new(fab_printer_link::Snapshot { state: Arc::new(report), ..Default::default() }));
+        p.sending.push(Sending { job: "block".into(), printer: p.links.picked.clone() });
         assert!(printing.switch_mode(&mut p, config, true).unwrap_err().contains("being prepared"));
-        p.sending = None;
+        p.sending.clear();
         assert_eq!(printing.switch_mode(&mut p, config, true), Ok(true));
         let twin = printing.linked_virtual(&p).unwrap().clone();
         assert_eq!((&twin.slots[0].material, twin.slots[0].colour), (&loaded.slots[0].material, loaded.slots[0].colour));
         assert_eq!(setup_of(&twin, printing.catalog.as_deref()).unwrap().name, config);
-        let standalone = printing.make_twin(&mut p, &preset).unwrap();
+        let source = p.links.picked.clone();
+        let standalone = printing.make_twin(&mut p, &source, &preset).unwrap();
         assert_ne!(standalone, PrinterChoice::Virtual(twin.name.clone()));
+        assert!(p.links.choices.contains(&(standalone, format!("{preset} (virtual of {config} (Virtual))"))),
+            "a twin of a configured Virtual printer must use the source mode shown in the picker");
         assert!(!p.links.choices.iter().any(|(c, _)| c == &PrinterChoice::Virtual(twin.name.clone())));
         assert!(!printing.link_printer(&mut p, &PrinterChoice::Virtual(twin.name.clone())));
         assert_eq!(printing.switch_mode(&mut p, config, false), Ok(true));
-        assert!(!printing.held_virtual);
+        assert!(!printing.linked(&p.links.picked).is_some_and(|entry| entry.virtual_mode));
         assert_eq!(printing.virtuals.as_ref().unwrap().twin_for(config), Some(&twin));
         assert_eq!(printing.switch_mode(&mut p, config, true), Ok(true));
         assert_eq!(printing.linked_virtual(&p), Some(&twin));
@@ -5521,13 +9835,13 @@ mod tests {
         assert!(!cat.twins.contains_key(fab_sla::printer::BUILTIN_PRINTER.0), "no resin printer in the twin picker");
         assert!(printers.iter().all(|p| cat.twins.contains_key(&p.machine_preset_name())), "built-in filament machines can be twinned");
         let mut forged = printers[0].clone();
-        forged.source = VirtualSource::Twin { preset: fab_sla::printer::BUILTIN_PRINTER.0.into(), model: forged.model() };
+        forged.source = VirtualSource::Twin { preset: fab_sla::printer::BUILTIN_PRINTER.0.into(), model: forged.model(), source: None };
         let mut filament = cat.twins[&printers[0].machine_preset_name()].printer.clone();
         filament.name = "stock-fixture".into();
         filament.slots[0].material = Some("PETG".into());
         filament.slots[0].colour = Some(0x136D8A);
         let choice = |p: &VirtualPrinter| PrinterChoice::Virtual(p.name.clone());
-        let saved = Saved { picked: choice(&forged).id(), printers: vec![filament.clone(), forged.clone(), printers[1].clone()], disconnected: Default::default() };
+        let saved = Saved { picked: choice(&forged).id(), printers: vec![filament.clone(), forged.clone(), printers[1].clone()], disconnected: Default::default(), bindings: Default::default() };
         let mut printing = Printing { virtuals: Some(Arc::new(saved.clone())), ..Default::default() };
         let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
         let real = PrinterChoice::Real("Configured fixture".into());
@@ -5542,16 +9856,17 @@ mod tests {
         for p in [&forged, &filament] {
             assert!(!printing.link_printer(&mut state, &choice(p)), "an unavailable twin cannot link");
         }
-        assert!(printing.printer.is_none());
+        assert!(printing.fleet.is_empty());
         printing.event(&mut state, &PrintEvent::Catalog(Some(cat.clone())));
         assert_eq!(choices(&state), [real, choice(&filament), choice(&printers[1]), PrinterChoice::None]);
         assert_eq!(printing.virtuals.as_ref().unwrap().printers[0], filament, "the returning profile keeps its edited stock");
         assert_eq!(state.links.picked, PrinterChoice::None, "the returning twin waits for an explicit pick");
-        printing.action(&mut state, &PrintAction::LinkPrinter(choice(&filament)), None);
-        assert!(printing.printer.is_some());
+        let pick_action = PrintAction::LinkPrinter(EditOwner::new(PrinterScope::Target, &state), choice(&filament));
+        printing.action(&mut state, &pick_action, None);
+        assert!(!printing.fleet.is_empty());
         assert_eq!(state.settings.machine, filament.machine_preset_name());
         printing.event(&mut state, &missing);
-        assert!(printing.printer.is_none(), "a linked twin disconnects if its preset disappears");
+        assert!(printing.fleet.is_empty(), "a linked twin disconnects if its preset disappears");
         assert_ne!(state.settings.machine, filament.machine_preset_name(), "a vanished twin's machine is not left selected");
         assert_eq!(state.links.picked, PrinterChoice::None);
         assert_eq!(printing.virtuals.as_ref().unwrap().picked.as_deref(), Some("printer:No printer"));
@@ -5559,7 +9874,7 @@ mod tests {
             part("first", 1, None, cube([100.0, 100.0, 0.0], 4.0)),
             part("second", 2, None, cube([112.0, 100.0, 0.0], 4.0)),
         ], ..Default::default() };
-        printing.virtuals = Some(Arc::new(Saved { printers: printers.clone(), picked: None, disconnected: Default::default() }));
+        printing.virtuals = Some(Arc::new(Saved { printers: printers.clone(), picked: None, disconnected: Default::default(), bindings: Default::default() }));
         for name in ["four-tools", "nine-materials"] {
             let vp = printers.iter().find(|p| p.name == name).unwrap();
             assert!(printing.link_printer(&mut state, &PrinterChoice::Virtual(name.into())));
@@ -5626,36 +9941,37 @@ mod tests {
                 let modes = &mut Arc::make_mut(printing.virtuals.as_mut().unwrap()).disconnected;
                 if virtual_mode { modes.insert(SIMULATED_PRINTER.into()); } else { modes.clear(); }
                 assert!(printing.link_printer(p, &choice));
-                p.printers.set(&p.links.picked, Arc::new(fab_printer_link::Snapshot { virtual_printer: virtual_mode, ..Default::default() }));
+                p.printers.set(&p.links.picked, printing.linked(&choice).unwrap().epoch, Arc::new(fab_printer_link::Snapshot { virtual_printer: virtual_mode, ..Default::default() }));
             };
             link(&mut printing, &mut p, was_virtual);
-            let epoch = printing.epoch;
+            let ticket = p.ticket_for(&choice).unwrap();
             let options = p.print_options;
             let meta = Arc::new(job_meta(&sliced, &choice, p.target_printer().map(Arc::as_ref), &options, Vec::new()));
             let id = meta.id.clone();
             p.follow.jobs.push(CommittedJob { meta: meta.clone(), ..Default::default() });
-            p.sending = Some(meta.name.clone());
-            p.confirm_print = true;
-            p.confirm_stop = ControlDestination::filament(&p);
+            p.sending.push(Sending { job: id.clone(), printer: choice.clone() });
+            p.confirm_print = Some(PrintConfirm::Filament(p.ticket_for(&choice).unwrap()));
+            p.confirm_stop = ControlDestination::filament(PrinterScope::Shown, &p);
             p.print_options.plate_clear = true;
             p.follow.confirm_start = Some(id.clone());
-            let to = PackageFor::Printer(ToPrinter { destination: choice.clone(), epoch, options, meta: meta.clone(), scripts: Arc::default(), queue: false });
+            let to = PackageFor::Printer(ToPrinter { ticket: ticket.clone(), options, meta: meta.clone(), scripts: Arc::default(), queue: false });
             printing.packaging.push(Packaging { id: 1, sliced: sliced.clone(), to, stop: Arc::default() });
             link(&mut printing, &mut p, !was_virtual);
-            assert!(!p.confirm_print && !p.print_options.plate_clear && p.confirm_stop.is_none() && p.follow.confirm_start.is_none());
-            assert!(printing.event(&mut p, &PrintEvent::Packaged { id: 1, result: Packaged::Checked(checked.clone()) }));
-            assert_eq!(p.print_blocked.as_deref(), Some(SWITCHED));
+            assert!(p.confirm_print.is_none() && !p.print_options.plate_clear && p.confirm_stop.is_none() && p.follow.confirm_start.is_none());
+            assert_eq!(printing.event(&mut p, &PrintEvent::Packaged { id: 1, result: Packaged::Checked(checked.clone()) }), PrintOutcome::Target);
+            assert_eq!(p.print_blocked.get(&choice), Some(STALE_DISPATCH));
             assert_eq!(p.follow.job_of(&id).unwrap().state, JobState::Queued);
-            assert_eq!(printing.start_job(&mut p, &id).unwrap_err(), WRONG_DESTINATION);
-            assert_eq!(printing.send_job(&mut p, printing.epoch, &choice, checked.clone(), &meta, options).unwrap_err(), WRONG_DESTINATION);
+            let other_mode = p.ticket_for(&choice).unwrap();
+            assert_eq!(printing.start_job(&mut p, &id, &other_mode).unwrap_err(), WRONG_DESTINATION);
+            assert_eq!(printing.send_job(&mut p, &other_mode, checked.clone(), &meta, options).unwrap_err(), WRONG_DESTINATION);
 
-            p.print_blocked = None;
-            printing.starting = Some((id.clone(), epoch));
-            p.sending = Some(meta.name.clone());
+            p.print_blocked.set(&choice, None);
+            printing.starting.push((id.clone(), 2));
+            p.sending.push(Sending { job: id.clone(), printer: choice.clone() });
             link(&mut printing, &mut p, was_virtual);
-            assert_eq!(printing.send_job(&mut p, epoch, &choice, checked.clone(), &meta, options).unwrap_err(), SWITCHED);
-            assert!(printing.event(&mut p, &PrintEvent::JobChecked { id: id.clone(), epoch, destination: choice.clone(), options, result: Ok(checked.clone()) }));
-            assert_eq!(p.print_blocked.as_deref(), Some(SWITCHED));
+            assert_eq!(printing.send_job(&mut p, &ticket, checked.clone(), &meta, options).unwrap_err(), STALE_DISPATCH);
+            assert_eq!(printing.event(&mut p, &PrintEvent::JobChecked { id: id.clone(), attempt: 2, ticket, options, result: Ok(checked.clone()) }), PrintOutcome::Target);
+            assert_eq!(p.print_blocked.get(&choice), Some(STALE_DISPATCH));
             let job = p.follow.job_of(&id).unwrap();
             assert_eq!((job.link_send, &job.state), (0, &JobState::Queued));
         }
@@ -5668,7 +9984,7 @@ mod tests {
         let vp = printers.iter().find(|p| p.name == "nine-materials").unwrap();
         let destination = PrinterChoice::Virtual(vp.name.clone());
         let mut printing = Printing::default();
-        printing.virtuals = Some(Arc::new(Saved { printers: printers.clone(), picked: None, disconnected: Default::default() }));
+        printing.virtuals = Some(Arc::new(Saved { printers: printers.clone(), picked: None, disconnected: Default::default(), bindings: Default::default() }));
         let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
         assert!(printing.link_printer(&mut state, &destination));
         let imports = std::env::temp_dir().join(format!("fab-painted-job-{}", std::process::id()));
@@ -5677,7 +9993,7 @@ mod tests {
         let machine = printing.machine().unwrap().clone();
         let heads = colours::Offline::of(&machine).heads;
         let report = fab_printer_link::virtual_link::report(&setup_of(vp, None).unwrap());
-        state.printers.set(&state.links.picked, Arc::new(fab_printer_link::Snapshot {
+        state.printers.set(&state.links.picked, 1, Arc::new(fab_printer_link::Snapshot {
             name: vp.title.clone(), virtual_printer: true, state: Arc::new(report.clone()), ..Default::default()
         }));
         let layout = colours::layout(Some((&vp.title, &report)), None, &colours::Offline::of(&machine), &|_| None);
@@ -5707,11 +10023,6 @@ m.fill(m.box({size: [7mm 0.3mm 4mm] at: [0 0.22mm 0]}), Material{albedo: #f02020
             tray_colours.push(tray.colour.unwrap());
         }
         assert_eq!(tray_colours.len(), 2);
-        let remap = |printing: &mut Printing, state: &mut PrintState, ev: &mut Evaluated| {
-            if let Some(mapped) = printing.refresh_printer(state, Some(&Arc::new(ev.clone()))) {
-                ev.set_mapped(mapped);
-            }
-        };
         remap(&mut printing, &mut state, &mut ev);
         // A painted top over a solid first layer; dry travel lifts clear even on this small part.
         ev.plate.settings.extend([("filament_retraction_minimum_travel".into(), "0".into()),
@@ -7114,7 +11425,7 @@ pub(crate) mod slice_bench {
     // The app's Cx on a native GPU session, pumped as the app pumps it: a slice's continuations
     // run from its events, so waiting for a worker event without pumping would never end.
     pub(crate) struct SliceRuntime {
-        cx: Cx,
+        pub(super) cx: Cx,
         session: u32,
         paint: bool,
         frame_events: std::rc::Rc<std::cell::Cell<usize>>,
@@ -7126,7 +11437,7 @@ pub(crate) mod slice_bench {
             Self::with_events(|_| {})
         }
 
-        fn with_events(mut observe: impl FnMut(&Event) + 'static) -> Self {
+        pub(super) fn with_events(mut observe: impl FnMut(&Event) + 'static) -> Self {
             use makepad_widgets::makepad_platform::makepad_hal::{Hal, OpenReq, open_flags, backend_id};
             let guard = crate::live_slice::HUB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
             let cx_guard = crate::cx_owned();
@@ -7196,6 +11507,10 @@ pub(crate) mod slice_bench {
             crate::live_slice::set_resume(&engine, version, pool, true);
             (engine, rx)
         }
+        pub(super) fn turn(&mut self) {
+            let present = self.paint && self.cx.frame_completion_serial() >= self.cx.frame_submission_serial();
+            assert!(self.cx.hal_session_turn(1_000_000, present));
+        }
         pub(crate) fn recv<T>(&mut self, rx: &std::sync::mpsc::Receiver<T>) -> T {
             self.recv_or(rx, || false).expect("the next")
         }
@@ -7211,8 +11526,7 @@ pub(crate) mod slice_bench {
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
                 assert!(start.elapsed().as_secs() < 180, "the engine answers");
-                let present = self.paint && self.cx.frame_completion_serial() >= self.cx.frame_submission_serial();
-                assert!(self.cx.hal_session_turn(1_000_000, present));
+                self.turn();
             }
         }
     }
@@ -7250,7 +11564,7 @@ pub(crate) mod slice_bench {
         let mut settings = defaults_settings();
         let colours = tool_colours(ev, None).model;
         settings.materials = colours.into_iter().enumerate().map(|(i, color)| JobMaterial { preset: String::new(), color, nozzle: i % 2, tray: None, dedicated: false }).collect();
-        CheckSetup { settings, catalog: None, mapping: Some(ev.mapped.clone()) }
+        CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings, catalog: None, mapping: Some(ev.mapped.clone()) }
     }
 
     /// What one Print editor slice showed: progress and the streamed layers over time.
@@ -7283,7 +11597,7 @@ pub(crate) mod slice_bench {
         let t0 = Instant::now();
         let (e2, s2) = (ev.clone(), setup.clone());
         let make: makepad_fab_slice::live::MakeInput = Arc::new(move || crate::live_slice::input_for(crate::live_slice::plate_id(&e2), &s2, Arc::new(e2.plate.printable()), e2.machine.clone(), Some(&e2.frames), Some(&e2.fields)));
-        let job = crate::live_slice::PrintJob { gen: 9, settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "bench".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+        let job = crate::live_slice::PrintJob { gen: 9, head_envelope: setup.head_envelope().to_path_buf(), settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "bench".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
         let mut last = String::new();
         let mut out = AppSlice { progress: Vec::new(), streamed: Vec::new(), shown: Vec::new(), stages: Vec::new(), bands: Vec::new(), seconds: 0.0, rebuilds: 0 };
         // The Print editor and its slice view, taking events as the app does.
@@ -7509,7 +11823,7 @@ pub(crate) mod slice_bench {
         p.follow.jobs.push(CommittedJob::restored(saved[0].0.clone(), saved[0].1.clone(), now, wall));
         let mut reports = fab_printer_link::model::Reports::default();
         let report = format!(r#"{{"print":{{"msg":0,"gcode_state":"RUNNING","stg_cur":0,"subtask_name":"{}","layer_num":2,"total_layer_num":{},"mc_remaining_time":10}}}}"#, meta.name, meta.layers);
-        p.printers.set(&p.links.picked, Arc::new(fab_printer_link::Snapshot { status: fab_printer_link::ConnectionStatus::Connected, state: Arc::new(reports.apply(report.as_bytes()).unwrap().unwrap()), ..Default::default() }));
+        p.printers.set(&p.links.picked, 1, Arc::new(fab_printer_link::Snapshot { status: fab_printer_link::ConnectionStatus::Connected, state: Arc::new(reports.apply(report.as_bytes()).unwrap().unwrap()), ..Default::default() }));
         printer_changed(&mut p, now);
         assert!(p.monitor_holds() && p.monitor_preview().is_none(), "its slice is on its way");
         assert_eq!(p.follow.job.as_ref().and_then(|j| j.id.as_deref()), Some(meta.id.as_str()));
@@ -7561,7 +11875,7 @@ pub(crate) mod slice_bench {
                 _ => {}
             }
         };
-        let job = crate::live_slice::PrintJob { gen: 0, settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(&ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "count".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+        let job = crate::live_slice::PrintJob { gen: 0, head_envelope: setup.head_envelope().to_path_buf(), settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(&ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "count".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
         let sliced = finish_sliced(&job, &settled, Arc::from([]));
         (sliced, paths.expect("toolpaths"))
     }
@@ -7627,7 +11941,7 @@ pub(crate) mod slice_bench {
     fn sliced_and_changes(engine: &makepad_fab_slice::live::LiveEngine, rx: &std::sync::mpsc::Receiver<LiveEvent>, ev: &Arc<Evaluated>, state: &PrintState) -> (Arc<makepad_fab_slice::live::Settled>, Arc<makepad_fab_gcode::heads::Changes>) {
         let mut settings = defaults_settings();
         settings.materials = state.settings.materials.clone();
-        let setup = CheckSetup { settings, catalog: None, mapping: Some(ev.mapped.clone()) };
+        let setup = CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings, catalog: None, mapping: Some(ev.mapped.clone()) };
         engine.settle(1, crate::live_slice::input_for(crate::live_slice::plate_id(ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)));
         let (mut settled, mut changes) = (None, None);
         while settled.is_none() || changes.is_none() {
@@ -7685,21 +11999,25 @@ pub(crate) mod slice_bench {
             let event = runtime.recv(&slices);
             if matches!(event, PrintEvent::Sliced { gen, .. } if gen == generation) { break event; }
         };
+        let gen_before = printing.gen;
         assert!(printing.action(state, &PrintAction::AskPrint(true), Some(old)), "Print asks for a new slice");
         assert_eq!(state.status, waiting(colours), "an asked slice waits for the printer's colours");
         assert_eq!(printing.reask, Some(false));
-        assert!(!printing.slice_asked());
+        assert_eq!((printing.gen, printing.slice_gen), (gen_before, None), "no slice starts while the printer's colours are applied");
+        assert!(printing.slice_asked(), "a held Print press survives leaving Sliced view");
 
         let mut old_bed = (**rebuilt).clone();
         old_bed.machine.max_height += 1.0;
         printing.resume_asked(state, Some(&Arc::new(old_bed)));
         assert_eq!(state.status, waiting(bed), "the same ask also waits for the printer's bed");
         assert_eq!(printing.reask, Some(false));
+        assert_eq!((printing.gen, printing.slice_gen), (gen_before, None), "no slice starts while the printer's bed updates");
 
         assert_eq!(setup.plate_waits(rebuilt), None, "an equal mapping is ready even in a different Arc");
         assert!(printing.resume_asked(state, Some(rebuilt)));
+        assert_eq!(printing.slice_gen, Some(gen_before + 1), "resume_asked starts a fresh slice once the rebuilt plate lands");
         assert!(printing.slice_asked() && printing.reask.is_none());
-        assert!(printing.event(state, &slice_answer(printing.gen)));
+        assert_eq!(printing.event(state, &slice_answer(printing.gen)), PrintOutcome::Target);
         assert!(matches!(state.status, SliceStatus::Done { .. }), "the resumed slice finished: {:?}", state.status);
         assert!(state.can_send(), "the finished slice for the rebuilt plate can be sent");
 
@@ -7713,7 +12031,7 @@ pub(crate) mod slice_bench {
         part.nozzle = Some(1 - part.nozzle.unwrap());
         assert_eq!(printing.plate_waits(state, &wrong), None);
         printing.slice(state, Some(&Arc::new(wrong)));
-        assert!(printing.event(state, &slice_answer(printing.gen)));
+        assert_eq!(printing.event(state, &slice_answer(printing.gen)), PrintOutcome::Target);
         assert!(matches!(&state.status, SliceStatus::Failed(e) if e.contains("must print on nozzle") && e.contains("is mapped to nozzle")),
             "a real part/material mismatch reaches the slicer: {:?}", state.status);
     }

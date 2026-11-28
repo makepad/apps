@@ -103,7 +103,12 @@ impl Origin {
     /// Its areas and the plate mode it pins. Design holds the Program beside the plate while the
     /// code toggle was last on (`view_prefs::load_code`, read on each call: a click's worth).
     pub fn tree(self) -> (AreaTree, Option<PlateMode>) {
-        (self.arrangement(crate::view_prefs::load_code()), self.kind().pinned_mode())
+        let code = if self == Origin::Design { crate::view_prefs::load_code() } else { (true, None) };
+        self.tree_with_code(code)
+    }
+
+    pub(crate) fn tree_with_code(self, code: (bool, Option<f64>)) -> (AreaTree, Option<PlateMode>) {
+        (self.arrangement(code), self.kind().pinned_mode())
     }
 
     /// Its areas, Design's with the Program beside the plate when `code` says so (on, and its
@@ -152,11 +157,30 @@ impl Origin {
     }
 }
 
+/// Design with the parts stacked over the plates on the left, as it was laid out until the parts
+/// list became a person's to add (2026-11-27), the Program beside the plate when `code` says so.
+/// No default shows it; a reveal of an editor no default holds (Parts) joins its neighbours here.
+pub(crate) fn design_with_parts(code: (bool, Option<f64>)) -> AreaTree {
+    use AreaTree as T;
+    use SplitterAlign::{FromA, FromB, Weighted};
+    use SplitterAxis::{Horizontal, Vertical};
+    let plate = T::split(Vertical, FromB(STEPS_H), T::area(Editor::Viewport), T::area(Editor::Steps));
+    let (code, width) = code;
+    let plate = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate, T::area(Editor::Code)) } else { plate };
+    let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
+    let top = T::stack(&[Editor::Slicer, Editor::Printer], 0);
+    let below = T::stack(&[Editor::Overrides, Editor::Strength], 0);
+    let right = T::split(Vertical, Weighted(0.5), top, below);
+    T::split(Horizontal, FromA(250.0), left, T::split(Horizontal, FromB(320.0), plate, right)).numbered()
+}
+
 /// The editors near `editor` in the first default that holds it, nearest first
-/// ([`AreaTree::nearby`]); none when no default does. A Reveal of an editor no area holds puts it
+/// ([`AreaTree::nearby`]), else in [`design_with_parts`]; none when neither does. A Reveal of an editor no area holds puts it
 /// with the nearest of them on screen. O(defaults x tabs), on a reveal; no file read.
 pub fn neighbours(editor: Editor) -> Vec<Editor> {
-    Origin::ALL.iter().find_map(|o| o.arrangement((false, None)).nearby(editor)).unwrap_or_default()
+    Origin::ALL.iter().find_map(|o| o.arrangement((false, None)).nearby(editor))
+        .or_else(|| design_with_parts((false, None)).nearby(editor))
+        .unwrap_or_default()
 }
 
 /// One workspace of the caption's row.
@@ -180,6 +204,11 @@ pub struct WorkspaceDef {
 impl WorkspaceDef {
     pub(crate) fn of(origin: Origin, id: WorkspaceId) -> WorkspaceDef {
         let (tree, mode) = origin.tree();
+        WorkspaceDef { id, name: origin.name().to_string(), tree, mode, origin: Some(origin), shape: 0, maximized: None }
+    }
+
+    pub(crate) fn of_with_code(origin: Origin, id: WorkspaceId, code: (bool, Option<f64>)) -> WorkspaceDef {
+        let (tree, mode) = origin.tree_with_code(code);
         WorkspaceDef { id, name: origin.name().to_string(), tree, mode, origin: Some(origin), shape: 0, maximized: None }
     }
 
@@ -353,13 +382,19 @@ pub struct Workspaces {
 
 impl Default for Workspaces {
     fn default() -> Self {
-        let list: Vec<WorkspaceDef> = Origin::ALL.iter().enumerate().map(|(i, o)| WorkspaceDef::of(*o, WorkspaceId(i as u32 + 1))).collect();
-        Workspaces { current: list[0].id, next: list.len() as u32 + 1, list, instances: HashMap::new(), instance_rev: 0,
-            temp: None, temp_gen: 0, history: HashMap::new(), history_rev: 0, group: None, rev: 0, unsaved: false }
+        Self::defaults_with_code((true, None))
     }
 }
 
 impl Workspaces {
+    pub(crate) fn defaults_with_code(code: (bool, Option<f64>)) -> Self {
+        let list: Vec<WorkspaceDef> = Origin::ALL.iter().enumerate()
+            .map(|(i, o)| WorkspaceDef::of_with_code(*o, WorkspaceId(i as u32 + 1), code))
+            .collect();
+        Workspaces { current: list[0].id, next: list.len() as u32 + 1, list, instances: HashMap::new(), instance_rev: 0,
+            temp: None, temp_gen: 0, history: HashMap::new(), history_rev: 0, group: None, rev: 0, unsaved: false }
+    }
+
     /// The AI's temporary layout shows fresh Plate views, each as the one it copies (its shelf,
     /// its link and mode): what the AI frames and turns there never moves the person's Plate
     /// views, and Back lets go of them. O(workspaces x tabs).
@@ -857,11 +892,15 @@ impl Workspaces {
     /// none when it does not read as a list (or is empty, or an area in it holds no editor, or a
     /// workspace has neither areas nor a default).
     pub fn from_ron(text: &str) -> Option<Workspaces> {
+        Self::from_ron_with_code(text, crate::view_prefs::load_code())
+    }
+
+    pub(crate) fn from_ron_with_code(text: &str, code: (bool, Option<f64>)) -> Option<Workspaces> {
         let file = WorkspacesFile::deserialize_ron(text).ok()?;
         let list: Vec<WorkspaceDef> = file.list.into_iter().map(|d| {
             let tree = match (d.tree, d.origin) {
                 (Some(tree), _) => tree.numbered(),
-                (None, Some(origin)) => origin.tree().0,
+                (None, Some(origin)) => origin.tree_with_code(code).0,
                 (None, None) => return None,
             };
             let tree = without_retired(tree);
@@ -886,11 +925,15 @@ impl Workspaces {
     /// The person's list on this machine, else the defaults (a file that does not read says so
     /// in the log and leaves the defaults).
     pub fn load() -> Workspaces {
-        let Some(path) = crate::view_prefs::workspaces_path() else { return Workspaces::default() };
-        let Ok(text) = std::fs::read_to_string(&path) else { return Workspaces::default() };
-        Workspaces::from_ron(&text).unwrap_or_else(|| {
+        Self::load_with_code(crate::view_prefs::load_code())
+    }
+
+    pub(crate) fn load_with_code(code: (bool, Option<f64>)) -> Workspaces {
+        let Some(path) = crate::view_prefs::workspaces_path() else { return Self::defaults_with_code(code) };
+        let Ok(text) = std::fs::read_to_string(&path) else { return Self::defaults_with_code(code) };
+        Self::from_ron_with_code(&text, code).unwrap_or_else(|| {
             log!("fab: {} does not read as workspaces; the default ones show", path.display());
-            Workspaces::default()
+            Self::defaults_with_code(code)
         })
     }
 

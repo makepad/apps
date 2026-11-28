@@ -1,6 +1,6 @@
 use super::*;
 use makepad_create::docs::OpenDocument;
-use makepad_work_core::event::Id;
+use makepad_town_core::event::Id;
 use makepad_markdown_editor::{MarkdownEditor, MarkdownEditorAction};
 
 impl App {
@@ -23,13 +23,7 @@ impl App {
         if !open.dirty() { return Ok(false) }
         match open.flush(model) {
             Ok(wrote) => {
-                if wrote {
-                    if model.state.docs[&open.id].has_linked_tasks() {
-                        self.read_workspace();
-                    } else {
-                        self.view.workspace.update_document_author(model, open.id);
-                    }
-                }
+                if wrote && model.state.docs[&open.id].has_linked_tasks() { self.read_workspace(); }
                 self.doc_problem(cx, "");
                 Ok(wrote)
             }
@@ -78,7 +72,6 @@ impl App {
 
     pub(super) fn show_docs(&mut self, cx: &mut Cx) {
         if self.view.page != Page::Docs {
-            self.ui.widget(cx, ids!(title_prompt)).set_visible(cx, false);
             if self.document.is_some() {
                 if let Err(error) = self.switch_doc(cx, None) {
                     self.view.page = Page::Docs;
@@ -87,12 +80,7 @@ impl App {
             }
             if self.view.page != Page::Docs { return }
         }
-        let rows = self.view.workspace.selected().map_or(&[][..], |p| p.docs.as_slice());
-        let selected = rows.iter().find(|r| Some(r.id) == self.view.open_doc).or_else(|| rows.first());
-        let id = selected.map(|r| r.id);
-        self.ui.label(cx, ids!(doc_heading)).set_text(cx, selected.map_or("", |r| r.title.as_str()));
-        self.ui.widget(cx, ids!(docs_empty)).set_visible(cx, id.is_none());
-        self.ui.widget(cx, ids!(doc_sheet)).set_visible(cx, id.is_some());
+        let id = self.view.open_doc.filter(|id| self.view.workspace.selected().is_some_and(|p| p.docs.iter().any(|d| d.id == *id)));
         if let Err(error) = self.switch_doc(cx, id) { self.doc_problem(cx, &error); }
         self.view.open_doc = self.document.as_ref().map(|d| d.id);
     }
@@ -121,40 +109,6 @@ impl App {
             }
         }
         if changed && self.document.as_ref().is_some_and(OpenDocument::dirty) { self.arm_doc_timer(cx); }
-        let list = self.ui.portal_list(cx, ids!(document_list.list));
-        for (i, row) in list.items_with_actions(actions) {
-            if row.button(cx, ids!(open_doc)).clicked(actions) {
-                let target = self.view.workspace.selected().and_then(|p| p.docs.get(i)).map(|r| r.id);
-                if target.is_some() && self.switch_doc(cx, target).is_ok() {
-                    self.view.open_doc = target;
-                    self.update_page(cx);
-                }
-            }
-        }
-        let prompt = self.ui.widget(cx, ids!(title_prompt));
-        let input = self.ui.text_input(cx, ids!(doc_title_input));
-        if self.ui.button(cx, ids!(new_doc)).clicked(actions) {
-            prompt.set_visible(cx, true);
-            input.set_key_focus(cx);
-        }
-        if self.ui.button(cx, ids!(cancel_doc)).clicked(actions) || input.escaped(actions) {
-            prompt.set_visible(cx, false);
-            input.set_text(cx, "");
-        }
-        if prompt.visible() && (input.returned(actions).is_some() || self.ui.button(cx, ids!(add_doc)).clicked(actions)) {
-            let Some(project) = self.view.workspace.current else { return };
-            if self.flush_doc(cx).is_err() { return }
-            match self.dispatch(Action::AddDoc { project, title: input.text() }, Origin::Ui) {
-                Ok(id) => {
-                    self.view.open_doc = Some(id);
-                    input.set_text(cx, "");
-                    prompt.set_visible(cx, false);
-                    self.refresh(cx);
-                    if let Some(editor) = widget.borrow::<MarkdownEditor>() { editor.set_key_focus(cx); }
-                }
-                Err(error) => self.doc_problem(cx, &error),
-            }
-        }
     }
 
     pub(super) fn dispatch(&mut self, action: Action, origin: Origin) -> Result<Id, String> {
@@ -172,7 +126,7 @@ mod tests {
 
     #[test]
     fn only_the_last_typing_timeout_signs_the_burst() {
-        use makepad_work_core::{doc::BreakRef, entity::field};
+        use makepad_town_core::{doc::BreakRef, entity::field};
         use MarkdownEditorAction::{Changed, TaskToggled};
 
         let dir = std::env::temp_dir().join(format!("doc-editor-pause-{}", std::process::id()));

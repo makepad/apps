@@ -3,6 +3,7 @@
 //! PNGs when MOTION_CAPTURE_DIR is set: a picture of the geometry the
 //! morph produces, not of the GPU renderer.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::frame::{Item, ItemKind};
 use makepad_motion::{geometry, MotionDoc};
 
@@ -145,7 +146,7 @@ fn paint(canvas: &mut Canvas, item: &Item, opacity: f64) {
                 paint(canvas, child, opacity);
             }
         }
-        ItemKind::Path { path, fill: Some(fill), .. } => {
+        ItemKind::Primitive(PrimitiveFrame::Path { path, fill: Some(fill), .. }) => {
             let Some(b) = geometry::bounds(path) else { return };
             let m = item.transform([b[2], b[3]]);
             let polys: Vec<Vec<[f64; 2]>> = geometry::flatten(path, 0.05).into_iter().map(|(pts, _)| pts.into_iter().map(|p| m.apply(p)).collect()).collect();

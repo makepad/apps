@@ -51,6 +51,9 @@ pub mod layers;
 pub mod math;
 mod load;
 pub mod model;
+mod loaded;
+pub use loaded::{LoadedLayers, LoadedPlainFrame};
+pub use makepad_motion_plain::plain;
 pub mod modules;
 #[cfg(feature = "scene3d")]
 mod kernel2d;
@@ -105,6 +108,7 @@ pub use features::{AudioFeatures, AudioSignal, FeatureCurve, FeaturePhone, Featu
 pub use frame::{Affine, CameraFrame, EffectFrame, EffectValue, Item, ItemKind, KineticFrame, LightFrame, Local, MaterialFrame, MotionFrame, NodeFrame, PlateFrame, TextUnit, WidgetValue};
 pub use load::{check_path_data, RESERVED_UNIFORMS};
 pub use model::*;
+pub use plain::{PlainDoc, PlainFrame};
 pub use resolve::uses_musical_time;
 pub use signals::{LiveSignals, SignalSource};
 pub use timing::{BeatGrid, Length, Onset, Section, TimeExpr, TimeRef, Timing};
@@ -130,11 +134,6 @@ pub fn register_resources(vm: &mut makepad_script::ScriptVm) {
     }
 }
 
-/// The share of a document's width inside its side margins (6% each
-/// side): what `wrap: @safe` and `fit: @safe` mean, and the width
-/// `inspect` holds text to.
-pub const SAFE_WIDTH: f64 = 0.88;
-
-
+pub use makepad_motion_plain::SAFE_WIDTH;
 
 pub mod tree;

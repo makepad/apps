@@ -38,7 +38,7 @@ script_mod! {
             }
         }
         draw_text +: {text_style: theme.font_regular{font_size: fab.font_size_ui}}
-        draw_key +: {color: fab.color_text_muted text_style: theme.font_regular{font_size: 6.75}}
+        draw_key +: {color: fab.color_text_dim text_style: theme.font_regular{font_size: 6.75}}
         draw_cue +: {
             text_style: theme.font_regular{font_size: fab.font_size_ui}
             max_lines: 1
@@ -656,7 +656,7 @@ impl Widget for FabWorkspaceTabs {
 
     fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Group;
-        makepad_platform::a11y::set_string(&mut node.name, "Workspaces");
+        node.name = self.tab_name(self.current).map_or_else(|| "Workspaces".to_string(), |name| format!("Current workspace: {name}"));
     }
 
     /// The workspace tabs and controls in their on-screen order.

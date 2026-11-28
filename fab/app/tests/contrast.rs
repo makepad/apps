@@ -5,7 +5,7 @@
 //! grey with no contrast." Standalone on a Mac no sheet was worn, so Fab ran
 //! under the library's plain base theme: a mid-grey ground, and second and
 //! disabled inks that are white at a few percent. The feature kinds, the
-//! feature count, the caption's "3 parts · 21 solids", the inactive "Parts"
+//! feature count, the status bar's "3 parts · 21 solids", the inactive "Parts"
 //! tab and the Add chevron were grey on grey.
 //!
 //! Each element is found by its accessibility node; inside its box the
@@ -20,13 +20,15 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, NodeMatch, Role, Selector, TestApp, TestConfig};
 use makepad_widgets::theme_tokens::contrast;
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 const WORDS: f64 = 4.5;
@@ -58,6 +60,23 @@ fn head_of(reply: &str) -> String {
     reply.field("head").and_then(|f| f.value.string()).expect("reply has a head").to_string()
 }
 
+fn rgb_to_rgba(c: [u8; 3]) -> u32 {
+    ((c[0] as u32) << 24) | ((c[1] as u32) << 16) | ((c[2] as u32) << 8) | 0xff
+}
+
+fn rgb_dist_sq(a: [u8; 3], b: [u8; 3]) -> u32 {
+    let d = |i: usize| a[i] as i32 - b[i] as i32;
+    (d(0) * d(0) + d(1) * d(1) + d(2) * d(2)) as u32
+}
+
+fn luminance(c: [u8; 3]) -> f64 {
+    let ch = |v: u8| {
+        let v = v as f64 / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+}
+
 struct Frame {
     width: usize,
     height: usize,
@@ -75,20 +94,146 @@ impl Frame {
         Frame { width, height, rgb }
     }
 
-    /// The ground (the commonest colour) and the ink (the pixel furthest from
-    /// it) inside a box in device pixels, and their contrast.
+    /// The worst-case non-glyph ground (modal colour and the 5th/95th
+    /// luminance percentiles outside a 2-device-pixel glyph halo) and the ink
+    /// (the pixel furthest from modal ground) inside a box in device pixels,
+    /// and their minimum WCAG contrast.
     fn reading(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> (u32, u32, f64) {
         let (x1, y1) = (x1.min(self.width), y1.min(self.height));
-        let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+        assert!(x0 < x1 && y0 < y1, "an empty box");
+        let mut counts: BTreeMap<[u8; 3], usize> = BTreeMap::new();
         for y in y0..y1 {
+            let row = y * self.width;
             for x in x0..x1 {
-                *counts.entry(self.rgb[y * self.width + x]).or_default() += 1;
+                *counts.entry(self.rgb[row + x]).or_default() += 1;
             }
         }
-        let rgba = |c: [u8; 3]| ((c[0] as u32) << 24) | ((c[1] as u32) << 16) | ((c[2] as u32) << 8) | 0xff;
-        let ground = counts.iter().max_by_key(|(_, n)| **n).map(|(c, _)| rgba(*c)).expect("an empty box");
-        let (ink, ratio) = counts.keys().map(|c| (rgba(*c), contrast(ground, rgba(*c)))).fold((ground, 1.0), |best, c| if c.1 > best.1 { c } else { best });
-        (ground, ink, ratio)
+        // Deterministic ground mode via 4-bit (16-level) coarse RGB bins so a
+        // shaded or noisy background cannot shatter across hundreds of exact
+        // triplets and lose the mode to a flat solid-colour glyph. Within the
+        // winning coarse bin, take the exact mode (ties toward lowest RGB),
+        // which matches raw mode on flat grounds.
+        let mut coarse: BTreeMap<[u8; 3], usize> = BTreeMap::new();
+        for (&c, &n) in &counts {
+            *coarse.entry([c[0] >> 4, c[1] >> 4, c[2] >> 4]).or_default() += n;
+        }
+        let best_bin = coarse
+            .iter()
+            .max_by(|(ba, na), (bb, nb)| na.cmp(nb).then_with(|| bb.cmp(ba)))
+            .map(|(&b, _)| b)
+            .expect("an empty box");
+        let mut modal_rgb = counts
+            .iter()
+            .filter(|(&c, _)| [c[0] >> 4, c[1] >> 4, c[2] >> 4] == best_bin)
+            .max_by(|(ca, na), (cb, nb)| na.cmp(nb).then_with(|| cb.cmp(ca)))
+            .map(|(&c, _)| c)
+            .expect("winning coarse bin is non-empty");
+        let mut modal = rgb_to_rgba(modal_rgb);
+        // Deterministic ink: furthest WCAG contrast from modal ground, breaking
+        // ties toward lowest RGB (BTreeMap ascending key order).
+        let furthest_from = |base: u32, base_rgb: [u8; 3]| {
+            counts
+                .keys()
+                .map(|&c| {
+                    let rgba = rgb_to_rgba(c);
+                    (c, rgba, contrast(base, rgba))
+                })
+                .fold((base_rgb, base, 1.0_f64), |best, cand| {
+                    if cand.2 > best.2 { cand } else { best }
+                })
+        };
+        let (mut ink_rgb, mut ink, mut modal_ratio) = furthest_from(modal, modal_rgb);
+        if modal_rgb == ink_rgb {
+            return (modal, ink, modal_ratio);
+        }
+
+        // Mark core glyph pixels (at least as close to ink as to modal ground),
+        // then exclude a 2-device-pixel halo so anti-aliased glyph fringes
+        // cannot land in the 5th/95th-percentile background extremes.
+        let bw = x1 - x0;
+        let bh = y1 - y0;
+        let mut core_glyph = vec![false; bw * bh];
+        let mut core_count = 0usize;
+        for dy in 0..bh {
+            let row = (y0 + dy) * self.width;
+            for dx in 0..bw {
+                let c = self.rgb[row + x0 + dx];
+                if rgb_dist_sq(c, ink_rgb) <= rgb_dist_sq(c, modal_rgb) {
+                    core_glyph[dy * bw + dx] = true;
+                    core_count += 1;
+                }
+            }
+        }
+        // Polarity guard: in every text/icon box the background is the majority
+        // of pixels. If even the coarse-bin mode landed on a flat glyph over a
+        // wide multi-bin gradient, invert back to the majority side.
+        if core_count * 2 > bw * bh {
+            modal_rgb = ink_rgb;
+            modal = ink;
+            (ink_rgb, ink, modal_ratio) = furthest_from(modal, modal_rgb);
+            for dy in 0..bh {
+                let row = (y0 + dy) * self.width;
+                for dx in 0..bw {
+                    let c = self.rgb[row + x0 + dx];
+                    core_glyph[dy * bw + dx] = rgb_dist_sq(c, ink_rgb) <= rgb_dist_sq(c, modal_rgb);
+                }
+            }
+        }
+        let collect_bg = |pad: usize| -> Vec<[u8; 3]> {
+            let mut out = Vec::with_capacity(bw * bh);
+            for dy in 0..bh {
+                let ny0 = dy.saturating_sub(pad);
+                let ny1 = (dy + pad + 1).min(bh);
+                let row = (y0 + dy) * self.width;
+                for dx in 0..bw {
+                    let nx0 = dx.saturating_sub(pad);
+                    let nx1 = (dx + pad + 1).min(bw);
+                    let mut near_glyph = false;
+                    'halo: for ny in ny0..ny1 {
+                        let base = ny * bw;
+                        for nx in nx0..nx1 {
+                            if core_glyph[base + nx] {
+                                near_glyph = true;
+                                break 'halo;
+                            }
+                        }
+                    }
+                    if !near_glyph {
+                        out.push(self.rgb[row + x0 + dx]);
+                    }
+                }
+            }
+            out
+        };
+        let mut bg = collect_bg(2);
+        if bg.is_empty() {
+            bg = collect_bg(1);
+        }
+        if bg.is_empty() {
+            bg = collect_bg(0);
+        }
+        if bg.is_empty() {
+            return (modal, ink, modal_ratio);
+        }
+
+        bg.sort_unstable_by(|a, b| {
+            luminance(*a)
+                .total_cmp(&luminance(*b))
+                .then_with(|| a.cmp(b))
+        });
+        let lo = rgb_to_rgba(bg[(bg.len() - 1) * 5 / 100]);
+        let hi = rgb_to_rgba(bg[(bg.len() - 1) * 95 / 100]);
+
+        let mut worst_ground = modal;
+        let mut worst_ratio = modal_ratio;
+        for cand in [lo, hi] {
+            let r = contrast(cand, ink);
+            if r < worst_ratio {
+                worst_ground = cand;
+                worst_ratio = r;
+            }
+        }
+        (worst_ground, ink, worst_ratio)
     }
 }
 
@@ -98,6 +243,15 @@ fn check(frame: &Frame, dpi: f64, what: &str, node: &NodeMatch, left: Option<f64
     let (x, y, w, h) = (node.x() as f64, node.y() as f64, node.width() as f64, node.height() as f64);
     let w = left.map_or(w, |l| l.min(w));
     let (ground, ink, ratio) = frame.reading(d(x), d(y), d(x + w), d(y + h));
+    (ratio < need).then(|| format!("{what}: ink #{:06x} on #{:06x} {ratio:.2}:1 (need {need})", ink >> 8, ground >> 8))
+}
+
+fn check_inset(frame: &Frame, dpi: f64, what: &str, node: &NodeMatch, pad_l: f64, pad_r: f64, pad_v: f64, need: f64) -> Option<String> {
+    let d = |v: f64| (v * dpi).round().max(0.0) as usize;
+    let (x, y, w, h) = (node.x() as f64, node.y() as f64, node.width() as f64, node.height() as f64);
+    let (x0, y0) = (d(x + pad_l), d(y + pad_v));
+    let (x1, y1) = (d((x + w - pad_r).max(x + pad_l + 1.0)), d((y + h - pad_v).max(y + pad_v + 1.0)));
+    let (ground, ink, ratio) = frame.reading(x0, y0, x1, y1);
     (ratio < need).then(|| format!("{what}: ink #{:06x} on #{:06x} {ratio:.2}:1 (need {need})", ink >> 8, ground >> 8))
 }
 
@@ -118,9 +272,18 @@ fn measure(app: TestApp, sheet: &str) {
     let head = head_of(&text(&call(&app, "script", &batch).expect("script")));
     let batch = format!(r#"{{"request_id":"place","expected":{head:?},"edits":{}}}"#, Value::Str(r#"place("plate", at: [150mm 165mm])"#.to_string()).to_json());
     call(&app, "place", &batch).expect("place");
-    app.locator(Selector::role(Role::Tab).name("Features")).wait_visible().click();
+    parts_tab::open(&app);
+    app.locator(Selector::role(Role::Tab).name("plate")).wait_visible().click();
     // The feature rows, once two looks in a row agree on them (the layout has settled).
-    let rows_of = |app: &TestApp| -> Vec<NodeMatch> { app.widget_snapshot().nodes().into_iter().filter(|n| n.visible() && n.node.role == Role::ListItem && n.width() > 0).collect() };
+    let feature_children = |nodes: &[NodeMatch]| {
+        nodes.iter().find(|n| n.visible() && n.node.role == Role::ListItem && n.node.name == "Features").map(|f| f.children.clone())
+    };
+    let visible_row = |n: &NodeMatch| n.visible() && n.node.role == Role::ListItem && n.width() > 0 && n.height() > 0;
+    let rows_of = |app: &TestApp| -> Vec<NodeMatch> {
+        let nodes = app.widget_snapshot().nodes();
+        let Some(children) = feature_children(&nodes) else { return Vec::new(); };
+        nodes.into_iter().filter(|n| visible_row(n) && children.contains(&n.id)).collect()
+    };
     let mut rows = rows_of(&app);
     wait_poll(&app, || {
         std::thread::sleep(Duration::from_millis(50));
@@ -132,28 +295,79 @@ fn measure(app: TestApp, sheet: &str) {
         }
         Err(format!("the feature tree shows {} rows", rows.len()))
     });
+    let count = app.locator(Selector::path("editor_bar.state").name("3 features")).wait_visible().snapshot();
+    let caption = wait_poll(&app, || {
+        let n = app.locator(Selector::path("status_bar.info")).wait_visible().snapshot();
+        if !n.node.name.is_empty() && n.width() > 0 && n.height() > 0 { Ok(n) } else { Err("the status bar's counts are empty".to_string()) }
+    });
+    let chevron = app.locator(Selector::path("add.chevron_slot.chevron")).wait_visible().snapshot();
+    assert!(chevron.width() > 0 && chevron.height() > 0, "the Add chevron has no box");
     let nodes = app.widget_snapshot().nodes();
-    let by_id = |id: &str| nodes.iter().find(|n| n.visible() && n.path.rsplit('.').next() == Some(id)).cloned().unwrap_or_else(|| panic!("no visible `{id}`"));
-    let count = by_id("count");
-    let caption = by_id("doc_state");
-    let chevron = by_id("chevron");
-    let parts_tab = app.locator(Selector::role(Role::Tab).name("Parts")).wait_visible().snapshot();
-    assert!(parts_tab.width() > 0 && parts_tab.height() > 0, "the Parts tab has no box");
+    let children = feature_children(&nodes).expect("the visible Features tree");
+    let rows: Vec<_> = nodes.iter().filter(|n| visible_row(n) && children.contains(&n.id)).collect();
+    let window = app.locator(Selector::role(Role::Window)).wait_visible().snapshot();
+    let rail_select = app.locator(Selector::role(Role::Radio).name("Select")).wait_visible().snapshot();
+    let rail_move = app.locator(Selector::role(Role::Radio).name("Move")).wait_visible().snapshot();
+    let settings_btn = app.locator(Selector::role(Role::Button).name("Settings")).wait_visible().snapshot();
+    let print_btn = app.locator(Selector::role(Role::Button).name("Print")).wait_visible().snapshot();
     let shot = app.screenshot();
     let frame = Frame::decode(&shot);
-    let widest = nodes.iter().map(|n| n.width()).max().unwrap_or(1) as f64;
-    let dpi = (frame.width as f64 / widest).round().max(1.0);
+    let dpi = (frame.width as f64 / window.width() as f64).round().max(1.0);
 
     let mut failed = Vec::new();
-    // The kind column: the row's first 78 points (8 in, 74 for the kind).
+    let mut checked_kinds = 0usize;
     for row in rows.iter().filter(|r| !r.node.states.contains(makepad_test::States::SELECTED)) {
-        failed.extend(check(&frame, dpi, &format!("kind of {:?}", row.node.name), row, Some(78.0), WORDS));
+        let kind = nodes.iter()
+            .find(|c| c.visible() && c.node.role == Role::StaticText && row.children.contains(&c.id) && c.width() > 0 && c.height() > 0)
+            .unwrap_or_else(|| panic!("no visible kind child for feature row {:?}", row.node.name));
+        failed.extend(check(&frame, dpi, &format!("kind {:?} of {:?}", kind.node.name, row.node.name), kind, None, WORDS));
+        checked_kinds += 1;
     }
+    assert!(checked_kinds >= 3, "expected at least 3 unselected feature kinds, checked {checked_kinds}");
     failed.extend(check(&frame, dpi, "feature count", &count, None, WORDS));
-    failed.extend(check(&frame, dpi, "caption subtitle", &caption, None, WORDS));
-    failed.extend(check(&frame, dpi, "Parts tab (inactive)", &parts_tab, None, WORDS));
+    failed.extend(check(&frame, dpi, "status bar counts", &caption, None, WORDS));
     failed.extend(check(&frame, dpi, "Add chevron", &chevron, None, GRAPHIC));
-    assert!(failed.is_empty(), "contrast under {sheet}: under the bar: {failed:?}; see {shot:?}");
+    failed.extend(check_inset(&frame, dpi, "3D rail Select (active)", &rail_select, 5.0, 5.0, 5.0, GRAPHIC));
+    failed.extend(check_inset(&frame, dpi, "3D rail Move (inactive)", &rail_move, 5.0, 5.0, 5.0, GRAPHIC));
+    failed.extend(check_inset(&frame, dpi, "Topbar Settings icon button", &settings_btn, 5.0, 5.0, 4.0, GRAPHIC));
+    failed.extend(check_inset(&frame, dpi, "Topbar Print button", &print_btn, 5.0, 5.0, 4.0, WORDS));
+    // Open Parts' FabSearch: measure focused placeholder, then unfocused typed text and magnifier.
+    app.locator(Selector::role(Role::Button).name("Filter parts")).wait_visible().click();
+    let search_sel = Selector::role(Role::TextField).name("Filter parts");
+    let search_box = wait_poll(&app, || {
+        std::thread::sleep(Duration::from_millis(60));
+        let a = app.locator(search_sel.clone()).wait_visible().snapshot();
+        std::thread::sleep(Duration::from_millis(60));
+        let b = app.locator(search_sel.clone()).wait_visible().snapshot();
+        if a.bounds == b.bounds && b.width() >= 60 && b.height() > 0 { Ok(b) }
+        else { Err(format!("open search still animating: {:?}", b.bounds)) }
+    });
+    std::thread::sleep(Duration::from_millis(250)); // TextInputFlat empty:on is 0.2s
+    let shot_search_empty = app.screenshot();
+    let frame_search_empty = Frame::decode(&shot_search_empty);
+    failed.extend(check_inset(&frame_search_empty, dpi, "open search placeholder", &search_box, 30.0, 4.0, 4.0, WORDS));
+    app.locator(search_sel.clone()).fill("plate");
+    app.locator(Selector::role(Role::Tab).name("Parts")).click_at_center();
+    std::thread::sleep(Duration::from_millis(300)); // TextInputFlat focus:off is 0.25s
+    let search_typed = app.locator(search_sel).wait_visible().snapshot();
+    let search_glyph = app.locator(Selector::path("filter.row.glyph_slot.glyph")).wait_visible().snapshot();
+    let shot_search_typed = app.screenshot();
+    let frame_search_typed = Frame::decode(&shot_search_typed);
+    failed.extend(check_inset(&frame_search_typed, dpi, "open search text", &search_typed, 26.0, 4.0, 4.0, WORDS));
+    failed.extend(check(&frame_search_typed, dpi, "open search magnifier", &search_glyph, None, GRAPHIC));
+    app.locator(Selector::role(Role::Tab).name("Plates")).wait_visible().click();
+    wait_poll(&app, || {
+        let t = app.locator(Selector::role(Role::Tab).name("Parts")).wait_visible().snapshot();
+        if !t.node.states.contains(makepad_test::States::SELECTED) { Ok(()) } else { Err("Parts tab is still selected".to_string()) }
+    });
+    std::thread::sleep(Duration::from_millis(400)); // TabFlat active:off is 0.3s, hover:off is 0.2s
+    let parts_tab = app.locator(Selector::role(Role::Tab).name("Parts")).wait_visible().snapshot();
+    assert!(!parts_tab.node.states.contains(makepad_test::States::SELECTED), "Parts tab must be inactive");
+    assert!(parts_tab.width() > 0 && parts_tab.height() > 0, "the Parts tab has no box");
+    let shot_inactive = app.screenshot();
+    let frame_inactive = Frame::decode(&shot_inactive);
+    failed.extend(check(&frame_inactive, dpi, "Parts tab (inactive)", &parts_tab, None, WORDS));
+    assert!(failed.is_empty(), "contrast under {sheet}: under the bar: {failed:?}; see {shot:?} and {shot_inactive:?}");
 }
 
 fn run(sheet: &str) {
@@ -176,6 +390,12 @@ fn macos_light() { run("macos"); }
 fn macos_dark() { run("macos-dark"); }
 #[test]
 fn omarchy() { run("omarchy"); }
+#[test]
+fn safety_yellow() { run("safety-yellow"); }
+#[test]
+fn futuristic_plastic() { run("futuristic-plastic"); }
+#[test]
+fn kids_toy() { run("kids-toy"); }
 
 /// The app main thread's CPU budget per wait; the runtime also detects idle hangs.
 const HANG: Duration = Duration::from_secs(300);

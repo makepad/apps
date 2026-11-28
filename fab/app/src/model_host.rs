@@ -34,7 +34,7 @@ use makepad_widgets::jobs::{self, JobHandle, JobId, JobSpec};
 pub const HERE: &str = "this computer";
 
 pub enum Job {
-    PrintSetup(crate::print::CheckSetup),
+    PrintSetup { seq: u64, setup: crate::print::CheckSetup },
     /// A plate's or a demo's picture ended ([`crate::plate_paint`]): the list shows it, and the
     /// next one without a picture is painted.
     Painted(crate::plate_paint::Painted),
@@ -296,8 +296,16 @@ pub type PlateUpdate = (Arc<Evaluated>, Arc<Scene>, RetainedInstances, Vec<Arc<P
 /// A program and its parameter model.
 pub type Program = Option<(Arc<fab_model::program::Compiled>, Arc<Vec<fab_model::params::PartParams>>)>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrintSetupFailure {
+    Machine(crate::print::MachineError),
+    Eval(fab_model::eval::Failure),
+}
+
 /// A finished job, posted to the UI.
 pub struct Done {
+    pub print_setup_seq: Option<u64>,
+    pub print_setup_failure: Option<PrintSetupFailure>,
     pub(crate) person: Option<Arc<crate::journal::PersonReply>>,
     pub id: u64,
     pub ok: bool,
@@ -396,7 +404,7 @@ pub enum HostAction {
     Done(Box<Done>),
     /// An electronics write left the model worker (landed, or kept aside over an outside change),
     /// after every status of an earlier job: the writes before it can no longer be on the bed.
-    DocsLanded { bed: u64, docs: Arc<fab_model::Docs> },
+    DocsLanded { bed: u64, docs: Arc<fab_model::Docs>, all: Arc<fab_model::Docs> },
     /// The plate with its display meshes as the view shows them (exact parts' detail, the Mesh
     /// look), and its scene: what shows changes, nothing else.
     Shown(Box<(Arc<Evaluated>, Arc<Scene>)>),
@@ -454,6 +462,8 @@ impl std::fmt::Debug for Done {
 type Queued = (Job, Option<JobHandle>, Author);
 
 pub struct ModelHost {
+    app_data: PathBuf,
+    documents: PathBuf,
     /// Numbers come from this shared counter; a reservation takes one early.
     steps: Arc<AtomicU64>,
     /// The newest entry logged by either history.
@@ -566,13 +576,6 @@ pub fn documents_dir() -> PathBuf {
     home.join("Documents").join("Fab")
 }
 
-/// The plate store: records and working copies in `~/.makepad/fab/plates`, saved plates'
-/// folders in `~/Documents/Fab`, the demos' pictures in `~/.makepad/fab/demos`.
-pub fn plate_store() -> fab_ai::plates::PlateStore {
-    let home = makepad_fab_settings::home::user_home();
-    fab_ai::plates::PlateStore::under(&home.join(".makepad").join("fab"), &documents_dir())
-}
-
 /// The worker's state as the app follows it. The picks follow the build first (each described
 /// again on it): once per build, one description per pick.
 fn status(s: &mut Session) -> Status {
@@ -649,7 +652,7 @@ fn show_grown(session: &mut Session, scenes: &mut Scenes, overhangs: bool, file:
         if faded {
             log!("fab: {part} faded in");
         }
-        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(session, ev, scene)), status: status(session), model_changed: settled, check_slice: None, source_files: None, source_problem: None, capped: None })));
+        Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(session, ev, scene)), status: status(session), model_changed: settled, check_slice: None, source_files: None, source_problem: None, capped: None })));
         Cx::post_action(HostAction::GrownBuilt);
     }
     log!("fab: {part} shape built in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
@@ -1002,7 +1005,7 @@ fn job_words(job: &Job) -> String {
         Job::MeshFields(false) => "meshing the field parts".to_string(),
         Job::Thumbnail(_) => "a thumbnail".to_string(),
         Job::Painted(_) => "the plates' pictures".to_string(),
-        Job::PrintSetup(_) => "the print setup".to_string(),
+        Job::PrintSetup { .. } => "the print setup".to_string(),
         Job::Mapped(_) => "the colour mapping".to_string(),
         Job::ColourMode(mode, _) => mode.label().to_string(),
         Job::PatternsGrown => "the grown patterns".to_string(),
@@ -1068,7 +1071,7 @@ fn job_title(job: &Job) -> Option<String> {
         Job::SaveView { .. } | Job::Fit { .. } | Job::ViewPick { .. } => return None,
         Job::MeshFields(true) => "Meshing the field parts".to_string(),
         Job::ExactDetail(_) => "Refining the exact parts".to_string(),
-        Job::MakeCalibration { .. } | Job::MeshFields(false) | Job::Thumbnail(_) | Job::Painted(_) | Job::PrintSetup(_) | Job::ColourMode(..) | Job::Mapped(_) | Job::PatternsGrown | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_) | Job::OverhangList { .. } | Job::EncodeSheets { .. } | Job::ServeXr | Job::Preview { .. } | Job::Solved(_) | Job::SetEnv { .. } | Job::Docs { .. } | Job::Memory { .. } | Job::Grown(_) | Job::GrownSettled(_) | Job::RoundPlan { .. } => return None,
+        Job::MakeCalibration { .. } | Job::MeshFields(false) | Job::Thumbnail(_) | Job::Painted(_) | Job::PrintSetup { .. } | Job::ColourMode(..) | Job::Mapped(_) | Job::PatternsGrown | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_) | Job::OverhangList { .. } | Job::EncodeSheets { .. } | Job::ServeXr | Job::Preview { .. } | Job::Solved(_) | Job::SetEnv { .. } | Job::Docs { .. } | Job::Memory { .. } | Job::Grown(_) | Job::GrownSettled(_) | Job::RoundPlan { .. } => return None,
     })
 }
 
@@ -1286,7 +1289,7 @@ fn class_of(job: &Job) -> Class {
     match job {
         Job::Solved(_) | Job::SetEnv { .. } | Job::Docs { .. } | Job::Memory { .. } | Job::Grown(_) | Job::GrownSettled(_) | Job::PatternsGrown => Class::Visible,
         Job::MeshFields(false) | Job::ExactDetail(_) | Job::Thumbnail(_) | Job::Painted(_)
-        | Job::EncodeSheets { .. } | Job::MakeCalibration { .. } | Job::PrintSetup(_)
+        | Job::EncodeSheets { .. } | Job::MakeCalibration { .. } | Job::PrintSetup { .. }
         | Job::Mapped(_) | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_) | Job::OverhangList { .. } => Class::Background,
         _ => Class::Interactive,
     }
@@ -1303,7 +1306,7 @@ fn left_at_quit(job: &Job) -> bool {
 /// Work a quit makes stale by its ticket ([`ModelHost::quit`]): queued, it never starts; it reads
 /// what the view shows and keeps nothing.
 fn stale_at_quit(job: &Job) -> bool {
-    matches!(job, Job::Preview { .. } | Job::PrintSetup(_) | Job::OverhangList { .. } | Job::Fit { .. })
+    matches!(job, Job::Preview { .. } | Job::PrintSetup { .. } | Job::OverhangList { .. } | Job::Fit { .. })
 }
 
 /// One job a quit waits for ([`ModelHost::keeping`]), counted from its queueing until it ends or is
@@ -1537,6 +1540,38 @@ fn job_call_id(job: &Job) -> Option<u64> {
     }
 }
 
+/// The answer a job owes whoever waits on it, for when it panics before it sends one
+/// ([`HostState::crashed`]). A quit's answer needs none: its [`QuitReply`] answers as it drops.
+#[derive(Clone, Copy, Debug)]
+enum Owed {
+    Nothing,
+    /// A call's answer: the app service's caller waits for it however long it takes.
+    Call(u64),
+    Fit(u64),
+    Sheets(u64),
+    Round(u64),
+}
+
+impl Owed {
+    fn of(job: &Job) -> Self {
+        match job {
+            Job::Fit { id, .. } => Owed::Fit(*id),
+            Job::EncodeSheets { id, .. } => Owed::Sheets(*id),
+            Job::RoundPlan { id, .. } => Owed::Round(*id),
+            _ => job_call_id(job).map_or(Owed::Nothing, Owed::Call),
+        }
+    }
+}
+
+/// Runs a job on the model worker. One that panics answers its waiter with an error
+/// ([`HostState::crashed`]) instead of leaving it waiting; the host goes on with the next job.
+fn run_answering(state: &mut HostState, owed: Owed, run: impl FnOnce(&mut HostState)) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(state))) {
+        let why = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "a panic".into());
+        state.crashed(owed, &why);
+    }
+}
+
 /// A job a failure can sensibly be retried for, to queue again: a file that could not be
 /// read or written may be there now. A failed edit or build is not retried: the same
 /// input fails the same way.
@@ -1577,6 +1612,67 @@ pub fn job_reason(text: &str) -> String {
         Some((place, _)) if place.rsplitn(3, ':').nth(1).is_some_and(|line| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())) => format!("{why} ({place})"),
         _ => why,
     }
+}
+
+/// Runs on the model strand. Only the first Trash call commits the retirement:
+/// a failed removed flag or successor must leave the current opening recording.
+pub(crate) fn delete_saved_plate(session: &mut Session, id: &str, own_pid: u32,
+    trash: &dyn Fn(&std::path::Path) -> Result<(), String>) -> Result<Option<Arc<Evaluated>>, String> {
+    use crate::journal;
+    use std::cell::Cell;
+    use std::io::ErrorKind;
+
+    const OPEN: &str = "This plate is open in another Fab window. Close it there first.";
+    let store = session.store.as_ref().ok_or("this session keeps no plates")?;
+    if !journal::reader::literal(id) { return Err("Invalid plate id.".into()) }
+    let plate = store.dir(id);
+    if !std::fs::symlink_metadata(&plate).is_ok_and(|m| m.is_dir()) { return Err(format!("no plate {id}")) }
+    let others = journal::other_presence_holders(&plate, own_pid)
+        .map_err(|_| "Fab couldn't check whether this plate is open in another window. It is kept.")?;
+    if others != 0 { return Err(OPEN.into()) }
+
+    // (busy only while another Delete of this plate holds it)
+    let pause = journal::pause_plate(&plate).map_err(|_| "Fab couldn't prepare this plate's journal for the Trash. It is kept.")?;
+    let lock = match journal::delete_lock(&plate) {
+        Ok(lock) => Some(lock),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => { pause.resume(); return Err(OPEN.into()) }
+        Err(e) => {
+            log!("journal: {}: {:?}", plate.display(), e.kind());
+            None
+        }
+    };
+    let prepared = Cell::new(Some(pause.prepare().map_err(|e| e.to_string())?));
+    let retired = Cell::new(None);
+    #[cfg(windows)]
+    let (lock, moving) = (Cell::new(lock), Cell::new(None));
+    let moved = Cell::new(false);
+    let result = session.delete_plate(id, &|path| {
+        if path != plate { return trash(path) }
+        if let Some(ready) = prepared.take() {
+            retired.set(Some(ready.commit().map_err(|e| e.to_string())?));
+            journal::release_presence(path);
+            #[cfg(windows)]
+            {
+                drop(lock.take());
+                moving.set(Some(journal::reader::MovingPlate::begin(path).map_err(|e| e.to_string())?));
+            }
+        }
+        trash(path)?;
+        moved.set(true);
+        Ok(())
+    });
+    #[cfg(windows)]
+    drop(moving.take());
+    drop(lock);
+    drop(prepared);
+    if moved.get() {
+        if let Err(e) = journal::finish_delete_notes(&plate, trash) {
+            log!("journal: could not move fallback for {}: {:?}", plate.display(), e.kind());
+        }
+    }
+    // Discovery can acquire a new gate for this directory only after cleanup.
+    drop(retired);
+    result
 }
 
 /// A document put on the bed: built, or the bed as it was when it does not build (or the build
@@ -1630,20 +1726,28 @@ struct ListReads {
     reasons: HashMap<PathBuf, (std::time::SystemTime, String)>,
 }
 
-fn plate_list(session: &Session, reads: &mut ListReads) -> fab::api::PlateList {
+fn read_picture(
+    pictures: &mut HashMap<PathBuf, (std::time::SystemTime, Arc<[u8]>)>,
+    path: PathBuf,
+) -> Option<Arc<[u8]>> {
+    let Ok(at) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        pictures.remove(&path);
+        return None;
+    };
+    if let Some((_, png)) = pictures.get(&path).filter(|(seen, _)| *seen == at) {
+        return Some(png.clone());
+    }
+    let Some(png) = std::fs::read(&path).ok().filter(|png| !png.is_empty()).map(Arc::<[u8]>::from) else {
+        pictures.remove(&path);
+        return None;
+    };
+    pictures.insert(path, (at, png.clone()));
+    Some(png)
+}
+
+fn plate_list(session: &Session, reads: &mut ListReads, painting: &std::collections::HashSet<String>) -> fab::api::PlateList {
     let ListReads { pictures, reasons } = reads;
     let store = session.store.as_ref();
-    let mut picture = |path: Option<PathBuf>| -> Option<Arc<[u8]>> {
-        let path = path?;
-        let at = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-        if let Some((seen, png)) = pictures.get(&path).filter(|(seen, _)| *seen == at).map(|(s, p)| (*s, p.clone())) {
-            let _ = seen;
-            return Some(png);
-        }
-        let png: Arc<[u8]> = Arc::from(std::fs::read(&path).ok().filter(|png| !png.is_empty())?);
-        pictures.insert(path, (at, png.clone()));
-        Some(png)
-    };
     let today = makepad_civil_time::local_or_utc(makepad_civil_time::now_secs()).day_number();
     let title = |key: &str| crate::demo_part::demo(key).map_or_else(|| key.to_string(), |d| d.title.to_string());
     let plates = session.plates().into_iter().map(|p| {
@@ -1657,7 +1761,24 @@ fn plate_list(session: &Session, reads: &mut ListReads) -> fab::api::PlateList {
             .chain(unread.map(|file| unread_reason(file, reasons, session.model.env())))
             .collect();
         fab::api::PlateCard {
-        picture: picture(store.and_then(|s| s.picture_of(&p))),
+        picture: store.and_then(|s| {
+            let working = s.picture(&p.id);
+            if painting.contains(&p.id) {
+                return pictures.get(&working)
+                    .or_else(|| p.file.as_ref().and_then(|f| pictures.get(&fab_model::project::thumbnail_path(f))))
+                    .map(|(_, png)| png.clone());
+            }
+            let chosen = s.picture_of(&p);
+            if chosen.as_ref() != Some(&working) {
+                pictures.remove(&working);
+            }
+            if chosen.is_none() {
+                if let Some(file) = &p.file {
+                    pictures.remove(&fab_model::project::thumbnail_path(file));
+                }
+            }
+            chosen.and_then(|path| read_picture(pictures, path))
+        }),
         group: String::new(),
         note: match &p.origin {
             _ if !kept.is_empty() => "files kept aside".to_string(),
@@ -1688,7 +1809,14 @@ fn plate_list(session: &Session, reads: &mut ListReads) -> fab::api::PlateList {
         file: None,
         note: String::new(),
         why: String::new(),
-        picture: picture(store.map(|s| s.demo_picture(d.key))),
+        picture: store.and_then(|s| {
+            let path = s.demo_picture(d.key);
+            if painting.contains(&format!("demo:{}", d.key)) {
+                pictures.get(&path).map(|(_, png)| png.clone())
+            } else {
+                read_picture(pictures, path)
+            }
+        }),
     }).collect();
     let (on_bed, on_demo) = match (&session.plate, session.demo_key()) {
         (Some(id), _) => (Some(id.clone()), false),
@@ -1699,6 +1827,9 @@ fn plate_list(session: &Session, reads: &mut ListReads) -> fab::api::PlateList {
 }
 
 struct HostState {
+    app_data: PathBuf,
+    documents: PathBuf,
+    setup_failed: bool,
     journal: crate::journal::ModelJournal,
     spawner: makepad_widgets::makepad_platform::thread::ThreadSpawner,
     /// Numbers come from this shared counter; a reservation takes one early.
@@ -1718,7 +1849,9 @@ struct HostState {
     list_reads: ListReads,
     /// The pictures being painted ([`crate::plate_paint`]), of a run of them; the plates and demos
     /// looked at for one this session (a plate's id, a demo's key after `demo:`).
-    painting: usize,
+    painting: std::collections::HashSet<String>,
+    /// Seen keys whose picture changed on disk (e.g. viewport thumbnail) while a painter was in flight.
+    paint_dirty: std::collections::HashSet<String>,
     painting_run: Option<crate::live_slice::Painting>,
     paint_seen: std::collections::HashSet<String>,
     /// Pictures whose build stopped at the memory budget beside others: each is painted again
@@ -1754,7 +1887,7 @@ struct HostState {
 impl HostState {
     fn init(&mut self) {
         let machine = crate::print::CheckSetup::fab_defaults().machine().expect("Fab defaults have a valid machine");
-        let mut session = Session::new(machine, documents_dir());
+        let mut session = Session::new(machine, self.documents.clone());
         session.holds_bodies = true;
         session.model.set_steps(self.steps.clone(), self.logged.clone());
         // The scripts' standard env: a case script reads its board whether or not the
@@ -1772,7 +1905,7 @@ impl HostState {
         };
         let persist = self.persist;
         if persist {
-            let store = plate_store();
+            let store = fab_ai::plates::PlateStore::under(&self.app_data, &self.documents);
             crate::journal::recover_loss_notes(store.clone(), self.spawner.clone(), &self.pool);
             session.store = Some(store);
             self.journal.install(&mut session, Some(self.spawner.clone()));
@@ -1782,7 +1915,7 @@ impl HostState {
         // that plate's build can take long (a big field), and the list shows meanwhile; a plate
         // opened from it stops the build ([`ModelHost::recovery`]) and goes on the bed next.
         let (left, unflushed) = if persist { session.left_on_bed() } else { (None, None) };
-        Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(&session, &mut self.list_reads)))));
+        Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(&session, &mut self.list_reads, &self.painting)))));
         // What a first start's fold of earlier versions' plates wrote reads back from the disk's
         // cache; its flush to the disk runs off this worker, so neither the list nor the plate
         // opened from it waits on a slow disk.
@@ -1817,11 +1950,11 @@ impl HostState {
         // The plate list again before the first plate, the one on the bed marked: the app knows
         // whether anything came back.
         self.plates_seen = Some(session.plates_rev);
-        Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(&session, &mut self.list_reads)))));
+        Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(&session, &mut self.list_reads, &self.painting)))));
         // The empty model: the bed alone, so the view has something from the start.
         if let Ok(ev) = recovered {
             let scene = self.scenes.of(&session, &ev, self.overhangs);
-            let done = Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status_after_job(previous_switch, &mut session), model_changed: true, check_slice: None, source_files: Some(Arc::new(session.source_files())), source_problem: None, capped: None };
+            let done = Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status_after_job(previous_switch, &mut session), model_changed: true, check_slice: None, source_files: Some(Arc::new(session.source_files())), source_problem: None, capped: None };
             Cx::post_action(HostAction::Done(Box::new(done)));
         }
         self.session = Some(session);
@@ -1832,7 +1965,7 @@ impl HostState {
     /// Send the app the plate list when it changed.
     fn post_plates(&mut self) {
         let Some(session) = self.session.as_ref() else { return };
-        send_plates(session, &mut self.plates_seen, &mut self.list_reads);
+        send_plates(session, &mut self.plates_seen, &mut self.list_reads, &self.painting);
     }
 
     /// Paint the next pictures the list lacks, several at once: the plates first, then the
@@ -1850,10 +1983,10 @@ impl HostState {
         // The run goes on while any is painted: its end, here when none is, is a heavy job's.
         let run = self.painting_run.take();
         let at_once = (self.pool.worker_count() / 2).max(1);
-        while !self.painting_alone && self.painting < at_once {
+        while !self.painting_alone && self.painting.len() < at_once {
             // one that stopped at the memory budget beside others goes alone, once they ended
             let again = match self.paint_again.front() {
-                Some(_) if self.painting > 0 => break,
+                Some(_) if !self.painting.is_empty() => break,
                 Some(_) => self.paint_again.pop_front(),
                 None => None,
             };
@@ -1866,14 +1999,15 @@ impl HostState {
                 }
                 break;
             };
+            let seen = order.seen();
             order.alone = again.is_some();
             if !crate::plate_paint::start(&self.pool, order) {
                 break;
             }
-            self.painting += 1;
+            self.painting.insert(seen);
             self.painting_alone = again.is_some();
         }
-        if self.painting > 0 {
+        if !self.painting.is_empty() {
             self.painting_run = Some(run.unwrap_or_else(crate::live_slice::Painting::begin));
         }
     }
@@ -1903,6 +2037,33 @@ impl HostState {
                 (wanted && seen.insert(key)).then(|| crate::plate_paint::Order { key: d.key.to_string(), out: picture, subject: crate::plate_paint::Subject::Demo(d), machine: session.eval.machine.clone(), alone: false })
             })
         })
+    }
+
+    /// A job panicked (the panic itself is in the log): whoever waits on it gets an error now,
+    /// and the worker no longer says it is busy with it. Its job card ended failed as the panic
+    /// dropped its handle. The plate stays as the job left it, and the next job runs on it.
+    fn crashed(&mut self, owed: Owed, why: &str) {
+        let what = format!("the model worker crashed on this job: {why}");
+        log!("fab: {what}");
+        self.words.lock().unwrap_or_else(|e| e.into_inner()).set(None, None);
+        let text = format!("{{error: {}}}", fab_ai::out::quote(&what));
+        Cx::post_action(match owed {
+            Owed::Nothing => return,
+            Owed::Call(id) => {
+                let person = self.journal.person();
+                // A failed Done, so the window's waiters on the call end as on any failed job;
+                // its status is the plate's now. A status that cannot be read either still
+                // answers the call, without one.
+                let shown = self.session.as_mut().and_then(|s| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| status(s))).ok());
+                match shown {
+                    Some(status) => HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person, images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status, model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })),
+                    None => HostAction::Answered { id, ok: false, text, person },
+                }
+            }
+            Owed::Fit(id) => HostAction::Fit { id, result: Err(what) },
+            Owed::Sheets(id) => HostAction::Sheets { id, result: Err(what), made: None },
+            Owed::Round(id) => HostAction::RoundPlan { id, plan: Box::new(Err(what)) },
+        });
     }
 
     fn run(&mut self, queued: Queued, ticket: Ticket) {
@@ -1949,18 +2110,29 @@ impl HostState {
             return;
         }
         if let Job::Painted(painted) = queued.0 {
-            self.painting = self.painting.saturating_sub(1);
-            if self.painting == 0 {
+            let seen = match &painted {
+                crate::plate_paint::Painted::Done { seen, .. } | crate::plate_paint::Painted::Again(seen) => seen.clone(),
+            };
+            self.painting.remove(&seen);
+            if self.painting.is_empty() {
                 self.painting_alone = false;
             }
+            let dirty = self.paint_dirty.remove(&seen);
             match painted {
-                crate::plate_paint::Painted::Done(true) => {
+                crate::plate_paint::Painted::Done { written, .. } if written || dirty => {
                     if let Some(session) = self.session.as_mut() {
                         session.plates_rev += 1;
                     }
                 }
-                crate::plate_paint::Painted::Done(false) => {}
-                crate::plate_paint::Painted::Again(key) => self.paint_again.push_back(key),
+                crate::plate_paint::Painted::Done { .. } => {}
+                crate::plate_paint::Painted::Again(key) => {
+                    if dirty {
+                        if let Some(session) = self.session.as_mut() {
+                            session.plates_rev += 1;
+                        }
+                    }
+                    self.paint_again.push_back(key);
+                }
             }
             self.post_plates();
             self.paint_next();
@@ -1979,9 +2151,19 @@ impl HostState {
         if self.persist && std::time::Instant::now() >= self.retry_after {
             self.words.lock().unwrap().set(Some("the plate's working copy".to_string()), None);
             if let Some(session) = self.session.as_mut().filter(|s| s.needs_autosave()) {
-                if let Err(e) = session.autosave() {
-                    log!("fab: autosave failed: {e}");
-                    self.retry_after = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let rev_before = session.plates_rev;
+                match session.autosave() {
+                    Ok(()) => {
+                        if session.plates_rev != rev_before {
+                            if let Some(id) = session.plate.as_ref().filter(|id| self.painting.contains(*id)) {
+                                self.paint_dirty.insert(id.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log!("fab: autosave failed: {e}");
+                        self.retry_after = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    }
                 }
             }
         }
@@ -2221,7 +2403,7 @@ impl HostState {
     }
 
     fn process(&mut self, (job, mut running, author): Queued, ticket: Ticket) {
-        let Self { session, xr, overhangs, scenes, grows, pool, plates_seen, list_reads, docs_newest, .. } = self;
+        let Self { session, xr, overhangs, scenes, grows, pool, plates_seen, list_reads, painting, paint_dirty, docs_newest, .. } = self;
         let mut authored = session.as_mut().expect("model initialized before jobs").as_author(author);
         let mut session = &mut *authored;
         Cx::post_action(HostAction::Ready);
@@ -2232,7 +2414,7 @@ impl HostState {
             }
             if let Some(id) = job_call_id(&job) {
                 let text = "{error: \"cancelled\"}".to_string();
-                Cx::post_action(HostAction::Done(Box::new(Done { person: self.journal.person(), images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: self.journal.person(), images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
             }
             return;
         }
@@ -2265,16 +2447,17 @@ impl HostState {
         let previous_name = session.model.name.clone();
         let previous_switch = session.switched;
         let (id, reply) = match job {
-            Job::PrintSetup(setup) => {
+            Job::PrintSetup { seq, setup } => {
                 // the printer's mechanisms profile (calibrated fits) sizes joints and links
                 // as-printed checks (fab.weave) slice with the app's own setup and paint
                 let own = setup.clone();
                 session.print_setup = Some(Arc::new(move |ev: &Evaluated| own.model_job(ev)));
                 session.slices = Some(Arc::new(crate::live_slice::AiSlices::new(setup.clone())));
-                let machine = match setup.machine() {
+                let machine = match setup.machine_typed() {
                     Ok(machine) => machine,
                     Err(e) => {
-                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                        let text = format!("{{error: {}}}", fab_ai::out::quote(&e.redacted_message()));
+                        Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: Some(seq), print_setup_failure: Some(PrintSetupFailure::Machine(e)), person: None, images: Vec::new(), id: 0, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                         return;
                     }
                 };
@@ -2305,18 +2488,25 @@ impl HostState {
                     }
                 };
                 let changed = session.set_profile(profile) | machine_changed | chord | rim;
-                if changed && session.last.is_some() {
+                let stale_last = self.setup_failed || session.last.as_ref().is_some_and(|ev| {
+                    ev.profile != session.eval.profile || !ev.machine.same_volume(&session.eval.machine)
+                });
+                let rebuild = changed || stale_last;
+                if rebuild && session.last.is_some() {
                     let job = JobSpec::new(format!("Rebuilding {} for the printer", session.model.name)).machine(HERE).start();
-                    let built = job.enter(|| session.rebuild());
+                    let built = job.enter(|| session.rebuild_eval());
                     if let Err(e) = &built {
                         log!("fab: rebuild for the printer profile: {e}");
                     }
                     job.finish(&built, false);
                     if let Err(e) = built {
-                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                        self.setup_failed = true;
+                        let text = format!("{{error: {}}}", fab_ai::out::quote(&crate::print::redacted_eval_failure(&e)));
+                        Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: Some(seq), print_setup_failure: Some(PrintSetupFailure::Eval(e)), person: None, images: Vec::new(), id: 0, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                         return;
                     }
                 }
+                self.setup_failed = false;
                 if let Some(ev) = session.last.clone() {
                     let mut ev = (*ev).clone();
                     // The plate keeps the volume it was built for; it shows the printer's name.
@@ -2333,10 +2523,10 @@ impl HostState {
                     let ev = Arc::new(ev);
                     session.last = Some(ev.clone());
                     let scene = scenes.of(session, &ev, *overhangs);
-                    if *xr && changed {
+                    if *xr && rebuild {
                         post_xr_plate(&ev, 0);
                     }
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: error.is_none(), text: error.map(|e| format!("{{error: {}}}", fab_ai::out::quote(&e))).unwrap_or_default(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: changed, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: Some(seq), print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: error.is_none(), text: error.map(|e| format!("{{error: {}}}", fab_ai::out::quote(&e))).unwrap_or_default(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: rebuild, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2354,7 +2544,7 @@ impl HostState {
                 }
                 if let Some(ev) = session.last.clone() {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2394,7 +2584,7 @@ impl HostState {
                             }
                         }
                     }
-                    Cx::post_action(HostAction::DocsLanded { bed, docs: landed });
+                    Cx::post_action(HostAction::DocsLanded { bed, docs: landed, all: session.model.docs().clone() });
                 } else {
                     let switched = session.switched;
                     let why = format!("electronics documents for another plate (bed {bed}, now {switched}) reached the model");
@@ -2424,7 +2614,7 @@ impl HostState {
                     Ok(ev) => {
                         let scene = scenes.of(session, &ev, *overhangs);
                         let status = Status { case_generation: Some(generation), ..status(&mut session) };
-                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status, model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                        Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status, model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                     }
                     Err(reason) => {
                         log!("fab: updating the electronics boards: {reason}");
@@ -2462,7 +2652,7 @@ impl HostState {
                         post_xr_plate(&ev, 0);
                     }
                     // The parts print with other tools: the slice is out of date.
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2478,14 +2668,14 @@ impl HostState {
                         post_xr_plate(&ev, 0);
                     }
                     // the paint now prints as it shows: the slice that waited for it goes
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
             Job::BendsMeasured(content) => {
                 if let Some(ev) = session.bends_measured(content) {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2513,7 +2703,7 @@ impl HostState {
                 *overhangs = on;
                 if let Some(ev) = session.last.clone() {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { print_setup_seq: None, print_setup_failure: None, person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2926,9 +3116,18 @@ impl HostState {
                             let _ = std::fs::remove_file(fab_ai::plates::painted_content(&picture));
                             // a cache: never waits on the disk ([`fab_ai::plates::has_picture`])
                             match fab_model::project::write_unflushed(&picture, &png) {
-                                Ok(()) => session.plates_rev += 1,
+                                Ok(()) => {
+                                    let seen = format!("demo:{key}");
+                                    if painting.contains(&seen) {
+                                        paint_dirty.insert(seen);
+                                    }
+                                    session.plates_rev += 1;
+                                }
                                 Err(e) => log!("fab: the demo's picture could not be saved: {e}"),
                             }
+                        }
+                        if let Some(id) = session.plate.as_ref().filter(|id| painting.contains(*id)) {
+                            paint_dirty.insert(id.clone());
                         }
                         session.set_thumbnail(Arc::from(png));
                     }
@@ -2950,13 +3149,8 @@ impl HostState {
             }
             Job::DeletePlate { id, plate } => {
                 let trash_home = makepad_fab_settings::home::user_home();
-                let store_dir = session.store.as_ref().map(|s| s.dir(&plate));
-                let trash = |path: &std::path::Path| {
-                    // this window's presence file sits inside the folder about to move
-                    if store_dir.as_deref() == Some(path) { crate::journal::release_presence(path); }
-                    fab_ai::plates::move_to_trash(&trash_home, path)
-                };
-                (id, match session.delete_plate(&plate, &trash) {
+                let trash = |path: &std::path::Path| fab_ai::plates::move_to_trash(&trash_home, path);
+                (id, match delete_saved_plate(session, &plate, std::process::id(), &trash) {
                     Ok(Some(ev)) => {
                         let what = session.model.name.clone();
                         on_bed(&mut session, &what, Ok(ev))
@@ -2973,12 +3167,7 @@ impl HostState {
             }
             Job::ImportFile { id, path, new_plate } => (id, session.import_file(&path, new_plate)),
             Job::MakeCalibration { step, setup, colour } => {
-                let made = fab_calibrate::make(step, &setup.coupon_setup())
-                    .ok_or_else(|| format!("{} has no test part", step.title())).map(|mut c| {
-                        (c.printer, c.filament) = setup.calibration_names();
-                        (Arc::new(c), colour)
-                    });
-                Cx::post_action(crate::calibrate::CalEvent::Made(made));
+                Cx::post_action(crate::calibrate::CalEvent::make(step, &setup, colour));
                 return;
             }
             Job::Calibration { id, coupon, colour } => (id, session.calibration(&coupon, colour)),
@@ -3070,22 +3259,27 @@ impl HostState {
                 }
             }
         }
-        let done = Done { person: self.journal.person(), images: reply.images, id, ok: reply.ok, text: reply.text, review: Mutex::new(review), update, status: status_after_job(previous_switch, &mut session), model_changed: !measurement_only, check_slice, source_files, source_problem, capped };
+        if self.setup_failed && update.is_some() && session.last.as_ref().is_some_and(|ev| {
+            ev.profile == session.eval.profile && ev.machine.same_volume(&session.eval.machine)
+        }) {
+            self.setup_failed = false;
+        }
+        let done = Done { print_setup_seq: None, print_setup_failure: None, person: self.journal.person(), images: reply.images, id, ok: reply.ok, text: reply.text, review: Mutex::new(review), update, status: status_after_job(previous_switch, &mut session), model_changed: !measurement_only, check_slice, source_files, source_problem, capped };
         // The list before the answer: what is on the bed now (a switch's plate) is the app's
         // before whoever asked acts on the answer. A click on the plate the switch left found
         // the list still naming it on the bed, and was dropped as a click on that plate.
-        send_plates(session, plates_seen, list_reads);
+        send_plates(session, plates_seen, list_reads, painting);
         Cx::post_action(HostAction::Done(Box::new(done)));
     }
 }
 
 /// Sends the app the plate list if it changed since the one sent last.
-fn send_plates(session: &Session, plates_seen: &mut Option<u64>, list_reads: &mut ListReads) {
+fn send_plates(session: &Session, plates_seen: &mut Option<u64>, list_reads: &mut ListReads, painting: &std::collections::HashSet<String>) {
     if *plates_seen == Some(session.plates_rev) {
         return;
     }
     *plates_seen = Some(session.plates_rev);
-    Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(session, list_reads)))));
+    Cx::post_action(HostAction::Plates(Mutex::new(Some(plate_list(session, list_reads, painting)))));
 }
 
 /// The plate builds every host has queued, running or not yet taken ([`ModelHost::building`]),
@@ -3110,7 +3304,7 @@ impl Drop for ModelHost {
 
 impl ModelHost {
     /// Remote/test sessions leave the user's crash copy alone.
-    pub fn start(cx: &Cx, persist: bool) -> ModelHost {
+    pub fn start_in(cx: &Cx, persist: bool, dirs: &crate::dirs::FabDirs) -> ModelHost {
         load_hold::register();
         let steps = Arc::new(AtomicU64::new(0));
         let logged = Arc::new(AtomicU64::new(0));
@@ -3124,8 +3318,9 @@ impl ModelHost {
         let docs_newest = Arc::new(Mutex::new(HashMap::new()));
         let replacing = Arc::new(AtomicUsize::new(0));
         let switched_now = Arc::new(AtomicU64::new(0));
-        let state = HostState { journal: Default::default(), spawner: cx.thread_spawner(), steps: steps.clone(), logged: logged.clone(), words: words.clone(), docs_newest: docs_newest.clone(), replacing: replacing.clone(), switched_now: switched_now.clone(), session: None, xr: false, overhangs: false, scenes: Scenes::on(cx.task_pool()), plates_seen: None, list_reads: ListReads::default(),
-            painting: 0, painting_run: None, paint_seen: Default::default(), paint_again: Default::default(), painting_alone: false, quitting: quitting.clone(), saved: saved.clone(), persist, retry_after: std::time::Instant::now(),
+        let state = HostState { app_data: dirs.app_data.clone(), documents: dirs.documents.clone(),
+            setup_failed: false, journal: Default::default(), spawner: cx.thread_spawner(), steps: steps.clone(), logged: logged.clone(), words: words.clone(), docs_newest: docs_newest.clone(), replacing: replacing.clone(), switched_now: switched_now.clone(), session: None, xr: false, overhangs: false, scenes: Scenes::on(cx.task_pool()), plates_seen: None, list_reads: ListReads::default(),
+            painting: Default::default(), paint_dirty: Default::default(), painting_run: None, paint_seen: Default::default(), paint_again: Default::default(), painting_alone: false, quitting: quitting.clone(), saved: saved.clone(), persist, retry_after: std::time::Instant::now(),
             pool: cx.task_pool(), stress_seen: 0, volumes_seen: std::sync::Weak::new(), veins_seen: 0, veins_asked: Default::default(), grows: grow_runs.clone(), grow_seen: 0, grow_next: 0, hub: Default::default(), recovery };
         let strand = Strand::with_state(&cx.task_pool(), "fab model", state);
         strand.submit(Class::Visible, Ticket::none(), |state| {
@@ -3134,7 +3329,8 @@ impl ModelHost {
             state.words.lock().unwrap().set(None, None);
             state.switched_now.store(state.session.as_ref().map_or(0, |s| s.switched), Ordering::Release);
         }).detach();
-        ModelHost { steps, logged, words, grow_runs, strand, setup_version: Version::new(), overhang_list_version: Version::new(), fit_version: Version::new(), retry: HashMap::new(), call_jobs: HashMap::new(), build_jobs: Vec::new(), next_id: 1, plate_journal: None, person_calls: Vec::new(), xr: false, preview_version: Version::new(), preview_stops: Arc::default(), preview_gen: 0, thumbnail: ThumbnailSlot::default(), shape_held: Arc::new(AtomicUsize::new(0)), building: 0, load: None, recovery: recovery_job, quitting,
+        ModelHost { app_data: dirs.app_data.clone(), documents: dirs.documents.clone(),
+            steps, logged, words, grow_runs, strand, setup_version: Version::new(), overhang_list_version: Version::new(), fit_version: Version::new(), retry: HashMap::new(), call_jobs: HashMap::new(), build_jobs: Vec::new(), next_id: 1, plate_journal: None, person_calls: Vec::new(), xr: false, preview_version: Version::new(), preview_stops: Arc::default(), preview_gen: 0, thumbnail: ThumbnailSlot::default(), shape_held: Arc::new(AtomicUsize::new(0)), building: 0, load: None, recovery: recovery_job, quitting,
             keeping: Arc::new(AtomicUsize::new(0)), saved, persist, pool: cx.task_pool(), docs_newest, docs_seq: 0, held: Vec::new(), barrier: false, replacing, switched_now }
     }
 
@@ -3280,7 +3476,7 @@ impl ModelHost {
         let doing = self.words.lock().ok().and_then(|words| words.doing.clone());
         let keeping = self.keeping.load(Ordering::Acquire);
         if keeping == 0 && self.held.is_empty() && !self.barrier && self.saved.load(Ordering::Acquire) {
-            let store = self.persist.then(plate_store);
+            let store = self.persist.then(|| fab_ai::plates::PlateStore::under(&self.app_data, &self.documents));
             let written = view.clone();
             let fast_reply = reply.clone();
             let leave = move || {
@@ -3453,7 +3649,7 @@ impl ModelHost {
         let class = class_of(&job);
         let ticket = match &job {
             Job::Preview { .. } => self.preview_version.next(),
-            Job::PrintSetup(_) => self.setup_version.next(),
+            Job::PrintSetup { .. } => self.setup_version.next(),
             Job::OverhangList { .. } => self.overhang_list_version.next(),
             Job::Fit { .. } => self.fit_version.next(),
             _ => Ticket::none(),
@@ -3473,7 +3669,8 @@ impl ModelHost {
                     h.cancelled();
                 }
             } else {
-                state.journal.clone().during(work, || state.run((job, handle, author), ticket));
+                let owed = Owed::of(&job);
+                state.journal.clone().during(work, || run_answering(state, owed, |state| state.run((job, handle, author), ticket)));
             }
             state.switched_now.store(state.session.as_ref().map_or(0, |s| s.switched), Ordering::Release);
             if replacing {
@@ -3594,8 +3791,8 @@ impl ModelHost {
         self.queue(Job::EncodeSheets { id, frames, made });
     }
 
-    pub fn print_setup(&mut self, setup: crate::print::CheckSetup) {
-        self.queue(Job::PrintSetup(setup));
+    pub fn print_setup(&mut self, seq: u64, setup: crate::print::CheckSetup) {
+        self.queue(Job::PrintSetup { seq, setup });
     }
 
     /// A picture painter ended ([`HostAction::Painted`]): the list takes the picture, the next is painted.
@@ -3802,7 +3999,7 @@ mod measurement_tests {
                 }
             }
         }));
-        let mut host = ModelHost::start(&cx, false);
+        let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
         let (built, plate) = channel();
         let (resume, wait) = channel();
         host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
@@ -4059,7 +4256,7 @@ mod scene_tests {
         let store = fab_ai::plates::PlateStore::under(&root.join("fab"), &home);
         let _cx = crate::cx_shared();
         let cx = Cx::new(Box::new(|_, _| {}));
-        let host = ModelHost::start(&cx, false);
+        let host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
         let (done, ran) = std::sync::mpsc::channel();
         host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
             let mut s = Session::new(Machine::dual_nozzle_350(), home.clone());
@@ -4173,14 +4370,14 @@ mod scene_tests {
         ]));
         let _cx = crate::cx_shared();
         let mut cx = Cx::new(Box::new(|_, _| {}));
-        let mut host = ModelHost::start(&cx, false);
+        let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
         let on_bed = |host: &ModelHost| {
             let (tx, rx) = std::sync::mpsc::channel();
             host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
                 let s = state.session.as_ref().expect("a session");
                 tx.send((s.plate.clone(), s.switched, s.model.elec_memory().get(FILE).cloned())).unwrap();
             }).detach();
-            rx.recv_timeout(Duration::from_secs(60)).expect("the model host gets through its queue")
+            rx.recv().expect("the model host gets through its queue")
         };
         let plate_docs = docs.clone();
         let (made, plates) = std::sync::mpsc::channel();
@@ -4196,7 +4393,7 @@ mod scene_tests {
             state.session = Some(s);
             made.send((a, b)).unwrap();
         }).detach();
-        let (a, b) = plates.recv_timeout(Duration::from_secs(60)).expect("the plates are made");
+        let (a, b) = plates.recv().expect("the plates are made");
         let (_, bed, _) = on_bed(&host);
         let mut elec = crate::elec_host::ElecHost::start(&mut cx, bed, Some(a.clone()), docs, Arc::default(),
             Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -4379,7 +4576,7 @@ mod plate_list_tests {
         assert!(s.recover().is_none(), "nothing was on the bed");
         let mut reads = ListReads::default();
         let card = |list: &fab::api::PlateList| list.plates.iter().find(|c| c.name == "vase").cloned().expect("the old plate is listed");
-        let first = card(&plate_list(&s, &mut reads));
+        let first = card(&plate_list(&s, &mut reads, &std::collections::HashSet::new()));
         assert_eq!(first.note, "this Fab cannot read its file");
         assert!(first.why.contains("unknown named arg nozzle"), "{}", first.why);
         assert_eq!(met(), 0, "the fold-in's and the list's reads file no script error: the row says why");
@@ -4390,7 +4587,7 @@ mod plate_list_tests {
         std::fs::write(&file, old.replace("\n\nplace", "\n\n\nplace")).unwrap();
         std::fs::File::options().write(true).open(&file).unwrap().set_modified(at).unwrap();
         for _ in 0..5 {
-            assert_eq!(card(&plate_list(&s, &mut reads)).why, first.why);
+            assert_eq!(card(&plate_list(&s, &mut reads, &std::collections::HashSet::new())).why, first.why);
         }
         assert_eq!(met(), 0, "the list's reads file nothing");
         // The file in this Fab's format, a new version of it: read again, it reads now.
@@ -4399,7 +4596,7 @@ mod plate_list_tests {
         std::fs::write(&file, "use mod.fab.*\n\nscript(\"vase.cad.splash\")\n\nplace(\"vase\")\n").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
         std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
-        let again = card(&plate_list(&s, &mut reads));
+        let again = card(&plate_list(&s, &mut reads, &std::collections::HashSet::new()));
         assert!(again.why.contains("reads now"), "{}", again.why);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4437,7 +4634,7 @@ mod plate_list_tests {
         let mut s = session();
         s.switch(&a).unwrap();
         s.switch(&b).unwrap();
-        let list = plate_list(&s, &mut ListReads::default());
+        let list = plate_list(&s, &mut ListReads::default(), &std::collections::HashSet::new());
         let card = |id: &str| list.plates.iter().find(|c| c.id == id).cloned().expect("listed");
         let (changed, kept) = (card(&a), card(&b));
         assert_eq!(changed.note, "changed outside Fab");
@@ -4445,6 +4642,43 @@ mod plate_list_tests {
         assert_eq!(kept.note, "files kept aside");
         assert!(kept.why.contains("did not read back") && kept.why.contains(&format!("kept in {}", store.dir(&b).join("kept-aside").display())), "{}", kept.why);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn in_flight_plate_keeps_cached_file_picture_when_working_picture_appears() {
+        const A: &[u8] = b"A";
+        const B: &[u8] = b"B";
+        let root = std::env::temp_dir().join(format!("fab-in-flight-picture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (fab, home) = (root.join("fab"), root.join("Documents").join("Fab"));
+        let mut s = Session::new(Machine::dual_nozzle_350(), home.clone());
+        s.store = Some(fab_ai::plates::PlateStore::under(&fab, &home));
+        let source = format!("{}let block = m.box({{size: [10mm 10mm 10mm]}})\nobject(block)\n", fab_model::program::EMPTY);
+        s.replace_model(fab_model::FabModel::with_script("block", "block.cad.splash", &source), None).unwrap();
+        let file = s.save(None).unwrap();
+        let id = s.plate.clone().unwrap();
+        let working = s.store.as_ref().unwrap().picture(&id);
+        assert!(!working.exists(), "the saved plate starts without a working picture");
+        std::fs::write(fab_model::project::thumbnail_path(&file), A).unwrap();
+
+        let mut painting = std::collections::HashSet::new();
+        let mut reads = ListReads::default();
+        let mut picture = |painting: &std::collections::HashSet<String>| {
+            plate_list(&s, &mut reads, painting).plates.into_iter()
+                .find(|card| card.id == id).expect("the saved plate is listed").picture
+        };
+        assert_eq!(picture(&painting).as_deref(), Some(A), "the first list reads the file picture");
+        painting.insert(id.clone());
+        std::fs::write(&working, B).unwrap();
+        assert_eq!(picture(&painting).as_deref(), Some(A), "the file picture stays visible during painting");
+        painting.remove(&id);
+        assert_eq!(picture(&painting).as_deref(), Some(B), "the finished paint publishes the working picture");
+
+        std::fs::remove_file(&working).unwrap();
+        assert_eq!(picture(&painting).as_deref(), Some(A), "the file picture returns after the working picture is deleted");
+        painting.insert(id.clone());
+        assert_eq!(picture(&painting).as_deref(), Some(A), "the next paint keeps the file picture");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The plate a fresh Fab builds when nothing was on the bed (the empty model) files no script
@@ -4611,7 +4845,7 @@ mod person_first {
                 }
             }
         }));
-        let mut host = ModelHost::start(&cx, false);
+        let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
         let id = host.reserve_call_id();
         let reply = Arc::new(QuitReply { id, answered: false.into() });
         let handle = JobSpec::new("Saving the plate before quitting").start();
@@ -4628,6 +4862,53 @@ mod person_first {
         assert_eq!(answers.try_iter().collect::<Vec<_>>(), [id]);
         // The job board removes a fleeting success from its history.
         assert!(jobs::board().get(job_id).is_none_or(|j| matches!(j.end, jobs::JobEnd::Done { next: None })));
+    }
+
+    /// Runs `f` on the model host's worker, on its state, and gives back what it returns.
+    fn on_worker<T: Send + 'static>(host: &ModelHost, f: impl FnOnce(&mut HostState) -> T + Send + 'static) -> T {
+        let (done, ran) = std::sync::mpsc::channel();
+        host.strand.submit(Class::Interactive, Ticket::none(), move |state| done.send(f(state)).unwrap()).detach();
+        ran.recv().unwrap()
+    }
+
+    /// Why: a job that panicked on the model worker left whoever waited on it waiting for good
+    /// (the strand keeps the panic in a handle nobody holds), and a call through the app service
+    /// waits for its answer however long it takes. Its caller gets an error: with a plate open
+    /// as a failed Done (the window's failed-job path), without one as a bare answer. Its job
+    /// card ends failed, the worker stops saying it is busy with it, and the next job runs.
+    #[test]
+    fn a_job_that_panics_answers_its_caller_with_an_error() {
+        let _cx = crate::cx_owned();
+        let (send, answers) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(move |_, event| {
+            if let Event::Actions(actions) = event {
+                for action in actions {
+                    match action.downcast_ref::<HostAction>() {
+                        Some(HostAction::Done(done)) => send.send(("done", done.id, done.ok, done.text.clone())).unwrap(),
+                        Some(HostAction::Answered { id, ok, text, .. }) => send.send(("answered", *id, *ok, text.clone())).unwrap(),
+                        _ => (),
+                    }
+                }
+            }
+        }));
+        let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
+        // with the session the host started with
+        let open = host.reserve_call_id();
+        on_worker(&host, move |state| run_answering(state, Owed::Call(open), |_| panic!("a bug in a job")));
+        // without one, a call's own run panics on the way every job takes
+        on_worker(&host, |state| state.session = None);
+        let bare = host.reserve_call_id();
+        let handle = JobSpec::new("Inspecting the plate").start();
+        let job_id = handle.id();
+        host.queue_with(Job::Call { id: bare, tool: "inspect".into(), args: Value::Null }, Some(handle), Author::Person, None);
+        let busy = on_worker(&host, |state| state.words.lock().unwrap().doing.clone());
+        assert_eq!(busy, None, "the worker still says it is busy with the job that crashed");
+        cx.handle_action_receiver();
+        let got: Vec<_> = answers.try_iter().filter(|a| a.1 == open || a.1 == bare).collect();
+        let crashed = |text: &String| text.contains("crashed on this job");
+        assert!(matches!(&got[..], [("done", a, false, t), ("answered", b, false, u)] if *a == open && *b == bare && crashed(t) && crashed(u)),
+            "each caller gets an error, a failed Done with a plate open and a bare answer without: {got:?}");
+        assert!(jobs::board().get(job_id).is_some_and(|j| matches!(j.end, jobs::JobEnd::Failed { .. })), "the crashed job's card ends failed");
     }
 
     /// Why: a quit dropped every edit still queued behind a long job (the pool's close drops a
@@ -4659,7 +4940,7 @@ mod person_first {
                 }
             }
         }));
-        let mut host = ModelHost::start(&cx, true);
+        let mut host = ModelHost::start_in(&cx, true, &crate::dirs::FabDirs::system());
         let source = |x: u32| format!("{}let block = m.box({{size: [{x}mm 10mm 10mm]}})\nobject(block)\n", fab_model::program::EMPTY);
         let first = source(10);
         host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
@@ -4694,15 +4975,16 @@ mod person_first {
         cx.handle_action_receiver();
         cx.handle_actions();
         assert_eq!(*answered.lock().unwrap(), vec![quit], "the quit answers once, with its id");
-        let mut s = Session::new(Machine::dual_nozzle_350(), documents_dir());
-        s.store = Some(plate_store());
+        let dirs = crate::dirs::FabDirs::under(&root);
+        let mut s = Session::new(Machine::dual_nozzle_350(), dirs.documents.clone());
+        s.store = Some(fab_ai::plates::PlateStore::under(&dirs.app_data, &dirs.documents));
         assert!(s.recover().is_some_and(|built| built.is_ok()), "the plate left on the bed comes back");
         assert_eq!(s.model.state().scripts.get("block.cad.splash"), Some(&typed), "the edit queued behind the long job is in the working copy when the quit answers");
         drop(host);
 
         // the next run: a job of its own ends (its end saves the plate it found and notes it
         // saved), then a long job holds the worker and work that keeps nothing waits behind it
-        let mut host = ModelHost::start(&cx, true);
+        let mut host = ModelHost::start_in(&cx, true, &crate::dirs::FabDirs::system());
         host.queue(Job::TestMode(false));
         let held = Arc::new((Mutex::new(false), Condvar::new()));
         let hold = held.clone();

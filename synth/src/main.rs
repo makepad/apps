@@ -5,6 +5,13 @@
 
 pub use makepad_widgets;
 
+/// Releases the evaluation reserve on allocation failure so a runaway can report a memory error and the app can keep running.
+/// On wasm with atomics, the platform installs the guard around its thread-caching allocator.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+#[global_allocator]
+static ALLOC: makepad_widgets::makepad_platform::alloc_guard::Guarded<std::alloc::System> =
+    makepad_widgets::makepad_platform::alloc_guard::Guarded(std::alloc::System);
+
 use makepad_widgets::*;
 
 mod about;
@@ -74,8 +81,7 @@ pub struct App {
     resources: Resources,
     #[rust]
     songs: SongLibrary,
-    /// The default output devices, opened once the first event names them
-    /// (a muted, hidden instance renders and writes silence).
+    /// The default output devices, opened once the first event names them.
     #[rust]
     output_devices: Vec<AudioDeviceId>,
     /// MIDI in: keyboards for the score's `MidiIn` loops and its composer.
@@ -83,18 +89,11 @@ pub struct App {
     midi: midi::Midi,
 }
 
-/// A hidden instance (tests, headless runs) makes no sound.
-fn muted() -> bool {
-    std::env::var_os("MAKEPAD_MUTE").is_some_and(|v| v != "0")
-}
-
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         let mut output = self.desk.engine.output();
         cx.audio_output(0, move |info, buffer| output.fill(info.sample_rate, buffer));
-        self.desk.engine.set_muted(muted());
-        // A muted (hidden, test) instance opens no MIDI device.
-        if !muted() {
+        if !makepad_platform::audio_mute::process_muted() {
             self.midi.start(cx);
         }
         let ui = self.ui.clone();

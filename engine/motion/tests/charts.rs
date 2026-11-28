@@ -2,6 +2,7 @@
 //! twice and passes the label checks; layout, races, voice-synced landing,
 //! number formats, and the checks finding what they should.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -22,7 +23,7 @@ fn skill_examples() -> Vec<String> {
 
 fn texts(frame: &MotionFrame) -> Vec<String> {
     frame.walk().into_iter().filter_map(|(_, item)| match &item.kind {
-        ItemKind::Text { text, .. } if item.opacity > 0.5 => Some(text.clone()),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if item.opacity > 0.5 => Some(text.clone()),
         _ => None,
     }).collect()
 }
@@ -63,7 +64,7 @@ fn bars_stay_inside_their_box_and_reach_their_values() {
     ]}"#);
     let frame = doc.eval(3.9);
     let bars: Vec<(f64, f64, f64)> = frame.walk().into_iter().filter_map(|(_, item)| match &item.kind {
-        ItemKind::Rect { size, .. } if size[0] > 100.0 && size[1] > 5.0 => {
+        ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) if size[0] > 100.0 && size[1] > 5.0 => {
             let o = item.world.apply([0.0, 0.0]);
             assert!(o[0] >= 200.0 && o[0] + size[0] <= 1400.0 + 1e-6 && o[1] >= 150.0 && o[1] + size[1] <= 850.0 + 1e-6, "{o:?} {size:?}");
             Some((o[0], size[1], o[1] + size[1]))
@@ -89,7 +90,7 @@ fn a_bar_race_reorders_as_its_datasets_arrive() {
     let order = |t: f64| {
         let frame = doc.eval(t);
         let mut bars: Vec<(f64, String)> = frame.walk().into_iter().filter_map(|(_, item)| match &item.kind {
-            ItemKind::Rect { size, .. } if size[1] > 20.0 && size[0] > 3.0 => Some((item.world.apply([0.0, 0.0])[1], item.path.clone())),
+            ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) if size[1] > 20.0 && size[0] > 3.0 => Some((item.world.apply([0.0, 0.0])[1], item.path.clone())),
             _ => None,
         }).collect();
         bars.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -114,7 +115,7 @@ fn a_line_reaches_each_point_as_its_label_is_spoken() {
     let (doc, warnings) = doc.with_context(MotionContext::analyzed(features, None, 0.0)).unwrap();
     assert!(warnings.iter().all(|w| !w.message.contains("word")), "{warnings:?}");
     let trim = |t: f64| doc.eval(t).walk().into_iter().find_map(|(_, item)| match &item.kind {
-        ItemKind::Path { trim, stroke: Some(_), .. } if item.path.ends_with(']') && trim[1] < 1.0 + 1e-9 => Some(trim[1]),
+        ItemKind::Primitive(PrimitiveFrame::Path { trim, stroke: Some(_), .. }) if item.path.ends_with(']') && trim[1] < 1.0 + 1e-9 => Some(trim[1]),
         _ => None,
     }).unwrap();
     // Lands a beat of `grow` after the word starts (0.35 × grow = 0.28 s).
@@ -165,7 +166,7 @@ fn led_cells_are_dark_before_they_spin_and_land_on_their_text() {
     let lit = |t: f64| -> usize {
         doc.eval(t).walk().into_iter().filter(|(_, item)| item.path.len() > 0).filter_map(|(_, item)| match &item.kind {
             // A lit dot is a circle: its first curve ends one radius below the start.
-            ItemKind::Path { path, fill: Some(_), .. } if item.path.contains("layers") => Some(path.cmds.windows(2).filter(|pair| {
+            ItemKind::Primitive(PrimitiveFrame::Path { path, fill: Some(_), .. }) if item.path.contains("layers") => Some(path.cmds.windows(2).filter(|pair| {
                 matches!((&pair[0], &pair[1]), (geometry::PathCmd::MoveTo(_, y), geometry::PathCmd::BezierTo(_, _, _, _, _, end_y)) if end_y - y > 0.01)
             }).count()),
             _ => None,
@@ -183,7 +184,7 @@ fn a_head_to_head_card_rolls_its_digits_onto_their_values() {
     let digits = |t: f64| -> Vec<String> {
         let frame = doc.eval(t);
         let mut out: Vec<(f64, String)> = frame.walk().into_iter().filter_map(|(_, item)| match &item.kind {
-            ItemKind::Text { text, .. } if item.opacity > 0.5 && item.path.contains("layers[0].layers") && text.len() == 1 => Some((item.world.apply([0.0, 0.0])[0], text.clone())),
+            ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if item.opacity > 0.5 && item.path.contains("layers[0].layers") && text.len() == 1 => Some((item.world.apply([0.0, 0.0])[0], text.clone())),
             _ => None,
         }).collect();
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -200,7 +201,7 @@ fn a_head_to_head_card_rolls_its_digits_onto_their_values() {
 fn a_scoreboard_moves_rows_to_their_new_ranks() {
     let doc = load(&wrap(r#"Chart{type: @scoreboard size: vec2(1300, 700) data: [["Brute", 57.9], ["Spark", 10.9]] next: [[["Brute", 57.9], ["Spark", 66.6]]] switch: [3.0]}"#));
     let y_of = |t: f64, name: &str| doc.eval(t).walk().into_iter().find_map(|(_, item)| match &item.kind {
-        ItemKind::Text { text, .. } if text == name => Some(item.world.apply([0.0, 0.0])[1]),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if text == name => Some(item.world.apply([0.0, 0.0])[1]),
         _ => None,
     }).unwrap();
     assert!(y_of(2.0, "BRUTE") < y_of(2.0, "SPARK"));
@@ -218,7 +219,7 @@ fn counters_count_time_in_motions_time_formats() {
 fn fill_height(doc: &MotionDoc, t: f64) -> f64 {
     doc.eval(t).walk().into_iter().find_map(|(_, item)| match &item.kind {
         // The fill: narrower than the tube, taller than a tick.
-        ItemKind::Rect { size, radius, .. } if *radius > 1.0 && size[1] > 3.0 && size[0] < 70.0 => Some(size[1]),
+        ItemKind::Primitive(PrimitiveFrame::Rect { size, radius, .. }) if *radius > 1.0 && size[1] > 3.0 && size[0] < 70.0 => Some(size[1]),
         _ => None,
     }).unwrap_or(0.0)
 }
@@ -255,8 +256,8 @@ fn a_rider_stays_on_its_line() {
         let (mut line, mut rider) = (None, None);
         for (_, item) in frame.walk() {
             match &item.kind {
-                ItemKind::Path { path, trim, stroke: Some(_), .. } => line = Some((path.clone(), trim[1], item.world.apply([0.0, 0.0]))),
-                ItemKind::Rect { size, .. } if *size == [4.0, 4.0] => rider = Some(item.world.apply([0.0, 0.0])),
+                ItemKind::Primitive(PrimitiveFrame::Path { path, trim, stroke: Some(_), .. }) => line = Some((path.clone(), trim[1], item.world.apply([0.0, 0.0]))),
+                ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) if *size == [4.0, 4.0] => rider = Some(item.world.apply([0.0, 0.0])),
                 _ => {}
             }
         }
@@ -283,7 +284,7 @@ fn a_log_axis_marker_climbs_with_its_labels() {
 fn a_gantt_review_colours_each_task_as_today_passes_it() {
     let doc = load(&wrap(r#"Chart{type: @gantt csv: "task,start,end,status\nA,0,3,done\nB,2,8,late" review: {from: 0 to: 10 at: 3.0 length: 4.0}}"#));
     let fill = |t: f64, name: &str| doc.eval(t).walk().into_iter().find_map(|(_, item)| match &item.kind {
-        ItemKind::Rect { fill: Some(f), .. } if doc.all_layers().iter().any(|l| l.path == item.path && l.name.as_deref() == Some(name)) => Some(*f),
+        ItemKind::Primitive(PrimitiveFrame::Rect { fill: Some(f), .. }) if doc.all_layers().iter().any(|l| l.path == item.path && l.name.as_deref() == Some(name)) => Some(*f),
         _ => None,
     }).unwrap();
     // Before the line reaches A's end (week 3 = 4.2 s) A is neutral; after, green.
@@ -300,7 +301,7 @@ fn a_gantt_review_colours_each_task_as_today_passes_it() {
 fn an_activation_wave_reaches_nodes_hop_by_hop() {
     let doc = load(&wrap(r#"Chart{type: @network layout: @layers data: [{label: "a" group: "in"}, {label: "b" group: "mid"}, {label: "c" group: "out"}]
         links: [["a", "b"], ["b", "c"]] activate: [{from: "a" at: 2.0 hop: 1.0}]}"#));
-    let lit = |t: f64| doc.eval(t).walk().into_iter().filter(|(_, item)| matches!(item.kind, ItemKind::Ellipse { fill: Some(_), .. }) && item.opacity > 0.3
+    let lit = |t: f64| doc.eval(t).walk().into_iter().filter(|(_, item)| matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Ellipse { fill: Some(_), .. })) && item.opacity > 0.3
         && doc.all_layers().iter().any(|l| l.path == item.path && l.name.as_deref() == Some("node lit"))).count();
     assert_eq!((lit(1.9), lit(2.1), lit(3.1), lit(4.1)), (0, 1, 2, 3));
 }
@@ -310,7 +311,7 @@ fn a_probability_table_lights_the_sampled_token_per_step() {
     let doc = load(&wrap(r#"Chart{type: @probs size: vec2(1000, 520) data: [["up", 0.61], ["down", 0.12]]
         next: [[{label: "my" value: 0.3} {label: "the" value: 0.5}, {label: "your" value: 0.2 pick: true}]] switch: [3.0]}"#));
     let lit = |t: f64| doc.eval(t).walk().into_iter().find_map(|(_, item)| match &item.kind {
-        ItemKind::Text { text, units, .. } if item.opacity > 0.5 && text.starts_with('"') && units.first().is_some_and(|u| u.color[0] > 0.9 && u.color[2] < 0.4) => Some(text.clone()),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) if item.opacity > 0.5 && text.starts_with('"') && units.first().is_some_and(|u| u.color[0] > 0.9 && u.color[2] < 0.4) => Some(text.clone()),
         _ => None,
     });
     assert_eq!(lit(2.0).as_deref(), Some("\"up\""));
@@ -323,7 +324,7 @@ fn a_drum_lands_on_every_digit_even_for_huge_counts() {
         let doc = load(&wrap(&format!(r#"Chart{{type: @counter face: @drum data: [["n", {value}]] land: [3.0] grow: 2.0}}"#)));
         let frame = doc.eval(7.9);
         let mut digits: Vec<(f64, String)> = frame.walk().into_iter().filter_map(|(_, item)| match &item.kind {
-            ItemKind::Text { text, .. } if item.opacity > 0.5 && text.len() == 1 && text.chars().all(|c| c.is_ascii_digit())
+            ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if item.opacity > 0.5 && text.len() == 1 && text.chars().all(|c| c.is_ascii_digit())
                 && doc.all_layers().iter().any(|l| l.path == item.path && l.name.as_deref().is_some_and(|n| n.starts_with("value ·"))) => Some((item.world.apply([0.0, 0.0])[0], text.clone())),
             _ => None,
         }).collect();

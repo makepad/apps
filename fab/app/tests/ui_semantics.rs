@@ -8,8 +8,8 @@
 //!   two placements of one script: the code panel does not change there, so nothing but the
 //!   selection asks for a redraw (the row used to stay unselected until some other input
 //!   redrew the panel);
-//! - the workspace switch is selected by name (the plate view's header has no Plate mode control
-//!   of its own: the tabs set the mode), the Slice render mode by its switch;
+//! - the workspace switch is selected by name, and the plate view's bar shows the plate's mode
+//!   once (the header never doubles it); the Slice render mode is picked from its dropdown;
 //! - a checkbox (Supports) toggles through the
 //!   action path and read back;
 //! - the Slice render mode slices the plate, and the layer slider takes a value: the
@@ -17,10 +17,18 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/view_menu.rs"]
+mod view_menu;
+#[path = "common/toolbar_search.rs"]
+mod toolbar_search;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, KeyCode, KeyModifiers, NodeId, Role, Selector, States, TestApp};
@@ -122,7 +130,7 @@ object(block)
     assert!(reply.contains("solid: \"block/block\""), "{reply}");
     // The part is a named row of the parts list.
     // The parts list is a tab beside the program's solids.
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     let block = Selector::role(Role::TreeItem).name("Block");
     let base_id = app.locator(block.clone()).wait_visible().snapshot().node.id;
     assert_eq!(app.locator(block.clone()).snapshot().node.level, 1, "one instance is flat");
@@ -187,27 +195,26 @@ object(block)
     assert_eq!(app.locator(Selector::role(Role::TreeItem).name("Renamed placement")).wait_visible().snapshot().node.id, linked.id, "F2 on a part renames that placement");
 
     // ---- the workspace switch, then the Slice render mode ----
-    // The workspace tabs set the plate's mode: the plate view's header, drawn with its render
-    // switch, has no Plate mode control of its own beside it (it once doubled the tabs).
+    // The plate view's bar carries the plate's mode beside its render mode, once: the header
+    // never doubles it (it once doubled the workspace tabs).
     for ws in ["Monitor", "3D modeling"] {
         workspace_row::press(&app, ws);
-        app.locator(Selector::id("rm_slice")).wait_visible();
-        assert_eq!(app.locator(Selector::all().name("Plate mode")).count(), 0, "the plate view's header in {ws} has no Plate mode control");
+        app.locator(render_mode::control()).wait_visible();
+        assert_eq!(app.locator(Selector::all().name("Plate mode")).count(), 1, "the plate view's header in {ws} has one Plate mode control");
     }
-    app.locator(Selector::id("rm_slice")).click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     // Sliced brings the Slice panel forward beside the parts.
     app.locator(Selector::role(Role::Tab).name("Slice")).wait_visible();
     app.locator(Selector::widget_type("FabSlicePanel")).wait_visible();
-    // ---- the caption's Code toggle hides and shows the code split ----
+    // ---- View > Code hides and shows the code split ----
     // the code is an area of its own: alone in it, its nub and no tab
     let code_tab = |app: &TestApp| app.locator(Selector::id("code")).count() > 0;
     let shown = code_tab(&app);
-    app.locator(Selector::role(Role::ToggleButton).name("Code")).click();
+    view_menu::pick(&app, "Code");
     wait_poll(&app, || {
         if code_tab(&app) == shown { Err(format!("the Code toggle did not change the code split (shown: {shown})")) } else { Ok(()) }
     });
-    app.locator(Selector::role(Role::ToggleButton).name("Code")).click();
+    view_menu::pick(&app, "Code");
     wait_poll(&app, || {
         if code_tab(&app) != shown { Err("the Code toggle did not bring the code split back".to_string()) } else { Ok(()) }
     });
@@ -241,6 +248,10 @@ object(block)
     }
     // ---- a checkbox, in the Slicer panel ----
     app.locator(Selector::role(Role::Tab).name("Slicer")).wait_visible().click();
+    let search = toolbar_search::slicer_end(&app);
+    assert_eq!(search.role, Role::Button, "the closed search is the last tool");
+    app.locator(Selector::raw(format!("id={}", search.id.short()))).click_at_center();
+    app.locator(Selector::role(Role::Tab).name("Slicer").state("selected")).wait_visible();
     app.locator(Selector::id("search.row.input")).wait_visible().fill("supports");
     let supports = Selector::role(Role::CheckBox).name("Support and brim Supports");
     app.locator(supports.clone()).wait_visible();

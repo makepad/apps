@@ -214,10 +214,20 @@ pub fn text_verified(sources: &Sources, libs: &Libs, prev: &Evaluated, edits: Ve
         written.push(SourceRange { doc: edit.doc, span: start..start + edit.text.len() as u32 });
         shift.1 += edit.text.len() as i64 - (edit.span.end - edit.span.start) as i64;
     }
-    let edited: Vec<DocId> = edits.iter().map(|edit| edit.doc).collect();
     let edit = SpanEdit { edits, written, reevaluate: true, ..SpanEdit::default() };
     let mut sources = sources.clone();
     sources.apply(&edit.edits).map_err(one)?;
+    docs_verified(sources, libs, prev, edit, cancel)
+}
+
+/// Verify a planned document set (`Docs::plan_set`): `sources` already hold its text edits and
+/// presence changes, `edit` is the step that made them. The rule is `text_verified`'s, written once:
+/// no unit or bench gets a mistake it did not have, and no new error note lands in an edited
+/// document. Edited means every document the edits touch and every document the plan makes
+/// present, since a created document brings its whole text in without a text edit.
+/// Cost: one clone of `prev`, one map follow, one evaluation of the changed units, and a pass over
+/// the unit, bench and note diagnostics.
+pub fn docs_verified(sources: Sources, libs: &Libs, prev: &Evaluated, edit: SpanEdit, cancel: &AtomicBool) -> Result<Verified, EvalError> {
     let mut base = prev.clone();
     base.map.follow(&edit);
     let evaluated = evaluate_from(Some(&base), &sources, libs, cancel)?;
@@ -233,6 +243,8 @@ pub fn text_verified(sources: &Sources, libs: &Libs, prev: &Evaluated, edits: Ve
     for bench in &evaluated.benches {
         mistakes.extend(new(&bench.state, prev.benches.iter().find(|old| old.name == bench.name).map(|old| &old.state)));
     }
+    let edited: Vec<DocId> = edit.edits.iter().map(|e| e.doc)
+        .chain(edit.present.iter().filter_map(|&(doc, present)| present.then_some(doc))).collect();
     let in_edited = |diag: &Diag| diag.sel.iter().any(|sel| matches!(sel, Sel::Source { doc, .. } if edited.contains(doc)));
     for note in &evaluated.notes {
         if note.severity == Severity::Error && in_edited(note) && !prev.notes.iter().any(|old| old.message == note.message) {

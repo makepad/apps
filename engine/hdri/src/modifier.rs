@@ -4349,7 +4349,9 @@ mod led_tests {
             ring.factor(vec2f(0.27 * 0.8725 * a.sin(), 0.27 * 0.8725 * a.cos()))
         }).collect();
         let mid = 0.5 * (row.iter().cloned().fold(f32::MAX, f32::min) + row.iter().cloned().fold(0.0, f32::max));
-        let diodes = (0..row.len()).filter(|&i| row[i] > mid && row[(i + row.len() - 1) % row.len()] <= mid).count();
+        // The wrap is written out: `row[(i + row.len() - 1) % row.len()]` is miscompiled by the loop vectoriser
+        // under `target-cpu=native` on AVX-512 (a masked gather faults).
+        let diodes = (0..row.len()).filter(|&i| row[i] > mid && row[if i == 0 { row.len() - 1 } else { i - 1 }] <= mid).count();
         assert_eq!(diodes, 36);
         for diffusion in [0.05, 0.22, 0.6] {
             let p = ModifierParams { kind: "led_panel".to_string(), rim: 0.02, baffle: 0.5, ribs: 16, plate: 0.0, diffusion: Some(diffusion), across: None, ..ModifierParams::default() };

@@ -366,6 +366,25 @@ pub(crate) enum Lod {
     View,
 }
 
+/// The tower's shapes laid out by field so the CPU can read several distances together.
+#[derive(Clone, Copy, Debug, Default)]
+struct Shapes {
+    turret_x: [f32; TURRETS],
+    turret_z: [f32; TURRETS],
+    turret_top: [f32; TURRETS],
+    /// The column radius at each turret's foot.
+    turret_r0: [f32; TURRETS],
+    turret_taper: [f32; TURRETS],
+    /// Height from the common base to each turret's top.
+    turret_span: [f32; TURRETS],
+    puff_x: [f32; PUFFS],
+    puff_y: [f32; PUFFS],
+    puff_z: [f32; PUFFS],
+    puff_r: [f32; PUFFS],
+    /// Distance over which each puff joins its turret's mass.
+    puff_join: [f32; PUFFS],
+}
+
 /// The numbers the density reads (both marches, and the GPU's uniforms): the storm's place and frame, its envelope,
 /// its noise.
 #[derive(Clone, Copy, Debug)]
@@ -384,6 +403,7 @@ struct Envelope {
     turrets: [[f32; 4]; TURRETS],
     /// Each puff: (along, up, across) in the leaned frame, its radius.
     puffs: [[f32; 4]; PUFFS],
+    shapes: Shapes,
     /// The anvil: its reach downwind, its half width there, its thickness at the tower (0: none), its reach upwind; its
     /// half width at the tower; how far it joins the tower, metres.
     anvil: [f32; 4],
@@ -490,6 +510,23 @@ impl Envelope {
         let dome_height = CAULI_HEIGHT1 * b.puffiness / PUFFINESS_AT;
         let lump_most = 0.25 * (dome_height + 0.25 * CAULI_HEIGHT2) * lump_tile * (1.0 + LUMP_FINE);
         let place = |k: u32| vec3f(unit(100 + 3 * k), unit(101 + 3 * k), unit(102 + 3 * k));
+        let mut shapes = Shapes::default();
+        for (i, t) in turrets.iter().enumerate() {
+            let (taper, share) = if i == 0 { (UPDRAFT_TAPER, UPDRAFT_COLUMN) } else { (TAPER, COLUMN_SHARE) };
+            shapes.turret_x[i] = t[0];
+            shapes.turret_z[i] = t[1];
+            shapes.turret_top[i] = t[3];
+            shapes.turret_r0[i] = share * t[2];
+            shapes.turret_taper[i] = taper;
+            shapes.turret_span[i] = t[3] - base;
+        }
+        for (j, s) in puffs.iter().enumerate() {
+            shapes.puff_x[j] = s[0];
+            shapes.puff_y[j] = s[1];
+            shapes.puff_z[j] = s[2];
+            shapes.puff_r[j] = s[3];
+            shapes.puff_join[j] = PUFF_JOIN * s[3];
+        }
         Envelope {
             centre: vec2f(d * a.sin(), -d * a.cos()),
             wind,
@@ -499,6 +536,7 @@ impl Envelope {
             lean: b.lean_deg.to_radians().tan(),
             turrets,
             puffs,
+            shapes,
             anvil: [along, radius * (ANVIL_SPREAD.0 + ANVIL_SPREAD.1 * b.anvil), b.anvil_m * scale * anvil_on, ANVIL_UPWIND * along],
             anvil_near: ANVIL_NEAR * radius,
             anvil_join: ANVIL_JOIN * radius * anvil_on,
@@ -550,42 +588,41 @@ impl Envelope {
         (qx * self.wind.x + qz * self.wind.y, p.y, qz * self.wind.x - qx * self.wind.y)
     }
 
-    /// A turret's distance at (leaned along, across, up): a column narrowing by `taper` from its foot to its cap's start,
-    /// a dome cap CAP_SHARE of its radius high.
-    #[inline]
-    fn turret(&self, t: &[f32; 4], taper: f32, share: f32, ul: f32, v: f32, y: f32) -> f32 {
-        let r = share * t[2] * (1.0 - taper * ((y - self.base) / (t[3] - self.base)).clamp(0.0, 1.0));
-        let rc = CAP_SHARE * r;
-        let yc = y.clamp(self.base - 2000.0, t[3] - rc);
-        let (dx, dz, dy) = (ul - t[0], v - t[1], (y - yc) * (r / rc));
-        (dx * dx + dz * dz + dy * dy).sqrt() - r
-    }
-
-    /// A puff's distance joined to `d` (over PUFF_JOIN of its radius).
-    #[inline]
-    fn puff(&self, d: f32, s: &[f32; 4], ul: f32, v: f32, y: f32) -> f32 {
-        let (dx, dy, dz) = (ul - s[0], y - s[1], v - s[2]);
-        smin(d, (dx * dx + dy * dy + dz * dz).sqrt() - s[3], PUFF_JOIN * s[3])
-    }
-
     /// The tower's distance at (leaned along, across, up): (the updraft's mass, the flanking line), each its turrets and
     /// their puffs joined. The GPU's `cb_tower` mirrors it.
+    /// The distances are computed independently so the loops can vectorise, then joined in their original order.
     #[inline]
     fn tower(&self, ul: f32, v: f32, y: f32) -> (f32, f32) {
+        let s = &self.shapes;
+        let mut dt = [0.0f32; TURRETS];
+        for i in 0..TURRETS {
+            let r = s.turret_r0[i] * (1.0 - s.turret_taper[i] * ((y - self.base) / s.turret_span[i]).clamp(0.0, 1.0));
+            let rc = CAP_SHARE * r;
+            // These bounds give the same value as clamp without its assertion, so the loop can vectorise.
+            let yc = y.max(self.base - 2000.0).min(s.turret_top[i] - rc);
+            let (dx, dz, dy) = (ul - s.turret_x[i], v - s.turret_z[i], (y - yc) * (r / rc));
+            dt[i] = (dx * dx + dz * dz + dy * dy).sqrt() - r;
+        }
+        let mut dp = [0.0f32; PUFFS];
+        for j in 0..PUFFS {
+            let (dx, dy, dz) = (ul - s.puff_x[j], y - s.puff_y[j], v - s.puff_z[j]);
+            dp[j] = (dx * dx + dy * dy + dz * dz).sqrt() - s.puff_r[j];
+        }
+
         let ks = TURRET_JOIN * self.radius;
-        let mut dm = self.turret(&self.turrets[0], UPDRAFT_TAPER, UPDRAFT_COLUMN, ul, v, y);
-        for t in &self.turrets[1..MAIN_TURRETS] {
-            dm = smin(dm, self.turret(t, TAPER, COLUMN_SHARE, ul, v, y), ks);
+        let mut dm = dt[0];
+        for i in 1..MAIN_TURRETS {
+            dm = smin(dm, dt[i], ks);
         }
-        for s in &self.puffs[..MAIN_PUFFS] {
-            dm = self.puff(dm, s, ul, v, y);
+        for j in 0..MAIN_PUFFS {
+            dm = smin(dm, dp[j], s.puff_join[j]);
         }
-        let mut df = self.turret(&self.turrets[MAIN_TURRETS], TAPER, COLUMN_SHARE, ul, v, y);
-        for t in &self.turrets[MAIN_TURRETS + 1..] {
-            df = smin(df, self.turret(t, TAPER, COLUMN_SHARE, ul, v, y), ks);
+        let mut df = dt[MAIN_TURRETS];
+        for i in MAIN_TURRETS + 1..TURRETS {
+            df = smin(df, dt[i], ks);
         }
-        for s in &self.puffs[MAIN_PUFFS..] {
-            df = self.puff(df, s, ul, v, y);
+        for j in MAIN_PUFFS..PUFFS {
+            df = smin(df, dp[j], s.puff_join[j]);
         }
         (dm, df)
     }

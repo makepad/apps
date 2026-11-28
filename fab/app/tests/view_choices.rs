@@ -12,7 +12,7 @@
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, KeyCode, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyModifiers, Selector, TestApp, TestConfig};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -44,10 +44,10 @@ fn finished_with_ao(app: &TestApp) -> bool {
     recording(app).get("screen_ao").and_then(Value::as_bool).expect("the report says whether it took the screen AO")
 }
 
-/// A command of the palette (F3).
+/// A command of the palette (Cmd/Ctrl+Shift+P).
 fn command(app: &TestApp, name: &str) {
     app.press_key(KeyCode::Escape);
-    app.press_key(KeyCode::F3);
+    app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
     app.type_text(name);
     app.press_key(KeyCode::ReturnKey);
 }

@@ -408,6 +408,7 @@ pub fn plate_info(c: Option<&Compiled>, ev: &Evaluated, revision: u64) -> PlateI
         revision,
         preview: false,
         whole: None,
+        whole_active: None,
     }
 }
 

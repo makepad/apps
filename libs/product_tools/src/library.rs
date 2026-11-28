@@ -210,6 +210,8 @@ fn asset_info(client: &mut AssetClient, id: &str, revision: Option<&str>) -> Res
     let reference = AssetRevisionRef { asset_id, revision };
     let manifest = client.resolve_ref(&reference).map_err(|error| ToolError::failed(error.to_string()))?;
     let note = client.get_annotation(&asset_id).ok();
+    let (model, hub) = note.as_ref().map(annotation_origin).unwrap_or_default();
+    let model = model.or_else(|| manifest.provenance.as_ref().map(|provenance| provenance.model.trim().to_string()).filter(|model| !model.is_empty()));
     let files: Vec<Json> = manifest.files.iter().map(|file| {
         let mut fields = vec![("role", json::s(format!("{:?}", file.role))), ("media", json::s(format!("{:?}", file.media))), ("bytes", Json::Int(file.byte_len as i64))];
         if let Some(dims) = file.dims {
@@ -225,9 +227,16 @@ fn asset_info(client: &mut AssetClient, id: &str, revision: Option<&str>) -> Res
         ("head", head.map(|head| json::s(head.to_string())).unwrap_or(Json::Null)),
         ("retired", Json::Bool(detail.retired)),
         ("files", Json::Arr(files)),
-        ("tags", Json::Arr(note.map(|note| note.tags.into_iter().map(json::s).collect()).unwrap_or_default())),
+        ("tags", Json::Arr(note.as_ref().map(|note| note.tags.iter().cloned().map(json::s).collect()).unwrap_or_default())),
         ("dependencies", Json::Arr(manifest.dependencies.iter().map(reference_json).collect())),
     ];
+    // Where a generated asset came from: its model and the hub node that ran it.
+    if let Some(model) = model {
+        fields.push(("model", json::s(model)));
+    }
+    if let Some(hub) = hub {
+        fields.push(("hub", json::s(hub)));
+    }
     if manifest.metrics.media_millis > 0 {
         fields.push(("seconds", num(manifest.metrics.media_millis as f64 / 1000.0)));
     }
@@ -239,6 +248,24 @@ fn asset_info(client: &mut AssetClient, id: &str, revision: Option<&str>) -> Res
         fields.push(("used_by", Json::Int(users.total as i64)));
     }
     Ok(json::obj(fields))
+}
+
+/// The model and hub node an annotation names: the model as annotated; the
+/// hub from `backend` when a flow published the asset (the flow engine keeps
+/// the node there; another generator's backend means something else), else
+/// from the nearest generator's `hub` in the provenance record.
+fn annotation_origin(note: &makepad_asset_client::AnnotationDto) -> (Option<String>, Option<String>) {
+    let model = Some(note.model.trim().to_string()).filter(|model| !model.is_empty());
+    let backend = note.backend.trim();
+    let hub = if note.generator == "makepad-flow" && !backend.is_empty() {
+        Some(backend.to_string())
+    } else {
+        json::parse(note.provenance.as_bytes()).ok().and_then(|provenance| {
+            let hub = provenance.get("generators")?.as_arr()?.first()?.get("hub")?.as_str()?.trim().to_string();
+            (!hub.is_empty()).then_some(hub)
+        })
+    };
+    (model, hub)
 }
 
 fn preview(client: &mut AssetClient, asset: &AssetRevisionRef) -> Result<(Json, Vec<u8>), ToolError> {
@@ -372,4 +399,27 @@ fn import_media(client: &mut AssetClient, path: &str, title: Option<&str>, lyric
         ("title", json::s(name)),
         ("use", json::s(format!("asset(\"{}\", \"{}\")", reference.asset_id, reference.revision))),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::annotation_origin;
+    use makepad_asset_client::AnnotationDto;
+
+    #[test]
+    fn asset_origin_reads_the_hub_from_a_flows_backend_or_its_provenance() {
+        let flow = AnnotationDto { generator: "makepad-flow".into(), backend: "node 42".into(), model: "fasth3-4step-q4-24g".into(), ..Default::default() };
+        assert_eq!(annotation_origin(&flow), (Some("fasth3-4step-q4-24g".into()), Some("node 42".into())));
+        // An older flow publish kept the node only in its provenance.
+        let older = AnnotationDto {
+            generator: "makepad-flow".into(),
+            provenance: r#"{"flow":"gen:video","generators":[{"node":"video","model":"m","hub":"node 9"},{"node":"image","hub":"node 7"}]}"#.into(),
+            ..Default::default()
+        };
+        assert_eq!(annotation_origin(&older), (None, Some("node 9".into())));
+        // An importer's backend is not a hub node.
+        let imported = AnnotationDto { generator: "asset-importer".into(), backend: "ffmpeg".into(), ..Default::default() };
+        assert_eq!(annotation_origin(&imported), (None, None));
+        assert_eq!(annotation_origin(&AnnotationDto::default()), (None, None));
+    }
 }

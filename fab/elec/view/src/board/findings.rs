@@ -239,6 +239,7 @@ fn row_id(id: u64) -> LiveId {
 }
 
 fn kind_title(kind: &CheckKind) -> String {
+    if kind == &CheckKind::OpenPort { return "Open block port".into(); }
     let name = format!("{kind:?}");
     // Custom's payload is a rule name, not part of the variant's name.
     let name = name.split('(').next().unwrap_or(&name);

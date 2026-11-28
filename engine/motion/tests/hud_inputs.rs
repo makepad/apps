@@ -2,6 +2,7 @@
 //! a reload; a document that is a function of a game's script (a fn image);
 //! one document and one VM shared by many instances.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use makepad_script::{ScriptFnImage, ScriptMod, ScriptVm, ScriptVmBase, ScriptVmHost};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -68,13 +69,13 @@ fn image(prelude: &str) -> ScriptFnImage {
 
 fn texts(frame: &MotionFrame) -> Vec<String> {
     frame.items.iter().filter_map(|item| match &item.kind {
-        ItemKind::Text { text, .. } => Some(text.clone()),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => Some(text.clone()),
         _ => None,
     }).collect()
 }
 
 fn rect_x(frame: &MotionFrame) -> f64 {
-    frame.items.iter().find(|item| matches!(item.kind, ItemKind::Rect { .. })).map(|item| item.world.apply([0.0, 0.0])[0]).expect("the rect")
+    frame.items.iter().find(|item| matches!(item.kind, ItemKind::Primitive(PrimitiveFrame::Rect { .. }))).map(|item| item.world.apply([0.0, 0.0])[0]).expect("the rect")
 }
 
 #[test]

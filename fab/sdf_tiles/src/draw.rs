@@ -178,7 +178,7 @@ script_mod! {
         draw_list: uniform_buffer(draw.DrawListUniforms)
         geom: vertex_buffer(geom.QuadVertex, sdf_tiles.TileCorners)
         alpha_blend: false
-        backface_culling: false
+        cull_mode: @None
         color_format: @Rf32
         world_from_obj: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         sun_rx: uniform(vec4(1.0, 0.0, 0.0, 0.0))
@@ -642,7 +642,7 @@ pub fn draw_tiles(cx: &mut Cx2d, draw: &mut DrawSdfTile, tiles: &[Option<Chunk>]
     set_frame(&*cx.cx, &mut draw.draw_vars, proj, height, world_from_obj, planes);
     draw.draw_vars.set_uniform(&*cx.cx, id!(gbuf_id), &[id]);
     draw.draw_vars.set_uniform(&*cx.cx, id!(cut_painted), &[if cut_painted { 1.0 } else { 0.0 }]);
-    draw.draw_vars.options.backface_culling = one_sided;
+    draw.draw_vars.options.cull_mode = if one_sided { CullMode::Back } else { CullMode::None };
     for t in tiles.iter().flatten().filter(|t| view.is_none_or(|v| v.sees_box(&t.quads))) {
         cx.add_retained_instances(&mut draw.draw_vars, &t.tiles);
     }
@@ -780,7 +780,7 @@ pub fn draw_tiles_lit(cx: &mut Cx2d, draw: &mut DrawSdfTileLit, tiles: &[Option<
     dv.set_uniform(c, id!(display), &[if light.display { 1.0 } else { 0.0 }, light.sun_spec, 0.0, 0.0]);
     dv.set_uniform(c, id!(key_spec), &light.key_spec);
     dv.set_uniform(c, id!(key_tint), &light.key_tint);
-    draw.draw_vars.options.backface_culling = one_sided;
+    draw.draw_vars.options.cull_mode = if one_sided { CullMode::Back } else { CullMode::None };
     for t in tiles.iter().flatten().filter(|t| view.is_none_or(|v| v.sees_box(&t.quads))) {
         cx.add_retained_instances(&mut draw.draw_vars, &t.tiles);
     }

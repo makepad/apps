@@ -8,6 +8,8 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, Role, Selector, TestApp};
@@ -42,6 +44,7 @@ fn head_of(reply: &str) -> String {
 /// The parts list holds the user's parts (the mushroom's row shows), never
 /// printability markers (nor the printer's own geometry).
 fn no_issue_rows(app: &TestApp) {
+    parts_tab::open(app);
     let rows = wait_poll(app, || {
         let nodes = app.widget_snapshot().nodes();
         let in_parts = nodes.iter().any(|n| n.node.role == makepad_test::Role::TreeItem && n.node.path.contains("Parts"));

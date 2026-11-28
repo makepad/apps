@@ -198,6 +198,27 @@ pub fn defs_catalog(libs: &Libs, project: &ProjectDefs) -> Arc<Catalog> {
     }).clone()
 }
 
+/// Evaluate independent local part documents against the standard definitions. Each document
+/// gets its own project and VM so an invalid cached part cannot affect any other entry.
+pub fn from_part_docs(lib: &str, docs: &[(String, Arc<str>)]) -> Vec<CatalogEntry> {
+    let libs = crate::std_libs();
+    let library_hash = library_inputs(&libs);
+    let mut entries = Vec::new();
+    for (name, text) in docs {
+        let mut sources = Sources::new();
+        if sources.add(name, text.clone()).is_err() { continue }
+        let project = ProjectDefs::new(&sources, &libs);
+        let (parts, diags) = enumerate(&libs, Some(&project), project_inputs(&project, library_hash));
+        if diags.iter().any(|d| d.severity == fab_elec_core::Severity::Error) { continue }
+        entries.extend(parts.into_iter().filter(|entry| entry.part.is_some()).map(|mut entry| {
+            entry.lib = lib.into();
+            entry
+        }));
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
 /// The rail a miniature's power port sits at when the port declares no volts. Only miniatures use
 /// it, never a design, and a miniature that does names those ports (`Miniature::previewed`).
 const MINIATURE_RAIL: f64 = 3.3;
@@ -239,6 +260,12 @@ pub fn blocks_alone(src: &CatalogSource, entries: &[&CatalogEntry]) -> Vec<Resul
     ctx.borrow_mut().docs.retain(|doc| doc.id == empty.id || src.libs.doc(doc.id).is_some_and(is_definition));
     circuit::load_libraries(&mut vm, &ctx);
     circuit::load_project_docs(&mut vm, &ctx, src.docs.iter(), &src.assets);
+    // This VM is only for miniatures. Planned blocks show their ports, even if a builder exists.
+    for rec in &mut ctx.borrow_mut().defs {
+        if rec.def.planned {
+            rec.build = None;
+        }
+    }
     // A definition document's own mistakes are the catalog's diagnostics; a miniature reports only
     // what its block's build says, so one broken document does not blank every tile.
     ctx.borrow_mut().diags.clear();
@@ -744,5 +771,23 @@ fn first_sentence(text: &str) -> String {
     match text.char_indices().find(|&(i, c)| c == '.' && (i + 1 == text.len() || text.as_bytes()[i + 1] == b' ')) {
         Some((i, _)) => text[..=i].to_string(),
         None => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod imported_tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_cached_document_does_not_hide_other_local_parts() {
+        let docs = [
+            ("broken.part.splash".into(), "let x = (}".into()),
+            ("sensor.part.splash".into(), r#"let e = mod.elec
+e.define("sensor", {kind: @ic prefix: "U" symbol: e.f.ic_symbol("sensor", {left: [["A" @in]]})})
+"#.into()),
+        ];
+        let entries = from_part_docs("imported", &docs);
+        assert_eq!(entries.iter().map(|e| (e.lib.as_str(), e.name.as_str())).collect::<Vec<_>>(),
+            [("imported", "sensor")], "one corrupt file must not hide its valid neighbour or introduce standard parts as imports");
     }
 }

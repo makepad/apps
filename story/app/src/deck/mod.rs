@@ -993,7 +993,7 @@ impl DeckPage {
         // Typing in the chat or the source is not a deck key (while
         // presenting both are folded away: a focus they kept does not hold
         // the deck's keys, Esc included).
-        if self.presenting.is_none() && has_focus(cx, ui.widget(cx, ids!(ai_chat)).widget(cx, ids!(input)).area()) {
+        if self.presenting.is_none() && has_focus(cx, ui.widget(cx, ids!(chat_split.ai_chat)).widget(cx, ids!(input)).area()) {
             return;
         }
         if ui.menu_layer(cx, ids!(menus)).open_owner() == Some(live_id!(deck_file_menu)) || self.slide_menu_open(cx, ui)

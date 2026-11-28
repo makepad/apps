@@ -3,7 +3,7 @@
 //! of the document and one clear problem instead of failing to build.
 
 use super::MotionDraw;
-use makepad_motion::frame::{Affine, Item};
+use makepad_motion::frame::Item;
 use makepad_widgets::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ pub(crate) struct Scenes3d {
 
 impl Scenes3d {
     pub fn begin_frame(&mut self, _cx: &mut Cx) {}
+    pub(super) fn waiting_document(&self) -> Option<&str> { None }
     pub(crate) fn release_all(&mut self, _cx: &mut Cx) {}
 
     pub fn errors(&self) -> Vec<String> {
@@ -27,6 +28,12 @@ impl Scenes3d {
     pub fn debug_state(&self, _cx: &Cx) -> String {
         String::new()
     }
+
+    pub fn loading(&self) -> bool {
+        false
+    }
+
+    pub(super) fn hash_progress(&self, _mark: &mut impl std::hash::Hasher) {}
 
     pub fn painted(&self, _cx: &Cx) -> bool {
         true
@@ -58,8 +65,6 @@ impl Scenes3d {
     pub(super) fn anchor(&self, _path: &str, _node: &str) -> Option<([f64; 2], bool)> {
         None
     }
-
-    pub(super) fn place(&mut self, _path: &str, _m: Affine, _size: [f64; 2]) {}
 }
 
 /// No kept scenes without motion3d.
@@ -95,6 +100,9 @@ pub(crate) fn adopt_loaded(loaded: SceneLoaded) -> Option<Box<dyn FnOnce() + Sen
 }
 
 pub(super) fn render(md: &mut MotionDraw, _cx: &mut Cx2d, item: &Item, _scale: f64) -> Option<Texture> {
+    if md.refuse_plain_item(item) {
+        return None;
+    }
     let error = format!("{}: a Scene3D layer needs makepad-motion-draw's `scene3d` feature", item.path);
     if !md.scenes3d.errors.contains(&error) {
         md.scenes3d.errors.push(error);

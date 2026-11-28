@@ -15,11 +15,12 @@
 //! The platform decodes and converts on the capture thread and keeps only
 //! the newest frame ([`CameraLatest`]); the draw takes it into one texture,
 //! which is the node's picture for the compositor. Crop, turn, mirror and
-//! the corrections are the compositor's shader.
+//! the corrections are the compositor's shader. A test pattern generates
+//! BGRA frames on demand and uses the same texture upload without a camera slot.
 
-use makepad_story_cut::CameraSpec;
+use makepad_story_cut::{CameraDevice, CameraSpec};
 use makepad_story_edit_render::compose::ExternalFrame;
-use makepad_widgets::makepad_platform::video::{camera_clock_ns, CameraFrameInputFn, CameraLatest, VideoFormat, VideoFormatId, VideoInputDesc, VideoInputId, VideoPixelFormat};
+use makepad_widgets::makepad_platform::video::{camera_clock_ns, CameraBgraFrame, CameraFrameInputFn, CameraLatest, VideoFormat, VideoFormatId, VideoInputDesc, VideoInputId, VideoPixelFormat};
 use makepad_widgets::*;
 use std::sync::Arc;
 
@@ -83,16 +84,75 @@ enum Stage {
     Failed(String),
 }
 
+const BGRA_FOURCC: u32 = u32::from_le_bytes(*b"BGRA");
+
+enum FeedSource {
+    Camera { slot: usize, latest: Arc<CameraLatest> },
+    TestPattern(TestPattern),
+}
+
+impl FeedSource {
+    fn slot(&self) -> Option<usize> {
+        match self {
+            Self::Camera { slot, .. } => Some(*slot),
+            Self::TestPattern(_) => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TestPattern {
+    frame: CameraBgraFrame,
+    last_frame: Option<f64>,
+}
+
+impl TestPattern {
+    fn next_frame(&mut self, spec: &CameraSpec, now: f64, clock: Option<u64>) -> Option<CameraBgraFrame> {
+        if self.last_frame.is_some_and(|last| now - last < 1.0 / spec.fps) {
+            return None;
+        }
+        self.last_frame = Some(now);
+        let (width, height) = (spec.width as usize, spec.height as usize);
+        let marker_height = (height / 24).max(1);
+        let marker_start = (height - marker_height) * width;
+        let frame = &mut self.frame;
+        if frame.pixels.is_empty() {
+            const BARS: [u32; 7] = [0xffbfbfbf, 0xffbfbf00, 0xff00bfbf, 0xff00bf00, 0xffbf00bf, 0xffbf0000, 0xff0000bf];
+            frame.width = width;
+            frame.height = height;
+            frame.pixels.resize(width * height, 0);
+            for (y, row) in frame.pixels[..marker_start].chunks_exact_mut(width).enumerate() {
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    *pixel = if y < height * 2 / 3 {
+                        BARS[x * BARS.len() / width]
+                    } else {
+                        let grey = (255 * x / (width - 1).max(1)) as u32;
+                        0xff000000 | (grey * 0x010101)
+                    };
+                }
+            }
+        }
+        let marker_width = (width / 16).max(1);
+        let x = (now.fract() * (width - marker_width + 1) as f64) as usize;
+        for row in frame.pixels[marker_start..].chunks_exact_mut(width) {
+            row[..x].fill(0xff000000);
+            row[x..x + marker_width].fill(0xffffffff);
+            row[x + marker_width..].fill(0xff000000);
+        }
+        frame.timestamp_ns = clock.unwrap_or(0);
+        Some(std::mem::take(frame))
+    }
+}
+
 /// One `Camera` node of one slide.
 pub struct Feed {
     slide: usize,
     node: String,
     spec: CameraSpec,
-    slot: usize,
+    source: FeedSource,
     stage: Stage,
     /// The device chosen: its name and input.
     device: Option<String>,
-    latest: Arc<CameraLatest>,
     texture: Option<Texture>,
     size: (u32, u32),
     /// Bumped with every new picture.
@@ -133,8 +193,51 @@ impl Feed {
         Some((sorted[sorted.len() / 2], sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)]))
     }
 
+    fn upload(&mut self, cx: &mut Cx, frame: &mut CameraBgraFrame, clock: Option<u64>) {
+        if let Some(now_ns) = clock.filter(|_| frame.timestamp_ns > 0) {
+            if self.ages.len() == AGE_SAMPLES {
+                self.ages.remove(0);
+            }
+            self.ages.push(now_ns.saturating_sub(frame.timestamp_ns) as f64 / 1.0e6);
+        }
+        self.frames += 1;
+        let sum = frame.pixels.iter().step_by(61).fold(0u64, |sum, pixel| sum.wrapping_mul(31).wrapping_add(*pixel as u64));
+        if sum != self.checksum {
+            self.differing += 1;
+            self.checksum = sum;
+        }
+        let (width, height) = (frame.width, frame.height);
+        match &self.texture {
+            Some(texture) if self.size == (width as u32, height as u32) => texture.swap_vec_u32(cx, &mut frame.pixels),
+            Some(texture) => {
+                texture.set_data_u32(cx, width, height, std::mem::take(&mut frame.pixels));
+                self.size = (width as u32, height as u32);
+            }
+            None => {
+                // Both buffers need the static picture before the first texture swap.
+                let pixels = match self.source {
+                    FeedSource::TestPattern(_) => frame.pixels.clone(),
+                    FeedSource::Camera { .. } => std::mem::take(&mut frame.pixels),
+                };
+                self.texture = Some(Texture::new_with_format(
+                    cx,
+                    TextureFormat::VecBGRAu8_32 { width, height, data: Some(pixels), updated: TextureUpdated::Full },
+                ));
+                self.size = (width as u32, height as u32);
+            }
+        }
+        self.serial += 1;
+    }
+
+    fn stats(&self) -> (u64, u64, u64, Option<String>) {
+        match &self.source {
+            FeedSource::Camera { latest, .. } => latest.stats(),
+            FeedSource::TestPattern(_) => (self.serial, 0, 0, None),
+        }
+    }
+
     fn report(&mut self, why: &str) {
-        let (received, replaced, failed, last_error) = self.latest.stats();
+        let (received, replaced, failed, last_error) = self.stats();
         match self.latency() {
             Some((median, p95)) => log!(
                 "deck camera {} ({why}): {} frames shown, age at draw median {median:.1} ms p95 {p95:.1} ms, {} differ from the frame before; {received} received, {replaced} replaced unseen, {failed} failed{}",
@@ -143,7 +246,13 @@ impl Feed {
                 self.differing,
                 last_error.map(|error| format!(" ({error})")).unwrap_or_default()
             ),
-            None => log!("deck camera {} ({why}): no frame shown; {received} received, {failed} failed{}", self.label(), last_error.map(|error| format!(" ({error})")).unwrap_or_default()),
+            None => log!(
+                "deck camera {} ({why}): {} frames shown, age unavailable, {} differ from the frame before; {received} received, {replaced} replaced unseen, {failed} failed{}",
+                self.label(),
+                self.frames,
+                self.differing,
+                last_error.map(|error| format!(" ({error})")).unwrap_or_default()
+            ),
         }
         self.ages.clear();
         self.frames = 0;
@@ -238,28 +347,38 @@ impl Cameras {
                 if self.feeds.iter().any(|feed| feed.slide == *slide && feed.node == *node) {
                     continue;
                 }
-                let Some(slot) = self.in_use.iter().position(|used| !used) else {
-                    log!("deck camera: no free camera slot for {node} of slide {slide}");
-                    continue;
+                let (source, stage) = if spec.device == CameraDevice::TestPattern {
+                    let format = VideoFormat {
+                        format_id: VideoFormatId::default(),
+                        width: spec.width as usize,
+                        height: spec.height as usize,
+                        frame_rate: Some(spec.fps),
+                        pixel_format: VideoPixelFormat::Unsupported(BGRA_FOURCC),
+                    };
+                    (FeedSource::TestPattern(TestPattern::default()), Stage::Open(format))
+                } else {
+                    let Some(slot) = self.in_use.iter().position(|used| !used) else {
+                        log!("deck camera: no free camera slot for {node} of slide {slide}");
+                        continue;
+                    };
+                    self.in_use[slot] = true;
+                    log!("deck camera {}: slide {slide} entered, slot {slot} taken", spec.device.label());
+                    let latest = CameraLatest::new();
+                    // Installing the frame callback also makes the platform list its cameras.
+                    cx.watch(slot, latest.input_fn());
+                    (FeedSource::Camera { slot, latest }, Stage::Waiting)
                 };
-                self.in_use[slot] = true;
-                log!("deck camera {}: slide {slide} entered, slot {slot} taken", spec.device.label());
-                let latest = CameraLatest::new();
-                // Installing the frame callback is also what makes the
-                // platform list the cameras (once).
-                cx.watch(slot, latest.input_fn());
                 self.feeds.push(Feed {
                     slide: *slide,
                     node: node.clone(),
                     spec: spec.clone(),
-                    slot,
-                    stage: Stage::Waiting,
+                    source,
+                    stage,
                     device: None,
-                    latest,
                     texture: None,
                     size: (0, 0),
                     serial: 0,
-                    ages: Vec::new(),
+                    ages: Vec::with_capacity(AGE_SAMPLES),
                     frames: 0,
                     checksum: 0,
                     differing: 0,
@@ -268,18 +387,17 @@ impl Cameras {
             }
         }
         // Prepare (open) / activate (stream) / deactivate (stop).
-        let devices = self.devices.clone();
+        let devices = self.devices.as_deref();
         for feed in &mut self.feeds {
-            if matches!(feed.stage, Stage::Waiting) {
-                if let Some(devices) = &devices {
-                    Self::open(cx, feed, devices);
-                }
+            let slot = feed.source.slot();
+            if let (Stage::Waiting, Some(slot), Some(devices)) = (&feed.stage, slot, devices) {
+                Self::open(cx, feed, slot, devices);
             }
             let shown = active.contains(&feed.slide);
             match (&feed.stage, shown) {
                 (Stage::Open(format), true) => {
                     let format = *format;
-                    match cx.stream(feed.slot, true) {
+                    match slot.map_or(Ok(()), |slot| cx.stream(slot, true)) {
                         Ok(()) => {
                             feed.reported_at = Cx::monotonic_now();
                             feed.stage = Stage::Streaming(format);
@@ -293,7 +411,9 @@ impl Cameras {
                 (Stage::Streaming(format), false) => {
                     let format = *format;
                     // Stops before it returns: no frame arrives after this.
-                    let _ = cx.stream(feed.slot, false);
+                    if let Some(slot) = slot {
+                        let _ = cx.stream(slot, false);
+                    }
                     feed.report("stopped");
                     feed.stage = Stage::Open(format);
                 }
@@ -304,7 +424,7 @@ impl Cameras {
 
     /// Find the feed's device in the system's list and open it at the
     /// nearest format to the node's size and rate.
-    fn open(cx: &mut impl CameraPort, feed: &mut Feed, devices: &[VideoInputDesc]) {
+    fn open(cx: &mut impl CameraPort, feed: &mut Feed, slot: usize, devices: &[VideoInputDesc]) {
         let names: Vec<&str> = devices.iter().map(|desc| desc.name.as_str()).collect();
         let Some(at) = feed.spec.device.pick(names) else {
             let why = if devices.is_empty() { "no camera is connected".to_string() } else { format!("no camera matches; connected: {}", devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")) };
@@ -320,7 +440,7 @@ impl Cameras {
             feed.stage = Stage::Failed(why);
             return;
         };
-        match cx.open(feed.slot, desc.input_id, format.format_id) {
+        match cx.open(slot, desc.input_id, format.format_id) {
             Ok(opened) => {
                 log!("deck camera {}: open at {}x{} {:?} {:?} fps (asked {}x{} @ {})", desc.name, opened.width, opened.height, opened.pixel_format, opened.frame_rate, feed.spec.width, feed.spec.height, feed.spec.fps);
                 feed.device = Some(desc.name.clone());
@@ -334,18 +454,22 @@ impl Cameras {
     }
 
     fn teardown(&mut self, cx: &mut impl CameraPort, feed: &mut Feed) {
-        log!("deck camera {}: slide {} left, releasing slot {} ({:?})", feed.label(), feed.slide, feed.slot, feed.stage);
+        let slot = feed.source.slot();
+        log!("deck camera {}: slide {} left ({:?})", feed.label(), feed.slide, feed.stage);
         if matches!(feed.stage, Stage::Streaming(_)) {
-            let _ = cx.stream(feed.slot, false);
+            if let Some(slot) = slot {
+                let _ = cx.stream(slot, false);
+            }
             feed.report("torn down");
         }
-        cx.close(feed.slot);
-        // The slot's callback no longer feeds anyone.
-        cx.watch(feed.slot, Box::new(|_| {}));
+        if let Some(slot) = slot {
+            cx.close(slot);
+            cx.watch(slot, Box::new(|_| {}));
+            self.in_use[slot] = false;
+        }
         if let Some(texture) = feed.texture.take() {
             cx.release_texture(texture);
         }
-        self.in_use[feed.slot] = false;
     }
 
     /// Quit every camera (the page closes, the document changes, Stage
@@ -366,36 +490,16 @@ impl Cameras {
             if !matches!(feed.stage, Stage::Streaming(_)) {
                 continue;
             }
-            if let Some(mut frame) = feed.latest.take() {
-                if let Some(now_ns) = clock.filter(|_| frame.timestamp_ns > 0) {
-                    if feed.ages.len() == AGE_SAMPLES {
-                        feed.ages.remove(0);
-                    }
-                    feed.ages.push(now_ns.saturating_sub(frame.timestamp_ns) as f64 / 1.0e6);
+            let frame = match &mut feed.source {
+                FeedSource::Camera { latest, .. } => latest.take(),
+                FeedSource::TestPattern(pattern) => pattern.next_frame(&feed.spec, now, clock),
+            };
+            if let Some(mut frame) = frame {
+                feed.upload(cx, &mut frame, clock);
+                match &mut feed.source {
+                    FeedSource::Camera { latest, .. } => latest.recycle(frame),
+                    FeedSource::TestPattern(pattern) => pattern.frame = frame,
                 }
-                feed.frames += 1;
-                let sum = frame.pixels.iter().step_by(61).fold(0u64, |sum, pixel| sum.wrapping_mul(31).wrapping_add(*pixel as u64));
-                if sum != feed.checksum {
-                    feed.differing += 1;
-                    feed.checksum = sum;
-                }
-                let (width, height) = (frame.width, frame.height);
-                match &feed.texture {
-                    Some(texture) if feed.size == (width as u32, height as u32) => texture.swap_vec_u32(cx, &mut frame.pixels),
-                    Some(texture) => {
-                        texture.set_data_u32(cx, width, height, std::mem::take(&mut frame.pixels));
-                        feed.size = (width as u32, height as u32);
-                    }
-                    None => {
-                        feed.texture = Some(Texture::new_with_format(
-                            cx,
-                            TextureFormat::VecBGRAu8_32 { width, height, data: Some(std::mem::take(&mut frame.pixels)), updated: TextureUpdated::Full },
-                        ));
-                        feed.size = (width as u32, height as u32);
-                    }
-                }
-                feed.latest.recycle(frame);
-                feed.serial += 1;
                 changed = true;
             }
             if now - feed.reported_at >= REPORT_EVERY {
@@ -432,6 +536,7 @@ fn format_key(format: &VideoFormat, width: u32, height: u32, fps: f64) -> (f64, 
 /// How a format reads in the picker: `1280x720 · 30 fps · MJPG`.
 pub fn format_label(format: &VideoFormat) -> String {
     let pixels = match format.pixel_format {
+        VideoPixelFormat::Unsupported(BGRA_FOURCC) => "BGRA",
         VideoPixelFormat::MJPEG => "MJPG",
         VideoPixelFormat::YUY2 => "YUYV",
         VideoPixelFormat::NV12 => "NV12",
@@ -555,17 +660,19 @@ mod tests {
             self.list.clone()
         }
         fn watch(&mut self, slot: usize, frames: CameraFrameInputFn) {
+            self.log.push(format!("watch {slot}"));
             self.callbacks[slot] = Some(frames);
         }
         fn open(&mut self, slot: usize, input: VideoInputId, format: VideoFormatId) -> Result<VideoFormat, String> {
+            self.log.push(format!("open {slot}"));
             let list = self.list.as_ref().ok_or("the cameras are not listed")?;
             let found = list.iter().find(|desc| desc.input_id == input).and_then(|desc| desc.formats.iter().find(|f| f.format_id == format)).copied().ok_or("no such camera")?;
             self.held[slot] = Some((input, format));
-            self.log.push(format!("open {slot}"));
             Ok(found)
         }
         fn stream(&mut self, slot: usize, on: bool) -> Result<(), String> {
             if self.held[slot].is_none() {
+                self.log.push(format!("stream {slot} {on} without open"));
                 return Err("no camera is open in this slot".into());
             }
             let before = self.wanted();
@@ -594,7 +701,7 @@ mod tests {
     }
 
     fn received(cameras: &Cameras, slide: usize) -> u64 {
-        cameras.feeds_of(slide).map(|feed| feed.latest.stats().0).sum()
+        cameras.feeds_of(slide).map(|feed| feed.stats().0).sum()
     }
 
     #[test]
@@ -627,6 +734,35 @@ mod tests {
         let declared = hub_talk();
         let mut sim = SimPort::new(None);
         let mut cameras = Cameras::new(&sim);
+        let spec = CameraSpec { device: CameraDevice::TestPattern, width: 14, height: 6, fps: 4.0, ..Default::default() };
+        let pattern_slide = [(0, vec![("bars".into(), spec.clone())])];
+        cameras.reconcile(&mut sim, &pattern_slide, &[0], &[]);
+        let feed = &mut cameras.feeds[0];
+        let Stage::Streaming(format) = feed.stage else { panic!("pattern streams before the list arrives") };
+        assert_eq!(format_label(&format), "14x6 · 4 fps · BGRA");
+        let FeedSource::TestPattern(pattern) = &mut feed.source else { panic!("expected a generated feed") };
+        let frame = pattern.next_frame(&spec, 0.0, Some(17)).unwrap();
+        assert_eq!((frame.width, frame.height, frame.timestamp_ns), (14, 6, 17));
+        let bars: Vec<_> = frame.pixels[..14].iter().step_by(2).copied().collect();
+        assert_eq!(bars, [0xffbfbfbf, 0xffbfbf00, 0xff00bfbf, 0xff00bf00, 0xffbf00bf, 0xffbf0000, 0xff0000bf]);
+        assert_eq!((frame.pixels[56], frame.pixels[69]), (0xff000000, 0xffffffff), "ramp from black to white");
+        assert_eq!(frame.pixels[70], 0xffffffff, "marker starts at the left");
+        pattern.frame = frame;
+        assert!(pattern.next_frame(&spec, 0.125, None).is_none(), "wait for the requested frame interval");
+        let frame = pattern.next_frame(&spec, 0.5, None).unwrap();
+        assert_eq!(frame.timestamp_ns, 0);
+        assert_eq!((frame.pixels[70], frame.pixels[77]), (0xff000000, 0xffffffff), "marker crosses the band");
+        pattern.frame = frame;
+        let frame = pattern.next_frame(&spec, 1.0, None).unwrap();
+        assert_eq!(frame.pixels[70], 0xffffffff, "marker returns after one second");
+        pattern.frame = frame;
+        cameras.reconcile(&mut sim, &pattern_slide, &[], &[0]);
+        assert!(matches!(cameras.feeds[0].stage, Stage::Open(_)), "prepared pattern stops streaming");
+        assert!(cameras.in_use.iter().all(|used| !used), "pattern takes no platform slot");
+        cameras.reconcile(&mut sim, &pattern_slide, &[], &[]);
+        assert!(cameras.feeds.is_empty(), "pattern leaves with its slide");
+        assert!(sim.log.is_empty(), "pattern lifecycle called the port: {:?}", sim.log);
+
         cameras.reconcile(&mut sim, &declared, &[3], &[]);
         assert!(matches!(cameras.feeds_of(3).next().unwrap().stage, Stage::Waiting));
         assert_eq!(sim.opens, 0);

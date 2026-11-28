@@ -608,9 +608,10 @@ fn camera_ctor(spec: &CameraSpec, length: f64) -> Result<String, String> {
     let mut fields = Vec::new();
     match &spec.device {
         CameraDevice::First => {}
+        CameraDevice::TestPattern => fields.push("device: @test_pattern".into()),
         CameraDevice::Index(at) => fields.push(format!("device: {at}")),
         CameraDevice::Name(name) if !name.trim().is_empty() => fields.push(format!("device: {}", source::string_literal(name.trim()))),
-        CameraDevice::Name(_) => return Err("a camera's `device` is part of its name, or its number".into()),
+        CameraDevice::Name(_) => return Err("a camera's `device` is a nonempty name, a number, @test_pattern or nil".into()),
     }
     if spec.width == 0 || spec.height == 0 || !(spec.fps > 0.0 && spec.fps <= 240.0) {
         return Err("a camera's `width`, `height` and `fps` are positive (fps up to 240)".into());
@@ -901,9 +902,10 @@ fn set_camera(source: &str, doc: &DeckDoc, index: usize, set: &CameraSet) -> Res
             "device",
             match device {
                 CameraDevice::First => "nil".into(),
+                CameraDevice::TestPattern => "@test_pattern".into(),
                 CameraDevice::Index(at) => at.to_string(),
                 CameraDevice::Name(name) if !name.trim().is_empty() => source::string_literal(name.trim()),
-                CameraDevice::Name(_) => return Err("a camera's `device` is part of its name, or its number".into()),
+                CameraDevice::Name(_) => return Err("a camera's `device` is a nonempty name, a number, @test_pattern or nil".into()),
             },
         ));
     }

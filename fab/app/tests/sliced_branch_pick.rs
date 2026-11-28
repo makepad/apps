@@ -9,12 +9,16 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/picture.rs"]
 mod picture;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, KeyCode, Role, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyModifiers, Role, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
 use std::time::{Duration, Instant};
@@ -139,10 +143,10 @@ fn camera_at_rest(app: &TestApp, what: &str) -> Value {
     report
 }
 
-/// A command of the palette (F3), as the person runs it.
+/// A command of the palette (Cmd/Ctrl+Shift+P), as the person runs it.
 fn command(app: &TestApp, name: &str) {
     app.press_key(KeyCode::Escape);
-    app.press_key(KeyCode::F3);
+    app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
     app.type_text(name);
     app.press_key(KeyCode::ReturnKey);
 }
@@ -236,12 +240,11 @@ fn a_branch_in_sliced_is_clicked_to_pick_it_and_a_press_on_it_still_orbits() {
         call(&app, "place", &batch).expect("place");
         // Framed from the front, selected and then let go; then Sliced, its trees planned.
         command(&app, "View: Front");
-        app.locator(Selector::role(Role::Tab).name("Parts")).click();
+        parts_tab::open(&app);
         app.locator(Selector::role(Role::TreeItem).name("Mushroom")).wait_visible().click();
         app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the slice", || common::slice_state(&app) == "Sliced");
         let front = looking(&camera_at_rest(&app, "the framed front view"));
         // Frame Selected comes while View: Front may still glide: it frames along where the glide

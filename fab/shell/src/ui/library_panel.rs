@@ -22,7 +22,21 @@ script_mod! {
         show_bg: true draw_bg +: { color: fab.color_editor }
         // the toolbar: the area's editor selector (and this editor's tools, when it has any)
         editor_bar := mod.widgets.FabEditorBar{}
-        library := mod.widgets.LibraryPanel{}
+        library := mod.widgets.LibraryPanel{
+            search +: {
+                draw_text +: {
+                    color: fab.color_text_input
+                    color_hover: fab.color_text_input
+                    color_focus: fab.color_text_input
+                    color_down: fab.color_text_input
+                    color_empty: fab.color_text_input_dim
+                    color_empty_hover: fab.color_text_input_dim
+                    color_empty_focus: fab.color_text_input_dim
+                }
+                draw_cursor +: { color: fab.color_text_input }
+            }
+            preview +: { well +: { big +: { draw_svg +: { color: fab.color_text_well } } } }
+        }
     }
 }
 

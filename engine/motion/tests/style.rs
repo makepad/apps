@@ -2,6 +2,7 @@
 //! that load and evaluate, the author's fields and the style's own
 //! overrides win, and a kit's printed parts load as ordinary layers.
 
+use makepad_motion::plain::{PrimitiveFrame, TextProps};
 use makepad_motion::style::{detached_source, kits};
 use makepad_motion::*;
 
@@ -60,7 +61,7 @@ fn text_takes_the_kits_type_and_motion_where_the_author_left_it_open() {
     }
     walk(&d.layers, &mut texts);
     let fonts: Vec<(String, f64, f64)> = texts.iter().filter_map(|l| match &l.kind {
-        LayerKind::Text { font, weight, tracking: Prop::Const([tracking]), .. } => Some((font.clone(), *weight, *tracking)),
+        LayerKind::Text { props: TextProps { font, weight, tracking: Prop::Const([tracking]), .. }, .. } => Some((font.clone(), *weight, *tracking)),
         _ => None,
     }).collect();
     assert!(fonts.iter().any(|(f, w, t)| f == "Inter" && *w == 900.0 && *t < 0.0), "the kit's display face: {fonts:?}");
@@ -69,7 +70,7 @@ fn text_takes_the_kits_type_and_motion_where_the_author_left_it_open() {
     let frame = d.eval(0.0);
     fn find<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
         items.iter().find_map(|i| match &i.kind {
-            ItemKind::Text { text, .. } if &**text == name => Some(i),
+            ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) if &**text == name => Some(i),
             ItemKind::Group { children, .. } => find(children, name),
             _ => None,
         })

@@ -25,8 +25,8 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-pub use judge::{judge, BenchFacts, BenchRun, CaseFacts, CheckFacts, Facts, FindingFact, Focus, Outcome, PrintFacts, Producers, Report, Row, Status, UnitFacts, BoardMeasures, Verdict};
-pub use read::{read, units};
+pub use judge::{judge, judge_with_unavailable, BenchFacts, BenchRun, CaseFacts, CheckFacts, Facts, FindingFact, Focus, Outcome, PrintFacts, Producers, Report, Row, Status, UnitFacts, BoardMeasures, Verdict, WishRow};
+pub use read::{is_unknown_measure, read, units, MEASURES, REQUIRE_EXAMPLE};
 
 use fab_elec_core::DocId;
 use std::ops::Range;
@@ -37,6 +37,22 @@ pub struct ReqDoc {
     pub doc: DocId,
     pub requirements: Vec<Requirement>,
     pub waivers: Vec<Waiver>,
+    pub wishes: Vec<Wish>,
+    pub brief: Option<Brief>,
+}
+
+/// A person's unmeasured wish, with its whole statement's byte range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wish {
+    pub words: String,
+    pub span: Range<u32>,
+}
+
+/// The verbatim brief, with its whole statement's byte range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Brief {
+    pub words: String,
+    pub span: Range<u32>,
 }
 
 /// `require(name, measure, bound?)`.
@@ -65,23 +81,23 @@ pub struct Waiver {
     pub proposed: bool,
 }
 
-/// What a requirement measures. Units are named by the unit's (circuit's) name.
+/// What a requirement measures. Board and case measures without a unit bind to the design's only board.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Measure {
     /// `board(u).size`: the outline's bounding box, `[w h]`.
-    BoardSize(String),
+    BoardSize(Option<String>),
     /// `board(u).layers`: copper layers.
-    BoardLayers(String),
+    BoardLayers(Option<String>),
     /// `board(u).parts`: parts placed on the board.
-    BoardParts(String),
+    BoardParts(Option<String>),
     /// `board(u).unplaced`: parts of the circuit the board does not place.
-    BoardUnplaced(String),
+    BoardUnplaced(Option<String>),
     /// `board(u).unrouted`: the board's `Unconnected` findings.
-    BoardUnrouted(String),
+    BoardUnrouted(Option<String>),
     /// `checks(@family, {unit}?).errors` or `.warnings`.
     Checks { family: Family, unit: Option<String>, count: CountOf },
     /// `case(u).fits`: no error among the board's case findings.
-    CaseFits(String),
+    CaseFits(Option<String>),
     /// `bench(b)`: every expectation of the bench passes in its last counted check.
     Bench(String),
     /// `bench(b).expect(name)`: that expectation passes.

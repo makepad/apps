@@ -392,7 +392,7 @@ fn circuit_board_adapters_preserve_existing_model_data() {
         name: "R".into(), kind: PartKind::Resistor, symbol: Symbol::default(),
         footprint: Some(Arc::new(Footprint { name: "Lib:Default".into(), ..Default::default() })),
         body: None, pins: Vec::new(), fields: Fields(vec![("datasheet".into(), "part-data".into())]), emitter: None,
-        gpio: None,
+        gpio: None, lifecycle: None, approved: false,
     });
     let mut circuit = Circuit::default();
     for (id, reference, dnp) in [(0, "R1", false), (1, "R2", true)] {

@@ -47,6 +47,7 @@ makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
 makepad-scene = { path = "../../../../libs/scene", version = "0.1.0" }
 makepad-video = { package = "makepad-platform-video", path = "../../../../platform/video", version = "1.0.0" }
 makepad-code-editor = { path = "../../../../code_editor" }
+makepad-git = { path = "../../../../libs/git" }
 makepad-code-values = { path = "../../../../libs/code_values" }
 makepad-edit-values = { path = "../../../../libs/edit_values" }
 makepad-script = { path = "../../../../platform/script" }

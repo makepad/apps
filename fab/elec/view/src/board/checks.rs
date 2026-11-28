@@ -241,6 +241,7 @@ fn measure(measure: Measure) -> String {
         }
         // Quantity currently has no Display implementation.
         Measure::Qty(qty) => format!("{qty:?}"),
+        Measure::VRange(r) => if r.min == r.max { format!("{} V", r.min) } else { format!("{} to {} V", r.min, r.max) },
     }
 }
 

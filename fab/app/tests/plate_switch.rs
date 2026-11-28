@@ -5,8 +5,14 @@
 //! shows before the plate the last run left on the bed is built, and a plate opened from it
 //! meanwhile goes on the bed in its place.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use fab::api::{Camera, PlateView};
 use fab_model::program::{part_id, ScriptEnv};
@@ -112,11 +118,18 @@ fn settled_camera(app: &TestApp) -> String {
 }
 
 fn tab(app: &TestApp, name: &str) {
+    if name == "Parts" {
+        parts_tab::reveal(app);
+    }
     app.locator(Selector::role(Role::Tab).name(name)).wait_visible().click();
 }
 
 /// Put a plate on the bed from the Plates panel, and wait for its part in the Parts tab.
 fn open(app: &TestApp, name: &str) {
+    open_with_part(app, name, &format!("{name} part"));
+}
+
+fn open_with_part(app: &TestApp, name: &str, part: &str) {
     tab(app, "Plates");
     let rows = || app.widget_snapshot().nodes().into_iter().filter(|w| w.visible() && w.node.role == Role::ListItem).map(|w| w.node.name.clone()).collect::<Vec<_>>();
     // a plate with edits its file lacks is listed with a *
@@ -130,9 +143,8 @@ fn open(app: &TestApp, name: &str) {
     app.locator(Selector::role(Role::ListItem).name(row)).click();
     tab(app, "Parts");
     let items = || app.widget_snapshot().nodes().into_iter().filter(|w| w.visible() && w.node.role == Role::TreeItem).map(|w| w.node.name.clone()).collect::<Vec<_>>();
-    let part = format!("{name} part");
     wait_poll(app, || {
-        if !items().contains(&part) { Err(format!("{name} is not on the bed: the parts are {:?}", items())) } else { Ok(()) }
+        if !items().iter().any(|item| item == part) { Err(format!("{name} is not on the bed: the parts are {:?}", items())) } else { Ok(()) }
     });
 }
 
@@ -244,6 +256,15 @@ fn a_plate_switched_back_to_in_the_slice_view_is_not_sliced_again() {
     seed_plate(&home.join("Documents/Fab/alpha"), "alpha", &pair(10, 14), &["block", "peg"]);
     seed_plate(&home.join("Documents/Fab/beta"), "beta", &pair(12, 9), &["block", "peg"]);
 
+    let hinge = r#"let a = m.box({size: [6mm 2.6mm 6mm] at: [0 1.3mm 0]})
+let b = m.box({size: [6mm 2.6mm 6mm] at: [10mm 1.3mm 0]})
+let pa = m.union(a, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let pb = m.union(b, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let h = m.hinge(pa, pb, {at: [5mm 0 0] plate: 0.4mm})
+object(pa)
+"#;
+    seed_plate(&home.join("Documents/Fab/hinge"), "hinge", hinge, &["pa"]);
+
     let mut config = TestConfig::current_package(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"), "plate_switch::reslice").unwrap();
     config.env.insert("MAKEPAD_TEST_HOME".into(), home.display().to_string());
     config.env.insert("FAB_PLATES".into(), "1".into());
@@ -251,8 +272,7 @@ fn a_plate_switched_back_to_in_the_slice_view_is_not_sliced_again() {
         app.locator(Selector::role(Role::Window)).wait_visible();
         let from = log_mark(&app);
         open(&app, "alpha");
-        app.locator(Selector::id("rm_slice")).click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         let first = slice_cost_after(&app, from, 2);
         assert!(first.iter().all(|l| !l.contains("traced 0 ")), "alpha is sliced in the Slice view: {first:?}");
 
@@ -266,6 +286,24 @@ fn a_plate_switched_back_to_in_the_slice_view_is_not_sliced_again() {
         open(&app, "alpha");
         let back = slice_cost_after(&app, from, 2);
         assert!(back.iter().all(|l| l.contains("traced 0 planned 0 ")), "alpha back is not sliced again: {back:?}");
+
+        let from = log_mark(&app);
+        open_with_part(&app, "hinge", "hinge part pa");
+        let first = slice_cost_after(&app, from, 2);
+        assert!(first.iter().all(|l| !l.contains("traced 0 ")), "the saved hinge slices on its first open: {first:?}");
+        app.locator(Selector::id("viewport")).wheel(0.0, 0.0);
+        std::thread::sleep(Duration::from_millis(300));
+        let tail = app.log_since(from).expect("the first hinge slice");
+        assert_eq!(tail.lines.iter().filter(|l| l.contains("fab live work: part ")).count(), 2,
+            "the saved hinge settles after a single slice");
+
+        let from = log_mark(&app);
+        open(&app, "beta");
+        slice_cost_after(&app, from, 2);
+        let from = log_mark(&app);
+        open_with_part(&app, "hinge", "hinge part pa");
+        let back = slice_cost_after(&app, from, 2);
+        assert!(back.iter().all(|l| l.contains("traced 0 planned 0 ")), "the reopened hinge reuses its slice: {back:?}");
     });
     std::fs::remove_dir_all(&home).expect("remove seeded test home after the owned app exits");
     result.unwrap();
@@ -309,6 +347,7 @@ fn an_ai_switch_waits_for_a_value_drag_and_the_drag_lands_on_its_own_plate() {
         app.locator(Selector::role(Role::Window)).wait_visible();
         open(&app, "alpha");
         app.locator(Selector::role(Role::TreeItem).name("alpha part")).click();
+        part_editor::open(&app);
         assert_eq!(param_mm(&app, "alpha/s"), 10.0, "alpha starts at 10 mm");
         let beta = plate_id(&app, "beta");
 

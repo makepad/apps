@@ -23,14 +23,75 @@ pub fn add(text: &str, doc: &ReqDoc, name: &str, measure: &str, bound: Option<&s
         Some(bound) => format!("require({}, {}, {})", quote(name), measure.trim(), bound),
         None => format!("require({}, {})", quote(name), measure.trim()),
     };
-    let at = doc.requirements.iter().map(|r| line_end(text, r.span.end as usize)).max().unwrap_or(text.len());
+    let at = after_requirements(text, doc);
     let new = insert_line(text, at, &statement);
     let (after, mistakes) = read(doc.doc, &new);
-    let added: Vec<&str> = after.requirements.iter().map(|r| r.name.as_str()).filter(|n| !doc.requirements.iter().any(|r| r.name == *n)).collect();
-    if added != [name] || after.requirements.len() != doc.requirements.len() + 1 || after.waivers.len() != doc.waivers.len()
-        || mistakes.len() > read(doc.doc, text).1.len()
+    let old_errors = read(doc.doc, text).1;
+    let added = after.requirements.iter().find(|r| r.name == name);
+    if added.is_none() || !statements(text, doc, None).eq(statements(&new, &after, added.map(|r| &r.span)))
+        || mistakes.len() > old_errors.len()
     {
-        return Err(format!("measure: {statement} does not read as one requirement named {name:?}: check the measure and bound"));
+        let mut previous: Vec<_> = old_errors.iter().map(|e| e.message.as_str()).collect();
+        let new_error = mistakes.iter().find(|e| {
+            if let Some(i) = previous.iter().position(|&msg| msg == e.message) {
+                previous.swap_remove(i);
+                false
+            } else {
+                true
+            }
+        });
+        let why = new_error.map_or("check the measure and bound", |e| e.message.as_str());
+        return Err(format!("measure: {statement} does not read as one requirement named {name:?}: {why}"));
+    }
+    Ok(new)
+}
+
+fn after_requirements(text: &str, doc: &ReqDoc) -> usize {
+    doc.requirements.last().map_or(text.len(), |r| line_end(text, r.span.end as usize))
+}
+
+// Compare the other statements byte for byte, allowing their source offsets to move.
+fn statements<'a>(text: &'a str, doc: &'a ReqDoc, except: Option<&'a Range<u32>>) -> impl Iterator<Item = &'a str> {
+    doc.requirements.iter().map(|r| &r.span).chain(doc.waivers.iter().map(|w| &w.span))
+        .chain(doc.wishes.iter().map(|w| &w.span)).chain(doc.brief.iter().map(|b| &b.span))
+        .filter(move |s| Some(*s) != except).map(|s| &text[s.start as usize..s.end as usize])
+}
+
+/// Append one unmeasured wish at the same insertion point as a requirement.
+pub fn wish(text: &str, doc: &ReqDoc, words: &str) -> Result<String, String> {
+    let words = words.trim();
+    if words.is_empty() { return Err("a wish is empty: write it in the person's words".into()); }
+    let at = after_requirements(text, doc);
+    let index = doc.wishes.iter().take_while(|w| (w.span.start as usize) < at).count();
+    let new = insert_line(text, at, &format!("wish({})", quote(words)));
+    let (after, mistakes) = read(doc.doc, &new);
+    let added = after.wishes.get(index).filter(|w| w.words == words);
+    if added.is_none() || !statements(text, doc, None).eq(statements(&new, &after, added.map(|w| &w.span)))
+        || mistakes.len() > read(doc.doc, text).1.len() {
+        return Err("the edit did not add exactly one wish".into());
+    }
+    Ok(new)
+}
+
+/// Replace the brief in place, insert it first, or remove it when the words are blank.
+pub fn brief(text: &str, doc: &ReqDoc, words: &str) -> Result<String, String> {
+    let old = doc.brief.as_ref().map(|b| &b.span);
+    let words = (!words.trim().is_empty()).then_some(words);
+    let new = match (old, words) {
+        (None, None) => return Ok(text.into()),
+        (Some(span), None) => cut(text, vec![line_of(text, span.clone())]),
+        (None, Some(words)) => format!("brief({})\n{text}", quote(words)),
+        (Some(span), Some(words)) => {
+            let mut new = text.to_owned();
+            new.replace_range(span.start as usize..span.end as usize, &format!("brief({})", quote(words)));
+            new
+        }
+    };
+    let (after, mistakes) = read(doc.doc, &new);
+    if after.brief.as_ref().map(|b| b.words.as_str()) != words
+        || !statements(text, doc, old).eq(statements(&new, &after, after.brief.as_ref().map(|b| &b.span)))
+        || mistakes.len() > read(doc.doc, text).1.len() {
+        return Err("the edit did not change just the brief".into());
     }
     Ok(new)
 }

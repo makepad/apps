@@ -1,0 +1,8 @@
+brief("USB-C powered 8-LED controller board, 2 layers, max 60 x 40 mm. 5 V USB-C input regulated down to 3.3 V (at least 300 mA budget), 20-pin MCU with SWD header, 8 green indicator LEDs at ~5 mA each, and 1 tactile mode button. Must be ERC clean, DRC clean, and fully routed. Keep silkscreen labels clean and readable.")
+require("fits the enclosure", board.size, {max: [60mm 40mm]})
+require("two copper layers", board.layers, {is: 2})
+require("every part placed", board.unplaced, {max: 0})
+require("fully routed", board.unrouted, {max: 0})
+require("ERC clean", checks(@erc).errors, {max: 0})
+require("DRC clean", checks(@drc).errors, {max: 0})
+wish("Keep silkscreen labels clean and readable.")

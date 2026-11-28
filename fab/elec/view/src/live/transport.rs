@@ -44,7 +44,7 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.radius)
-                sdf.fill(theme.prop_field)
+                sdf.fill(fab.color_field)
                 return sdf.result
             }
         }
@@ -90,7 +90,7 @@ script_mod! {
                 height: 30 width: 241 padding: 3 spacing: 0 draw_bg +: {radius: fab.radius_lg}
                 strip := TimeStrip{
                     width: 235 height: 24 transport: true
-                    face_selected: theme.prop_choice_on face_hover: fab.color_button_hover
+                    face_selected: fab.color_choice_on face_hover: fab.color_button_hover
                     ink_normal: fab.color_text_active ink_disabled: fab.color_text_muted
                     ink_play: fab.color_ok ink_pause: fab.color_warning ink_record: fab.color_error
                     draw_face +: {
@@ -113,10 +113,15 @@ script_mod! {
                 length := ComboBox{
                     width: 75 height: 22 margin: 0 padding: Inset{left: 5 right: 16}
                     accepts_typed: true a11y: {label: "Recording length"}
-                    input +: {draw_text +: {text_style: theme.font_code{font_size: fab.font_size_ui}}}
+                    input +: {draw_text +: {
+                        color: fab.color_text_input color_hover: fab.color_text_input_hover
+                        color_focus: fab.color_text_input color_down: fab.color_text_input_down
+                        text_style: theme.font_code{font_size: fab.font_size_ui}
+                    }}
                     draw_bg +: {
                         border_size: 0.0 border_radius: fab.radius
-                        color: theme.prop_field color_hover: theme.prop_field color_focus: theme.prop_field
+                        color: fab.color_input_field color_hover: fab.color_input_field color_focus: fab.color_input_field
+                        arrow_color: fab.color_text_input arrow_color_hover: fab.color_text_input_hover
                     }
                 }
             }
@@ -136,7 +141,7 @@ script_mod! {
             mute := mod.widgets.FabSegmentTab{
                 independent: true width: 22 height: 22 padding: 0 text: "M" a11y: {label: "Mute"}
                 draw_bg +: {color: #0000 color_hover: fab.color_button_hover color_active: fab.color_button_active}
-                draw_text +: {color_active: #fff}
+                draw_text +: {color_down: fab.color_mute_ink_down color_active: fab.color_mute_ink_active}
             }
             // the board restarted from power-on, in every mode and while it runs
             mod.widgets.FabTip{

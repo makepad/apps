@@ -858,7 +858,7 @@ impl State {
 
 /// The directory a job keeps its files in.
 fn job_dir(edit: &str, job: u64) -> PathBuf {
-    makepad_ai_hub::home::makepad_home().join("stage-product").join("generate").join(edit).join(format!("{}-{job}", std::process::id()))
+    makepad_widgets::makepad_platform::home::app_state_home().join("stage-product").join("generate").join(edit).join(format!("{}-{job}", std::process::id()))
 }
 
 impl StoryApp {

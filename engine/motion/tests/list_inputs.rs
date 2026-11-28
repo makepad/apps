@@ -1,6 +1,7 @@
 //! List-valued inputs and `Repeat{source: …}`: one copy per item, each
 //! with its `item()` fields filled, set by the host like any input.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 /// The texts of a frame's Repeat copies, in order.
@@ -8,7 +9,7 @@ fn texts(doc: &MotionDoc, t: f64) -> Vec<String> {
     fn walk(items: &[Item], out: &mut Vec<String>) {
         for item in items {
             match &item.kind {
-                ItemKind::Text { text, .. } => out.push(text.clone()),
+                ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => out.push(text.clone()),
                 ItemKind::Group { children, .. } => walk(children, out),
                 _ => {}
             }

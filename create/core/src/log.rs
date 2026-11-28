@@ -1,10 +1,10 @@
 //! The log on disk: events appended as raw bytes, never rewritten, in the order this machine got
 //! them. Each record is `header_len u32 | header | body_len u32 | body | sig_len u16 | sig`
-//! (little-endian). The first record founds the room. Later records name their author’s previous event;
-//! a new author starts with an accept. What the app shows is folded from the verified room
+//! (little-endian). The first record founds the town. Later records cite an event by their author
+//! or start with an accept. What the app shows is folded from the verified town
 //! ([`crate::fold`]) and never stored as truth.
 
-use crate::event::{kind, Content, Event, FormatError, Id, Member, RoomId};
+use crate::event::{kind, Content, Event, FormatError, Id, Member, TownId};
 use crate::key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -13,13 +13,13 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum OpenError {
-    NotARoom,
+    NotATown,
     Io(io::Error),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::NotARoom => f.write_str("the log has no verified room genesis"), Self::Io(e) => e.fmt(f) }
+        match self { Self::NotATown => f.write_str("the log has no verified town genesis"), Self::Io(e) => e.fmt(f) }
     }
 }
 
@@ -29,7 +29,7 @@ impl From<io::Error> for OpenError {
 }
 
 pub struct Log {
-    room: RoomId,
+    town: TownId,
     latest: HashMap<PublicKey, Id>,
     file: File,
     // If a write and its rollback both fail, repair the tail before any subsequent append.
@@ -41,36 +41,36 @@ pub struct Log {
 }
 
 impl Log {
-    fn empty(file: File, room: RoomId) -> Self {
-        Self { file, room, latest: HashMap::new(), rollback_at: None, events: vec![], index: HashMap::new(), cited: HashSet::new() }
+    fn empty(file: File, town: TownId) -> Self {
+        Self { file, town, latest: HashMap::new(), rollback_at: None, events: vec![], index: HashMap::new(), cited: HashSet::new() }
     }
 
-    pub fn room_id(&self) -> RoomId { self.room }
+    pub fn town_id(&self) -> TownId { self.town }
     pub fn genesis(&self) -> &Event { &self.events[0] }
 
     fn read_genesis(header: &[u8], body: &[u8], sig: &[u8]) -> Result<Event, OpenError> {
-        let room = Event::genesis_room(header);
-        let event = Event::from_parts(room, header.to_vec(), body.to_vec(), sig.to_vec()).map_err(|_| OpenError::NotARoom)?;
-        if event.header.kind != kind::ROOM || !event.content().and_then(|c| Content::decode(kind::ROOM, event.header.kind_version, c))
-            .is_some_and(|c| matches!(c, Content::Room { .. })) {
-            return Err(OpenError::NotARoom)
+        let town = Event::genesis_town(header);
+        let event = Event::from_parts(town, header.to_vec(), body.to_vec(), sig.to_vec()).map_err(|_| OpenError::NotATown)?;
+        if event.header.kind != kind::TOWN || !event.content().and_then(|c| Content::decode(kind::TOWN, event.header.kind_version, c))
+            .is_some_and(|c| matches!(c, Content::Town { .. })) {
+            return Err(OpenError::NotATown)
         }
         Ok(event)
     }
 
-    /// Inspect a room without opening it for repair or reading the rest of its history.
+    /// Inspect a town without opening it for repair or reading the rest of its history.
     pub fn inspect_genesis(path: &Path) -> Result<Event, OpenError> {
         let mut file = File::open(path)?;
         let mut part = |width: usize| -> Result<Vec<u8>, OpenError> {
             let mut len = [0; 4];
             file.read_exact(&mut len[..width]).map_err(|e| match e.kind() {
-                io::ErrorKind::UnexpectedEof => OpenError::NotARoom,
+                io::ErrorKind::UnexpectedEof => OpenError::NotATown,
                 _ => OpenError::Io(e),
             })?;
             let len = u32::from_le_bytes(len) as u64;
             let mut bytes = Vec::new();
             (&mut file).take(len).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != len { return Err(OpenError::NotARoom) }
+            if bytes.len() as u64 != len { return Err(OpenError::NotATown) }
             Ok(bytes)
         };
         Self::read_genesis(&part(4)?, &part(4)?, &part(2)?)
@@ -81,7 +81,7 @@ impl Log {
         let genesis = Self::read_genesis(&genesis.header_bytes, &genesis.body, &genesis.sig)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        let mut log = Self::empty(file, genesis.room);
+        let mut log = Self::empty(file, genesis.town);
         let mut bytes = vec![];
         encode_record(&genesis, &mut bytes);
         if let Err(e) = log.file.write_all(&bytes).and_then(|_| log.file.sync_data()) {
@@ -98,9 +98,9 @@ impl Log {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let ((h, b, s), mut at) = record(&bytes).ok_or(OpenError::NotARoom)?;
+        let ((h, b, s), mut at) = record(&bytes).ok_or(OpenError::NotATown)?;
         let genesis = Self::read_genesis(h, b, s)?;
-        let mut log = Self::empty(file, genesis.room);
+        let mut log = Self::empty(file, genesis.town);
         log.push(genesis);
         let mut problems = Vec::new();
         while at < bytes.len() {
@@ -110,9 +110,9 @@ impl Log {
                 break;
             };
             let (header, body, sig) = parts;
-            match Event::from_parts(log.room, header.to_vec(), body.to_vec(), sig.to_vec()).and_then(|event| {
+            match Event::from_parts(log.town, header.to_vec(), body.to_vec(), sig.to_vec()).and_then(|event| {
                 if !log.index.contains_key(&event.id) {
-                    log.check_chain(&event, log.latest.get(&event.header.author))?;
+                    log.check_chain(&event, &HashMap::new())?;
                     log.push(event);
                 }
                 Ok(())
@@ -135,14 +135,16 @@ impl Log {
         self.events.push(event);
     }
 
-    fn check_chain(&self, event: &Event, previous: Option<&Id>) -> Result<(), FormatError> {
-        if event.room != self.room || event.header.kind == kind::ROOM {
-            return Err(FormatError::Malformed("event belongs to another room or repeats genesis"));
+    fn check_chain(&self, event: &Event, staged: &HashMap<Id, PublicKey>) -> Result<(), FormatError> {
+        if event.town != self.town || event.header.kind == kind::TOWN {
+            return Err(FormatError::Malformed("event belongs to another town or repeats genesis"));
         }
-        if let Some(id) = previous {
-            if event.header.parents.contains(id) { return Ok(()) }
-            return Err(FormatError::Malformed("event omits author's previous event"));
+        if event.header.parents.iter().any(|id| {
+            staged.get(id).copied().or_else(|| self.get(id).map(|p| p.header.author)) == Some(event.header.author)
+        }) {
+            return Ok(())
         }
+        // MEMBER v1 and its Accept are frozen: every build must read them to know who may write.
         if event.header.kind == kind::MEMBER && matches!(
             event.content().and_then(|b| Content::decode(kind::MEMBER, event.header.kind_version, b)),
             Some(Content::Member(Member::Accept { .. }))) {
@@ -154,11 +156,10 @@ impl Log {
 
     /// Validate a whole batch before its first disk or in-memory write.
     pub(crate) fn check_batch(&self, events: &[Event]) -> Result<(), FormatError> {
-        let mut latest = HashMap::new();
+        let mut staged = HashMap::new();
         for event in events {
-            let author = event.header.author;
-            self.check_chain(event, latest.get(&author).or_else(|| self.latest.get(&author)))?;
-            latest.insert(author, event.id);
+            self.check_chain(event, &staged)?;
+            staged.insert(event.id, event.header.author);
         }
         Ok(())
     }
@@ -230,8 +231,7 @@ impl Log {
         heads
     }
 
-    /// The parents of `author`'s next event: every head, and the author's own last event (an
-    /// author's events form a chain, so a forked history shows).
+    /// The parents of `author`'s next event: every head and the author's own last event.
     pub fn parents_for(&self, author: &PublicKey) -> Vec<Id> {
         let mut parents = self.heads();
         if let Some(last) = self.latest.get(author) {
@@ -292,7 +292,7 @@ pub(crate) mod tests {
             let bytes = Content::Member(op).encode();
             let draft = Draft { kind: kind::MEMBER, kind_version: 1, critical: true, actor: Actor::Human, via: Via::Ui,
                 wall_ms: 0, parents: log.parents_for(&key.public()), content: &bytes };
-            let event = Event::create(key, log.room_id(), draft, [0; 16]).unwrap();
+            let event = Event::create(key, log.town_id(), draft, [0; 16]).unwrap();
             let id = event.id;
             log.append(event).unwrap();
             id
@@ -305,7 +305,7 @@ pub(crate) mod tests {
     fn say(key: &DeviceKey, log: &Log, text: &str) -> Event {
         let content = Content::Chat(Chat { text: text.into(), ..Chat::default() }).encode();
         let draft = Draft { kind: 2, kind_version: 1, critical: false, actor: Actor::Human, via: Via::Ui, wall_ms: 0, parents: log.parents_for(&key.public()), content: &content };
-        Event::create(key, log.room_id(), draft, [text.len() as u8; 16]).unwrap()
+        Event::create(key, log.town_id(), draft, [text.len() as u8; 16]).unwrap()
     }
 
     #[test]
@@ -317,12 +317,12 @@ pub(crate) mod tests {
         let dir = temp_dir("future-header");
         let path = dir.join("received");
         let key = DeviceKey::generate().unwrap();
-        let (room, genesis) = Event::found(&key, 2, 0, 0, [0; 16]).unwrap();
+        let (town, genesis) = Event::found(&key, 2, 0, 0, [0; 16]).unwrap();
         let mut log = Log::found(&path, genesis.clone()).unwrap();
-        let content = Content::Entity { kind: Key::Name("FutureCard".into()), project: None, derive: None, fields: vec![] };
+        let content = Content::Entity { copied_from: vec![], kind: Key::Name("FutureCard".into()), project: None, derive: None, fields: vec![] };
         let mut ids = Vec::new();
         for (flags, tail) in [(0x80, false), (0, true), (0x80, true)] {
-            let base = Event::create(&key, room, Draft { kind: content.kind(), kind_version: content.version(), critical: false,
+            let base = Event::create(&key, town, Draft { kind: content.kind(), kind_version: content.version(), critical: false,
                 actor: Actor::Human, via: Via::Ui, wall_ms: 0, parents: log.heads(), content: &content.encode() }, [1; 16]).unwrap();
             let mut wire = base.header_bytes.clone();
             wire[4] |= flags;
@@ -331,14 +331,14 @@ pub(crate) mod tests {
                 wire.extend_from_slice(&[0, 0, 0, 0, 3, 0, 0, 0, 0, 0xff, 7]);
             }
             let id = sha256_hash(&wire);
-            let sig = key.sign(Domain::Event, &[room.as_slice(), &wire].concat()).unwrap();
-            let event = Event::from_parts(room, wire.clone(), base.body.clone(), sig.clone()).unwrap();
+            let sig = key.sign(Domain::Event, &[town.as_slice(), &wire].concat()).unwrap();
+            let event = Event::from_parts(town, wire.clone(), base.body.clone(), sig.clone()).unwrap();
             assert_eq!(event.id, id);
             assert_eq!(event.header.encode(), wire);
             assert_eq!(event.header.shape, base.header.shape, "shape ends before later extensions");
             assert!(event.content().is_none() && !event.redacted());
-            assert_eq!(Event::from_parts(room, wire.clone(), vec![0; 16], sig), Err(FormatError::BodyMismatch));
-            assert_eq!(Event::from_parts(room, wire, base.body.clone(), base.sig.clone()), Err(FormatError::BadSignature));
+            assert_eq!(Event::from_parts(town, wire.clone(), vec![0; 16], sig), Err(FormatError::BodyMismatch));
+            assert_eq!(Event::from_parts(town, wire, base.body.clone(), base.sig.clone()), Err(FormatError::BadSignature));
             ids.push(id);
             log.append(event).unwrap();
         }
@@ -365,7 +365,7 @@ pub(crate) mod tests {
         let path = dir.join("log");
         let (me, peer) = (DeviceKey::generate().unwrap(), DeviceKey::generate().unwrap());
         std::fs::write(&path, []).unwrap();
-        assert!(matches!(Log::open(&path), Err(OpenError::NotARoom)), "an empty file has no genesis");
+        assert!(matches!(Log::open(&path), Err(OpenError::NotATown)), "an empty file has no genesis");
         std::fs::remove_file(&path).unwrap();
         let (_, genesis) = Event::found(&me, 1, 0, 0, [0; 16]).unwrap();
         let mut log = Log::found(&path, genesis.clone()).unwrap();
@@ -388,28 +388,56 @@ pub(crate) mod tests {
         let c = say(&me, &log, "c");
         assert_eq!(c.header.parents, { let mut p = vec![a.id, b.id]; p.sort(); p }, "the author's own last event is a parent beside the heads");
         log.append(c.clone()).unwrap();
-        assert!(log.append(fork.clone()).is_err(), "a fork cannot replace the accepted successor");
+        log.append(fork.clone()).unwrap();
         drop(log);
 
         let (log, problems) = Log::open(&path).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(log.events().iter().map(|e| e.id).collect::<Vec<_>>(), [first_ids.as_slice(), &[a.id, b.id, c.id]].concat(), "the same events, in the same order");
+        assert_eq!(log.events().iter().map(|e| e.id).collect::<Vec<_>>(), [first_ids.as_slice(), &[a.id, b.id, c.id, fork.id]].concat(), "both successors reopen in arrival order");
         assert_eq!(log.get(&b.id).map(|e| &e.body), Some(&b.body), "found by id");
         drop(log);
 
-        let mut rejected = Vec::new();
-        encode_record(&fork, &mut rejected);
-        let len = std::fs::metadata(&path).unwrap().len() + rejected.len() as u64;
+        let len = std::fs::metadata(&path).unwrap().len();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&rejected).unwrap();
         file.write_all(&[200, 0, 0, 0, 1, 2, 3]).unwrap();
         drop(file);
         let (log, problems) = Log::open(&path).unwrap();
-        assert_eq!(problems.len(), 2, "the fork and torn tail are both reported: {problems:?}");
-        assert!(log.get(&fork.id).is_none(), "a fork on disk is skipped");
-        assert_eq!(log.events().len(), first_ids.len() + 3, "the valid records stay");
+        assert_eq!(problems.len(), 1, "only the torn tail needs repair: {problems:?}");
+        assert_eq!(log.get(&fork.id), Some(&fork), "the fork survives repair");
+        assert_eq!(log.events().len(), first_ids.len() + 4, "every complete record stays");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "the torn tail is cut off");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_restored_log_syncs_its_own_tip_before_writing() {
+        use crate::{fold::fold, sync::SyncEngine};
+        let dir = temp_dir("restored-tip");
+        let (ana, ben) = (DeviceKey::generate().unwrap(), DeviceKey::generate().unwrap());
+        let (_, genesis) = Event::found(&ana, 2, 0, 0, [0; 16]).unwrap();
+        let mut original = Log::found(&dir.join("original"), genesis.clone()).unwrap();
+        admit(&mut original, &ana, &ben);
+        let mut restored = Log::found(&dir.join("restore"), genesis).unwrap();
+        restored.append_all(original.events()[1..].to_vec()).unwrap();
+        let tip = say(&ana, &original, "after the backup");
+        original.append(tip.clone()).unwrap();
+        let head = say(&ben, &original, "seen");
+        original.append(head.clone()).unwrap();
+
+        let (mut sender, mut receiver) = (SyncEngine::new(), SyncEngine::new());
+        receiver.connect(&restored);
+        sender.on_message(&receiver.poll_send(&restored).unwrap(), &mut original).unwrap();
+        while let Some(bytes) = sender.poll_send(&original) {
+            receiver.on_message(&bytes, &mut restored).unwrap();
+        }
+        assert_eq!(restored.heads(), [head.id]);
+        let next = say(&ana, &restored, "after syncing");
+        assert!(next.header.parents.contains(&tip.id), "the restored author cites its true tip beside the head");
+        restored.append(next.clone()).unwrap();
+        let state = fold(restored.events());
+        assert_eq!(state.forked(&ana.public()), None);
+        assert!(state.message(&next.id).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -420,17 +448,17 @@ pub(crate) mod tests {
         let (_, genesis) = Event::found(&me, 1, 0, 0, [0; 16]).unwrap();
         let log = Log::found(&path, genesis).unwrap();
         let len = std::fs::metadata(&path).unwrap().len();
-        let content = Content::Chat(Chat { text: "x".into(), to_ai: false, quote: None, tasks: vec![] }).encode();
+        let content = Content::Chat(Chat { text: "x".into(), ..Chat::default() }).encode();
         let draft = |count: usize| Draft { kind: 2, kind_version: 1, critical: false, actor: Actor::Human, via: Via::Ui,
             wall_ms: 0, parents: (0..count).map(|n| { let mut id = [0; 32]; id[..8].copy_from_slice(&(n as u64).to_le_bytes()); id }).collect(),
             content: &content };
-        let error = Event::create(&me, log.room_id(), draft(u16::MAX as usize + 1), [1; 16]).unwrap_err();
+        let error = Event::create(&me, log.town_id(), draft(u16::MAX as usize + 1), [1; 16]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "65,536 parents don't fit the u16 count: {error}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "no bytes were written");
         assert_eq!(log.events().len(), 1, "nothing entered the log");
-        let widest = Event::create(&me, log.room_id(), draft(u16::MAX as usize), [1; 16]).unwrap();
+        let widest = Event::create(&me, log.town_id(), draft(u16::MAX as usize), [1; 16]).unwrap();
         assert_eq!(widest.header.parents.len(), u16::MAX as usize, "the widest event keeps its whole count");
-        assert_eq!(Event::from_parts(widest.room, widest.header_bytes.clone(), widest.body.clone(), widest.sig.clone()).unwrap(), widest,
+        assert_eq!(Event::from_parts(widest.town, widest.header_bytes.clone(), widest.body.clone(), widest.sig.clone()).unwrap(), widest,
             "and reads back as signed");
         drop(log);
         std::fs::remove_dir_all(&dir).unwrap();

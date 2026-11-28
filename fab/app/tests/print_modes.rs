@@ -4,6 +4,8 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use fab::ui::print_settings::control_name;
 use fab_plate::{print_setting, PrintSetting, SettingKind, PRINT_SETTINGS};
@@ -146,8 +148,7 @@ fn see(app: &TestApp, selector: Selector, what: &str) {
 
 /// The Parts list showing the part, then the Slicer panel.
 fn show_slicer(app: &TestApp, name: &str) {
-    see(app, Selector::role(Role::Tab).name("Parts"), "the Parts tab");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(app);
     see(app, Selector::role(Role::TreeItem).name(name), &format!("the part {name}"));
     see(app, Selector::role(Role::Tab).name("Slicer"), "the Slicer tab");
     app.locator(Selector::role(Role::Tab).name("Slicer")).click();
@@ -251,7 +252,7 @@ fn global_and_override(app: &TestApp, name: &str) {
     set(app, density, "40%");
     wait_until(app, "global commit", || project(app).contains("settings({sparse_infill_density: \"40%\"})"));
     select_box(app, name);
-    wait_until(app, "the object's title", || app.widget_snapshot().nodes().iter().any(|n| n.name == "Follows the global settings." && n.visible()));
+    app.locator(Selector::path("head.note").name("No overrides: the global settings apply.")).wait_visible();
     // The object inherits it: 40, and a value equal to the global one is no override; a new
     // value is (edits land in order, so the first would have shown by the time the second has).
     set(app, density, "40%");

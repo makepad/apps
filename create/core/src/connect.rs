@@ -86,7 +86,14 @@ struct Incoming {
     frame: Option<(Kind, bool, usize)>,
     partial: [Vec<u8>; 3],
     inbox: VecDeque<(Kind, Vec<u8>)>,
+    sync_cost: u64,
+    // Plaintext already taken from TLS when a complete Sync used the last credit.
+    remainder: VecDeque<u8>,
 }
+
+/// A short (even empty) message occupies a queue entry. Charge at least one
+/// fragment so a stream of tiny messages also runs out of receive credit.
+pub(crate) fn sync_cost(body: &[u8]) -> u64 { body.len().max(FRAGMENT) as u64 }
 
 impl Incoming {
     fn start_frame(&mut self) -> Result<(Kind, bool, usize), Failure> {
@@ -116,8 +123,25 @@ impl Incoming {
         Ok((kind, more, len))
     }
 
-    fn feed(&mut self, mut plain: &[u8]) -> Result<(), Failure> {
-        while !plain.is_empty() {
+    fn feed(&mut self, plain: &[u8], credit: u64) -> Result<(), Failure> {
+        let used = self.parse(plain, credit)?;
+        self.remainder.extend(&plain[used..]);
+        Ok(())
+    }
+
+    fn resume(&mut self, credit: u64) -> Result<(), Failure> {
+        if !self.remainder.is_empty() && self.sync_cost < credit {
+            let mut chunk = std::mem::take(&mut self.remainder);
+            let used = self.parse(chunk.make_contiguous(), credit)?;
+            chunk.drain(..used);
+            self.remainder = chunk;
+        }
+        Ok(())
+    }
+
+    fn parse(&mut self, mut plain: &[u8], credit: u64) -> Result<usize, Failure> {
+        let total = plain.len();
+        while !plain.is_empty() && self.sync_cost < credit {
             let (kind, more, remaining) = if let Some(frame) = self.frame { frame } else {
                 let n = (FRAME_HEADER - self.header_len).min(plain.len());
                 self.header[self.header_len..self.header_len + n].copy_from_slice(&plain[..n]);
@@ -132,15 +156,17 @@ impl Incoming {
             partial.extend_from_slice(piece);
             if piece.len() < remaining {
                 self.frame = Some((kind, more, remaining - piece.len()));
+                plain = rest;
                 break;
             }
             self.frame = None;
             if !more {
+                if kind == Kind::Sync { self.sync_cost += sync_cost(partial); }
                 self.inbox.push_back((kind, std::mem::take(partial)));
             }
             plain = rest;
         }
-        Ok(())
+        Ok(total - plain.len())
     }
 }
 
@@ -194,8 +220,20 @@ pub fn probe_hour(unix_secs: u64) -> u64 {
 /// `k_probe = HMAC(link_secret, label)`. Only the two devices can make it, and it changes every
 /// hour, so no tag is a handle an observer can follow across networks.
 pub fn probe_tag(link_secret: &[u8; 32], hour: u64) -> [u8; 8] {
-    let key = hmac_sha256(link_secret, label::PROBE_KEY);
-    hmac_sha256(&key, &[label::PROBE_TAG, &hour.to_be_bytes()].concat())[..8].try_into().unwrap()
+    ProbeKey::new(link_secret).tag(hour)
+}
+
+/// Kept in memory for the lifetime of a wanted device.
+pub(crate) struct ProbeKey([u8; 32]);
+
+impl ProbeKey {
+    pub(crate) fn new(secret: &[u8; 32]) -> Self {
+        Self(hmac_sha256(secret, label::PROBE_KEY))
+    }
+
+    fn tag(&self, hour: u64) -> [u8; 8] {
+        hmac_sha256(&self.0, &[label::PROBE_TAG, &hour.to_be_bytes()].concat())[..8].try_into().unwrap()
+    }
 }
 
 /// The tags of one hour of a reconnect: the one probes carry, and the neighbouring hours' that a
@@ -209,9 +247,13 @@ pub struct ProbeTags {
 
 impl ProbeTags {
     pub fn new(link_secret: &[u8; 32], hour: u64) -> ProbeTags {
+        Self::from_key(&ProbeKey::new(link_secret), hour)
+    }
+
+    pub(crate) fn from_key(key: &ProbeKey, hour: u64) -> Self {
         ProbeTags {
-            send: probe_tag(link_secret, hour),
-            accept: [probe_tag(link_secret, hour.wrapping_sub(1)), probe_tag(link_secret, hour.wrapping_add(1))],
+            send: key.tag(hour),
+            accept: [key.tag(hour.wrapping_sub(1)), key.tag(hour.wrapping_add(1))],
             hour,
         }
     }
@@ -237,11 +279,15 @@ pub struct Connection {
     restart_probe: Option<(SocketAddr, Vec<u8>)>,
     /// We asked the stream to close.
     closing: bool,
+    drain_sync: bool,
     dropped: Option<Dropped>,
     /// Derived once, when the peer's probe supplies the second nonce.
     stream_id: Option<[u8; 8]>,
     stream: Option<Stream>,
     rate_cap: Option<u64>,
+    // The hub grants complete datagrams before poll_transmit starts their retransmission clocks.
+    packet_budget: Option<usize>,
+    transmit_after: u64,
     rate: u64,
     window_at: u64,
     window_sent: u64,
@@ -262,6 +308,7 @@ pub struct Connection {
     to_tls: Vec<u8>,
     queues: [SendQueue; 3],
     incoming: Incoming,
+    read_credit: u64,
     out: Vec<(SocketAddr, Vec<u8>)>,
     phase: Phase,
     notice_until: Option<u64>,
@@ -271,9 +318,13 @@ pub struct Connection {
 /// to the punch and is not a secret.
 pub fn first_contact_tag(mode: &Mode) -> Option<[u8; 8]> {
     let Mode::FirstContact(f) = mode else { return None };
-    let (a, b) = (link::invite_id(&f.own_invite), link::invite_id(&f.peer_invite));
+    Some(invite_tag(&f.own_invite, &f.peer_invite))
+}
+
+pub(crate) fn invite_tag(own: &Invite, peer: &Invite) -> [u8; 8] {
+    let (a, b) = (link::invite_id(own), link::invite_id(peer));
     let (lower, higher) = if a < b { (a, b) } else { (b, a) };
-    Some(sha256_hash(&[label::FIRST_TAG, &lower, &higher].concat())[..8].try_into().unwrap())
+    sha256_hash(&[label::FIRST_TAG, &lower, &higher].concat())[..8].try_into().unwrap()
 }
 
 fn stream_id(own: [u8; 8], peer: [u8; 8]) -> [u8; 8] {
@@ -337,10 +388,13 @@ impl Connection {
             peer_nonce: None,
             restart_probe: None,
             closing: false,
+            drain_sync: false,
             dropped: None,
             stream_id: None,
             stream: None,
             rate_cap: None,
+            packet_budget: None,
+            transmit_after: 0,
             rate: 0,
             window_at: now,
             window_sent: 0,
@@ -358,6 +412,7 @@ impl Connection {
             to_tls: Vec::new(),
             queues: Default::default(),
             incoming: Incoming::default(),
+            read_credit: u64::MAX,
             out: Vec::new(),
             phase: Phase::Punching { since: now },
             notice_until: None,
@@ -366,6 +421,16 @@ impl Connection {
 
     pub fn phase(&self) -> &Phase {
         &self.phase
+    }
+
+    /// If a linked stream has reached its idle deadline, drain the socket before polling it.
+    pub fn idle_due(&self, now: u64) -> bool {
+        self.phase == Phase::Linked && self.stream.as_ref().is_some_and(|s| s.idle_due(now))
+    }
+
+    /// Stream state, including its precise close reason, for link diagnostics.
+    pub fn stream_state(&self) -> Option<stream::State> {
+        self.stream.as_ref().map(Stream::state)
     }
 
     /// A failed connection may be dropped once its final notice has had time to retransmit.
@@ -410,9 +475,28 @@ impl Connection {
         }
     }
 
+    /// Finish the already authorized sync prefix before queuing FIN. The owning slot
+    /// bounds this drain by its farewell deadline, including at zero receive credit.
+    pub(crate) fn close_after_sync(&mut self) {
+        self.queues[Kind::Call.index()] = SendQueue::default();
+        self.queues[Kind::Blob.index()] = SendQueue::default();
+        self.drain_sync = true;
+        self.finish_sync_if_ready();
+    }
+
+    fn finish_sync_if_ready(&mut self) {
+        if self.drain_sync && self.queues[Kind::Sync.index()].messages.is_empty()
+            && self.to_tls.is_empty() && self.to_stream.is_empty()
+        {
+            self.drain_sync = false;
+            self.close();
+        }
+    }
+
     /// Whether the stream's close we asked for has finished (or the stream is gone).
     pub fn close_done(&self) -> bool {
-        !self.closing || self.stream.as_ref().is_none_or(|s| matches!(s.state(), stream::State::Closed(_)))
+        matches!(self.phase, Phase::Failed(_)) || (!self.drain_sync && !self.closing)
+            || self.stream.as_ref().is_none_or(|s| matches!(s.state(), stream::State::Closed(_)))
     }
 
     /// Why a link that was up ended, when it ended by the other device's doing.
@@ -426,9 +510,27 @@ impl Connection {
         self.restart_probe.take()
     }
 
+    #[cfg(test)]
+    pub(crate) fn transport_mut(&mut self) -> Option<&mut Stream> { self.stream.as_mut() }
+
     /// The path's current peer address, once the punch opened it.
     pub fn peer_address(&self) -> Option<SocketAddr> {
         self.stream.as_ref().map(|s| s.peer()).or_else(|| self.punch.peer())
+    }
+
+    pub fn stream_id(&self) -> Option<[u8; 8]> {
+        self.stream_id
+    }
+
+    /// A routing key only. Punch and stream still validate the datagram they receive.
+    pub(crate) fn punch_tag(packet: &[u8]) -> Option<[u8; 8]> {
+        if !punch::is_punch(packet) || !matches!(packet[1], 1 | 2) { return None }
+        packet.get(2..10)?.try_into().ok()
+    }
+
+    pub(crate) fn packet_stream_id(packet: &[u8]) -> Option<[u8; 8]> {
+        if packet.first() != Some(&STREAM_KIND) { return None }
+        packet.get(2..10)?.try_into().ok()
     }
 
     /// Whether `packet` belongs to a connection (a punch or a stream datagram).
@@ -447,6 +549,11 @@ impl Connection {
         if let Some(stream) = &mut self.stream {
             stream.set_rate_cap(cap);
         }
+    }
+
+    pub(crate) fn transmit_turn(&mut self, budget: Option<usize>, after: u64) {
+        self.packet_budget = budget;
+        self.transmit_after = after;
     }
 
     /// Wire bytes handed out by the stream, including its opening handshake.
@@ -567,7 +674,9 @@ impl Connection {
                 }
             }
         }
-        self.pump(now);
+        // While the socket is being drained, an unrelated packet before the peer's
+        // authenticated keepalive must not cause the stream to expire prematurely.
+        if !self.idle_due(now) { self.pump(now); }
     }
 
     /// Queues one whole message for the peer. Before the link is up it waits.
@@ -584,12 +693,25 @@ impl Connection {
 
     /// Whether all previously queued messages of this kind have been committed.
     pub fn writable(&self, kind: Kind) -> bool {
-        self.queues[kind.index()].messages.is_empty()
+        self.queues[kind.index()].messages.is_empty() && (kind == Kind::Call ||
+            self.committed_unsent() < crate::sync::BATCH_BYTES)
     }
 
     /// The next whole message from the peer.
     pub fn recv(&mut self) -> Option<(Kind, Vec<u8>)> {
-        self.incoming.inbox.pop_front()
+        let (kind, body) = self.incoming.inbox.pop_front()?;
+        if kind == Kind::Sync { self.incoming.sync_cost -= sync_cost(&body); }
+        Some((kind, body))
+    }
+
+    pub(crate) fn set_read_credit(&mut self, credit: u64) -> bool {
+        let paused = self.read_paused();
+        self.read_credit = credit;
+        paused && !self.read_paused()
+    }
+
+    fn read_paused(&self) -> bool {
+        self.linked.is_some() && self.incoming.sync_cost >= self.read_credit
     }
 
     /// The datagrams due at `now`, as (to, bytes).
@@ -611,7 +733,7 @@ impl Connection {
 
     /// When [`Connection::poll`] next has something to do (ms).
     pub fn next_wake(&self) -> u64 {
-        let stream = self.stream.as_ref().and_then(|s| s.next_timeout()).unwrap_or(u64::MAX);
+        let stream = self.stream.as_ref().and_then(|s| s.next_timeout()).unwrap_or(u64::MAX).max(self.transmit_after);
         if matches!(self.phase, Phase::Failed(_)) {
             return self.notice_until.map_or(u64::MAX, |end| end.min(stream));
         }
@@ -692,6 +814,10 @@ impl Connection {
         if let stream::State::Closed(reason) = stream.state() {
             if self.linked.is_some() && reason == CloseReason::Finished {
                 if !self.closing {
+                    // The transport can finish its FIN exchange while the UI
+                    // holds credit. Its contiguous pre-FIN bytes are still readable.
+                    self.read_layers()?;
+                    if self.read_paused() { return Ok(()) }
                     self.dropped = Some(Dropped::Closed);
                     return Err(Failure::Stream("the other device closed the link".into()));
                 }
@@ -711,12 +837,14 @@ impl Connection {
         }
         self.read_layers()?;
         // The peer closed after sending all it had: everything it sent is in the inbox by now.
-        if self.linked.is_some() && !self.closing && self.stream.as_ref().is_some_and(|s| s.state() == stream::State::Closing) {
+        if self.linked.is_some() && !self.closing && !self.read_paused()
+            && self.stream.as_ref().is_some_and(|s| s.state() == stream::State::Closing) {
             self.dropped = Some(Dropped::Closed);
             return Err(Failure::Stream("the other device closed the link".into()));
         }
         loop {
             self.commit().map_err(tls_error)?;
+            self.finish_sync_if_ready();
             let sent = self.poll_stream(now);
             if !sent || !self.keys_installed || (self.to_tls.is_empty() && self.to_stream.is_empty()
                 && self.queues.iter().all(|q| q.messages.is_empty())) {
@@ -729,7 +857,9 @@ impl Connection {
     fn poll_stream(&mut self, now: u64) -> bool {
         let stream = self.stream.as_mut().unwrap();
         let before = self.out.len();
-        while let Some(datagram) = stream.poll_transmit(now) {
+        while self.packet_budget != Some(0) {
+            let Some(datagram) = stream.poll_transmit(now) else { break };
+            if let Some(remaining) = &mut self.packet_budget { *remaining -= 1; }
             self.out.push(datagram);
             self.punch.note_sent(now);
         }
@@ -765,7 +895,8 @@ impl Connection {
         let make_proof = self.make_proof;
         let tls_error = |e: io::Error| Failure::Tls(e.to_string());
         let mut buf = [0u8; CHUNK];
-        loop {
+        self.incoming.resume(self.read_credit)?;
+        while self.linked.is_none() || self.incoming.sync_cost < self.read_credit {
             // Stream to TLS.
             let n = stream.read(&mut buf);
             if n > 0 {
@@ -783,14 +914,14 @@ impl Connection {
             }
             if let Some(running) = self.proof.as_mut() {
                 // TLS plaintext to the proof, then to messages.
-                loop {
+                while self.linked.is_none() || self.incoming.sync_cost < self.read_credit {
                     match tls.read_plaintext(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
                             if self.linked.is_some() {
-                                self.incoming.feed(&buf[..n])?;
+                                self.incoming.feed(&buf[..n], self.read_credit)?;
                             } else if let Some(done) = running.feed(&buf[..n]).map_err(Failure::Refused)? {
-                                self.incoming.feed(&done.leftover)?;
+                                self.incoming.feed(&done.leftover, self.read_credit)?;
                                 self.linked = Some(done);
                             }
                         }

@@ -3,6 +3,7 @@
 //! worked out again each frame at the frame's time; drawing code reads
 //! plain numbers.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -11,7 +12,7 @@ fn load(source: &str) -> MotionDoc {
 
 /// The first layer's width at `t` (a Rect sized from the live let).
 fn width(doc: &MotionDoc, t: f64) -> f64 {
-    let ItemKind::Rect { size, .. } = &doc.eval(t).items[0].kind else { panic!("not a rect") };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(t).items[0].kind else { panic!("not a rect") };
     size[0]
 }
 

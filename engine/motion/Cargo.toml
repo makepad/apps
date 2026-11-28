@@ -24,6 +24,8 @@ scene3d = ["dep:makepad-stage-motion3d", "dep:makepad-text-mesh"]
 dev-roots = ["makepad-doc-fonts/dev-roots"]
 
 [dependencies]
+makepad-motion-plain = { path = "../motion_plain" }
+makepad-splash-syntax = { path = "../../libs/splash_syntax" }
 # Value kinds: the one editable-values layer.
 makepad-edit-values = { path = "../../../../libs/edit_values" }
 makepad-asset-data = { path = "../../../apps/engine/asset/data" }

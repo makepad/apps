@@ -40,6 +40,19 @@ fn the_cx_thread_counts_a_real_document_and_shader_compile() {
     std::thread::spawn(move || {
         let _cx = makepad_widgets::Cx::new(Box::new(|_, _| {}));
         assert!(ui_thread::is_ui_thread());
+        let before = ui_thread::violations();
+        let stopped = makepad_score_live::PrepareControl::default();
+        stopped.cancel();
+        assert!(matches!(model::load_controlled(source, &stopped), Err(makepad_score_live::LoadError::Cancelled)));
+        assert!(matches!(makepad_score_live::vm::evaluate_controlled(source, &stopped), Err(makepad_score_live::LoadError::Cancelled)));
+        assert_eq!(ui_thread::violations(), before, "a request cancelled before either blocking driver records no UI work");
+        let slice = std::time::Duration::ZERO;
+        let word = makepad_score_live::PrepareControl::default();
+        let model::LoadStep::Pending(pending) = model::load_begin("loop {}", &word, slice) else {
+            panic!("the cooperative load yields to the UI");
+        };
+        assert!(matches!(pending.step(slice), model::LoadStep::Pending(_)), "the next UI slice also yields");
+        assert_eq!(ui_thread::violations(), before, "starting and resuming a cooperative load records no blocking evaluation");
         let loaded = model::load_controlled(source, &makepad_score_live::PrepareControl::default()).unwrap();
         Composer::new(loaded.into_evaluated()).pump(1.0, &mut Vec::new());
         for _ in 0..2 {

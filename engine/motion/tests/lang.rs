@@ -1,6 +1,7 @@
 //! A render of a document in another language: the document writes each
 //! text in the languages it is shown in and picks by `lang()`; a render
 //! for no language (the presenter's) is the document as written.
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ fn texts(frame: &MotionFrame) -> Vec<String> {
     let mut out = Vec::new();
     for item in &frame.items {
         match &item.kind {
-            ItemKind::Text { text, .. } => out.push(text.clone()),
+            ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => out.push(text.clone()),
             ItemKind::Draw2d { picture, .. } => {
                 for op in &picture.list.ops {
                     if let makepad_motion::draw2d::Op::Text(t) = op {

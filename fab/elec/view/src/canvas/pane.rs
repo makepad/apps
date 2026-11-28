@@ -18,6 +18,8 @@
 //! view), O(1) otherwise. Per frame: `Nav::step`, the hover fade, nothing else; frames are asked
 //! only while the camera or the fade moves. Semantic nodes are gathered at draw time from
 //! `CanvasItems::nodes` for what the camera shows, so their count follows the view, not the design.
+pub(crate) mod review_chip;
+
 use super::camera::{Camera2d, CanvasItems, CanvasNode};
 use super::looks::STATE_SECONDS;
 use super::nav::Nav;
@@ -314,6 +316,14 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
         self.place_at(rect, cx.current_dpi_factor(), bounds);
     }
 
+    /// A source switch keeps an already placed camera, including when floating controls
+    /// have just changed its covered inset. Future resizes still respect the person's fit.
+    pub(crate) fn place_comparison(&mut self, cx: &Cx2d, rect: Rect, bounds: [f64; 4]) {
+        let fit = (!self.placed).then_some(bounds);
+        self.inset_changed = false;
+        self.place(cx, rect, fit);
+    }
+
     /// [`Self::place`] at `dpi` physical pixels per point.
     pub fn place_at(&mut self, rect: Rect, dpi: f64, bounds: Option<[f64; 4]>) {
         if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
@@ -387,7 +397,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
         Some(CanvasInput::Hover(None))
     }
 
-    fn set_hover<I: CanvasItems<Key = K>>(&mut self, cx: &mut Cx, items: &I, at: Option<Vec2d>, now: f64, out: &mut Vec<CanvasInput<K>>) {
+    fn set_hover<I: CanvasItems<Key = K> + ?Sized>(&mut self, cx: &mut Cx, items: &I, at: Option<Vec2d>, now: f64, out: &mut Vec<CanvasInput<K>>) {
         self.hover_at = at;
         let keys = canvas_keys(cx);
         if at.is_some() {
@@ -414,6 +424,20 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
     /// Turns one event into canvas inputs. `area` is the pane's drawn area; `items` answers the
     /// hit tests.
     pub fn handle_event<I: CanvasItems<Key = K>>(&mut self, cx: &mut Cx, event: &Event, area: Area, items: &I) -> Vec<CanvasInput<K>> {
+        self.dispatch(cx, event, area, Some(items))
+    }
+
+    /// A read-only picture has no geometry dispatcher. Pointer drags pan, and Escape leaves it.
+    pub fn navigation(&mut self, cx: &mut Cx, event: &Event, area: Area) -> Vec<CanvasInput<K>> {
+        if self.press.as_ref().is_some_and(|p| !p.pan) { self.press = None; }
+        self.hover = None;
+        self.picked = None;
+        self.hover_at = None;
+        self.hover_mix = 1.0;
+        self.dispatch(cx, event, area, None)
+    }
+
+    fn dispatch(&mut self, cx: &mut Cx, event: &Event, area: Area, items: Option<&dyn CanvasItems<Key = K>>) -> Vec<CanvasInput<K>> {
         let mut out = Vec::new();
         if let Some(fe) = self.frame.is_event(event) {
             if self.step(fe.time) {
@@ -436,7 +460,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             // The focused pane's keys come as hits below; a key for the hovered one comes here.
             if focus != KeyFocus::Mine && takes_key(self.id, hovered, focus) {
                 cx.set_key_focus(area);
-                self.key_down(k, &mut out);
+                self.key_down(k, items.is_none(), &mut out);
                 return out;
             }
         }
@@ -444,22 +468,31 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             // A move that leaves the pointer over the same world point at the same zoom (a still
             // pointer's repeated events) keeps the hover as it is: no pick, no restarted fade.
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) if self.picked != Some((self.cam.to_world(e.abs), self.cam.px_per_unit)) => {
-                self.set_hover(cx, items, Some(e.abs), e.time, &mut out);
-                self.animate(cx);
+                if let Some(items) = items {
+                    self.set_hover(cx, items, Some(e.abs), e.time, &mut out);
+                    self.animate(cx);
+                } else {
+                    canvas_keys(cx).hovered = Some(self.id);
+                    cx.set_cursor(MouseCursor::Grab);
+                }
             }
             Hit::FingerHoverOut(e) => {
-                self.set_hover(cx, items, None, e.time, &mut out);
+                if let Some(items) = items {
+                    self.set_hover(cx, items, None, e.time, &mut out);
+                } else if canvas_keys(cx).hovered == Some(self.id) {
+                    canvas_keys(cx).hovered = None;
+                }
             }
             Hit::FingerDown(e) => {
                 cx.set_key_focus(area);
                 let button = e.device.mouse_button();
                 let pan_button = button.is_some_and(|b| b.contains(MouseButton::MIDDLE) || b.contains(MouseButton::SECONDARY));
-                let pan = self.space_held || e.modifiers.alt || pan_button;
+                let pan = items.is_none() || self.space_held || e.modifiers.alt || pan_button;
                 self.nav.stop();
                 let r = HIT_RADIUS / self.cam.px_per_unit.max(1e-12);
                 let world = self.cam.to_world(e.abs);
-                let key = if pan { None } else { items.hit(world, r).into_iter().next() };
-                let marquee = key.as_ref().is_some_and(|key| items.marquee_over(key, world, r));
+                let key = items.filter(|_| !pan).and_then(|items| items.hit(world, r).into_iter().next());
+                let marquee = key.as_ref().zip(items).is_some_and(|(key, items)| items.marquee_over(key, world, r));
                 if pan {
                     self.moved_by_hand();
                     self.nav.drag_begin(e.time);
@@ -515,7 +548,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
                 } else {
                     out.push(CanvasInput::Click { key: press.key, at: self.cam.to_world(e.abs), clicks: press.clicks, shift: press.shift });
                 }
-                self.set_hover(cx, items, Some(e.abs), e.time, &mut out);
+                if let Some(items) = items { self.set_hover(cx, items, Some(e.abs), e.time, &mut out); }
             }
             Hit::FingerScroll(e) => {
                 let zoom = scroll_is_mouse.unwrap_or(false) || e.modifiers.control || e.modifiers.logo;
@@ -535,7 +568,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             }
             Hit::KeyDown(k) => {
                 if takes_key(self.id, hovered, focus) {
-                    self.key_down(&k, &mut out);
+                    self.key_down(&k, items.is_none(), &mut out);
                 }
             }
             Hit::KeyUp(k) if k.key_code == KeyCode::Space => {
@@ -546,7 +579,14 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
         out
     }
 
-    fn key_down(&mut self, k: &KeyEvent, out: &mut Vec<CanvasInput<K>>) {
+    fn key_down(&mut self, k: &KeyEvent, navigation: bool, out: &mut Vec<CanvasInput<K>>) {
+        if navigation {
+            if k.key_code == KeyCode::Escape && !k.is_repeat {
+                self.press = None;
+                out.push(CanvasInput::Escape);
+            }
+            return;
+        }
         if k.key_code == KeyCode::Space {
             self.space_held = true;
         } else if k.key_code == KeyCode::Escape {
@@ -694,6 +734,52 @@ mod tests {
         pane.place_at(narrow, 1.0, Some(content));
         assert_eq!((pane.held_view(), pane.cam.view, pane.cam.dpi), (Some(held), narrow, 1.0));
         assert!(!pane.nav.moving(), "a flight cannot move the restored camera");
+    }
+
+    #[test]
+    fn navigation_pans_over_items_and_keeps_wheel_zoom() {
+        use super::{Camera2d, CanvasInput, CanvasItems, CanvasNode};
+        use makepad_widgets_core::makepad_platform::event::ScrollEvent;
+        use std::cell::Cell;
+        struct Items(Cell<usize>);
+        impl CanvasItems for Items {
+            type Key = u32;
+            fn hit(&self, _: [f64; 2], _: f64) -> Vec<u32> { self.0.set(self.0.get() + 1); vec![1] }
+            fn nodes(&self, _: &Camera2d) -> Vec<CanvasNode<u32>> { vec![] }
+        }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let rect = Rect { pos: dvec2(0., 0.), size: dvec2(200., 100.) };
+        let pass = DrawPass::new(&mut cx);
+        let mut list = DrawList2d::new(&mut cx);
+        pass.set_size(&mut cx, rect.size);
+        let mut area = Area::Empty;
+        {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_pass(&pass, None);
+            list.begin_always(&mut cx);
+            cx.begin_root_turtle(rect.size, Layout::flow_down());
+            cx.add_aligned_rect_area(&mut area, rect);
+            cx.end_pass_sized_turtle();
+            list.end(&mut cx);
+            cx.end_pass(&pass);
+        }
+        let press = || Event::MouseDown(MouseDownEvent { abs: rect.center(), button: MouseButton::PRIMARY,
+            window_id: WindowId(1, 1), modifiers: Default::default(), handled: Cell::new(Area::Empty), time: 0. });
+        let items = Items(Cell::new(0));
+        let mut pane = CanvasPane::<u32>::default();
+        assert!(pane.handle_event(&mut cx, &press(), area, &items).contains(&CanvasInput::Press { key: 1, down: true }),
+            "the live press at the same point hits an item");
+        assert!(pane.navigation(&mut cx, &press(), area).is_empty() && items.0.get() == 1 && pane.press.as_ref().is_some_and(|p| p.pan),
+            "a comparison press over that item begins a pan without another hit test");
+        let zoom = pane.cam.px_per_unit;
+        let wheel = Event::Scroll(ScrollEvent { window_id: WindowId(1, 1), abs: rect.center(), scroll: dvec2(0., -20.),
+            modifiers: Default::default(), handled_x: Cell::new(false), handled_y: Cell::new(false), is_mouse: true,
+            time: 1., phase: Default::default() });
+        pane.navigation(&mut cx, &wheel, area);
+        pane.step(2.);
+        assert_ne!(pane.cam.px_per_unit, zoom, "the wheel still zooms the comparison");
     }
 
     #[test]

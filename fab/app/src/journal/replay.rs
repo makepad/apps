@@ -20,6 +20,7 @@ fn file_name(row: &Value) -> io::Result<&str> {
     Ok(name)
 }
 fn blob(dir: &Path, hash: &str) -> io::Result<Vec<u8>> {
+    let _read = reader::ReadPermit::take(dir)?;
     let blobs = dir.join("blobs");
     if !fs::symlink_metadata(&blobs)?.is_dir() { return Err(invalid()) }
     let mut file = open_regular(&blobs.join(hash))?.ok_or(io::ErrorKind::NotFound)?;
@@ -236,14 +237,12 @@ struct Archive {
 
 impl Archive {
     fn read(dir: &Path, upto: Option<u64>, source: Option<&reader::VerifiedLog>) -> io::Result<Self> {
-        let opened;
-        let mut file = match source {
-            Some(log) => &log.file,
-            None => {
-                opened = open_regular(&dir.join(LOG))?.ok_or(io::ErrorKind::NotFound)?;
-                &opened
-            }
+        let _read = reader::ReadPermit::take(dir)?;
+        let opened = match source {
+            Some(log) => log.file()?,
+            None => open_regular(&dir.join(LOG))?.ok_or(io::ErrorKind::NotFound)?,
         };
+        let mut file = &opened;
         loop {
             // A pool job may start after the selected journal was moved. Keep
             // using the verified handle even when a contended sample needs a retry.
@@ -730,7 +729,7 @@ fn dispatch<'a>(tool: &'a str, args: &'a Value, reopened_head: Option<fab_model:
         "elec.capture.save" if !fields.iter().flatten().any(|(key, _)| key == "capture") => Unavailable("needs a live capture"),
         // These have app-owned handlers outside Cmd::Invoke.
         "elec.capture.save" => Unavailable("needs the app capture handler"),
-        "elec.req.add" | "elec.doc.read" | "elec.doc.list" =>
+        "elec.req.add" | "elec.doc.read" | "elec.doc.list" | "elec.step.propose" | "elec.step.list" =>
             Unavailable("needs the app document handler"),
         _ => Unavailable("not known to be replayable headless"),
     }
@@ -915,6 +914,9 @@ impl<'a> Calls<'a> {
         match step.kind {
             StepKind::Checkpoint => {}
             StepKind::Call => {
+                if row.get("replay").and_then(Value::as_bool) == Some(false) {
+                    return Ok(Outcome::NotReplayable { reason: "a person's decision; its edits are recorded as its effects".into() });
+                }
                 let action = string(row, "action")?;
                 let args = field(row, "args")?;
                 let how = dispatch(action, args, None);

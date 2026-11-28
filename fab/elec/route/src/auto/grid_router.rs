@@ -100,8 +100,8 @@ use crate::verify::{new_pieces, verify};
 use crate::world::{Fixity, Overlay, RItem, RPiece, World};
 use fab_elec_board::drc::sel_of;
 use fab_elec_board::{
-    connect_indexed, fill, fill_update, Anchor, Board, BoardOp, ConnItem, Connectivity, Flash, IndexChange, Item, Origin,
-    PieceIndex, RuleItem, RuleKey, RuleMatrix, Tent, Track, Via, ViaKind, ZoneFill,
+    connect, connect_indexed, fill, fill_all, fill_update, Anchor, Board, BoardOp, ConnItem, Connectivity, Flash,
+    IndexChange, Item, Origin, PieceIndex, RuleItem, RuleKey, RuleMatrix, Tent, Track, Via, ViaKind, ZoneFill,
 };
 use fab_elec_circuit::Measure;
 use fab_elec_core::{point_clearance, BBox, ItemId, LayerId, LayerSet, NetId, Nm, OnTrack, PolySet, Sel, Shape, P};
@@ -166,6 +166,18 @@ impl Autorouter for GridRouter {
         r.sol.metrics.work.open_after_first_pass = r.sol.metrics.nets_open;
         if p.effort == Effort::Full && !progress.cancelled() {
             r.rip_up(progress, &mut before);
+        }
+        // The search records open reasons before later copper and the final refill can join a net.
+        // A cancelled job returns at once: its untried nets were never searched.
+        if !r.sol.open.is_empty() && !progress.cancelled() {
+            let board = &r.settled.board;
+            let fills = fill_all(board, &p.rules);
+            let conn = connect(board, &fills);
+            let before = r.sol.open.len();
+            r.sol.open.retain(|(net, _)| rnet(board, &p.rules, &conn, &p.stack, *net).is_some());
+            let joined = (before - r.sol.open.len()) as u32;
+            r.sol.metrics.nets_open -= joined;
+            r.sol.metrics.nets_routed += joined;
         }
         r.sol
     }

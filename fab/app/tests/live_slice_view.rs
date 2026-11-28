@@ -23,11 +23,17 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/drawn_runs.rs"]
 mod drawn_runs;
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 
 use makepad_strict_json::Value;
@@ -232,8 +238,7 @@ fn the_print_plays_and_edits_under_the_slider_draw_top_down_keeping_the_plate_wh
     // Sliced slices two parts on two filaments; the playback bar names the layer on top.
     // The runtime's actions wait on the app's progress, not a clock: the first Sliced can keep a
     // cold JIT's main thread compiling for longer than a fixed wait gives it to take the select.
-    app.locator(Selector::id("rm_slice")).select();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     wait_until(&app, "the plate Sliced, its layer named", || {
         let r = readout(&app);
         assert!(!r.state.starts_with("Failed") && !r.names.iter().any(|n| n.starts_with("The slice failed")), "two filaments: the slice failed: {:?}", r.names);
@@ -299,7 +304,7 @@ fn the_print_plays_and_edits_under_the_slider_draw_top_down_keeping_the_plate_wh
     app.locator(slider.clone()).set_value("0.5");
     wait_until(&app, "the slider halfway", || readout(&app).layer.is_some_and(|(n, _)| n < whole));
 
-    app.locator(Selector::role(Role::Tab).name("Parts")).press();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("wavy")).wait_visible();
     app.locator(Selector::role(Role::TreeItem).name("wavy")).press();
     app.locator(Selector::id("t_shape")).wait_visible();
@@ -363,6 +368,7 @@ fn the_print_plays_and_edits_under_the_slider_draw_top_down_keeping_the_plate_wh
     let whole = readout(&app).layer.expect("the layer readout").1;
     app.locator(Selector::role(Role::TreeItem).name("post")).wait_visible();
     app.locator(Selector::role(Role::TreeItem).name("post")).press();
+    part_editor::open(&app);
     let control = Selector::role(Role::SpinButton).name("Radius");
     let radius = app.locator(control.clone()).wait_visible().snapshot().node.value;
     let from = seq(&app);

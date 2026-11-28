@@ -34,7 +34,7 @@
 use makepad_strict_json::Value;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
-use makepad_test::{run_with_config, KeyCode, NodeMatch, Role, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyEvent, KeyModifiers, NodeMatch, Role, Selector, StudioToApp, TestApp, TestConfig};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -271,7 +271,16 @@ fn a_click_selects_a_part_in_place_and_its_value_is_typed_in_the_card() {
         wait_until(&app, "the device view ringing the schematic's selection", || ringed(&app) == Some(vec![resistor.clone()]));
         // Case off and seen from the top, where the resistor's body shows in the device view.
         app.locator(Selector::role(Role::ToggleButton).name("Case")).wait_visible().press();
+        // (the view pie: Q held over the device view, its Top pressed)
+        let device = app.locator(Selector::id("device_viewport")).wait_visible().snapshot().bounds;
+        app.move_to(device.x as f64 + device.w as f64 * 0.5, device.y as f64 + device.h as f64 * 0.5);
+        let q = |down: bool| {
+            let key = KeyEvent { key_code: KeyCode::KeyQ, is_repeat: false, modifiers: KeyModifiers::default(), time: 0.0 };
+            app.forward(vec![if down { StudioToApp::KeyDown(key) } else { StudioToApp::KeyUp(key) }]);
+        };
+        q(true);
         app.locator(Selector::role(Role::Button).name("Top")).wait_visible().press();
+        q(false);
         let mut resistor_at = None;
         wait_until(&app, "the resistor's body still on screen in the device view", || {
             let at = ringed_at(&app).and_then(|parts| parts.first().and_then(|p| p.1));

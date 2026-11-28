@@ -269,8 +269,8 @@ script_mod! {
             none := mod.widgets.FabCard{
                 visible: true
                 margin: Inset{bottom: 10}
-                title := mod.widgets.FabTitleLabel{ text: "" }
-                text := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                title := mod.widgets.FabTitleLabel{ text: "" draw_text +: { color: fab.color_text_well } }
+                text := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
             }
             before := mod.widgets.FabPrinterSections{part: 0}
             // the printer in use: everything it reports, its trays, the print's question and its
@@ -471,8 +471,8 @@ script_mod! {
             jobs_none := mod.widgets.FabCard{
                 visible: false
                 margin: Inset{bottom: 10}
-                title := mod.widgets.FabTitleLabel{ text: "No printer in use." }
-                text := mod.widgets.FabLabelDim{ width: Fill text: "Use one of the printers below: its job, its profile, colours and slice, shows in its section." }
+                title := mod.widgets.FabTitleLabel{ text: "No printer in use." draw_text +: { color: fab.color_text_well } }
+                text := mod.widgets.FabLabelDim{ width: Fill text: "Use one of the printers below: its job, its profile, colours and slice, shows in its section." draw_text +: { color: fab.color_text_well_dim } }
             }
             jobs_before := mod.widgets.FabPrinterJobs{part: 0}
             // the printer in use: its job (profile, colours, slice), then the jobs sent to it
@@ -535,6 +535,8 @@ pub struct FabPrinterJobs {
     /// The sections drawn last, and their printers (none: "Other printers").
     #[rust] shown: Vec<LiveId>,
     #[rust] choices: Vec<(LiveId, PrinterChoice)>,
+    /// The target when the sections were drawn: a Use press links from it.
+    #[rust] owner: EditOwner,
     #[redraw] #[rust] area: Area,
 }
 
@@ -599,7 +601,7 @@ impl Widget for FabPrinterJobs {
         let Event::Actions(actions) = event else { return };
         for (id, choice) in &self.choices {
             if self.items.get(id).is_some_and(|w| w.button(cx, ids!(use_btn)).clicked(actions)) {
-                cx.action(PrintAction::LinkPrinter(choice.clone()));
+                cx.action(PrintAction::LinkPrinter(self.owner.clone(), choice.clone()));
             }
         }
     }
@@ -612,6 +614,7 @@ impl Widget for FabPrinterJobs {
         let mut plan: Vec<(LiveId, String, JobsOf, usize, bool, bool)> = Vec::new();
         if let Some(state) = scope.data.get::<AppState>() {
             let p = &state.print;
+            self.owner.capture(PrinterScope::Target, p);
             let printers = listed(p);
             let ids: Vec<String> = printers.iter().filter_map(|(c, _)| c.id()).collect();
             // the printers before the one in use, or after it (all of them before when none is)
@@ -686,6 +689,8 @@ pub struct FabPrinterSections {
     #[rust] items: ComponentMap<LiveId, WidgetRef>,
     /// The sections drawn last, and their printers.
     #[rust] shown: Vec<(LiveId, PrinterChoice)>,
+    /// The target when the sections were drawn: a Use press links from it.
+    #[rust] owner: EditOwner,
     #[redraw] #[rust] area: Area,
 }
 
@@ -752,7 +757,7 @@ impl Widget for FabPrinterSections {
         for (id, choice) in &self.shown {
             let Some(w) = self.items.get(id) else { continue };
             if w.button(cx, ids!(use_btn)).clicked(actions) {
-                cx.action(PrintAction::LinkPrinter(choice.clone()));
+                cx.action(PrintAction::LinkPrinter(self.owner.clone(), choice.clone()));
             }
         }
     }
@@ -762,6 +767,7 @@ impl Widget for FabPrinterSections {
         self.shown.clear();
         if let Some(state) = _scope.data.get::<AppState>() {
             let p = &state.print;
+            self.owner.capture(PrinterScope::Target, p);
             let printers = listed(p);
             let at = printers.iter().position(|(c, _)| *c == p.links.picked).filter(|_| p.resin.is_none());
             let range = match (self.part, at) {
@@ -1026,20 +1032,32 @@ fn printer_note(printer: &fab_printer_link::Snapshot, supported: bool, job_shown
     out.join("\n")
 }
 
+fn confirm_report(p: &PrintState) -> Option<&fab_printer_link::Snapshot> {
+    p.confirm_print.as_ref()?;
+    p.target_printer().map(Arc::as_ref)
+}
+
 /// What the confirm card asks or says: the print's question once its slice is ready, how far the
 /// slice is before that (with its progress), and what to do when none is on its way. The card
 /// follows the slice, so the question comes the moment the slice does.
-fn confirm_question(p: &PrintState, printer: &str, empty_plate: bool) -> (String, Option<f32>) {
+pub fn confirm_question(p: &PrintState, printer: &fab_printer_link::Snapshot, empty_plate: bool) -> (String, Option<f32>) {
+    let name = &printer.name;
     if empty_plate {
         return ("The plate is empty: there is nothing to print yet.".into(), None);
     }
+    if let Some(stage) = p.calibration_wait() {
+        return (format!("Preparing the print for {name}: {stage}…"), None);
+    }
+    if p.calibration_error.is_some() {
+        return (format!("Cannot print on {name}: the plate failed to rebuild for this calibration."), None);
+    }
     match &p.status {
-        SliceStatus::Running { progress, stage } => (format!("Preparing the print for {printer}: {stage}…"), Some(*progress)),
+        SliceStatus::Running { progress, stage } => (format!("Preparing the print for {name}: {stage}…"), Some(*progress)),
         SliceStatus::Failed(e) => (format!("The slice failed, so there is nothing to print: {}. Print tries again.", e.lines().next().unwrap_or("internal slicer error")), None),
-        _ if p.can_send() && p.printer_busy() => (format!("{printer} is busy. Queue the sliced plate? It waits in Monitor and starts only when you press Start there."), None),
-        _ if p.can_send() && p.target_printer().is_some_and(|s| s.virtual_printer) => (format!("Start a Virtual print of the sliced plate on {printer}?"), None),
-        _ if p.can_send() => (format!("Print the sliced plate on {printer}? It uploads to the printer's USB drive and starts at once."), None),
-        _ => (format!("Preparing the print for {printer}: the slice is about to start…"), None),
+        _ if p.can_send() && p.printer_busy() => (format!("{name} is busy. Queue the sliced plate? It waits in Monitor and starts only when you press Start there."), None),
+        _ if p.can_send() && printer.virtual_printer => (format!("Start a Virtual print of the sliced plate on {name}?"), None),
+        _ if p.can_send() => (format!("Print the sliced plate on {name}? It uploads to the printer's USB drive and starts at once."), None),
+        _ => (format!("Preparing the print for {name}: the slice is about to start…"), None),
     }
 }
 
@@ -1069,23 +1087,70 @@ fn picked_name(names: &[String], id: LiveId) -> Option<String> {
     names.iter().find(|n| LiveId::from_str(n) == id).cloned()
 }
 
+fn first_line<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+    s.lines().next().filter(|line| !line.trim().is_empty()).unwrap_or(fallback)
+}
+
+fn file_failure(why: &str) -> String {
+    format!("Export failed: {}", first_line(why, "could not write the file"))
+}
+
+/// The filament export's own status line, and whether it is a failure.
+pub fn export_line(p: &PrintState) -> Option<(String, bool)> {
+    match &p.export {
+        ExportStatus::Idle => None,
+        ExportStatus::Exporting => Some((p.calibration_wait().map_or_else(|| "Exporting…".into(), |stage| format!("Exporting · {stage}…")), false)),
+        ExportStatus::Written(path) => Some((format!("Wrote {}", path.display()), false)),
+        ExportStatus::Failed(why) => Some((file_failure(why), true)),
+    }
+}
+
+/// An active filament or resin export failure.
+pub fn export_failure(p: &PrintState) -> Option<String> {
+    if let ExportStatus::Failed(why) = &p.export {
+        return Some(file_failure(why));
+    }
+    p.resin.as_ref().filter(|r| r.export.starts_with("Export failed:"))
+        .map(|r| first_line(&r.export, "Export failed").to_owned())
+}
+
+/// The failure to show over a plate outside the Sliced view.
+pub fn stage_failure(p: &PrintState) -> Option<String> {
+    export_failure(p).or_else(|| (p.calibration_error.is_some() || matches!(p.status, SliceStatus::Failed(_))).then(|| slice_status(p).0))
+}
+
 /// The slice's status line and progress.
 pub fn slice_status(p: &PrintState) -> (String, Option<f32>) {
     // a resin printer's slice is its layer stack
     if let Some(r) = &p.resin {
         return (r.status(), None);
     }
+    if let Some(stage) = p.calibration_wait() {
+        let export = if matches!(p.export, ExportStatus::Exporting) { "Exporting · " } else { "" };
+        let status = if let SliceStatus::Done { seconds } = p.status { format!("Sliced in {seconds:.1} s. ") } else { String::new() };
+        return (format!("{status}{export}{stage}…"), None);
+    }
+    if let Some(err) = &p.calibration_error {
+        let prefix = if matches!(p.export, ExportStatus::Failed(_)) { "Export failed — calibration rebuild failed" } else { "Calibration rebuild failed" };
+        return (format!("{prefix}: {}", first_line(err, "the plate could not rebuild for this calibration")), None);
+    }
     match &p.status {
-        SliceStatus::Idle if p.preview.is_none() => ("Not sliced yet.".to_string(), None),
-        SliceStatus::Idle => (String::new(), None),
-        SliceStatus::Running { progress, stage } => (format!("{stage}…"), Some(*progress)),
+        SliceStatus::Idle => {
+            let line = export_line(p).map_or_else(|| if p.preview.is_none() { "Not sliced yet.".into() } else { String::new() }, |(t, _)| t);
+            (line, None)
+        }
+        SliceStatus::Running { progress, stage } => {
+            let prefix = if matches!(p.export, ExportStatus::Exporting) { "Exporting · " } else { "" };
+            (format!("{prefix}{stage}…"), Some(*progress))
+        }
         SliceStatus::Done { seconds } => {
             let mut t = format!("Sliced in {seconds:.1} s.");
             if p.stale {
                 t.push_str(" The plate changed since: slice again.");
             }
-            if let Some(e) = &p.exported {
-                t.push_str(&format!(" Wrote {}", e.display()));
+            if let Some((line, _)) = export_line(p) {
+                t.push(' ');
+                t.push_str(&line);
             }
             if let Some(w) = &p.fit_warning {
                 t.push_str(&format!(" {w}."));
@@ -1106,12 +1171,66 @@ pub fn slice_status(p: &PrintState) -> (String, Option<f32>) {
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct FabSettingsPanel {
+    #[rust]
+    machine_menu: Option<(EditOwner, Arc<[String]>)>,
     #[deref]
     view: View,
 }
 
+fn missing_machine(binding: &MachineBinding) -> Option<&str> {
+    match binding {
+        MachineBinding::Available { machine, explicit: Some(name), .. } if name != &machine.geometry.name => Some(name),
+        MachineBinding::MissingPreset(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// The target's machine menu and the preset names its picks will address.
+pub fn machine_menu(p: &PrintState) -> (Vec<MenuItem>, Arc<[String]>) {
+    let title = if p.links.title.is_empty() { "No printer" } else { &p.links.title };
+    let mut items = vec![MenuItem::heading(&format!("Machine for {title}"))];
+    if p.links.picked == PrinterChoice::None {
+        items.extend(names_menu(&p.profiles.machines, &p.settings.machine));
+        return (items, p.profiles.machines.clone().into());
+    }
+    let binding = p.printers.binding(&p.links.picked).map(Arc::as_ref);
+    let editable = matches!(p.links.picked, PrinterChoice::Real(_)) && !p.links.disconnected;
+    if let Some(MachineBinding::Available { machine, automatic, explicit, choices }) = binding {
+        let auto = MenuItem::new(live_id!(automatic_machine), &format!("Automatic ({})", automatic.geometry.name)).checked(explicit.is_none());
+        items.push(if editable { auto } else { auto.disabled() });
+        if editable {
+            if let Some(missing) = binding.and_then(missing_machine) {
+                items.push(MenuItem::new(LiveId(0), &format!("{missing} (missing)")).checked(true).disabled());
+            }
+            items.extend(names_menu(choices, explicit.as_deref().unwrap_or_default()));
+            return (items, choices.clone());
+        }
+        if p.links.layout.is_some() {
+            items.extend(names_menu(&p.profiles.machines, &p.settings.machine));
+            return (items, p.profiles.machines.clone().into());
+        }
+        items.push(MenuItem::new(LiveId(0), &machine.geometry.name).disabled());
+    } else {
+        let auto = MenuItem::new(live_id!(automatic_machine), "Automatic");
+        items.push(if editable { auto } else { auto.disabled() });
+        if let Some(missing) = binding.and_then(missing_machine) {
+            items.push(MenuItem::new(LiveId(0), &format!("{missing} (missing)")).checked(true).disabled());
+        }
+    }
+    (items, Arc::default())
+}
+
+fn machine_note(p: &PrintState) -> Option<String> {
+    let binding = p.printers.binding(&p.links.picked)?;
+    let missing = missing_machine(binding)?;
+    Some(match binding.machine() {
+        Some(machine) => format!("{missing} not found, using {}", machine.geometry.name),
+        None => format!("{missing} not found"),
+    })
+}
+
 impl FabSettingsPanel {
-    fn open(&self, cx: &mut Cx, tag: LiveId, anchor: Rect, state: &AppState) {
+    fn open(&mut self, cx: &mut Cx, tag: LiveId, anchor: Rect, state: &AppState) {
         let p = &state.print;
         let items = if tag == live_id!(print_source) {
             let mut v = vec![MenuItem::new(live_id!(installed), "Installed profiles").checked(p.settings.use_installed)];
@@ -1121,7 +1240,9 @@ impl FabSettingsPanel {
             v.push(MenuItem::new(live_id!(defaults), "Fab defaults").checked(!p.settings.use_installed));
             v
         } else if tag == live_id!(print_machine) {
-            names_menu(&p.profiles.machines, &p.settings.machine)
+            let (items, names) = machine_menu(p);
+            self.machine_menu = Some((EditOwner::new(PrinterScope::Target, p), names));
+            items
         } else if tag == live_id!(print_plate) {
             names_menu(&p.profiles.plates, &p.settings.plate)
         } else if tag == live_id!(print_process) {
@@ -1134,13 +1255,19 @@ impl FabSettingsPanel {
         }
     }
 
-    fn picks(&self, cx: &mut Cx, actions: &Actions, state: &AppState) {
+    fn picks(&mut self, cx: &mut Cx, actions: &Actions, state: &AppState) {
         let p = &state.print;
         if let Some(id) = menu_picked(actions, live_id!(print_source)) {
             cx.action(PrintAction::UseInstalled(id == live_id!(installed)));
         }
-        if let Some(n) = menu_picked(actions, live_id!(print_machine)).and_then(|id| picked_name(&p.profiles.machines, id)) {
-            cx.action(PrintAction::SetMachine(n));
+        if let Some(id) = menu_picked(actions, live_id!(print_machine)) {
+            if let Some((owner, names)) = self.machine_menu.take() {
+                if id == live_id!(automatic_machine) {
+                    cx.action(PrintAction::SetMachine(owner, None));
+                } else if let Some(name) = picked_name(&names, id) {
+                    cx.action(PrintAction::SetMachine(owner, Some(name)));
+                }
+            }
         }
         if let Some(n) = menu_picked(actions, live_id!(print_plate)).and_then(|id| picked_name(&p.profiles.plates, id)) {
             cx.action(PrintAction::SetPlate(n));
@@ -1171,7 +1298,7 @@ impl FabSettingsPanel {
             let at = p.colors.tools.iter().find(|pos| pos.head == m.nozzle && Some(pos.tray) == m.tray).map_or_else(|| p.colors.layout.heads.get(m.nozzle).cloned().unwrap_or_default(), |pos| pos.label(&p.colors.layout.heads));
             format!("{at}: {}", m.preset)
         }).collect();
-        let note = [materials.join("\n"), p.profiles.note.clone()].into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n");
+        let note = [materials.join("\n"), p.profiles.note.clone(), machine_note(p).unwrap_or_default()].into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n");
         v.label(cx, ids!(colours.note)).set_text(cx, note.trim());
 
         let (status, progress) = slice_status(p);
@@ -1231,14 +1358,28 @@ impl Widget for FabSettingsPanel {
 #[derive(Script, ScriptHook, Widget)]
 pub struct FabPrinterPanel {
     #[rust]
+    start_press: Option<PrintAction>,
+    #[rust]
     control_destination: Option<ControlDestination>,
     #[rust]
-    mode_printer: Option<String>,
+    can_switch_mode: bool,
+    #[rust]
+    speed_destination: Option<ControlDestination>,
+    #[rust]
+    edit_owner: EditOwner,
+    #[rust]
+    layout: Option<VirtualControls>,
+    #[rust]
+    menu_edit: Option<(EditOwner, Option<VirtualControls>)>,
     #[deref]
     view: View,
     /// The press of Print last brought into view.
     #[rust]
     asked: u64,
+    /// A press of Print whose question is to be scrolled into view once it is drawn: the draws
+    /// left to try (the panel may be laid out anew on the press, its stack shown or resized).
+    #[rust]
+    reveal_confirm: u8,
     /// Which of the printability errors "Show layer" goes to next.
     #[rust]
     next_issue: usize,
@@ -1266,26 +1407,29 @@ impl FabPrinterPanel {
     /// Set the link label and layout controls from the last pick or layout edit.
     fn sync_links(&mut self, cx: &mut Cx, p: &PrintState) {
         let links = &p.links;
+        self.edit_owner.capture(PrinterScope::Target, p);
+        self.layout = links.layout;
         let label = if links.title.is_empty() { p.target_printer().map(|p| p.name.as_str()) } else { Some(links.title.as_str()) };
-        self.view.label(cx, ids!(body.active.hdr.title)).set_text(cx, label.unwrap_or(""));
-        self.mode_printer = match &links.picked {
-            PrinterChoice::Real(config) if p.resin.is_none() && (p.target_printer().is_some() || links.disconnected) => Some(config.clone()),
-            _ => None,
-        };
+        self.view.prop_section(cx, ids!(body.active)).header().label(cx, ids!(hdr.title)).set_text(cx, label.unwrap_or(""));
+        self.can_switch_mode = matches!(links.picked, PrinterChoice::Real(_)) && p.resin.is_none()
+            && (p.target_printer().is_some() || links.disconnected);
         let modes = self.view.view(cx, ids!(body.active.modes));
-        self.view.view(cx, ids!(body.active.mode_row)).set_visible(cx, self.mode_printer.is_some());
+        self.view.view(cx, ids!(body.active.mode_row)).set_visible(cx, self.can_switch_mode);
         let disconnected = p.target_printer().map_or(links.disconnected, |s| s.virtual_printer);
         for (id, active) in [(ids!(connected), !disconnected), (ids!(disconnected), disconnected)] {
             let button = modes.radio_button(cx, id);
             if button.active(cx) != active { button.set_active(cx, active, Animate::No); }
         }
         let note = self.view.label(cx, ids!(body.active.link_note));
-        note.set_visible(cx, !links.note.is_empty());
-        note.set_text(cx, &links.note);
+        // The shown job card can carry the target refusal only while showing its report.
+        let refusal = p.print_blocked.get(&links.picked).filter(|_| (p.target_printer().is_none() || p.shown_choice() != &links.picked) && p.resin.is_none());
+        let text = refusal.unwrap_or(&links.note);
+        note.set_visible(cx, !text.is_empty());
+        note.set_text(cx, text);
         let card = self.view.view(cx, ids!(body.active.virtual_card));
         card.set_visible(cx, links.layout.is_some() && p.resin.is_none());
         // a printer with neither a link mode nor a virtual layout: nothing to set
-        self.view.label(cx, ids!(body.active.no_settings)).set_visible(cx, self.mode_printer.is_none() && (links.layout.is_none() || p.resin.is_some()));
+        self.view.label(cx, ids!(body.active.no_settings)).set_visible(cx, !self.can_switch_mode && (links.layout.is_none() || p.resin.is_some()));
         let Some(layout) = links.layout else { return };
         let nozzles = layout.kind == VirtualKind::Nozzles;
         card.label(cx, ids!(kind_row.kind.label)).set_text(cx, if nozzles { "Nozzles" } else { "Toolchanger" });
@@ -1300,12 +1444,12 @@ impl FabPrinterPanel {
     }
 
     /// Open a picker or turn a control press into one complete layout change.
-    fn link_actions(&self, cx: &mut Cx, actions: &Actions, p: &PrintState) {
+    fn link_actions(&mut self, cx: &mut Cx, actions: &Actions, p: &PrintState) {
         let links = &p.links;
-        if let Some(config) = &self.mode_printer {
+        if self.can_switch_mode {
             let modes = self.view.view(cx, ids!(body.active.modes));
             if let Some(i) = modes.radio_button_set(cx, ids_array!(connected, disconnected)).selected(cx, actions) {
-                cx.action(PrintAction::PrinterMode(config.clone(), i == 1));
+                cx.action(PrintAction::PrinterMode(self.edit_owner.clone(), i == 1));
             }
         }
         for action in ui_actions(actions) {
@@ -1317,6 +1461,7 @@ impl FabPrinterPanel {
             } else if *tag == live_id!(virtual_reset) {
                 links.presets.iter().map(|(name, title)| MenuItem::new(LiveId::from_str(name), title)).collect()
             } else { continue };
+            self.menu_edit = Some((self.edit_owner.clone(), self.layout));
             open_menu(cx, *tag, items, *anchor, MenuPlace::Below);
         }
         // Add printer: a virtual twin of a model (it is put in use), or how to add a network printer
@@ -1331,20 +1476,26 @@ impl FabPrinterPanel {
             }
             items.push(MenuItem::sep());
             items.push(MenuItem::new(live_id!(network_printer), "Network printer: its address and access code in ~/.makepad/fab/printers").disabled());
+            self.menu_edit = Some((self.edit_owner.clone(), self.layout));
             open_menu(cx, live_id!(add_printer), items, anchor, MenuPlace::Below);
         }
         if let Some(preset) = menu_picked(actions, live_id!(add_printer)).and_then(|id| links.twin_presets.iter().find(|preset| twin_id(preset) == id)) {
-            cx.action(PrintAction::MakeTwin(preset.clone()));
+            if let Some((owner, _)) = self.menu_edit.take() { cx.action(PrintAction::MakeTwin(owner, preset.clone())); }
         }
-        let Some(mut l) = links.layout else { return };
         if let Some(id) = menu_picked(actions, live_id!(virtual_reset)) {
             if let Some((name, _)) = links.presets.iter().find(|(n, _)| LiveId::from_str(n) == id) {
-                cx.action(PrintAction::ResetVirtual(name.clone()));
+                if let Some((owner, _)) = self.menu_edit.take() { cx.action(PrintAction::ResetVirtual(owner, name.clone())); }
             }
             return;
         }
+        let kind_pick = menu_picked(actions, live_id!(virtual_kind));
+        let (owner, layout) = if kind_pick.is_some() {
+            let Some(menu) = self.menu_edit.as_ref() else { return };
+            (&menu.0, menu.1)
+        } else { (&self.edit_owner, self.layout) };
+        let Some(mut l) = layout else { return };
         let card = self.view.view(cx, ids!(body.active.virtual_card));
-        if let Some(id) = menu_picked(actions, live_id!(virtual_kind)) {
+        if let Some(id) = kind_pick {
             let kind = if id == live_id!(nozzles) { VirtualKind::Nozzles } else { VirtualKind::Toolchanger };
             if l.kind == kind { return; }
             l.kind = kind;
@@ -1355,32 +1506,35 @@ impl FabPrinterPanel {
         else if card.button(cx, ids!(trays_row.plus)).clicked(actions) { l.trays += 1; }
         else if let Some(on) = card.check_box(cx, ids!(tpu_row.tpu)).changed(actions) { l.tpu = on; }
         else { return; }
-        cx.action(PrintAction::VirtualLayout { kind: l.kind, heads: l.heads, trays: l.trays, tpu: l.tpu });
+        cx.action(PrintAction::VirtualLayout { owner: owner.clone(), kind: l.kind, heads: l.heads, trays: l.trays, tpu: l.tpu });
     }
 
     fn sync(&mut self, cx: &mut Cx, state: &AppState) {
         let p = &state.print;
+        self.start_press = None;
+        self.speed_destination = None;
         self.sync_links(cx, p);
         let v = &self.view;
-        // Every press of Print shows the top of the panel: the confirm card, or "No printer linked".
+        // Every press of Print shows the top of the panel (the confirm card, or "No printer
+        // linked"), then, once drawn, the print's question, its buttons on screen however short
+        // the panel is (`draw_walk`).
         if self.asked != p.confirm_asked {
             self.asked = p.confirm_asked;
             v.widget(cx, ids!(body)).set_scroll_pos(cx, dvec2(0.0, 0.0));
+            self.reveal_confirm = 30;
         }
-        self.control_destination = if p.resin.is_some() { None } else { ControlDestination::filament(p) };
+        self.control_destination = if p.resin.is_some() { None } else { ControlDestination::filament(PrinterScope::Shown, p) };
         if let Some(r) = &p.resin {
             self.sync_resin(cx, state, r);
             return;
         }
+        self.sync_confirm(cx, state);
+        let v = &self.view;
         v.widget(cx, ids!(body.orient)).set_visible(cx, false);
         // calibration: for the printer and filament the job uses
         let cal = &p.calibrate;
         v.widget(cx, ids!(body.calibrate_part)).set_visible(cx, true);
-        v.label(cx, ids!(body.calibrate_part.cal_context)).set_text(cx, &if cal.printer.is_empty() || cal.filament.is_empty() {
-            "Choose a printer and filament in the Job editor".to_string()
-        } else {
-            format!("For {} · {}", cal.printer, cal.filament)
-        });
+        v.label(cx, ids!(body.calibrate_part.cal_context)).set_text(cx, &cal.context_text());
         v.label(cx, ids!(body.calibrate_part.cal_status)).set_visible(cx, !cal.status.is_empty());
         v.label(cx, ids!(body.calibrate_part.cal_status)).set_text(cx, &cal.status);
         // the camera: in Status, or floating over the window (then a line and the way back)
@@ -1395,15 +1549,15 @@ impl FabPrinterPanel {
         none.label(cx, ids!(title)).set_text(cx, title);
         none.label(cx, ids!(text)).set_text(cx, text);
         v.widget(cx, ids!(body.active)).set_visible(cx, in_use && self.active_shows(p));
-        let (pill_state, pill_text) = p.shown_printer().map_or((0.0, "Connecting".to_string()), |printer| printer_status(printer));
+        let shown = p.shown_printer();
+        let (pill_state, pill_text) = shown.map_or((0.0, "Connecting".to_string()), |printer| printer_status(printer));
         self.set_pill(cx, pill_state, &pill_text);
         for path in [ids!(body.card), ids!(body.trays_card)] {
-            v.widget(cx, path).set_visible(cx, p.shown_printer().is_some());
+            v.widget(cx, path).set_visible(cx, shown.is_some());
         }
         v.widget(cx, ids!(body.map_card)).set_visible(cx, true);
-        let Some(printer) = p.shown_printer() else {
+        let Some(printer) = shown else {
             v.view(cx, ids!(body.job)).set_visible(cx, false);
-            v.widget(cx, ids!(body.confirm)).set_visible(cx, false);
             v.widget(cx, ids!(body.stats_card)).set_visible(cx, false);
             return;
         };
@@ -1442,18 +1596,24 @@ impl FabPrinterPanel {
         // The job on its way or on the printer; Monitor shows it at the top of its view.
         let job_shown = job_card::job_view(p, Cx::time_now()).is_some();
         v.widget(cx, ids!(body.job)).set_visible(cx, job_shown && !state.ui.in_mode(crate::api::PlateMode::Monitor));
-        let gcode = s.gcode_state.as_deref().unwrap_or("");
+    }
 
-        // The confirm card: open from the press until Cancel or Start print, whatever the slice is
-        // doing; the app's checks decide what stands in the way.
-        let confirm = v.widget(cx, ids!(body.confirm));
-        confirm.set_visible(cx, supported && p.confirm_print);
-        if supported && p.confirm_print {
-            let row = confirm.view(cx, ids!(speed_row));
-            job_card::sync_speed_row(cx, &row, job_card::speed_before_start(p, printer));
+    fn sync_confirm(&mut self, cx: &mut Cx, state: &AppState) {
+        let p = &state.print;
+        let confirm = self.view.widget(cx, ids!(body.confirm));
+        let printer = confirm_report(p).filter(|_| fab_printer_link::printing_supported());
+        confirm.set_visible(cx, printer.is_some());
+        let Some(printer) = printer else { return };
+        if let (Some(PrintConfirm::Filament(ticket)), Some(preview)) = (&p.confirm_print, &p.preview) {
+            self.start_press = Some(PrintAction::SendToPrinter { ticket: ticket.clone(), preview: preview.id });
         }
+        let row = confirm.view(cx, ids!(speed_row));
+        let speed = job_card::confirm_speed(p);
+        job_card::sync_speed_row(cx, &row, speed.as_ref().map(|(_, speed)| *speed));
+        self.speed_destination = speed.map(|(dest, _)| dest);
+        let gcode = printer.state.gcode_state.as_deref().unwrap_or("");
         confirm.view(cx, ids!(stick_row)).set_visible(cx, false);
-        let (question, progress) = confirm_question(p, &printer.name, state.plate.parts.is_empty());
+        let (question, progress) = confirm_question(p, printer, state.plate.parts.is_empty());
         confirm.label(cx, ids!(question)).set_text(cx, &question);
         let bar = confirm.view(cx, ids!(progress));
         bar.set_visible(cx, progress.is_some());
@@ -1469,11 +1629,11 @@ impl FabPrinterPanel {
         confirm.label(cx, ids!(check)).set_text(cx, &check);
         let blocker = p.send_blocked.as_deref();
         // Accepted printability errors stay named, above whatever else stops Start print.
-        let accepted = p.errors_accepted().then(|| p.errors_text()).flatten();
+        let accepted = (p.calibration_wait().is_none() && p.calibration_error.is_none() && p.errors_accepted()).then(|| p.errors_text()).flatten();
         let said: Vec<&str> = accepted.as_deref().into_iter().chain(blocker).collect();
         confirm.label(cx, ids!(blocker)).set_text(cx, &said.join("\n"));
         confirm.label(cx, ids!(blocker)).set_visible(cx, !said.is_empty());
-        confirm.button(cx, ids!(buttons.go)).set_visible(cx, p.can_send() && blocker.is_none());
+        confirm.button(cx, ids!(buttons.go)).set_visible(cx, self.start_press.is_some() && p.can_send() && blocker.is_none());
         confirm.button(cx, ids!(buttons.go)).set_text(cx, if p.printer_busy() { "Queue print" } else { "Start print" });
         let errors = self.show_issue(cx, &confirm, p);
         // Printability errors alone, on a settled slice: the person may print anyway.
@@ -1539,7 +1699,7 @@ impl FabPrinterPanel {
         active.set_visible(cx, in_use && self.active_shows(p));
         let Some(id) = p.links.picked.id() else { return };
         let title = p.links.choices.iter().find(|(c, _)| *c == p.links.picked).map(|(_, t)| t.clone()).unwrap_or_default();
-        active.label(cx, ids!(hdr.title)).set_text(cx, &title);
+        active.as_prop_section().header().label(cx, ids!(hdr.title)).set_text(cx, &title);
         let of = JobsOf::Printer(id);
         let (count, printing) = jobs_count(p, &of);
         let (dot, text) = match count {
@@ -1581,8 +1741,12 @@ impl FabPrinterPanel {
 
     /// Where the printability errors are, one press each: the confirm card's button. The errors.
     fn show_issue(&self, cx: &mut Cx, confirm: &WidgetRef, p: &PrintState) -> Vec<usize> {
-        let errors = p.print_errors();
         let show = confirm.button(cx, ids!(show_issue));
+        if p.calibration_error.is_some() || p.calibration_wait().is_some() {
+            show.set_visible(cx, false);
+            return Vec::new();
+        }
+        let errors = p.print_errors();
         show.set_visible(cx, !errors.is_empty());
         if !errors.is_empty() {
             let next = self.next_issue % errors.len();
@@ -1635,7 +1799,7 @@ impl FabPrinterPanel {
         };
         card.set_visible(cx, shown.is_some());
         active.set_visible(cx, true);
-        active.label(cx, ids!(hdr.title)).set_text(cx, shown.map_or("Resin printer", |name| job.map_or(name, |j| j.printer.as_str())));
+        active.as_prop_section().header().label(cx, ids!(hdr.title)).set_text(cx, shown.map_or("Resin printer", |name| job.map_or(name, |j| j.printer.as_str())));
         if shown.is_none() {
             self.set_pill(cx, 0.0, "Not linked");
         }
@@ -1667,8 +1831,9 @@ impl FabPrinterPanel {
 
         // the confirm card: open from the press until Cancel or Start print
         let confirm = v.widget(cx, ids!(body.confirm));
-        confirm.set_visible(cx, p.confirm_print);
-        if p.confirm_print {
+        confirm.set_visible(cx, p.confirm_print == Some(PrintConfirm::Resin));
+        if p.confirm_print == Some(PrintConfirm::Resin) {
+            self.start_press = Some(PrintAction::SendResin { stack: r.stack });
             confirm.view(cx, ids!(speed_row)).set_visible(cx, false);
         }
         let empty = state.plate.parts.is_empty();
@@ -1769,15 +1934,15 @@ impl Widget for FabPrinterPanel {
         let confirm = v.widget(cx, ids!(body.confirm));
         if confirm.visible() {
             let row = confirm.view(cx, ids!(speed_row));
-            if let Some(speed) = job_card::picked_speed(cx, &row, actions) {
-                cx.action(PrintAction::SetVirtualSpeed(speed));
+            if let (Some(dest), Some(speed)) = (&self.speed_destination, job_card::picked_speed(cx, &row, actions)) {
+                cx.action(PrintAction::SetVirtualSpeed(dest.clone(), speed));
             }
         }
         if confirm.button(cx, ids!(buttons.cancel)).clicked(actions) {
             cx.action(PrintAction::AskPrint(false));
         }
         if confirm.button(cx, ids!(buttons.go)).clicked(actions) {
-            cx.action(PrintAction::SendToPrinter);
+            if let Some(press) = &self.start_press { cx.action(press.clone()); }
         }
         if confirm.button(cx, ids!(show_issue)).clicked(actions) {
             let errors = state.print.print_errors();
@@ -1845,13 +2010,119 @@ impl Widget for FabPrinterPanel {
         if let Some(state) = scope.data.get::<AppState>() {
             self.sync(cx, state);
         }
-        self.view.draw_walk(cx, scope, walk)
+        let step = self.view.draw_walk(cx, scope, walk);
+        if step.is_done() && self.reveal_confirm > 0 {
+            self.reveal_confirm -= 1;
+            let confirm = self.view.widget(cx, ids!(body.confirm));
+            let rect = confirm.area().rect(cx);
+            // on screen: within the panel's own rect (the body's is what it scrolls, not what shows)
+            let panel = self.view.area().rect(cx);
+            let inside = rect.pos.y >= panel.pos.y - 0.5 && rect.pos.y + rect.size.y <= panel.pos.y + panel.size.y + 0.5;
+            // (kept up for its draws: the press may lay the panel out anew a frame or two on)
+            if confirm.visible() && rect.size.y > 0.0 && !inside {
+                if let Some(mut body) = self.view.widget(cx, ids!(body)).borrow_mut::<ScrollShadowView>() {
+                    body.scroll_into_view_abs(cx, rect);
+                }
+                self.view.redraw(cx);
+            }
+        }
+        step
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn export_wording_keeps_success_quiet_and_failure_actionable() {
+        let mut p = PrintState::default();
+        assert_eq!(export_line(&p), None);
+        assert_eq!(slice_status(&p).0, "Not sliced yet.");
+        p.export = ExportStatus::Exporting;
+        assert_eq!(slice_status(&p).0, "Exporting…");
+        p.status = SliceStatus::Running { progress: 0.5, stage: "Planning".into() };
+        assert_eq!(slice_status(&p), ("Exporting · Planning…".into(), Some(0.5)));
+        p.status = SliceStatus::Done { seconds: 1.25 };
+        p.export = ExportStatus::Written("plate.gcode.3mf".into());
+        assert_eq!(export_line(&p), Some(("Wrote plate.gcode.3mf".into(), false)));
+        assert_eq!(slice_status(&p).0, "Sliced in 1.2 s. Wrote plate.gcode.3mf");
+        assert_eq!(stage_failure(&p), None);
+        p.export = ExportStatus::Failed("write refused\nmore detail".into());
+        assert_eq!(slice_status(&p).0, "Sliced in 1.2 s. Export failed: write refused");
+        assert_eq!(export_line(&p), Some(("Export failed: write refused".into(), true)));
+        assert_eq!(stage_failure(&p).as_deref(), Some("Export failed: write refused"));
+        p.export = ExportStatus::Failed(String::new());
+        assert_eq!(export_failure(&p).as_deref(), Some("Export failed: could not write the file"));
+        p.export = ExportStatus::Idle;
+        p.status = SliceStatus::Failed("bad slice".into());
+        assert_eq!(stage_failure(&p).as_deref(), Some("Slice failed: bad slice"));
+        p.resin = Some(resin::ResinShow { export: "Export failed: layer write refused\nmore detail".into(), ..Default::default() });
+        assert_eq!(stage_failure(&p).as_deref(), Some("Export failed: layer write refused"));
+    }
+
+    #[test]
+    fn split_printer_scopes_follow_the_surface_that_was_drawn() {
+        use fab_printer_link::{model::TrayId, Snapshot};
+        use jobs::{CommittedJob, JobMeta, JobState};
+        let [a, b] = ["A", "B"].map(|name| PrinterChoice::Real(name.into()));
+        let mut p = PrintState::default();
+        p.links.picked = a.clone();
+        p.printers.set(&a, 1, Arc::new(Snapshot { name: "A".into(), ..Default::default() }));
+        let report_b = Arc::new(Snapshot { name: "B".into(), virtual_printer: true, state: Arc::new(numbered_report()), ..Default::default() });
+        p.printers.set(&b, 2, report_b.clone());
+        let target = EditOwner::new(PrinterScope::Target, &p);
+        let target_control = ControlDestination::filament(PrinterScope::Target, &p).unwrap();
+        let shown_a = EditOwner::new(PrinterScope::Shown, &p);
+        let late_stop = ControlDestination::filament(PrinterScope::Shown, &p).unwrap();
+        p.shown = Some(b.clone());
+        assert!(!late_stop.matches(&p), "a late Monitor Stop for A must be refused while B is shown, even though A is the target");
+        assert!(!shown_a.matches(&p), "an edit drawn for shown A must be refused on B");
+        assert!(target.matches(&p) && target_control.matches(&p), "A's target edit and control survive showing B");
+        let shown_b = EditOwner::new(PrinterScope::Shown, &p);
+        let b_control = ControlDestination::filament(PrinterScope::Shown, &p).unwrap();
+        assert!(shown_b.matches(&p) && b_control.matches(&p), "B's shown edit and control match B");
+        let mut map_owner = EditOwner::default();
+        colour_map::capture_tray_owner(&mut map_owner, &p);
+        assert_eq!(map_owner, target, "the colour map must capture target A when B is shown");
+
+        let layout = trays::editable_layout(&p).expect("shown B offers a virtual tray menu");
+        let slot = TrayId { ams: 3, slot: 0 };
+        let tray = layout.trays.iter().find(|t| t.pos.tray == slot).expect("the telemetry menu must use B's fourth tool, absent on target A");
+        assert_eq!((tray.pos.head, layout.heads[tray.pos.head].as_str()), (3, "Tool 4"), "the editable position and menu label belong to B's profile");
+
+        apply(&mut p, &PrintAction::AskPrint(true));
+        p.preview = Some(follow::tests::preview_of(1));
+        p.settled = true;
+        let question = |p: &PrintState| {
+            let report = confirm_report(p).expect("A's confirmation must stay visible");
+            confirm_question(p, report, false).0
+        };
+        assert_eq!(question(&p), "Print the sliced plate on A? It uploads to the printer's USB drive and starts at once.",
+            "A's question uses its own name, connected mode and idle state while virtual B is busy");
+        p.print_blocked.set(&a, Some("A refused".into()));
+        p.print_blocked.set(&b, Some("B refused".into()));
+        assert_eq!(job_card::job_view(&p, 0.0).unwrap().phase, "B refused", "the shown job card names B's refusal");
+        apply(&mut p, &PrintAction::CloseJob);
+        assert!(p.print_blocked.get(&b).is_none() && p.print_blocked.get(&a) == Some("A refused"), "closing B's refusal preserves A's refusal");
+        for (id, printer) in [("a-job", &a), ("b-job", &b)] {
+            p.follow.jobs.push(CommittedJob { meta: Arc::new(JobMeta { id: id.into(), printer: printer.id(), ..Default::default() }), ..Default::default() });
+            p.sending.push(Sending { job: id.into(), printer: printer.clone() });
+        }
+        assert_eq!(job_card::job_view(&p, 0.0).unwrap().cancel_job.as_deref(), Some("b-job"), "the shown job card uses B's send");
+        let mut sent = p.follow.job_of("b-job").unwrap().clone();
+        sent.state = JobState::Sent;
+        p.shown = None;
+        assert!(p.unwatched_while_virtual(&sent), "B's real row sees B's held virtual link while A is both target and shown");
+        assert!(!shown_b.matches(&p) && !b_control.matches(&p), "B's shown actions expire when Monitor returns to A");
+        p.shown = Some(b.clone());
+        p.printers.set(&b, 2, Arc::new(Snapshot { virtual_printer: false, ..(*report_b).clone() }));
+        assert!(!shown_b.matches(&p) && !b_control.matches(&p), "a different reported mode refuses the old virtual edit and control");
+        p.printers.install(&b, 3, true);
+        assert!(p.shown_printer().is_none() && question(&p).contains("plate on A?"), "A's confirm survives B having no report");
+        p.printers.set(&b, 3, report_b);
+        assert!(!shown_b.matches(&p) && !b_control.matches(&p), "B's replacement refuses both old incarnations");
+    }
 
     #[test]
     fn failed_printer_status_distinguishes_a_stopped_job() {

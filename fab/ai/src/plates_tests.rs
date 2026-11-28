@@ -172,6 +172,11 @@ fn a_plate_switched_back_to_is_not_built_again() {
     let changed = s.counts().0;
     s.switch(&b).unwrap();
     assert!(s.counts().0 > changed, "b is built again for the new tolerance");
+    // a went aside built at the old tolerance (nothing built it again on the bed): back on the
+    // bed it is built again too, not shown with print meshes of the old one
+    let b_built = s.counts().0;
+    s.switch(&a).unwrap();
+    assert!(s.counts().0 > b_built, "a, built at the old tolerance, is built again for the new one");
 
     // two plates keep their build: the third most recent is built again
     s.replace_model(block("c"), None).unwrap();

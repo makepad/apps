@@ -11,7 +11,9 @@
 //!   belongs to (by default [`ChatHost::chat_call`]) and its answer goes back
 //!   when [`ChatHost::chat_answer`] has it; a long call keeps the chat's
 //!   deadline alive with [`ChatHost::chat_progress`]. Each line the person
-//!   sends starts their next turn ([`ChatHost::chat_turn_started`]).
+//!   sends starts their next turn when the model gets it: at once, or when the turn it waits
+//!   behind ends ([`ChatHost::chat_turn_started`]). The engine's line log says so; a line a stop
+//!   drops starts none.
 //! - **Turn actions.** A product puts buttons under a finished turn's answer
 //!   ([`ChatDock::set_turn_actions`]). The first call the turn made locates the
 //!   answer in the transcript. A press comes back to [`ChatHost::chat_turn_action`].
@@ -30,7 +32,9 @@
 //!   ([`ChatHost::chat_marks_picture`], [`ChatHost::chat_marks_text`]), and the line goes with
 //!   that picture (it is a picture of the chat like the others) and the text in its context.
 //! - **Notes.** Pages say what happened through a [`ChatOutbox`]: lines in
-//!   the transcript, a card to open, a line as if typed.
+//!   the transcript, a card to open, a line as if typed. A line sent with a receipt
+//!   ([`ChatOutbox::say_tracked`]) is sent exactly as written, and the product hears what became of
+//!   it ([`ChatHost::chat_said`]).
 //!
 //! The window's template names the panel `ai_chat` and the splitter that
 //! docks it `chat_split`. F10, the bridge's `/ai` routes and a toolbar
@@ -39,8 +43,8 @@
 //!
 //! Main-loop cost: every pump drains the services' channels (empty most of
 //! the time), reads each call's progress and task card once, and compares the
-//! conversation's generation; when it changed, it walks back over the entries
-//! after the person's newest line. Task cards keep
+//! length of the engine's line log with what it read (one compare when no line
+//! started or dropped). Task cards keep
 //! a quarter-second timer; changed readings are sent at most four times a second.
 //! The target, the suggestions and the picture are looked at ten times a second
 //! at most, and only while the chat is showing.
@@ -51,7 +55,7 @@ pub mod picture;
 
 use makepad_ai_services::engine::{ModelImage, ServiceRegistry};
 use makepad_ai_services::port::{AiServicePort, PortEvent};
-use makepad_ai_services::state::Entry;
+use makepad_ai_services::state::{EngineState, Entry, LineFate};
 use makepad_ai_services::wire::{CallOrigin, ServiceManifest, TaskCard, ToolResult};
 use makepad_ai_services::{Suggestion, Target};
 use makepad_app_aichat::attach::Source;
@@ -60,6 +64,7 @@ use makepad_strict_json::Value;
 use makepad_widgets::ai_slot::AiSlotRequests;
 use makepad_widgets::*;
 use picture::{Pixels, Waiting};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// How often the target, the suggestions and the picture are looked at.
@@ -90,7 +95,33 @@ pub enum ChatOut {
     Propose { app: String, tool: String, prefill: String },
     /// A line as if the person had typed it.
     Say(String),
+    /// A line sent exactly as written, whose fate goes to its receipt ([`ChatHost::chat_said`]).
+    SayTracked { receipt: u64, words: String },
 }
+
+/// What became of a line sent with a receipt ([`ChatOutbox::say_tracked`]). Every receipt hears
+/// `Queued` at most once, then either ends in `Cancelled` or `Refused`, or reaches `Started(turn)`
+/// (after which it may still hear `Stopped` or `Failed` if the turn is cut short before finishing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatSaid {
+    /// It waits behind the turn that runs.
+    Queued,
+    /// The model got it: it is the person's turn `turn` ([`ChatHost::chat_turn_started`] came
+    /// first).
+    Started(u64),
+    /// A stop dropped it before the model got it.
+    Cancelled,
+    /// The person stopped the running turn (Stop, Escape, New chat, or model swap) after it started.
+    Stopped,
+    /// The running turn ended on a model error after it started.
+    Failed,
+    /// It was not sent, and why.
+    Refused(&'static str),
+}
+
+/// Receipts are unique in the process: every page's outbox and the dock's own draw from one
+/// counter.
+static NEXT_RECEIPT: AtomicU64 = AtomicU64::new(1);
 
 /// What a page asks of the chat since the window last looked: the page
 /// keeps one, the window hands it to [`ChatDock::post`] each pump.
@@ -112,6 +143,14 @@ impl ChatOutbox {
     /// A line to the chat as if the person had typed it.
     pub fn say(&mut self, words: String) {
         self.0.push(ChatOut::Say(words));
+    }
+
+    /// Exactly `words` as the person's line (the composer's text, pictures and marks stay as
+    /// they are), and the receipt its fate comes back under ([`ChatHost::chat_said`]).
+    pub fn say_tracked(&mut self, words: String) -> u64 {
+        let receipt = NEXT_RECEIPT.fetch_add(1, Ordering::Relaxed);
+        self.0.push(ChatOut::SayTracked { receipt, words });
+        receipt
     }
 
     pub fn take(&mut self) -> Vec<ChatOut> {
@@ -176,7 +215,7 @@ pub struct ChatDock {
     /// The splitter shows the chat.
     open: bool,
     look: Look,
-    /// The person's turn the conversation's calls belong to now, from 1 ([`person_turn`]).
+    /// The person's turn the conversation's calls belong to now, from 1 ([`ChatDock::read_log`]).
     turn: u64,
     /// Each turn's first call id, in turn order.
     turn_calls: Vec<(u64, String)>,
@@ -184,10 +223,27 @@ pub struct ChatDock {
     turn_actions: Vec<(u64, Vec<TurnButton>)>,
     /// The panel needs the current turns and buttons.
     turn_actions_changed: bool,
-    /// The conversation's generation the pump last looked at.
-    seen_generation: Option<u64>,
-    /// The person's newest line then, and how many entries followed it.
-    newest_line: Option<(String, usize)>,
+    /// The engine's line log entries read so far.
+    log_read: usize,
+    /// Lines sent with a receipt that have not started or been dropped yet.
+    tracked: Vec<Tracked>,
+    /// The tracked line that is running, `(line id, receipt)`, until it stops or fails or the next
+    /// turn starts.
+    active_tracked: Option<(u64, u64)>,
+}
+
+/// A line sent with a receipt, until it starts or is dropped.
+struct Tracked {
+    line: u64,
+    receipt: u64,
+    /// It heard it waits.
+    queued: bool,
+}
+
+/// What the line log says, for the product, in order.
+enum Heard {
+    Turn(u64),
+    Said(u64, ChatSaid),
 }
 
 impl ChatDock {
@@ -238,10 +294,71 @@ impl ChatDock {
         self.drawn |= self.in_draw;
     }
 
+    /// The line log since the last read, as the person's turns and the receipts' news, in order.
+    /// The turn moves only when a line really starts. A tracked line still waiting after the read
+    /// hears so once. The first calls of turns gone from the transcript go, with their buttons.
+    fn read_log(&mut self, state: &EngineState) -> Vec<Heard> {
+        let log = &state.line_log;
+        let mut heard = Vec::new();
+        let mut started = false;
+        for fate in &log[self.log_read..] {
+            match *fate {
+                LineFate::Started(line) => {
+                    self.turn += 1;
+                    started = true;
+                    self.active_tracked = None;
+                    heard.push(Heard::Turn(self.turn));
+                    if let Some(at) = self.tracked.iter().position(|t| t.line == line) {
+                        let receipt = self.tracked.remove(at).receipt;
+                        self.active_tracked = Some((line, receipt));
+                        heard.push(Heard::Said(receipt, ChatSaid::Started(self.turn)));
+                    }
+                }
+                LineFate::Dropped(line) => {
+                    if let Some(at) = self.tracked.iter().position(|t| t.line == line) {
+                        heard.push(Heard::Said(self.tracked.remove(at).receipt, ChatSaid::Cancelled));
+                    }
+                }
+                LineFate::Stopped(line) => {
+                    if let Some((_, receipt)) = self.active_tracked.take_if(|(active, _)| *active == line) {
+                        heard.push(Heard::Said(receipt, ChatSaid::Stopped));
+                    }
+                }
+                LineFate::Failed(line) => {
+                    if let Some((_, receipt)) = self.active_tracked.take_if(|(active, _)| *active == line) {
+                        heard.push(Heard::Said(receipt, ChatSaid::Failed));
+                    }
+                }
+            }
+        }
+        self.log_read = log.len();
+        for tracked in self.tracked.iter_mut().filter(|t| !t.queued) {
+            tracked.queued = true;
+            heard.push(Heard::Said(tracked.receipt, ChatSaid::Queued));
+        }
+        if started {
+            let (turn_calls, turn_actions) = (&mut self.turn_calls, &mut self.turn_actions);
+            let mut changed = false;
+            turn_calls.retain(|(turn, call_id)| {
+                if state.tool(call_id).is_some() {
+                    return true;
+                }
+                if let Ok(at) = turn_actions.binary_search_by_key(turn, |(turn, _)| *turn) {
+                    turn_actions.remove(at);
+                }
+                changed = true;
+                false
+            });
+            self.turn_actions_changed |= changed;
+        }
+        heard
+    }
+
     /// The panel, once the window has it.
     pub fn panel(&mut self, cx: &mut Cx, window: &WidgetRef) -> Option<WidgetRef> {
         if self.panel.is_none() {
-            let panel = window.widget(cx, ids!(ai_chat));
+            // By its splitter: every `Window` also holds an `ai_chat` slot.
+            let panel = window.widget(cx, ids!(chat_split.ai_chat));
             if panel.is_empty() {
                 return None;
             }
@@ -293,17 +410,22 @@ pub trait ChatHost {
     fn chat_services(&mut self) -> Vec<ServiceManifest>;
     /// Run a tool for the chat; the id its answer comes back under.
     fn chat_call(&mut self, cx: &mut Cx, tool: &str, args: Value) -> u64;
-    /// Run a tool for its caller. The person's first line starts turn 1. Each new line starts
-    /// the next turn. Remote calls arrive as [`ChatCaller::Outside`]. A product can use the
-    /// turn to group work for undo. By default the call runs as [`ChatHost::chat_call`].
+    /// Run a tool for its caller. The person's first line the model gets starts turn 1, and each
+    /// one after it the next turn ([`ChatHost::chat_turn_started`]); a call belongs to the turn
+    /// running when the model made it. Remote calls arrive as [`ChatCaller::Outside`]. A product
+    /// can use the turn to group work for undo. By default the call runs as
+    /// [`ChatHost::chat_call`].
     fn chat_turn_call(&mut self, cx: &mut Cx, tool: &str, args: Value, _caller: ChatCaller) -> u64 {
         self.chat_call(cx, tool, args)
     }
     /// A call refused before dispatch. The argument text is private and may be malformed.
     fn chat_refused(&mut self, _cx: &mut Cx, _tool: &str, _call_id: &str, _raw_args: &str, _reason: &str, _caller: ChatCaller) {}
-    /// The person sent a line: their turn `turn` starts (whether the model takes it now or at the
-    /// end of the turn it is in). A product ends here what showed for their last turn.
+    /// The model got the person's line: their turn `turn` starts (at once, or when the turn the
+    /// line waited behind ended). A line a stop drops before that starts no turn, and a restored
+    /// conversation starts none. A product ends here what showed for their last turn.
     fn chat_turn_started(&mut self, _cx: &mut Cx, _turn: u64) {}
+    /// What became of the line sent with `receipt` ([`ChatOutbox::say_tracked`]).
+    fn chat_said(&mut self, _cx: &mut Cx, _receipt: u64, _said: ChatSaid) {}
     /// The person pressed the button the product put under turn `turn`'s answer, with id `_id`.
     fn chat_turn_action(&mut self, _cx: &mut Cx, _turn: u64, _id: &str) {}
     /// The answer of call `id` (made for the chat's `call_id`) once it is
@@ -500,7 +622,7 @@ pub fn pump<H: ChatHost>(host: &mut H, cx: &mut Cx) {
         }
     }
     take_requests(host, cx);
-    person_turn(host, cx, &panel);
+    follow_log(host, cx, &panel);
     let voice = host.chat_voice(cx);
     let says = host.chat_voice_says(cx);
     if let Some(mut chat) = panel.borrow_mut::<AiChatPanel>() {
@@ -732,50 +854,25 @@ fn run_calls<H: ChatHost>(host: &mut H, cx: &mut Cx) {
     dock.inflight = waiting;
 }
 
-/// The person's next turn: one more each time they send a line, seen as their newest line's text
-/// changing or fewer entries following it (the same line again, or the transcript dropping its
-/// oldest entries, leaves the entries after it alone). Calls the product's
-/// [`ChatHost::chat_turn_started`]. One compare per pump; when the conversation changed, a walk
-/// back over the entries after the person's newest line.
-fn person_turn<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
-    let started = {
+/// The engine's line log to the product: each line the model gets starts the person's next turn
+/// ([`ChatHost::chat_turn_started`]), and each tracked line's receipt hears its fate
+/// ([`ChatHost::chat_said`]). One compare per pump when no line started or dropped.
+fn follow_log<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
+    let heard = {
         let Some(chat) = panel.borrow::<AiChatPanel>() else { return };
         let Some(state) = chat.state() else { return };
-        let dock = host.chat_dock();
-        if dock.seen_generation == Some(state.generation) {
-            return;
-        }
-        dock.seen_generation = Some(state.generation);
-        let newest = state.entries.iter().rev().enumerate().find_map(|(after, entry)| match entry {
-            Entry::User { text, .. } => Some((text.as_str(), after)),
-            _ => None,
-        });
-        let started = match (newest, &dock.newest_line) {
-            (Some((text, after)), Some((was, was_after))) => text != was || after < *was_after,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        match (newest, &mut dock.newest_line) {
-            (Some((_, after)), Some(line)) if !started => line.1 = after,
-            (newest, line) => *line = newest.map(|(text, after)| (text.to_string(), after)),
-        }
-        if started {
-            dock.turn += 1;
-            dock.turn_calls.retain(|(turn, call_id)| {
-                if state.tool(call_id).is_some() {
-                    return true;
-                }
-                if let Ok(at) = dock.turn_actions.binary_search_by_key(turn, |(turn, _)| *turn) {
-                    dock.turn_actions.remove(at);
-                }
-                dock.turn_actions_changed = true;
-                false
-            });
-        }
-        started.then_some(dock.turn)
+        host.chat_dock().read_log(state)
     };
-    if let Some(turn) = started {
-        host.chat_turn_started(cx, turn);
+    tell(host, cx, heard);
+}
+
+/// What the line log said, to the product, in order.
+fn tell<H: ChatHost>(host: &mut H, cx: &mut Cx, heard: Vec<Heard>) {
+    for heard in heard {
+        match heard {
+            Heard::Turn(turn) => host.chat_turn_started(cx, turn),
+            Heard::Said(receipt, said) => host.chat_said(cx, receipt, said),
+        }
     }
 }
 
@@ -803,8 +900,18 @@ fn drain_outbox<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
                     chat.say(cx, line);
                 }
             }
+            ChatOut::SayTracked { receipt, words } => {
+                set_open(host, cx, true);
+                let sent = panel.borrow_mut::<AiChatPanel>().map(|mut chat| chat.send_exact(cx, &words));
+                match sent.unwrap_or(Err("No AI model is connected")) {
+                    Ok(line) => host.chat_dock().tracked.push(Tracked { line, receipt, queued: false }),
+                    Err(why) => host.chat_said(cx, receipt, ChatSaid::Refused(why)),
+                }
+            }
         }
     }
+    // The lines just sent: started at once, or waiting.
+    follow_log(host, cx, panel);
 }
 
 /// The picture that goes with a line the person is writing: read back once
@@ -814,7 +921,20 @@ fn pump_look<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
     // A line sent: the next one gets a fresh picture.
     let lines = panel.borrow::<AiChatPanel>().and_then(|chat| chat.state().map(|state| state.entries.iter().filter(|entry| matches!(entry, Entry::User { .. })).count())).unwrap_or(0);
     let dock = host.chat_dock();
-    if lines != dock.look.lines {
+    let line_sent = lines != dock.look.lines;
+    // A late readback for a line already sent must not become the next line's picture.
+    if line_sent || key.is_none() {
+        if let Some(ticket) = dock.look.grab.take().and_then(|(waiting, _, _)| waiting.ticket) {
+            cx.cancel_texture_readback(ticket);
+        }
+    }
+    if !line_sent && dock.look.attached.is_some() && key.is_none() {
+        if let Some(mut chat) = panel.borrow_mut::<AiChatPanel>() {
+            let _ = chat.set_next_line_picture(None);
+        }
+        dock.look.attached = None;
+    }
+    if line_sent {
         dock.look.lines = lines;
         dock.look.attached = None;
     }
@@ -826,7 +946,7 @@ fn pump_look<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
         let image = frame.and_then(|pixels: Pixels| pixels.fit(picture::EDGE).png());
         match image {
             Ok(png) => {
-                let sent = panel.borrow_mut::<AiChatPanel>().map(|mut chat| chat.attach_for_model(vec![ModelImage { label, png: Arc::from(png) }]));
+                let sent = panel.borrow_mut::<AiChatPanel>().map(|mut chat| chat.set_next_line_picture(Some(ModelImage { label, png: Arc::from(png) })));
                 if matches!(sent, Some(Err(_))) {
                     dock.look.refused = Some(look.clone());
                 }
@@ -893,6 +1013,143 @@ mod tests {
         run_calls(&mut host, &mut cx);
         assert_eq!(host.events, [("admit", 17), ("cancel", 17)], "the same drain cancels the ID the host just admitted");
         assert!(host.dock.inflight.is_empty(), "the cancelled call is gone before reply polling");
+    }
+
+    /// The person's turns follow the lines the model really gets, read from a real engine's line
+    /// log: the same line typed again after a stop is a new turn; a line typed during a turn starts
+    /// its own when that one ends, and the calls made meanwhile stay the running turn's; a tracked
+    /// line hears that it waits, then how it ended.
+    #[test]
+    fn turns_and_receipts_follow_the_lines_the_model_gets() {
+        use makepad_ai_services::engine::{EngineCore, Model, ModelEvent, ToolDefinition};
+        use makepad_ai_services::wire::{Risk, ToolDef};
+        use std::sync::Mutex;
+
+        /// Answers each tool result by ending its turn; the test ends the others.
+        struct Scripted(Arc<Mutex<Vec<ModelEvent>>>);
+        impl Model for Scripted {
+            fn label(&self) -> String { "Scripted".into() }
+            fn configure(&mut self, _: &str, _: &[ToolDefinition]) -> Result<(), String> { Ok(()) }
+            fn send_user(&mut self, _: &str, _: &str) {}
+            fn send_tool_result(&mut self, _: &str, _: &str, _: bool) {
+                self.0.lock().unwrap().push(ModelEvent::TurnDone { tool_calls: 0 });
+            }
+            fn cancel(&mut self) {}
+            fn reset(&mut self) {}
+            fn poll(&mut self) -> Vec<ModelEvent> { std::mem::take(&mut self.0.lock().unwrap()) }
+        }
+
+        #[derive(Default)]
+        struct Host {
+            dock: ChatDock,
+            calls: Vec<ChatCaller>,
+            turns: Vec<u64>,
+            said: Vec<(u64, ChatSaid)>,
+        }
+        impl ChatHost for Host {
+            fn chat_dock(&mut self) -> &mut ChatDock { &mut self.dock }
+            fn chat_turn_call(&mut self, _: &mut Cx, _: &str, _: Value, caller: ChatCaller) -> u64 {
+                self.calls.push(caller);
+                self.calls.len() as u64
+            }
+            fn chat_turn_started(&mut self, _: &mut Cx, turn: u64) { self.turns.push(turn); }
+            fn chat_said(&mut self, _: &mut Cx, receipt: u64, said: ChatSaid) { self.said.push((receipt, said)); }
+            fn chat_answer(&mut self, call_id: &str, _: u64) -> Option<ToolResult> { Some(ToolResult::ok(call_id, "read", "read")) }
+            fn chat_call(&mut self, _: &mut Cx, _: &str, _: Value) -> u64 { unreachable!() }
+            fn chat_progress(&self, _: u64) -> Option<(String, u16)> { unreachable!() }
+            fn chat_target(&mut self, _: &mut Cx) -> (Target, Vec<Suggestion>) { unreachable!() }
+            fn chat_services(&mut self) -> Vec<ServiceManifest> { unreachable!() }
+            fn chat_window(&self) -> WidgetRef { unreachable!() }
+        }
+
+        let mut host = Host::default();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let registry = ServiceRegistry::new();
+        let manifest = ServiceManifest::new("files", "Files", "Read a file.")
+            .with_tool(ToolDef::new("read", "Read a file.", r#"{"type":"object","properties":{}}"#, Risk::Read));
+        let (port, link) = AiServicePort::in_process(manifest).unwrap();
+        registry.register(link, "this window", None).unwrap();
+        host.dock.ports.push(port);
+        registry.pump();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut core = EngineCore::new(registry, Box::new(Scripted(out.clone())), None, 1);
+        // One window pump: the engine, then the dock reads its log and runs the calls.
+        let pump = |host: &mut Host, core: &mut EngineCore, cx: &mut Cx, now: f64| {
+            core.pump(now);
+            let heard = host.dock.read_log(core.state());
+            tell(host, cx, heard);
+            run_calls(host, cx);
+        };
+
+        core.send("again", 0.0);
+        pump(&mut host, &mut core, &mut cx, 0.1);
+        core.cancel(0.2);
+        core.send("again", 0.3);
+        pump(&mut host, &mut core, &mut cx, 0.4);
+        assert_eq!(host.turns, [1, 2], "the same line sent again after a stop is a new turn");
+
+        core.send("meanwhile", 0.5);
+        pump(&mut host, &mut core, &mut cx, 0.6);
+        assert_eq!(host.turns, [1, 2], "a line typed during a turn has not started");
+        out.lock().unwrap().extend([
+            ModelEvent::ToolCall { call_id: "m1".into(), name: "files.read".into(), args: "{}".into() },
+            ModelEvent::TurnDone { tool_calls: 1 },
+        ]);
+        pump(&mut host, &mut core, &mut cx, 0.7);
+        assert_eq!(host.calls, [ChatCaller::Turn(2)], "a call the running turn makes after a line was typed is still that turn's");
+        pump(&mut host, &mut core, &mut cx, 0.8);
+        assert_eq!(host.turns, [1, 2, 3], "the typed line starts its turn when the running one ends");
+
+        let line = core.send_exact("draft while busy");
+        host.dock.tracked.push(Tracked { line, receipt: 41, queued: false });
+        pump(&mut host, &mut core, &mut cx, 0.9);
+        assert_eq!(host.said, [(41, ChatSaid::Queued)], "a tracked line sent during a turn waits");
+        out.lock().unwrap().push(ModelEvent::TurnDone { tool_calls: 0 });
+        pump(&mut host, &mut core, &mut cx, 1.0);
+        assert_eq!(host.said, [(41, ChatSaid::Queued), (41, ChatSaid::Started(4))], "it starts with the turn after the running one");
+        assert_eq!(host.turns, [1, 2, 3, 4], "its turn started before its receipt heard so");
+
+        let line = core.send_exact("draft to drop");
+        host.dock.tracked.push(Tracked { line, receipt: 42, queued: false });
+        pump(&mut host, &mut core, &mut cx, 1.1);
+        core.cancel(1.15);
+        pump(&mut host, &mut core, &mut cx, 1.2);
+        let line = core.send_exact("draft while idle");
+        host.dock.tracked.push(Tracked { line, receipt: 43, queued: false });
+        pump(&mut host, &mut core, &mut cx, 1.3);
+        assert_eq!(host.said[2..], [(42, ChatSaid::Queued), (41, ChatSaid::Stopped), (42, ChatSaid::Cancelled), (43, ChatSaid::Started(5))],
+            "a stop ends the running tracked line, cancels the waiting one; one sent while idle starts at once");
+        assert!(host.dock.tracked.is_empty(), "every receipt ended");
+
+        core.clear(1.4);
+        pump(&mut host, &mut core, &mut cx, 1.5);
+        assert_eq!(host.said[6..], [(43, ChatSaid::Stopped)], "New chat with no tool in flight stops the running tracked line");
+        assert_eq!(host.dock.active_tracked, None, "no tracked line runs after the clear");
+
+        let line = core.send_exact("draft over a swap");
+        host.dock.tracked.push(Tracked { line, receipt: 44, queued: false });
+        pump(&mut host, &mut core, &mut cx, 1.6);
+        core.set_model(Box::new(Scripted(out.clone())));
+        pump(&mut host, &mut core, &mut cx, 1.7);
+        assert_eq!(host.said[7..], [(44, ChatSaid::Started(6)), (44, ChatSaid::Stopped)], "swapping the model stops the running tracked line");
+
+        let line = core.send_exact("draft that fails");
+        host.dock.tracked.push(Tracked { line, receipt: 45, queued: false });
+        pump(&mut host, &mut core, &mut cx, 1.8);
+        let line = core.send_exact("draft behind the failure");
+        host.dock.tracked.push(Tracked { line, receipt: 46, queued: false });
+        pump(&mut host, &mut core, &mut cx, 1.9);
+        out.lock().unwrap().push(ModelEvent::Error("overflow".into()));
+        pump(&mut host, &mut core, &mut cx, 2.0);
+        assert_eq!(host.said[9..], [(45, ChatSaid::Started(7)), (46, ChatSaid::Queued), (45, ChatSaid::Failed), (46, ChatSaid::Started(8))],
+            "a failure ends the running tracked line, then the queued one starts");
+        assert_eq!(host.turns, [1, 2, 3, 4, 5, 6, 7, 8], "the next turn starts after the failure");
+        out.lock().unwrap().push(ModelEvent::TurnDone { tool_calls: 0 });
+        pump(&mut host, &mut core, &mut cx, 2.1);
+        let heard = host.said.len();
+        core.cancel(2.2);
+        pump(&mut host, &mut core, &mut cx, 2.3);
+        assert_eq!(host.said.len(), heard, "a stop while idle tells no receipt anything");
     }
 
     /// What a page asks goes to the dock in order, and the page's outbox is

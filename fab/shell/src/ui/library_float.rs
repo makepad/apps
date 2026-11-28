@@ -37,7 +37,21 @@ script_mod! {
                     lib_fold := mod.widgets.FabIconButton{ width: 20 height: 20 a11y: {label: "Fold the Library"} draw_icon +: { svg: crate_resource("self://resources/icons/chevron_right.svg") } }
                 }
             }
-            library := mod.widgets.LibraryPanel{}
+            library := mod.widgets.LibraryPanel{
+                search +: {
+                    draw_text +: {
+                        color: fab.color_text_input
+                        color_hover: fab.color_text_input
+                        color_focus: fab.color_text_input
+                        color_down: fab.color_text_input
+                        color_empty: fab.color_text_input_dim
+                        color_empty_hover: fab.color_text_input_dim
+                        color_empty_focus: fab.color_text_input_dim
+                    }
+                    draw_cursor +: { color: fab.color_text_input }
+                }
+                preview +: { well +: { big +: { draw_svg +: { color: fab.color_text_well } } } }
+            }
         }
         lib_tab := mod.widgets.FabFloat{
             visible: false

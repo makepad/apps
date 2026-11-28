@@ -36,7 +36,9 @@ const BOM_READ: ActionDef = ActionDef {
   fields: {..}
   inherited: [text]
   alts: {..}
-  checks: [text]",
+  checks: [text]
+  lifecycle: choice active|nrnd|obsolete  the worst its parts state, when one does
+  approved: bool  true when every part on the line is approved; absent otherwise",
     inputs: &[], risk: Risk::Read, keys: "",
 };
 pub const FIELD_SET: ActionDef = ActionDef {
@@ -126,7 +128,14 @@ pub fn bom_read(design: &Design, args: &Args) -> Result<String, Diag> {
             }
             out.push('}');
         }
-        write!(out, " inherited: {} checks: {}}} ", words(row.inherited.iter().map(String::as_str)), words(row.checks.iter().copied())).unwrap();
+        write!(out, " inherited: {} checks: {}", words(row.inherited.iter().map(String::as_str)), words(row.checks.iter().copied())).unwrap();
+        if let Some(lifecycle) = row.lifecycle {
+            write!(out, " lifecycle: {}", lifecycle.name()).unwrap();
+        }
+        if row.approved {
+            out.push_str(" approved: true");
+        }
+        out.push_str("} ");
     }
     out.push_str("]}");
     Ok(out)
@@ -280,15 +289,16 @@ fn targets<'a>(design: &'a Design, docs: Option<&Docs>, args: &Args) -> Result<T
     Ok(Targets { unit, parts: targets, group })
 }
 
-pub fn field_set(design: &Design, docs: Option<&Docs>, tool: &str, args: &Args) -> Result<Plan, Diag> {
+pub fn field_set(design: &Design, docs: Option<&Docs>, tool: &str, args: &Args, by: By) -> Result<Plan, Diag> {
     check_tool(tool, &FIELD_SET, args)?;
     let key = arg(args, "key").unwrap().trim();
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') ||
         ["value", "footprint", "refs", "reference", "qty", "quantity", "dnp"].iter().any(|s| key.eq_ignore_ascii_case(s)) {
         return Err(error("key", "choose an editable text field such as mpn, supplier or supplier_part"));
     }
-    let targets = targets(design, docs, args)?;
     let text = arg(args, "text");
+    crate::sheet_actions::check_part_field(key, text, by)?;
+    let targets = targets(design, docs, args)?;
     let mut ops = Vec::new();
     for c in &targets.parts {
         // CAM reads Description before description. Override the actual inherited spelling.
@@ -475,7 +485,7 @@ mod tests {
             circuit.comps[id.ix()].refdes = "Cap.Pair".into();
         }
         let read = bom_read(&duplicate, &args(&[("only", "Cap.Pair")])).unwrap_err();
-        let edit = field_set(&duplicate, None, FIELD_SET.name, &args(&[("parts", "Cap.Pair"), ("key", "mpn")])).unwrap_err();
+        let edit = field_set(&duplicate, None, FIELD_SET.name, &args(&[("parts", "Cap.Pair"), ("key", "mpn")]), By::Person).unwrap_err();
         for failure in [read, edit] {
             assert!(failure.message.contains("path:reg.c_in") && failure.message.contains("path:reg.c_out"), "{failure:?}");
         }
@@ -536,7 +546,7 @@ mod tests {
         let leds = sheet.rows.iter().find(|r| r.refs.first().is_some_and(|r| r == "D1")).unwrap();
         assert_eq!(leds.qty, 8);
         let refusal = field_set(engine.design(), engine.docs(), FIELD_SET.name,
-            &args(&[("parts", "D1,D2"), ("key", "mpn"), ("text", "fitted")])).unwrap_err();
+            &args(&[("parts", "D1,D2"), ("key", "mpn"), ("text", "fitted")]), By::Person).unwrap_err();
         assert!(refusal.message.contains("D1, D2, D3, D4, D5, D6, D7 and D8 come from one expression in the code."));
         assert!(refusal.message.contains("Edit them together on the D1, D2, D3, D4, D5, D6, D7, D8 line."));
         assert!(refusal.message.contains("Selected: D1 (ledctl/lamps[0].d)"));
@@ -761,5 +771,46 @@ mod price_tests {
         assert!(answer.contains("micros: 6000000 currency: \"USD\" source: \"AI lookup\" date: \"2026-11-26\" url: \"https://example.invalid/part\""));
         assert!(answer.contains("lower_bound: true") && answer.contains("priced: 1"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod field_authority_tests {
+    use super::*;
+    use crate::sheet_actions::part_field;
+
+    fn args(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn ai_cannot_set_approved_through_field_actions() {
+        let design = fab_elec_fixtures::ledctl();
+        let part = |key: &str, text: &str, by| part_field(&design, None, "elec.part.field", &args(&[("part", "J1"), ("key", key), ("text", text)]), by);
+        let bom = |key: &str, text: &str, by| field_set(&design, None, FIELD_SET.name, &args(&[("parts", "J1"), ("key", key), ("text", text)]), by);
+        let refused = "approved is set by the person on the part definition";
+        for by in [By::Ai { turn: 1, call: 2 }, By::Agent { call: 3 }, By::Disk] {
+            for key in ["approved", "Approved"] {
+                let message = part(key, "true", by).unwrap_err().message;
+                assert!(message.contains(refused), "elec.part.field {key} by {by:?}: {message}");
+                let message = bom(key, "true", by).unwrap_err().message;
+                assert!(message.contains(refused), "elec.bom.field.set {key} by {by:?}: {message}");
+            }
+        }
+        let guidance = "approved is set on the part definition (approved: true), not as a component field";
+        for key in ["approved", "Approved"] {
+            assert!(part(key, "true", By::Person).unwrap_err().message.contains(guidance), "part field must direct the person to the definition");
+            assert!(bom(key, "true", By::Person).unwrap_err().message.contains(guidance), "BOM field must direct the person to the definition");
+        }
+        for by in [By::Ai { turn: 1, call: 2 }, By::Person] {
+            let message = part("lifecycle", "eol", by).unwrap_err().message;
+            assert!(message.contains("a lifecycle is active, nrnd or obsolete"), "{message}");
+            let message = bom("lifecycle", "eol", by).unwrap_err().message;
+            assert!(message.contains("a lifecycle is active, nrnd or obsolete"), "{message}");
+            for name in ["active", "nrnd", "obsolete"] {
+                assert!(part("lifecycle", name, by).is_ok(), "elec.part.field lifecycle {name} by {by:?}");
+                assert!(bom("lifecycle", name, by).is_ok(), "elec.bom.field.set lifecycle {name} by {by:?}");
+            }
+        }
     }
 }

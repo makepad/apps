@@ -5,6 +5,7 @@
 //! indexes an empty layout). One test: it points `MAKEPAD_FONTS_DIR` at its
 //! own folders, and the notices are the process's.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use std::path::PathBuf;
 
@@ -17,7 +18,7 @@ fn fonts_of(doc: &MotionDoc) -> Vec<String> {
         .items
         .iter()
         .map(|item| match &item.kind {
-            ItemKind::Text { font, .. } => font.clone(),
+            ItemKind::Primitive(PrimitiveFrame::Text { font, .. }) => font.clone(),
             ItemKind::Shader { font, .. } => font.clone().unwrap_or_else(|| "(kit)".into()),
             other => panic!("{other:?}"),
         })
@@ -66,7 +67,7 @@ fn an_external_font_draws_once_installed_and_in_the_default_face_until_then() {
         let frame = doc.eval(0.2);
         assert!(frame.errors.is_empty(), "no follow-on errors: {:?}", frame.errors);
         let texts: Vec<&str> = frame.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Text { text, .. } => Some(text.as_str()),
+            ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => Some(text.as_str()),
             _ => None,
         }).collect();
         assert_eq!(texts, ["W", "i", "o"], "a word in a missing font has all its letters");

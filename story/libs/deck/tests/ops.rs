@@ -503,9 +503,12 @@ fn a_camera_slide_and_a_camera_layer_are_written_and_read_back() {
     });
     assert_eq!(camera, Some(spec.clone()), "{written}");
     // Over a slide's picture, as a layer.
-    let (layered, doc) = run(&written, DeckOp::AddLayer { index: 0, layer: NewCut::Camera(CameraSpec { device: CameraDevice::Index(1), ..CameraSpec::default() }) });
-    let SlideCut::Inline(cut) = &doc.slides[0].cut else { panic!("inline") };
-    assert!(cut.nodes.iter().any(|node| matches!(&node.kind, CutNodeKind::Camera(read) if read.device == CameraDevice::Index(1))), "{layered}");
+    for (device, field) in [(CameraDevice::Index(1), "device: 1"), (CameraDevice::TestPattern, "device: @test_pattern")] {
+        let (layered, doc) = run(&written, DeckOp::AddLayer { index: 0, layer: NewCut::Camera(CameraSpec { device: device.clone(), ..CameraSpec::default() }) });
+        assert!(layered.contains(field), "{layered}");
+        let SlideCut::Inline(cut) = &doc.slides[0].cut else { panic!("inline") };
+        assert!(cut.nodes.iter().any(|node| matches!(&node.kind, CutNodeKind::Camera(read) if read.device == device)), "{layered}");
+    }
     // Nonsense is refused with a reason.
     let refused = |spec: CameraSpec| apply(&source, &DeckOp::AddSlide { after: None, name: "x".into(), cut: NewCut::Camera(spec) }).unwrap_err();
     assert!(refused(CameraSpec { width: 0, ..CameraSpec::default() }).contains("positive"));
@@ -532,8 +535,11 @@ fn a_cameras_device_format_and_turn_are_set_in_place() {
     let spec = camera(&doc);
     assert_eq!((spec.width, spec.height, spec.fps, spec.rotate, spec.mirror), (1920, 1080, 60.0, 90, true));
     assert_eq!(spec.device, CameraDevice::Name("OBSBOT Meet 2".into()), "other fields stay");
+    let (pattern, doc) = run(&turned, DeckOp::SetCamera { index: 1, set: CameraSet { device: Some(CameraDevice::TestPattern), ..CameraSet::default() } });
+    assert_eq!(camera(&doc).device, CameraDevice::TestPattern);
+    assert!(pattern.contains("device: @test_pattern"), "{pattern}");
     // Back to the first camera, and everything else in the file is as it was.
-    let (first, doc) = run(&turned, DeckOp::SetCamera { index: 1, set: CameraSet { device: Some(CameraDevice::First), ..CameraSet::default() } });
+    let (first, doc) = run(&pattern, DeckOp::SetCamera { index: 1, set: CameraSet { device: Some(CameraDevice::First), ..CameraSet::default() } });
     assert_eq!(camera(&doc).device, CameraDevice::First);
     assert!(first.contains("device: nil"), "{first}");
     assert!(apply(&source, &DeckOp::SetCamera { index: 0, set: CameraSet::default() }).unwrap_err().contains("no camera"));

@@ -4,11 +4,12 @@
 //! functions run in the document's own VM (the one its load evaluated it
 //! in; the VM sees only the supplied clocks, never wall time or a random source).
 
+use crate::plain::{PrimitiveFrame, TextProps};
 use crate::features::{VoiceFeatures, WordState};
 use crate::frame::*;
 use crate::model::*;
 use crate::value::Evaluated;
-use crate::Ease;
+use crate::{Ease, LoadedLayers};
 
 /// Character layers (lane CH1).
 mod character;
@@ -16,13 +17,34 @@ mod rig;
 use makepad_script::*;
 use std::sync::Arc;
 
-/// The value a property function gave.
-enum FnOut {
-    Nums(Vec<f64>),
-    Color(Color),
+use makepad_motion_plain::sample::{FnOut, PropertyCalls, Sampler, NEEDS_VM};
+
+/// Operations that need the VM of a loaded Motion document.
+pub(crate) trait Calls: PropertyCalls {
+    fn call_draw2d(&self, index: usize, local: f64, edit: f64) -> Result<(crate::draw2d::Draw2dFrame, Vec<String>), String>;
+    fn scene_source(&self, scene: &SceneSource) -> Result<SceneSource, String>;
 }
 
-impl MotionDoc {
+struct NoCalls;
+
+impl PropertyCalls for NoCalls {
+    fn call_fn(&self, _: usize, _: f64, _: usize, _: f64) -> Result<FnOut, String> {
+        Err(NEEDS_VM.into())
+    }
+
+}
+
+impl Calls for NoCalls {
+    fn call_draw2d(&self, _: usize, _: f64, _: f64) -> Result<(crate::draw2d::Draw2dFrame, Vec<String>), String> {
+        Err(NEEDS_VM.into())
+    }
+
+    fn scene_source(&self, _: &SceneSource) -> Result<SceneSource, String> {
+        Err(NEEDS_VM.into())
+    }
+}
+
+impl PropertyCalls for MotionDoc {
     /// Call property function `index` as `fn(local, i, edit)`: the layer's
     /// clock, the unit's index and the host's time.
     fn call_fn(&self, index: usize, t: f64, i: usize, edit: f64) -> Result<FnOut, String> {
@@ -43,6 +65,44 @@ impl MotionDoc {
         })
     }
 
+}
+
+impl Calls for MotionDoc {
+    /// A Draw2D layer's `draw` function at layer time `local`.
+    fn call_draw2d(&self, index: usize, local: f64, edit: f64) -> Result<(crate::draw2d::Draw2dFrame, Vec<String>), String> {
+        self.with_evaluated(|evaluated| {
+            let Some(&function) = self.run.fns.get(index) else {
+                return Err("the draw function is missing from the document's evaluation".into());
+            };
+            let (out, errors) = evaluated.with_vm(|vm| {
+                vm.capture_errors();
+                let (out, _) = vm.eval_bounded(&crate::value::DRAW_LIMITS, |vm| crate::draw2d::eval(vm, function, local, edit));
+                (out, vm.take_error_records())
+            });
+            let (picture, mut messages) = out;
+            for error in &errors {
+                messages.push(error.message().to_owned());
+            }
+            Ok((picture, messages))
+        })
+    }
+
+    fn scene_source(&self, scene: &SceneSource) -> Result<SceneSource, String> {
+        Ok(match scene {
+            SceneSource::Template { source, inputs } => {
+                // The frame's instance values, followed by the layer's overrides.
+                let held = self.vm.with(|e| e.host.host.inputs.clone());
+                let inputs = self.inputs.iter().map(|decl| decl.name.clone())
+                    .zip(held.iter().map(|(_, value)| value.clone())).chain(inputs.iter().cloned()).collect();
+                SceneSource::Template { source: source.clone(), inputs }
+            }
+            #[cfg(feature = "scene3d")]
+            SceneSource::Object(_) => scene.clone(),
+        })
+    }
+}
+
+impl MotionDoc {
     /// A post pass uniform given as `fn(t)` that returns a vector is a
     /// vector uniform: its width is read from one call at t = 0 (every
     /// frame calls it again; a failing call is reported by the frame).
@@ -65,25 +125,6 @@ impl MotionDoc {
                 d.width = width;
             }
         }
-    }
-
-    /// A Draw2D layer's `draw` function at layer time `local`.
-    fn call_draw2d(&self, index: usize, local: f64, edit: f64) -> Result<(crate::draw2d::Draw2dFrame, Vec<String>), String> {
-        self.with_evaluated(|evaluated| {
-            let Some(&function) = self.run.fns.get(index) else {
-                return Err("the draw function is missing from the document's evaluation".into());
-            };
-            let (out, errors) = evaluated.with_vm(|vm| {
-                vm.capture_errors();
-                let (out, _) = vm.eval_bounded(&crate::value::DRAW_LIMITS, |vm| crate::draw2d::eval(vm, function, local, edit));
-                (out, vm.take_error_records())
-            });
-            let (picture, mut messages) = out;
-            for error in &errors {
-                messages.push(error.message().to_owned());
-            }
-            Ok((picture, messages))
-        })
     }
 
     /// Run `f` with this document's VM.
@@ -137,35 +178,23 @@ impl MotionDoc {
         let _turn = self.vm.turn();
         let _lent = LentInputs::new(&self.vm, &mut inputs.slots);
         self.vm.with(|e| e.new_frame(t, live));
-        let mut ev = Evaluator { doc: self, errors: Vec::new(), edit: t + self.context.offset, instance: 0, root: 0, freezing: false, group_post: Vec::new() };
-        let mut items = Vec::new();
-        let mut data_layers: Vec<(String, Vec<Item>)> = Vec::new();
-        for (root, layer) in self.layers.iter().enumerate() {
-            ev.root = root;
-            let item = ev.layer(layer, t, 0.0, &Affine::IDENTITY, true);
-            match (&layer.data, &layer.name) {
-                (Some(_), Some(name)) => data_layers.push((name.clone(), item.into_iter().collect())),
-                (Some(_), None) => {}
-                _ => items.extend(item),
-            }
-        }
+        let mut ev = Evaluator::new(&self.plain, self, t);
+        let mut data_layers = Vec::new();
+        let items = ev.layers_at(t, Some(&mut data_layers));
         let camera = self.camera.as_ref().map(|camera| camera.iter().map(|(name, arg)| (name.clone(), ev.arg(arg, t))).collect());
         let post = (!self.post.is_empty()).then(|| ev.post_at(&self.post, t));
         let motion_blur = self.motion_blur.as_ref().map(|m| {
             let [shutter] = ev.sample(&m.shutter, t, 0);
             (shutter.clamp(0.0, 720.0), m.max, m.tol)
         });
-        let errors = ev.errors;
+        let mut frame = ev.into_frame(t, items);
+        frame.camera = camera;
+        frame.post = post;
+        frame.motion_blur = motion_blur;
+        frame.hdr = self.hdr;
+        frame.data_layers = data_layers;
         self.collect_garbage();
-        let group_post = std::mem::take(&mut ev.group_post);
-        MotionFrame { t, size: self.size, background: self.background, items, camera, fps: self.fps, hdr: self.hdr, post, group_post, motion_blur, data_layers, errors }
-    }
-
-    /// Frame times of the document at its own frame rate: `n / fps` for
-    /// every frame that starts before `duration`.
-    pub fn frame_times(&self) -> Vec<f64> {
-        let n = (self.duration * self.fps - 1e-9).ceil().max(1.0) as usize;
-        (0..n).map(|k| k as f64 / self.fps).collect()
+        frame
     }
 }
 
@@ -247,7 +276,8 @@ fn read_out(vm: &ScriptVm, value: ScriptValue) -> Result<FnOut, String> {
 }
 
 struct Evaluator<'a> {
-    doc: &'a MotionDoc,
+    doc: &'a LoadedLayers,
+    calls: &'a dyn Calls,
     errors: Vec<Diagnostic>,
     /// The frame's time on the host's clock (`edit` in property functions).
     edit: f64,
@@ -262,7 +292,44 @@ struct Evaluator<'a> {
     group_post: Vec<(String, (std::sync::Arc<Vec<makepad_render_graph::PassDecl>>, Vec<makepad_render_graph::PassValues>))>,
 }
 
-impl Evaluator<'_> {
+pub(crate) fn eval_plain(doc: &LoadedLayers, t: f64) -> MotionFrame {
+    let mut ev = Evaluator::new(doc, &NoCalls, t);
+    let items = ev.layers_at(t, None);
+    ev.into_frame(t, items)
+}
+
+impl<'a> Evaluator<'a> {
+    fn new(doc: &'a LoadedLayers, calls: &'a dyn Calls, t: f64) -> Self {
+        Self { doc, calls, errors: Vec::new(), edit: t + doc.context.offset, instance: 0, root: 0, freezing: false, group_post: Vec::new() }
+    }
+
+    fn layers_at(&mut self, t: f64, mut data_layers: Option<&mut Vec<(String, Vec<Item>)>>) -> Vec<Item> {
+        let mut items = Vec::new();
+        for (root, layer) in self.doc.layers.iter().enumerate() {
+            self.root = root;
+            if layer.data.is_some() && data_layers.is_none() {
+                continue;
+            }
+            let item = self.layer(layer, t, 0.0, &Affine::IDENTITY, true);
+            if layer.data.is_some() {
+                if let (Some(data_layers), Some(name)) = (data_layers.as_mut(), &layer.name) {
+                    data_layers.push((name.clone(), item.into_iter().collect()));
+                }
+            } else {
+                items.extend(item);
+            }
+        }
+        items
+    }
+
+    fn into_frame(self, t: f64, items: Vec<Item>) -> MotionFrame {
+        MotionFrame {
+            t, items, size: self.doc.size, background: self.doc.background, fps: self.doc.fps,
+            camera: None, post: None, motion_blur: None, hdr: false, data_layers: Vec::new(),
+            group_post: self.group_post, errors: self.errors,
+        }
+    }
+
     /// Post passes and their uniform values at `t`.
     fn post_at(&mut self, post: &[crate::model::PostPassSpec], t: f64) -> (std::sync::Arc<Vec<makepad_render_graph::PassDecl>>, Vec<makepad_render_graph::PassValues>) {
         let decls = std::sync::Arc::new(post.iter().map(|p| p.decl.clone()).collect::<Vec<_>>());
@@ -284,71 +351,16 @@ impl Evaluator<'_> {
         (decls, values)
     }
 
+    fn properties(&mut self) -> Sampler<'_> {
+        Sampler { calls: Some(self.calls), errors: &mut self.errors, instance: self.instance, edit: self.edit }
+    }
+
     fn sample<const N: usize>(&mut self, prop: &Prop<N>, t: f64, i: usize) -> [f64; N] {
-        self.sample_kind(prop, t, i, None)
+        self.properties().sample(prop, t, i)
     }
 
-    /// A blend also checks function results: ordinary field shorthand must
-    /// not silently truncate a vector control or hide differing value kinds.
     fn sample_kind<const N: usize>(&mut self, prop: &Prop<N>, t: f64, i: usize, kind: Option<usize>) -> [f64; N] {
-        match prop {
-            Prop::Const(value) => *value,
-            Prop::Track(track) => sample_track(track, t),
-            Prop::Blend(blend) => {
-                let x = self.sample_kind(&blend.x, t, i, Some(1))[0];
-                let y = blend.y.as_ref().map_or(0.0, |y| self.sample_kind(y, t, i, Some(1))[0]);
-                let kind = Some(blend.value_kind.unwrap_or(N));
-                blend.sample(x, y, |p| self.sample_kind(p, t, i, kind), |a, b, w| std::array::from_fn(|k| a[k] + (b[k] - a[k]) * w))
-            }
-            Prop::Fn(f) => match self.doc.call_fn(f.index, t, i + self.instance, self.edit) {
-                Ok(FnOut::Nums(values)) => {
-                    if kind.is_some_and(|kind| kind != values.len()) {
-                        self.fn_error(f, format!("mismatched blend value kinds: returned {} components, expected {}", values.len(), kind.unwrap()));
-                        return [0.0; N];
-                    }
-                    let mut out = [0.0; N];
-                    if values.len() == 1 {
-                        out = [values[0]; N];
-                        if N == 4 {
-                            out[3] = 1.0;
-                        }
-                    } else if values.len() >= N {
-                        out.copy_from_slice(&values[..N]);
-                    } else if N == 4 && values.len() == 3 {
-                        out[..3].copy_from_slice(&values);
-                        out[3] = 1.0;
-                    } else if N == 4 && values.len() == 2 {
-                        // A vec2 uniform (a post pass's `fn(t)`).
-                        out[..2].copy_from_slice(&values);
-                    } else {
-                        self.fn_error(f, format!("returned {} numbers where {N} are needed", values.len()));
-                    }
-                    out
-                }
-                Ok(FnOut::Color(color)) => {
-                    if N == 4 && kind.is_none_or(|kind| kind == 4) {
-                        std::array::from_fn(|k| color[k])
-                    } else {
-                        self.fn_error(f, "returned a colour where a number is needed".into());
-                        [0.0; N]
-                    }
-                }
-                Err(message) => {
-                    self.fn_error(f, message);
-                    [0.0; N]
-                }
-            },
-        }
-    }
-
-    fn fn_error(&mut self, f: &FnProp, message: String) {
-        let mut diag = Diagnostic::error(f.loc, "", format!("property function: {message}"));
-        if message.contains("cannot index into pod type Vec") {
-            diag = diag.hint("vectors have fields: write `p.x` and `p.y` (not `p[0]`), and compute with them directly (`p - size * 0.5`)");
-        }
-        if !self.errors.contains(&diag) {
-            self.errors.push(diag);
-        }
+        self.properties().sample_kind(prop, t, i, kind)
     }
 
     fn arg(&mut self, arg: &EffectArg, t: f64) -> EffectValue {
@@ -362,12 +374,6 @@ impl Evaluator<'_> {
             EffectArg::Text(s) => EffectValue::Text(s.clone()),
             EffectArg::Points(p) => EffectValue::Points(p.clone()),
         }
-    }
-
-    fn trim(&mut self, start: &Prop<1>, end: &Prop<1>, t: f64) -> [f64; 2] {
-        let a = self.sample(start, t, 0)[0].clamp(0.0, 1.0);
-        let b = self.sample(end, t, 0)[0].clamp(0.0, 1.0);
-        [a.min(b), a.max(b)]
     }
 
     /// A KineticText's words at host time `host`.
@@ -396,7 +402,7 @@ impl Evaluator<'_> {
     }
 
     fn opt4(&mut self, prop: &Option<Prop<4>>, t: f64) -> Option<Color> {
-        prop.as_ref().map(|prop| self.sample(prop, t, 0))
+        self.properties().opt4(prop, t)
     }
 
     /// The beat at document time `abs` (the host's grid, else the
@@ -411,76 +417,15 @@ impl Evaluator<'_> {
     /// Layer `layer` at `t` of its parent's clock, whose start is at `origin`
     /// on the document's clock; `parent` places the parent's children.
     fn layer(&mut self, layer: &Layer, t: f64, origin: f64, parent: &Affine, parent_static: bool) -> Option<Item> {
-        if !layer.visible {
-            return None;
-        }
-        let (lt, origin) = match &layer.span {
-            Some(span) => {
-                if !(t >= span.start.value && t < span.start.value + span.length.value) {
-                    return None;
-                }
-                (t - span.start.value, origin + span.start.value)
-            }
-            None => (t, origin),
-        };
-        let tr = &layer.transform;
-        let per_unit = matches!(&layer.kind, LayerKind::Text { by, source, .. } if *by != TextBy::Whole || matches!(source, TextSource::Voice(_)));
-        let at = match &tr.along {
-            Some(along) => point_along(&along.path, self.sample(&along.progress, lt, 0)[0]),
-            None => self.sample(&tr.at, lt, 0),
-        };
-        let (x, y) = if per_unit { (0.0, 0.0) } else { (self.sample(&tr.x, lt, 0)[0], self.sample(&tr.y, lt, 0)[0]) };
-        let world = parent.then(&Affine::translate(at[0] + x, at[1] + y));
-        let local = if per_unit {
-            Local { anchor: tr.anchor, scale: [1.0, 1.0], rotate: 0.0 }
-        } else {
-            let scale = self.sample(&tr.scale, lt, 0);
-            Local { anchor: tr.anchor, scale: [scale[0], scale[1]], rotate: self.sample(&tr.rotate, lt, 0)[0] }
-        };
-        let opacity = if per_unit { 1.0 } else { self.sample(&layer.opacity, lt, 0)[0].clamp(0.0, 1.0) };
-        let blur = if per_unit { 0.0 } else { self.sample(&layer.blur, lt, 0)[0].max(0.0) };
-        let feather = self.sample(&layer.feather, lt, 0)[0].max(0.0);
+        let (lt, origin) = makepad_motion_plain::placement::layer_clock(layer.visible, layer.span.as_ref(), t, origin)?;
+        let per_unit = matches!(&layer.kind, LayerKind::Text { props: TextProps { by, .. }, source, .. } if *by != TextBy::Whole || matches!(source, TextSource::Voice(_)));
+        let makepad_motion_plain::placement::Placement { world, local, opacity, blur, feather } =
+            self.properties().place(&layer.transform, &layer.opacity, &layer.blur, &layer.feather, lt, parent, per_unit);
         let is_static = parent_static && !layer.animated;
         let kind = match &layer.kind {
-            LayerKind::Rect { size, radius, fill, stroke, width, trim_start, trim_end, cap } => ItemKind::Rect {
-                cap: *cap,
-                size: self.sample(size, lt, 0),
-                radius: self.sample(radius, lt, 0)[0].max(0.0),
-                fill: self.opt4(fill, lt),
-                stroke: self.opt4(stroke, lt),
-                width: self.sample(width, lt, 0)[0].max(0.0),
-                trim: self.trim(trim_start, trim_end, lt),
-            },
-            LayerKind::Ellipse { size, fill, stroke, width, trim_start, trim_end, cap } => ItemKind::Ellipse {
-                cap: *cap,
-                size: self.sample(size, lt, 0),
-                fill: self.opt4(fill, lt),
-                stroke: self.opt4(stroke, lt),
-                width: self.sample(width, lt, 0)[0].max(0.0),
-                trim: self.trim(trim_start, trim_end, lt),
-            },
-            LayerKind::Path { data, fill, stroke, width, trim_start, trim_end, cap, join } => {
-                let path = match data {
-                    PathShape::Static(path) => path.clone(),
-                    PathShape::Morph { template, track, shapes } => {
-                        // The keyed index, eased: between two outlines.
-                        let x = sample_track(track, lt)[0].clamp(0.0, (shapes.len() - 1) as f64);
-                        let i = (x.floor() as usize).min(shapes.len().saturating_sub(2));
-                        let u = x - i as f64;
-                        let (a, b) = (&shapes[i], &shapes[(i + 1).min(shapes.len() - 1)]);
-                        template.interpolate(a, b, u).into()
-                    }
-                };
-                ItemKind::Path {
-                    path,
-                    fill: self.opt4(fill, lt),
-                    stroke: self.opt4(stroke, lt),
-                    width: self.sample(width, lt, 0)[0].max(0.0),
-                    trim: self.trim(trim_start, trim_end, lt),
-                    cap: *cap,
-                    join: *join,
-                }
-            }
+            LayerKind::Rect(props) => ItemKind::Primitive(props.eval(&mut self.properties(), lt)),
+            LayerKind::Ellipse(props) => ItemKind::Primitive(props.eval(&mut self.properties(), lt)),
+            LayerKind::Path(props) => ItemKind::Primitive(props.eval(&mut self.properties(), lt)),
             LayerKind::Svg { src, size } => ItemKind::Svg { src: src.clone(), size: size.as_ref().map(|s| self.sample(s, lt, 0)) },
             LayerKind::Image { src, size, fit, zoom, focus, .. } => ItemKind::Image {
                 mesh: None,
@@ -501,25 +446,22 @@ impl Evaluator<'_> {
                 let placed = world.then(&local.affine([0.0, 0.0]));
                 self.bones(rig, lt, origin, &placed, is_static)
             }
-            LayerKind::Group { layers, mask, mask_mode, stagger, size, post, .. } => {
+            LayerKind::Group { layers, mask, props, post, .. } => {
                 if !post.0.is_empty() {
                     let at = self.post_at(&post.0, lt);
                     self.group_post.push((layer.path.clone(), at));
                 }
-                let size = size.as_ref().map(|s| self.sample(s, lt, 0));
-                // Children are placed by the group's full transform.
-                let group_box = size.unwrap_or([0.0, 0.0]);
-                let placed = world.then(&local.affine(group_box));
+                let (size, placed) = props.placement(&mut self.properties(), lt, &world, &local);
                 let count = layers.len();
                 let mut children = Vec::new();
                 for (index, child) in layers.iter().enumerate() {
-                    let delay = stagger.delay(index, count);
+                    let delay = props.stagger.delay(index, count);
                     if let Some(item) = self.layer(child, lt - delay, origin + delay, &placed, is_static) {
                         children.push(item);
                     }
                 }
                 let mask = mask.as_ref().and_then(|mask| self.layer(mask, lt, origin, &placed, is_static)).map(Box::new);
-                ItemKind::Group { children, mask, mask_mode: *mask_mode, size }
+                ItemKind::Group { children, mask, mask_mode: props.mask_mode, size }
             }
             LayerKind::Vector { src, size, parts, draw_on, stagger, trace, fill, stroke } => ItemKind::Vector {
                 src: src.clone(),
@@ -540,49 +482,13 @@ impl Evaluator<'_> {
                 fill: self.opt4(fill, lt),
                 stroke: self.opt4(stroke, lt),
             },
-            LayerKind::Repeat { layer: template, items, count, layout, delay, step, jitter, seed } => {
+            LayerKind::Repeat { layer: template, items, props } => {
                 let placed = world.then(&local.affine([0.0, 0.0]));
-                let along = match layout {
-                    RepeatLayout::Along { path, .. } => Some(Polyline::of(path)),
-                    _ => None,
-                };
+                let along = props.guide();
                 let outer = self.instance;
-                let mut children = Vec::with_capacity(*count);
-                for i in 0..*count {
-                    let fi = i as f64;
-                    let rnd = |k: u32| -> f64 {
-                        let mut h = (*seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (k as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-                        h ^= h >> 31;
-                        h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-                        h ^= h >> 32;
-                        (h as f64 / u64::MAX as f64) * 2.0 - 1.0
-                    };
-                    let (mut pos, mut turn) = match layout {
-                        RepeatLayout::Grid { columns, spacing } => ([(i % columns) as f64 * spacing[0], (i / columns) as f64 * spacing[1]], 0.0),
-                        RepeatLayout::Radial { radius, start, sweep, face } => {
-                            let full = (sweep.abs() - 360.0).abs() < 1e-9;
-                            let a = start + sweep * if full { fi / (*count).max(1) as f64 } else { fi / ((*count).max(2) - 1) as f64 };
-                            let r = a.to_radians();
-                            ([radius * r.sin(), -radius * r.cos()], if *face { a } else { 0.0 })
-                        }
-                        RepeatLayout::Along { face, .. } => {
-                            let path = along.as_ref().unwrap();
-                            let u = if *count > 1 { fi / (*count - 1) as f64 } else { 0.0 };
-                            let p = path.point(u);
-                            let q = path.point((u + 0.001).min(1.0));
-                            let p0 = path.point((u - 0.001).max(0.0));
-                            let angle = (q[1] - p0[1]).atan2(q[0] - p0[0]).to_degrees();
-                            (p, if *face { angle } else { 0.0 })
-                        }
-                        RepeatLayout::Line => ([0.0, 0.0], 0.0),
-                    };
-                    pos[0] += step.x * fi + jitter.x * rnd(1);
-                    pos[1] += step.y * fi + jitter.y * rnd(2);
-                    turn += step.rotate * fi + jitter.rotate * rnd(3);
-                    let s = (1.0 + step.scale * fi + jitter.scale * rnd(4)).max(0.0);
-                    let o = (1.0 + step.opacity * fi + jitter.opacity * rnd(5)).clamp(0.0, 1.0);
-                    let copy = placed.then(&Affine::translate(pos[0], pos[1])).then(&Affine::rotate(turn)).then(&Affine::scale(s, s));
-                    let d = delay * fi;
+                let mut children = Vec::with_capacity(props.count);
+                for i in 0..props.count {
+                    let (copy, o, d) = props.place_copy(i, &placed, along.as_ref());
                     self.instance = outer + i;
                     // A copy of a `source` item is its own compiled layer.
                     let layer = items.get(i).unwrap_or(template);
@@ -679,7 +585,7 @@ impl Evaluator<'_> {
                     effects: Vec::new(),
                     blend: Blend::Normal,
                     is_static: false,
-                    kind: ItemKind::Rect { size: *size, radius: 0.0, fill: Some([1.0, 1.0, 1.0, 1.0]), stroke: None, width: 0.0, trim: [0.0, 1.0], cap: Cap::Butt },
+                    kind: ItemKind::Primitive(PrimitiveFrame::Rect { size: *size, radius: 0.0, fill: Some([1.0, 1.0, 1.0, 1.0]), stroke: None, width: 0.0, trim: [0.0, 1.0], cap: Cap::Butt }),
                 };
                 ItemKind::Group { children, mask: Some(Box::new(clip)), mask_mode: MaskMode::Alpha, size: Some(*size) }
             }
@@ -752,18 +658,12 @@ impl Evaluator<'_> {
                 bpm: self.doc.bpm,
                 textures: textures.clone(),
                 videos: videos.clone(),
-                scene: match scene {
-                    // The document's, then the layer's own (a Text3D's look), which win.
-                    SceneSource::Template { source, inputs } => SceneSource::Template {
-                        source: source.clone(),
-                        inputs: {
-                            // The values the frame's instance holds (in the VM for the frame).
-                            let held = self.doc.vm.with(|e| e.host.host.inputs.clone());
-                            self.doc.inputs.iter().map(|decl| decl.name.clone()).zip(held.iter().map(|(_, value)| value.clone())).chain(inputs.iter().cloned()).collect()
-                        },
-                    },
-                    #[cfg(feature = "scene3d")]
-                    SceneSource::Object(_) => scene.clone(),
+                scene: match self.calls.scene_source(scene) {
+                    Ok(scene) => scene,
+                    Err(message) => {
+                        self.errors.push(Diagnostic::error(*loc, layer.path.clone(), message));
+                        return None;
+                    }
                 },
                 first_line: loc.line,
                 size: size.as_ref().map_or(self.doc.size, |s| self.sample(s, lt, 0)),
@@ -823,7 +723,7 @@ impl Evaluator<'_> {
             },
             LayerKind::Draw2d { draw, size } => {
                 let size = size.as_ref().map_or(self.doc.size, |p| self.sample(p, lt, 0));
-                match self.doc.call_draw2d(draw.index, lt, self.edit) {
+                match self.calls.call_draw2d(draw.index, lt, self.edit) {
                     Ok((picture, messages)) => {
                         for message in messages {
                             self.errors.push(Diagnostic::error(draw.loc, layer.path.clone(), message));
@@ -842,21 +742,12 @@ impl Evaluator<'_> {
     }
 
     fn text(&mut self, layer: &Layer, lt: f64, origin: f64) -> ItemKind {
-        let LayerKind::Text { source, font, weight, italic, size, color, align, valign, by, stagger, ranges, line_height, tracking, wrap, fit, voice, plate, reveal, caret, path, flicker, only, axes, stroke, .. } = &layer.kind else {
+        let LayerKind::Text { source, props: TextProps { font, weight, italic, size, color, align, valign, by, stagger, line_height, tracking, wrap, fit, reveal }, ranges, voice, plate, caret, path, flicker, only, axes, stroke, .. } = &layer.kind else {
             unreachable!()
         };
         let size = self.sample(size, lt, 0)[0].max(0.0);
-        let plain = |this: &mut Self, text: String| -> (String, Vec<TextUnit>) {
-            let count = unit_range_iter(&text, *by).count();
-            let mut units = Vec::with_capacity(count);
-            units.extend(unit_range_iter(&text, *by).enumerate().map(|(i, range)| {
-                if *by == TextBy::Whole {
-                    // The item carries the text's own animation.
-                    TextUnit { range, offset: [0.0, 0.0], scale: [1.0, 1.0], rotate: 0.0, opacity: 1.0, color: this.sample(color, lt, 0), blur: 0.0, axes: Vec::new() }
-                } else {
-                    this.unit(layer, range, lt - stagger.delay(i, count), i, color)
-                }
-            }));
+        let plain = |this: &mut Self, text: String| {
+            let units = this.properties().text_units(&text, *by, stagger, &layer.transform, &layer.opacity, &layer.blur, color, lt);
             (text, units)
         };
         let (text, units) = match source {
@@ -911,16 +802,7 @@ impl Evaluator<'_> {
                 }
             }
         }
-        let chars = text.chars().filter(|c| !c.is_whitespace()).count();
-        let reveal = reveal.as_ref().map(|r| {
-            let r = self.sample(r, lt, 0)[0].max(0.0);
-            // A fraction of the characters, or (above 1) a count; spaces
-            // count too, as they appear.
-            let all = text.chars().count();
-            let n = if r <= 1.0 { (r * all as f64).round() as usize } else { r.floor() as usize };
-            let _ = chars;
-            n.min(all)
-        });
+        let reveal = self.properties().text_reveal(&text, reveal.as_ref(), lt);
         let plate = plate.as_ref().map(|p| PlateFrame {
             color: self.sample(&p.color, lt, 0),
             pad: p.pad,
@@ -936,7 +818,7 @@ impl Evaluator<'_> {
         let axes: Vec<_> = axes.iter().map(|(tag, value)| (tag.clone(), axis_step(tag, self.sample(value, lt, 0)[0]))).collect();
         self.text_ranges(ranges, &text, *by, &axes, &mut units, lt);
         let stroke = stroke.as_ref().map(|(color, width)| (self.sample(color, lt, 0), self.sample(width, lt, 0)[0].max(0.0)));
-        ItemKind::Text {
+        ItemKind::Primitive(PrimitiveFrame::Text {
             text,
             font: font.clone(),
             weight: *weight,
@@ -956,24 +838,11 @@ impl Evaluator<'_> {
             reveal,
             caret,
             outline: stroke,
-        }
+        })
     }
 
-    /// One unit's own animation at its clock `ut`.
     fn unit(&mut self, layer: &Layer, range: std::ops::Range<usize>, ut: f64, index: usize, color: &Prop<4>) -> TextUnit {
-        let tr = &layer.transform;
-        let x = self.sample(&tr.x, ut, index)[0];
-        let y = self.sample(&tr.y, ut, index)[0];
-        TextUnit {
-            range,
-            offset: [x, y],
-            scale: self.sample(&tr.scale, ut, index),
-            rotate: self.sample(&tr.rotate, ut, index)[0],
-            opacity: self.sample(&layer.opacity, ut, index)[0].clamp(0.0, 1.0),
-            color: self.sample(color, ut, index),
-            blur: self.sample(&layer.blur, ut, index)[0].max(0.0),
-            axes: Vec::new(),
-        }
+        self.properties().text_unit(&layer.transform, &layer.opacity, &layer.blur, range, ut, index, color)
     }
 
     /// Ranges sample once on the layer clock, then blend in written order.
@@ -1250,106 +1119,10 @@ pub fn format_number(n: f64, decimals: u32, grouping: Option<&str>) -> String {
     }
 }
 
-/// The point `progress` (0..1) of the way along SVG path data, by length.
-pub fn point_along(data: &str, progress: f64) -> [f64; 2] {
-    Polyline::of(data).point(progress)
-}
+pub use makepad_motion_plain::geometry::{point_along, Polyline};
 
-/// A path flattened once, for many points along it (a `Repeat` along a path).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Polyline {
-    pieces: Vec<(Vec<[f64; 2]>, bool)>,
-    total: f64,
-}
-
-impl Polyline {
-    pub fn of(data: &str) -> Self {
-        Self::from_path(&crate::geometry::parse_path(data))
-    }
-
-    pub fn from_path(path: &makepad_svg::VectorPath) -> Self {
-        let pieces = crate::geometry::flatten(path, 0.1);
-        let total = pieces.iter().map(|(p, _)| p.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt()).sum::<f64>()).sum();
-        Self { pieces, total }
-    }
-
-    pub fn length(&self) -> f64 {
-        self.total
-    }
-
-    pub fn point(&self, progress: f64) -> [f64; 2] {
-        self.sample(progress).0
-    }
-
-    /// Arc-length position and unit tangent, including either endpoint.
-    pub fn sample(&self, progress: f64) -> ([f64; 2], [f64; 2]) {
-        let target = progress.clamp(0.0, 1.0) * self.total;
-        let mut walked = 0.0;
-        let mut last = ([0.0, 0.0], [1.0, 0.0]);
-        for (points, _) in &self.pieces {
-            for w in points.windows(2) {
-                let delta = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
-                let seg = delta[0].hypot(delta[1]);
-                if seg == 0.0 { last.0 = w[1]; continue; }
-                let tangent = [delta[0] / seg, delta[1] / seg];
-                if walked + seg >= target {
-                    let u = (target - walked) / seg;
-                    return ([w[0][0] + delta[0] * u, w[0][1] + delta[1] * u], tangent);
-                }
-                walked += seg;
-                last = (w[1], tangent);
-            }
-        }
-        last
-    }
-}
-
-/// Byte ranges of the units `by` splits `text` into. Letters skip
-/// whitespace (a space takes no stagger step); words and lines are the
-/// runs between whitespace and newlines.
-pub fn unit_ranges(text: &str, by: TextBy) -> Vec<std::ops::Range<usize>> {
-    unit_range_iter(text, by).collect()
-}
-
-/// The same segmentation without an intermediate allocation, for frame
-/// units and coarser range selections. Empty lines keep their old behaviour
-/// (skipped); a whitespace-only line is still a line.
-fn unit_range_iter(text: &str, by: TextBy) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
-    let mut chars = text.char_indices();
-    let mut line_start = 0;
-    let mut whole = false;
-    std::iter::from_fn(move || match by {
-        TextBy::Whole => {
-            if whole { return None; }
-            whole = true;
-            Some(0..text.len())
-        }
-        TextBy::Letter | TextBy::Syllable => chars.find(|(_, c)| !c.is_whitespace()).map(|(at, c)| at..at + c.len_utf8()),
-        TextBy::Word => {
-            // A script written without spaces (Chinese, Japanese) is a word
-            // per character.
-            let (start, first) = chars.find(|(_, c)| !c.is_whitespace())?;
-            if crate::typography::is_cjk(first) {
-                return Some(start..start + first.len_utf8());
-            }
-            let rest = &text[start..];
-            let end = rest.char_indices().skip(1).find(|(_, c)| c.is_whitespace() || crate::typography::is_cjk(*c)).map_or(text.len(), |(at, _)| start + at);
-            while chars.as_str().len() > text.len() - end {
-                chars.next();
-            }
-            Some(start..end)
-        }
-        TextBy::Line => loop {
-            let start = line_start;
-            let end = match chars.find(|(_, c)| *c == '\n') {
-                Some((at, _)) => { line_start = at + 1; at }
-                None => { line_start = text.len(); text.len() }
-            };
-            if end > start { return Some(start..end); }
-            if line_start == text.len() { return None; }
-        },
-    })
-}
+pub use makepad_motion_plain::unit_ranges;
+use makepad_motion_plain::unit_range_iter;
 
 /// Each unit and its index/count in a range's selection. A coarser range
 /// advances one cursor through the containing words/lines (linear work).
@@ -1393,163 +1166,7 @@ impl RangeWindow {
     }
 }
 
-/// A key track's value at `t` (seconds on its layer's clock).
-pub fn sample_track<const N: usize>(track: &Track<N>, t: f64) -> [f64; N] {
-    let keys = &track.keys;
-    let Some(first) = keys.first() else { return [0.0; N] };
-    let mut t = t;
-    if let Some(repeat) = &track.repeat {
-        let period = repeat.period.value.max(1e-9);
-        let start = first.t.value;
-        if t > start {
-            let elapsed = t - start;
-            let cycle = (elapsed / period).floor();
-            let within = repeat.count.map_or(true, |count| cycle < count as f64);
-            if within {
-                let mut u = elapsed - cycle * period;
-                if repeat.mode == LoopMode::PingPong && (cycle as i64) % 2 == 1 {
-                    u = period - u;
-                }
-                t = start + u;
-            } else {
-                // Finished: rest where the last cycle ended.
-                let count = repeat.count.unwrap_or(1) as i64;
-                t = if repeat.mode == LoopMode::PingPong && count % 2 == 0 { start } else { start + period };
-            }
-        }
-    }
-    let last = &keys[keys.len() - 1];
-    let (t0, t1) = (first.t.value, last.t.value);
-    // Past the keys: the extrapolation.
-    if t < t0 || t > t1 {
-        let (mode, end) = if t < t0 { (track.before, 0) } else { (track.after, keys.len() - 1) };
-        match mode {
-            Extrap::Constant => return keys[end].v,
-            Extrap::Cycle if t1 > t0 => {
-                let span = t1 - t0;
-                t = t0 + (t - t0).rem_euclid(span);
-            }
-            Extrap::Cycle => return keys[end].v,
-            Extrap::Linear => {
-                let slope = end_slope(keys, end);
-                let dt = t - keys[end].t.value;
-                return std::array::from_fn(|i| keys[end].v[i] + slope[i] * dt);
-            }
-        }
-    }
-    if !(t > first.t.value) {
-        return first.v;
-    }
-    let next = keys.partition_point(|key| key.t.value <= t);
-    if next >= keys.len() {
-        return keys[keys.len() - 1].v;
-    }
-    let (a, b) = (&keys[next - 1], &keys[next]);
-    let span = b.t.value - a.t.value;
-    if b.bez.is_some_and(|h| h.bezier) {
-        let (_, out) = key_handles(keys, next - 1);
-        let (inn, _) = key_handles(keys, next);
-        return std::array::from_fn(|i| bezier_at([a.t.value, a.v[i]], [a.t.value + out.0, a.v[i] + out.1[i]], [b.t.value + inn.0, b.v[i] + inn.1[i]], [b.t.value, b.v[i]], t));
-    }
-    let u = b.ease.apply((t - a.t.value) / span.max(1e-12), span);
-    std::array::from_fn(|i| a.v[i] + (b.v[i] - a.v[i]) * u)
-}
-
-/// The slope a track leaves its end key `k` with (per second, each
-/// component): its handle's for a bezier end, else its segment's.
-fn end_slope<const N: usize>(keys: &[Key<N>], k: usize) -> [f64; N] {
-    if keys.len() < 2 {
-        return [0.0; N];
-    }
-    let (a, b) = if k == 0 { (0, 1) } else { (k - 1, k) };
-    let bezier = keys[b].bez.is_some_and(|h| h.bezier);
-    if bezier {
-        let (inn, out) = key_handles(keys, k);
-        let h = if k == 0 { out } else { inn };
-        if h.0.abs() > 1e-9 {
-            return std::array::from_fn(|i| h.1[i] / h.0);
-        }
-        return [0.0; N];
-    }
-    let dt = (keys[b].t.value - keys[a].t.value).max(1e-12);
-    std::array::from_fn(|i| (keys[b].v[i] - keys[a].v[i]) / dt)
-}
-
-/// Key `k`'s handles (in, out) as offsets (seconds, value per component):
-/// written ones as written, the rest from the neighbours by its mode. A
-/// handle never reaches past the next key in time.
-pub fn key_handles<const N: usize>(keys: &[Key<N>], k: usize) -> ((f64, [f64; N]), (f64, [f64; N])) {
-    let key = &keys[k];
-    let h = key.bez.unwrap_or_else(|| {
-        // A key without a record whose next segment is a bezier: smooth.
-        KeyHandles::default()
-    });
-    let dt_prev = if k > 0 { key.t.value - keys[k - 1].t.value } else { 0.0 };
-    let dt_next = if k + 1 < keys.len() { keys[k + 1].t.value - key.t.value } else { 0.0 };
-    let dv_prev: [f64; N] = std::array::from_fn(|i| if k > 0 { key.v[i] - keys[k - 1].v[i] } else { 0.0 });
-    let dv_next: [f64; N] = std::array::from_fn(|i| if k + 1 < keys.len() { keys[k + 1].v[i] - key.v[i] } else { 0.0 });
-    let clamp_t = |dt: f64, limit: f64| if limit > 0.0 { dt.clamp(-limit, limit) } else { 0.0 };
-    match h.mode {
-        HandleMode::Aligned | HandleMode::Free if N == 1 => {
-            let inn = h.r#in.unwrap_or([-dt_prev / 3.0, 0.0]);
-            let out = h.out.unwrap_or([dt_next / 3.0, 0.0]);
-            let it = clamp_t(inn[0].min(0.0), dt_prev);
-            let ot = clamp_t(out[0].max(0.0), dt_next);
-            // A handle cut short in time keeps its direction.
-            let iv = if inn[0].abs() > 1e-12 { inn[1] * it / inn[0] } else { inn[1] };
-            let ov = if out[0].abs() > 1e-12 { out[1] * ot / out[0] } else { out[1] };
-            ((it, std::array::from_fn(|_| iv)), (ot, std::array::from_fn(|_| ov)))
-        }
-        HandleMode::Vector => ((-dt_prev / 3.0, std::array::from_fn(|i| -dv_prev[i] / 3.0)), (dt_next / 3.0, std::array::from_fn(|i| dv_next[i] / 3.0))),
-        mode => {
-            // A slope through the key: the neighbours' (one-sided at the ends).
-            let slope: [f64; N] = std::array::from_fn(|i| {
-                let s = match (k > 0, k + 1 < keys.len()) {
-                    (true, true) => (dv_prev[i] + dv_next[i]) / (dt_prev + dt_next).max(1e-12),
-                    (false, true) => dv_next[i] / dt_next.max(1e-12),
-                    (true, false) => dv_prev[i] / dt_prev.max(1e-12),
-                    (false, false) => 0.0,
-                };
-                if mode != HandleMode::Clamped {
-                    return s;
-                }
-                // Clamped: flat at a peak or an end, and never past a neighbour.
-                let ends = k == 0 || k + 1 == keys.len();
-                if ends || dv_prev[i] * dv_next[i] <= 0.0 {
-                    return 0.0;
-                }
-                let lim_prev = 3.0 * dv_prev[i].abs() / dt_prev.max(1e-12);
-                let lim_next = 3.0 * dv_next[i].abs() / dt_next.max(1e-12);
-                s.signum() * s.abs().min(lim_prev).min(lim_next)
-            });
-            ((-dt_prev / 3.0, std::array::from_fn(|i| -slope[i] * dt_prev / 3.0)), (dt_next / 3.0, std::array::from_fn(|i| slope[i] * dt_next / 3.0)))
-        }
-    }
-}
-
-/// A cubic bezier through (time, value) points p0..p3, read at time `t`
-/// (time runs forward along it).
-pub fn bezier_at(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], t: f64) -> f64 {
-    let x = |u: f64| {
-        let m = 1.0 - u;
-        m * m * m * p0[0] + 3.0 * m * m * u * p1[0] + 3.0 * m * u * u * p2[0] + u * u * u * p3[0]
-    };
-    let y = |u: f64| {
-        let m = 1.0 - u;
-        m * m * m * p0[1] + 3.0 * m * m * u * p1[1] + 3.0 * m * u * u * p2[1] + u * u * u * p3[1]
-    };
-    // Bisection on x(u) = t (x is monotone: the handles stay within the segment).
-    let (mut lo, mut hi) = (0.0f64, 1.0f64);
-    for _ in 0..40 {
-        let mid = 0.5 * (lo + hi);
-        if x(mid) < t {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    y(0.5 * (lo + hi))
-}
+pub use makepad_motion_plain::{key_handles, sample_track};
 
 /// A `Repeat` copy's item paths made its own (`…layer#3`), so everything
 /// keyed by path (prepared pictures, caches) tells the copies apart.

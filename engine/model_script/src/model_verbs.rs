@@ -326,6 +326,22 @@ pub fn script_model_wanted(alias: &str) -> Option<String> { registry(|r| r.wante
 pub fn script_model_revision(alias: &str) -> Option<ScriptModelRevision> {
     registry(|r| r.wanted(alias).map(|hash| ScriptModelRevision { alias: alias.into(), hash: hash.clone() }))
 }
+/// The latest admitted model request recorded for `alias`, without draining the
+/// build queue (`take_script_model_requests`).
+///
+/// Lets an inspector, offline compiler or preview builder read the recorded
+/// `ProgramOp` list and metadata for an alias while leaving the process build
+/// queue intact. Returns `None` if `alias` has not been requested, was evicted,
+/// or had its current revision withheld (whose program is not retained).
+pub fn script_model_program(alias: &str) -> Option<ScriptModelRequest> {
+    registry(|r| {
+        let request = r.requested.get(alias)?;
+        if r.withheld.get(alias).is_some_and(|(hash, _)| hash == &request.hash) {
+            return None;
+        }
+        Some(request.clone())
+    })
+}
 /// The app evicted `alias` from residency: a later request builds it again.
 pub fn forget_script_model_install(alias: &str) {
     let _retired = registry(|r| { r.installed.remove(alias); r.program_bytes.remove(alias); r.requested.remove(alias) });
@@ -2441,5 +2457,56 @@ m
         forget_script_model_install(alias);
         assert_eq!(script_model_state(alias), ScriptModelState::Unknown);
         assert_eq!(revisions[0].state(), None, "an evicted revision no longer holds a reply");
+    }
+
+    #[test]
+    fn script_model_program_reads_admitted_request_without_draining_queue() {
+        struct WithholdAll;
+        impl ModelHost for WithholdAll {
+            fn log(&self, _message: String) {}
+            fn admit_program(&self, _alias: &str, _bytes: usize) -> Admit {
+                Admit::Withhold("over budget".into())
+            }
+        }
+
+        let alias = "gen/mdl/test-program-lookup";
+        let withheld_alias = "gen/mdl/test-program-lookup-withheld";
+        forget_script_model_install(alias);
+        forget_script_model_install(withheld_alias);
+        assert!(script_model_program(alias).is_none());
+
+        let program = vec![ProgramOp::Op(Operation::Construction(ConstructionOperation {
+            object: "b".into(),
+            kind: Construction::Shape {
+                shape: Shape::Box { size: [1.; 3], radius: 0., segments: 3 },
+                material: 0,
+            },
+        }))];
+        request_builtin_model(alias, "prop", program.clone());
+
+        let peeked = script_model_program(alias).expect("admitted program must be retained");
+        assert_eq!(peeked.alias, alias);
+        assert_eq!(peeked.class, "prop");
+        assert_eq!(peeked.program.len(), 1);
+
+        // Lookup must not drain the build queue.
+        let queued: Vec<_> = take_script_model_requests().into_iter().filter(|r| r.alias == alias).collect();
+        assert_eq!(queued.len(), 1, "peeking must leave the build queue intact");
+        assert_eq!(queued[0].hash, peeked.hash);
+        assert!(Arc::ptr_eq(&queued[0].program, &peeked.program));
+
+        // Still readable after the queue is drained.
+        let after_drain = script_model_program(alias).expect("retained after queue drain");
+        assert_eq!(after_drain.hash, peeked.hash);
+        assert!(Arc::ptr_eq(&after_drain.program, &peeked.program));
+
+        // Withheld revisions drop their program and return None.
+        request_model_for(&WithholdAll, withheld_alias, "prop", program);
+        assert!(script_model_program(withheld_alias).is_none(), "withheld revision must not return an empty program stub");
+
+        // Eviction clears the lookup.
+        forget_script_model_install(alias);
+        forget_script_model_install(withheld_alias);
+        assert!(script_model_program(alias).is_none());
     }
 }

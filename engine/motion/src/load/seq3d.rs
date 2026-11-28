@@ -10,6 +10,7 @@
 //! GLB) and `logo` (an SVG asset, markup or a path `d`) go into the scene
 //! as they are.
 
+use crate::plain::GroupProps;
 use super::{At, Reader};
 use crate::layers::Seq3D;
 use crate::model::*;
@@ -120,7 +121,7 @@ impl Seq3D {
             Ok(record) => LayerKind::Scene3dDoc { assets, scene: SceneSource::Template { source: SCENE.into(), inputs: vec![("seq3d".into(), input(&record))] }, loc: at.loc, written: false, size, textures, videos, layers: Vec::new() },
             Err(message) => {
                 c.err(at, "template", message, Some(&format!("`Seq3D{{template: @logo_sting text: \"BRAND\"}}`; templates: {}", seq3d::template_names())));
-                LayerKind::Group { layers: Vec::new(), mask: None, mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None, post: Default::default(), glyphs: false }
+                LayerKind::Group { layers: Vec::new(), mask: None, props: GroupProps { mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None }, post: Default::default(), glyphs: false }
             }
         }
     }

@@ -174,7 +174,10 @@ impl Tile3 {
         let wrap = |i: i32| (i & mask) as usize;
         let (x0, x1, y0, y1, z0, z1) = (wrap(ix), wrap(ix + 1), wrap(iy), wrap(iy + 1), wrap(iz), wrap(iz + 1));
         let size = self.size;
-        let at = |x: usize, y: usize, z: usize| self.data[(z * size + y) * size + x] as f32;
+        debug_assert!(self.data.len() == size * size * size);
+        // The length is a power of two, so this mask preserves every wrapped index and lets LLVM see the bound.
+        let last = self.data.len() - 1;
+        let at = |x: usize, y: usize, z: usize| self.data[((z * size + y) * size + x) & last] as f32;
         let near = mix_f32(mix_f32(at(x0, y0, z0), at(x1, y0, z0), tx), mix_f32(at(x0, y1, z0), at(x1, y1, z0), tx), ty);
         let far = mix_f32(mix_f32(at(x0, y0, z1), at(x1, y0, z1), tx), mix_f32(at(x0, y1, z1), at(x1, y1, z1), tx), ty);
         mix_f32(near, far, tz) * (1.0 / 255.0)

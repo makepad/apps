@@ -32,6 +32,8 @@
 
 #[path = "common/picture.rs"]
 mod picture;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, Role, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
@@ -198,7 +200,7 @@ fn the_board_takes_a_parts_key_shadow() {
         let scene = recording(&app).get("records").and_then(|r| r.get("scene")).and_then(Value::as_u64).unwrap_or(0);
         let lines = remote(&app, &["drop".into(), format!("path={}", plate.display()), format!("x={}", b.x + b.w * 0.5), format!("y={}", b.y + b.h * 0.5)]).expect("drop the guard project");
         assert!(lines.iter().any(|l| l.contains("\"ok\":1")), "open the guard project: {lines:?}");
-        app.locator(Selector::role(Role::Tab).name("Parts")).wait_visible().click();
+        parts_tab::open(&app);
         app.locator(Selector::role(Role::TreeItem).name("Board")).wait_visible();
         // A linked board draws in the board layer, outside the recording's parts_drawn count.
         // Its built Parts row and a new scene recording precede the finished-picture wait.

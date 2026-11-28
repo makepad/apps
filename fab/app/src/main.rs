@@ -16,6 +16,7 @@ mod img2mesh;
 pub mod journal;
 mod code_edit;
 mod demo_part;
+mod dirs;
 mod elec_flash;
 mod elec_radio;
 mod elec_fw;
@@ -23,6 +24,7 @@ mod elec_mic;
 mod elec_net;
 mod elec_screen;
 mod elec_host;
+mod req_draft;
 mod elec_export;
 mod live_slice;
 mod marks;
@@ -85,6 +87,8 @@ use fab::{
 use fab::ui::stage::StageAction;
 use fab::ui::topbar::Caption;
 use fab::workspaces::{ListOp, WorkspaceId, Workspaces};
+use fab_elec_view::flow::FlowStage;
+use fab::ui::review_strip::{ReviewAction, ReviewNext};
 use makepad_ai_services::wire::{ServiceManifest, TaskAction, TaskCard, ToolResult};
 use makepad_app_shell::chat::{self as shell_chat, ChatCaller, ChatDock, ChatHost};
 use makepad_model::json::{self, Value};
@@ -187,13 +191,14 @@ script_mod! {
                         }
                         // its own list: the chat redraws itself as it changes
                         b: View{width: Fill height: Fill new_batch: true
-                            ai_chat := AiChatPanel{width: Fill height: Fill web_research: true}
+                            ai_chat := AiChatPanel{width: Fill height: Fill}
                         }
                     }
                     // what comes and goes: notices, hints, the slice, the jobs, the plate's counts
                     status_bar := mod.widgets.FabStatusBar{}
                     // Offscreen review passes for fab.render (1x1, invisible).
-                    review := mod.widgets.FabReviewRenderer{}
+                    // A lookup by `review` would find the shell's strip first.
+                    review_renderer := mod.widgets.FabReviewRenderer{}
                     // The headset's view, in a process that serves one (1x1, invisible).
                     xr := mod.widgets.FabXr{}
                 }
@@ -330,6 +335,8 @@ pub struct App {
     #[rust]
     state: AppState,
     #[rust]
+    dirs: Arc<dirs::FabDirs>,
+    #[rust]
     loader: LoadCoordinator,
     #[rust]
     loaders_registered: bool,
@@ -352,6 +359,10 @@ pub struct App {
     /// The electronics engine strand, started when its workspace is first opened.
     #[rust]
     elec: Option<elec_host::ElecHost>,
+    #[rust]
+    last_accepted_slot: Option<(String, String)>,
+    #[rust]
+    next_editor: Option<FlowStage>,
     /// The serial queue for models named by the open electronics design.
     #[rust]
     part_models: Option<part_models::PartModels>,
@@ -800,6 +811,11 @@ fn shows_workspace(action: &ShellAction) -> bool {
 }
 
 impl App {
+    fn apply_startup_prefs(&mut self, prefs: fab::api::StartupPrefs) {
+        self.state.apply_startup_prefs(prefs, !self.keep_view);
+        part_models::set_sources(self.state.model_sources.bits());
+    }
+
     /// The plate mode `action` puts in force when it shows a workspace by kind or by id.
     fn mode_after(&self, action: &ShellAction) -> Option<PlateMode> {
         let ui = &self.state.ui;
@@ -1021,6 +1037,33 @@ impl App {
         changed
     }
 
+    fn check_elec_plate_action(has_docs: bool, action: &str) -> Result<(), &'static str> {
+        if !has_docs && !matches!(action, "elec.req.list" | "elec.req.add" | "elec.req.wish"
+            | "elec.step.list" | "elec.step.propose" | "elec.doc.list" | "elec.doc.read" | "elec.design.read") {
+            return Err("This plate has no electronics: it has no electronics documents.");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_elec_plate(docs: &fab_model::Docs, action: &str) -> Result<(), &'static str> {
+        Self::check_elec_plate_action(!elec_host::electronics(docs).is_empty(), action)
+    }
+
+    fn plate_has_elec(&self) -> bool {
+        if let Some(has) = self.elec.as_ref().filter(|e| e.bed() == self.status.switched).and_then(elec_host::ElecHost::has_docs) {
+            return has;
+        }
+        !elec_host::electronics(&self.status.docs).is_empty()
+    }
+
+    fn refuse_tool_call(&mut self, id: u64, error: &str) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()) {
+            draft.answered(id, false, error);
+        }
+        self.calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(error)), images: Vec::new() });
+    }
+
     /// `fab.elec_read` / `fab.elec_edit` call `id`: its `action` with its `args` run through
     /// the electronics host as the caller (`ElecHost::run_action`), the path a person's command takes
     /// too. `help` answers an action's entry from the catalog. The answer comes through
@@ -1031,21 +1074,18 @@ impl App {
         }
         let offered = fab_ai::elec_actions(tool);
         let names = || offered.iter().map(|def| def.name).collect::<Vec<_>>().join(", ");
-        let refuse = |calls: &mut chat::Calls, error: String| {
-            calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&error)), images: Vec::new() });
-        };
         let Some(action) = args.get("action").and_then(Value::as_str) else {
-            return refuse(&mut self.calls, format!("fab.{tool} takes action: one of {}, or help", names()));
+            return self.refuse_tool_call(id, &format!("fab.{tool} takes action: one of {}, or help", names()));
         };
         let fields: Vec<(String, String)> = match args.get("args") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Obj(fields)) => fields.iter().map(|(name, value)| (name.clone(), splash_arg(value))).collect(),
-            Some(_) => return refuse(&mut self.calls, "args is an object of the action's fields by name".into()),
+            Some(_) => return self.refuse_tool_call(id, "args is an object of the action's fields by name"),
         };
         if action == "help" {
             let of = fields.iter().find(|(name, _)| name == "of").map(|(_, value)| value.as_str());
             let Some(def) = of.and_then(fab_elec_design::action::find) else {
-                return refuse(&mut self.calls, format!("help takes of: an action's name; fab.{tool} has {}", names()));
+                return self.refuse_tool_call(id, &format!("help takes of: an action's name; fab.{tool} has {}", names()));
             };
             let help = fab_ai::elec_action_help(def);
             let text = if def.name == fab_elec_mech::read::ACTIONS[0].name {
@@ -1059,13 +1099,13 @@ impl App {
         }
         if !offered.iter().any(|def| def.name == action) {
             let elsewhere = fab_elec_design::action::find(action).and_then(|def| fab_ai::elec_tool_of(def.risk));
-            return refuse(&mut self.calls, match elsewhere {
+            return self.refuse_tool_call(id, &match elsewhere {
                 Some(other) => format!("{action} is offered by fab.{other}, not fab.{tool}"),
                 None => format!("fab.{tool} has no action {action}; it has {}", names()),
             });
         }
-        if self.status.docs.is_empty() {
-            return refuse(&mut self.calls, "This plate has no electronics: it has no electronics documents.".into());
+        if let Err(why) = Self::check_elec_plate_action(self.plate_has_elec(), action) {
+            return self.refuse_tool_call(id, why);
         }
         // What the person typed lands first, as before a bed switch.
         self.send_typing();
@@ -1082,37 +1122,34 @@ impl App {
     /// `{old new}` or the whole `text`.
     fn elec_text_call(&mut self, cx: &mut Cx, id: u64, args: &Value) {
         use fab_elec_host::doc_actions::TextChange;
-        let refuse = |calls: &mut chat::Calls, error: &str| {
-            calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(error)), images: Vec::new() });
-        };
         let Some(doc) = args.get("doc").and_then(Value::as_str) else {
-            return refuse(&mut self.calls, "doc: the document's name, as elec.doc.list gives it");
+            return self.refuse_tool_call(id, "doc: the document's name, as elec.doc.list gives it");
         };
         let rev = match args.get("rev") {
             Some(Value::Int(rev)) if *rev >= 0 => *rev as u64,
             Some(Value::F64(rev)) if *rev >= 0.0 && rev.fract() == 0.0 => *rev as u64,
             Some(Value::Str(rev)) if rev.trim().parse::<u64>().is_ok() => rev.trim().parse().unwrap_or_default(),
-            _ => return refuse(&mut self.calls, "rev: the revision elec.doc.read gave, a whole number"),
+            _ => return self.refuse_tool_call(id, "rev: the revision elec.doc.read gave, a whole number"),
         };
         let change = match (args.get("edits"), args.get("text")) {
-            (Some(_), Some(_)) => return refuse(&mut self.calls, "give edits or text, not both"),
+            (Some(_), Some(_)) => return self.refuse_tool_call(id, "give edits or text, not both"),
             (None, Some(Value::Str(text))) => TextChange::Whole(text.clone()),
-            (None, Some(_)) => return refuse(&mut self.calls, "text: the document's whole new text, a string"),
+            (None, Some(_)) => return self.refuse_tool_call(id, "text: the document's whole new text, a string"),
             (Some(Value::Arr(edits)), None) => {
                 let mut pairs = Vec::with_capacity(edits.len());
                 for (at, edit) in edits.iter().enumerate() {
                     let (Some(old), Some(new)) = (edit.get("old").and_then(Value::as_str), edit.get("new").and_then(Value::as_str)) else {
-                        return refuse(&mut self.calls, &format!("edit {}: an edit is {{old new}}, both strings", at + 1));
+                        return self.refuse_tool_call(id, &format!("edit {}: an edit is {{old new}}, both strings", at + 1));
                     };
                     pairs.push((old.to_string(), new.to_string()));
                 }
                 TextChange::Replace(pairs)
             }
-            (Some(_), None) => return refuse(&mut self.calls, "edits: an array of {old new}"),
-            (None, None) => return refuse(&mut self.calls, "give edits: [{old new}], or the whole text"),
+            (Some(_), None) => return self.refuse_tool_call(id, "edits: an array of {old new}"),
+            (None, None) => return self.refuse_tool_call(id, "give edits: [{old new}], or the whole text"),
         };
-        if self.status.docs.is_empty() {
-            return refuse(&mut self.calls, "This plate has no electronics: it has no electronics documents.");
+        if let Err(why) = Self::check_elec_plate_action(self.plate_has_elec(), fab_ai::ELEC_TEXT_TOOL) {
+            return self.refuse_tool_call(id, why);
         }
         // What the person typed lands first: the call's revision is checked against it.
         self.send_typing();
@@ -2378,6 +2415,26 @@ impl App {
     }
 
     fn host_done(&mut self, cx: &mut Cx, done: &model_host::Done) {
+        let sending_before = self.state.print.sending.len();
+        let mut handled_print_setup_fail = false;
+        if let Some(seq) = done.print_setup_seq {
+            if seq < self.printing.print_setup_seq() {
+                handled_print_setup_fail = !done.ok && done.update.is_none();
+            } else if let Some(failure) = &done.print_setup_failure {
+                match failure {
+                    model_host::PrintSetupFailure::Machine(error) => {
+                        self.printing.machine_preset_failed(&mut self.state.print, error);
+                        handled_print_setup_fail = true;
+                    }
+                    model_host::PrintSetupFailure::Eval(error) if !self.printing.calibration_pending()
+                        && self.plate.as_ref().is_some_and(|ev| self.printing.plate_profile_mismatch(&self.state.print, ev)) => {
+                        self.printing.profile_rebuild_failed(&mut self.state.print, self.plate.as_deref(), self.program.as_ref().map(|(c, _)| c.as_ref()), error);
+                        handled_print_setup_fail = true;
+                    }
+                    model_host::PrintSetupFailure::Eval(_) => {}
+                }
+            }
+        }
         if let Some(plate) = &done.status.journal { plate.attach(&cx.thread_spawner()); }
         if let Some(host) = &mut self.host { host.receive_done(done); }
         self.round_done(cx, done);
@@ -2450,6 +2507,9 @@ impl App {
         self.follow_turn();
         // another document: its history is new; else the person's steps since the AI's last turn
         if switched {
+            self.last_accepted_slot = None;
+            self.next_editor = None;
+            cx.global::<ReviewNext>().0 = None;
             self.since.mark(&self.status.steps, false);
             self.chat.refresh();
         } else if self.since.follow(&self.status.steps, &|seq| self.turn_undo.made(seq)) {
@@ -2776,6 +2836,7 @@ impl App {
             // Under the Test prints view the pieces stay until this plate's are made.
             if self.state.plate.whole.is_some() {
                 info.whole = Some(Arc::new(std::mem::replace(&mut info.parts, std::mem::take(&mut self.state.plate.parts))));
+                info.whole_active = self.state.plate.whole_active.take().filter(|o| info.whole_parts().iter().any(|p| p.object == *o));
             }
             self.state.plate = info;
             switch_watch::mark("plate info");
@@ -2819,6 +2880,7 @@ impl App {
                 let previous = self.state.print.settings.clone();
                 let (was_stale, prior) = (self.state.print.stale, self.state.print.stale_parts.take());
                 self.printing.plate_changed(&mut self.state.print, &ev);
+                self.printing.sync_calibration_plate(&mut self.state.print, Some(&ev), self.host.is_some());
                 // Only the parts this edit changed are out of date in the shown slice (with those
                 // of earlier edits since it); any other change dates all of it.
                 let p = &mut self.state.print;
@@ -2834,12 +2896,13 @@ impl App {
                 };
                 if previous != self.state.print.settings {
                     self.mech.supports_stale(&mut self.state);
-                    if let Some(host) = &mut self.host { host.print_setup(self.printing.check_setup(&self.state.print)); }
-                    live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
+                    self.printing.sync_calibration(&mut self.state.print);
+                    self.push_print_setup();
                 }
                 self.remap();
                 self.request_reslice();
             } else {
+                self.printing.sync_calibration_plate(&mut self.state.print, Some(&ev), self.host.is_some());
                 self.state.print.printability = ev.printability.clone();
             }
             switch_watch::mark("print state");
@@ -2925,7 +2988,7 @@ impl App {
             if let Some(message) = cap_line.take() {
                 self.state.ui.notices.say(NoticeView::Plate, message);
             }
-        } else if !done.ok && !self.calls.pending.contains_key(&done.id) && !self.host.as_ref().and_then(|h| h.call_job(done.id)).and_then(|j| makepad_widgets::jobs::board().get(j)).is_some_and(|j| j.shown_elsewhere) {
+        } else if !handled_print_setup_fail && !done.ok && !self.calls.pending.contains_key(&done.id) && !self.host.as_ref().and_then(|h| h.call_job(done.id)).and_then(|j| makepad_widgets::jobs::board().get(j)).is_some_and(|j| j.shown_elsewhere) {
             // A command of Fab's own failed: say why (a job shown in a place of its own, a load
             // on the view's progress card, says it there, and a cancelled load leaves the bed's
             // line as it was).
@@ -2949,6 +3012,7 @@ impl App {
             self.committed_notice.clear();
         }
         self.request_reslice();
+        if self.state.print.sending.len() > sending_before { cx.action(ShellAction::SetWorkspace(Workspace::Monitor)); }
         if self.calibration_job == Some(done.id) {
             self.calibration_job = None;
             if done.ok {
@@ -3750,9 +3814,9 @@ impl App {
         self.state.view.missing_spool_colours = self.state.print.colors.rows.iter()
             .filter(|r| r.used && r.tray.as_ref().and_then(|t| t.colour).is_none()).count();
         let changed = before != self.state.print.settings.materials;
+        self.printing.sync_calibration(&mut self.state.print);
         if changed || before_mapping != self.printing.mapping {
-            if let Some(host) = &mut self.host { host.print_setup(self.printing.check_setup(&self.state.print)); }
-            live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
+            self.push_print_setup();
         }
         if let (Some(mapped), Some(host)) = (mapped, &mut self.host) {
             host.mapped(mapped);
@@ -3844,7 +3908,7 @@ impl App {
         self.printing.live_input(&mut self.state.print, Some(&ev), swaps.into(), None);
         self.state.print.bump();
         // Live fields affect the viewport and the panels which show slice status or summaries.
-        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption), ids!(xr)]);
+        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption), ids!(xr)]);
     }
 
     /// A preview plate resliced (its draft meshes), the layer the view shows first. Every step
@@ -4042,14 +4106,14 @@ impl App {
         self.plate.as_ref().is_some_and(|ev| ev.machine.resin_screen().is_some())
     }
 
-    /// Something shows slices: the Slice render mode, or Monitor without a slice of its job (a
-    /// job the printer runs is matched to Fab's slice).
+    /// Monitor uses the plate's live slice only when it has no saved job to show. Reading that
+    /// job's preview from disk does not change demand for the plate's slicer.
     fn slice_shown(&self) -> bool {
         if self.resin_printer() {
             return false;
         }
         if self.state.ui.in_mode(PlateMode::Monitor) {
-            return self.state.print.monitor_preview().is_none();
+            return self.state.print.shown_choice() == &self.state.print.links.picked && self.state.print.follow.shown().is_none();
         }
         self.state.print.play.active
     }
@@ -4184,7 +4248,7 @@ impl App {
             return Some("there is nothing on the plate to slice".into());
         }
         match &self.state.print.status {
-            fab::print::SliceStatus::Failed(why) => Some(why.clone()),
+            fab::print::SliceStatus::Failed(_) => self.printing.external_slice_error(&self.state.print),
             _ => None,
         }
     }
@@ -4230,7 +4294,7 @@ impl App {
                 self.state.print.bump();
             }
             // A refusal said why it would not slice; now nothing is trying to.
-            if self.printing.machine().is_ok() && matches!(self.state.print.status, fab::print::SliceStatus::Failed(_)) {
+            if self.state.print.calibration_error.is_none() && self.printing.machine().is_ok() && matches!(self.state.print.status, fab::print::SliceStatus::Failed(_)) {
                 self.state.print.status = fab::print::SliceStatus::Idle;
                 self.state.print.bump();
             }
@@ -4318,6 +4382,7 @@ impl App {
     /// held them, and the plate's own scene with the elements `kept` (by name) picked again.
     fn restore_whole(&mut self, cx: &mut Cx, kept: Vec<String>) {
         let Some(whole) = self.state.plate.whole.take() else { return };
+        self.state.plate.whole_active = None;
         self.detail_plate = None;
         self.plate_revision += 1;
         self.state.plate.parts = Arc::unwrap_or_clone(whole);
@@ -4681,6 +4746,7 @@ impl App {
             // What was picked on the plate is picked again on the way back.
             let s = &self.state;
             self.test_view.selected = s.scene_state.selection.set.iter().filter_map(|e| s.scene.element(*e)).map(|e| e.name.clone()).collect();
+            self.state.plate.whole_active = fab::ui::parts::active_part(s).map(|i| s.plate.parts[i].object.clone());
             self.state.plate.whole = Some(Arc::new(std::mem::replace(&mut self.state.plate.parts, pieces)));
         } else {
             self.state.plate.parts = pieces;
@@ -4698,6 +4764,16 @@ impl App {
 
     fn print_action(&mut self, cx: &mut Cx, a: &fab::print::PrintAction) -> bool {
         use fab::print::PrintAction as A;
+        if matches!(a, A::ShowPrinter(_)) {
+            let wanted = self.slice_wanted();
+            self.printing.action(&mut self.state.print, a, self.plate.as_ref());
+            // Changing Monitor's view can change slice visibility. Only a plate/workspace
+            // action may turn that change into a request to start or stop the plate's slice.
+            let now_wanted = self.slice_wanted();
+            if now_wanted != wanted { self.slice_was_wanted = now_wanted; }
+            self.follow_printer(cx);
+            return true;
+        }
         if let A::TestMode(on) = a {
             self.state.print.test_mode = *on;
             if let Some(host) = &mut self.host {
@@ -4723,7 +4799,7 @@ impl App {
             return true;
         }
         if Self::resin_print_action(&mut self.state.print, &mut self.resin, a, sla::ResinView::control) {
-            if matches!(a, A::SendToPrinter) {
+            if matches!(a, A::SendResin { .. }) {
                 cx.action(ShellAction::SetWorkspace(Workspace::Monitor));
             }
             cx.redraw_all();
@@ -4733,21 +4809,22 @@ impl App {
             // A live input settles verbatim; otherwise slice the committed plate.
             self.focus_slice();
         }
-        if matches!(a, A::SendToPrinter) {
+        if matches!(a, A::SendToPrinter { .. }) {
             self.printing.plate_scripts = self.scripts.clone();
         }
+        let before = self.state.print.sending.len();
         let mut changed = self.printing.action(&mut self.state.print, a, self.plate.as_ref());
         if changed { self.state.print.bump(); }
-        let printer_only = matches!(a, A::AskPrint(_) | A::AskStop(..) | A::SetPrintOption(..) | A::SendToPrinter | A::CancelSend | A::CloseJob | A::PrinterControl(..) | A::PickJob(_) | A::AskStartJob(_) | A::StartJob(_) | A::RemoveJob(_));
+        let printer_only = matches!(a, A::AskPrint(_) | A::AskStop(..) | A::SetPrintOption(..) | A::SendToPrinter { .. } | A::SendResin { .. } | A::CancelSend(_) | A::CloseJob | A::PrinterControl(..) | A::PickJob(_) | A::AskStartJob(_) | A::StartJob { .. } | A::RemoveJob(_));
         // Start print went: Monitor shows it from here on.
-        if matches!(a, A::SendToPrinter) && self.state.print.sending.is_some() {
+        if matches!(a, A::SendToPrinter { .. }) && self.state.print.sending.len() > before {
             cx.action(ShellAction::SetWorkspace(Workspace::Monitor));
         }
         if changed && !printer_only && !matches!(a, A::Slice | A::Export) {
             self.state.print.stale = self.state.print.preview.is_some();
             self.state.print.stale_parts = None;
-            if let Some(host) = &mut self.host { host.print_setup(self.printing.check_setup(&self.state.print)); }
-            live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
+            self.printing.sync_calibration(&mut self.state.print);
+            self.push_print_setup();
             self.request_reslice();
         }
         if changed { self.remap(); }
@@ -4761,6 +4838,10 @@ impl App {
             }
         }
         changed |= fab::print::apply(&mut self.state.print, a);
+        if matches!(a, A::StartJob { ticket, .. } if ticket.printer != self.state.print.links.picked) {
+            cx.redraw_all();
+            return changed;
+        }
         if let fab::print::PrintAction::Overhangs(on) = a {
             if let Some(host) = &mut self.host { host.overhangs(*on); }
         }
@@ -4793,7 +4874,8 @@ impl App {
             A::AskPrint(false) | A::AcceptErrors(_) | A::PickStick(_) if on_resin || job => {}
             A::AskStop(ControlDestination::ResinJob { .. }, _) => {}
             A::SaveOrientationTest if on_resin => resin.ask_test(),
-            A::SendToPrinter if on_resin => resin.ask_print(),
+            A::SendResin { stack } if matches!(state.confirm_print, Some(fab::print::PrintConfirm::Resin))
+                && state.resin.as_ref().is_some_and(|r| r.stack == *stack) => resin.ask_print(),
             A::PrinterControl(dest @ ControlDestination::ResinJob { .. }, control) => {
                 if dest.matches(state) {
                     send_control(resin, *control);
@@ -4855,7 +4937,7 @@ impl App {
 
     /// Run the review renderer: start a queued request, collect frames.
     fn pump_review(&mut self, cx: &mut Cx) {
-        let widget = self.ui.widget(cx, ids!(review));
+        let widget = self.ui.widget(cx, ids!(review_renderer));
         let Some(mut renderer) = widget.borrow_mut::<review::FabReviewRenderer>() else { return };
         if let Some(captured) = renderer.poll(cx) {
             match captured.result {
@@ -4927,6 +5009,59 @@ impl App {
             let id = host.demo(demo);
             self.demo_card = Some((demo.key, id, false));
         }
+    }
+
+    fn next_editor_for(stage: FlowStage) -> fab::ui::editors::Editor {
+        use fab::ui::editors::Editor;
+        match stage {
+            FlowStage::Requirements => Editor::Requirements,
+            FlowStage::Architecture | FlowStage::Schematic | FlowStage::FixErc => Editor::Circuit,
+            FlowStage::Parts => Editor::Library,
+            FlowStage::Place | FlowStage::Route | FlowStage::Done => Editor::Board,
+        }
+    }
+
+    fn next_stage_event(&mut self, cx: &mut Cx, event: &Event) {
+        if let Event::Actions(actions) = event {
+            for action in actions.iter().filter_map(|a| a.downcast_ref::<ReviewAction>()) {
+                match *action {
+                    ReviewAction::DismissNext => self.next_editor = None,
+                    ReviewAction::NextStage(stage) if cx.get_global_ref::<ReviewNext>().is_some_and(|b| b.0.as_ref().is_some_and(|n| n.1.stage == stage))
+                        && self.elec.as_ref().is_some_and(|e| e.offered(stage)) => {
+                        self.next_editor = Some(stage);
+                        cx.action(ShellAction::SetWorkspace(Workspace::Electronics));
+                        cx.action(fab::ui::shell::ShowPanelIn(Workspace::Electronics, Self::next_editor_for(stage)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A reveal can create the tab in a subsequent layout. Run its action once its
+        // actual body is in front, with the mode and routing method that pane owns.
+        let Some(stage) = self.next_editor else { return };
+        let Some(elec) = self.elec.as_mut() else { return };
+        if self.state.ui.kind() != Workspace::Electronics || elec.awaiting_flow() { return; }
+        let tab = Self::next_editor_for(stage).tab();
+        let dock = self.ui.dock(cx, ids!(dock));
+        let body = dock.borrow_mut().and_then(|mut d| d.visible_items().find(|(id, _)| *id == tab).map(|(_, body)| body));
+        let Some(body) = body else { return };
+        self.next_editor = None;
+        if !elec.offered(stage) { return; }
+        match stage {
+            FlowStage::Architecture | FlowStage::Schematic | FlowStage::FixErc => {
+                if let Some(mut sheet) = body.borrow_mut::<fab_elec_view::explorer::view::ExplorerView>() {
+                    sheet.set_blocks_mode(cx, stage == FlowStage::Architecture);
+                }
+            }
+            FlowStage::Route => {
+                if let (Some(id), Some(mut board)) = (elec.flow_unit(), body.borrow_mut::<fab_elec_view::board::view::BoardPane>()) {
+                    board.set_unit(cx, Some(id));
+                    board.route_all(cx);
+                }
+            }
+            _ => {}
+        }
+        elec.start_next(cx, stage);
     }
 
     /// A demo with electronics documents opens in an electronics workspace, with its Scope in
@@ -5013,7 +5148,34 @@ impl App {
     }
 
     /// The edited plate goes to whatever wants a slice now. Print, Export or Slice asks for the settle.
+    fn push_print_setup(&mut self) {
+        let Some(seq) = self.printing.next_print_setup() else { return };
+        let setup = self.printing.check_setup(&self.state.print);
+        if let Some(host) = &mut self.host { host.print_setup(seq, setup.clone()); }
+        live_slice::set_print_setup(setup);
+    }
+
+    fn sync_calibrate_panel(&mut self) -> bool {
+        let p = &mut self.state.print;
+        let filament = p.settings.materials.first().map_or("", |m| m.preset.as_str());
+        self.calibrate.sync(&mut p.calibrate, self.printing.effective_calibration(), self.printing.requested_calibration_owner(), &p.settings.machine, filament)
+    }
+
+    fn sync_confirm_card(&mut self) -> bool {
+        if self.state.print.confirm_print.is_none() || self.state.print.resin.is_some() { return false; }
+        self.state.print.bind_print_ticket();
+        let mut changed = self.printing.confirm_slice(&mut self.state.print, self.plate.as_ref());
+        if changed { self.state.print.bump(); }
+        let blocked = self.printing.send_blocked(&self.state.print);
+        if blocked != self.state.print.send_blocked {
+            self.state.print.send_blocked = blocked;
+            changed = true;
+        }
+        changed
+    }
+
     fn request_reslice(&mut self) {
+        if self.printing.calibration_waiting(&self.state.print) || self.state.print.calibration_error.is_some() || self.printing.machine_error().is_some() { return; }
         if self.plate.as_ref().is_some_and(|ev| self.printing.plate_waits(&self.state.print, ev).is_some()) {
             print::Printing::mark_shown_slice_stale(&mut self.state.print);
             return;
@@ -5072,7 +5234,7 @@ impl App {
         self.printing.live_input(&mut self.state.print, self.plate.as_ref(), Arc::from([]), Some((part, m)));
         self.state.print.bump();
         // Live placement affects the view, placement/slice summaries and slicing status.
-        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption), ids!(xr)]);
+        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption), ids!(xr)]);
     }
 
     /// One batch of model operations as one undoable transaction, against
@@ -5355,14 +5517,35 @@ impl App {
         cx.redraw_all();
     }
 
+    /// Show the original part's features even while the viewport holds only its cut pieces.
+    fn focus_whole_object(&mut self, cx: &mut Cx, object: &str) {
+        if self.state.plate.whole.is_none() {
+            if let Some(e) = self.state.plate.parts.iter().find(|p| p.object == object).and_then(|p| p.element) {
+                self.dispatch(cx, &ShellAction::SelectOnly(e));
+            }
+            self.follow_selection(cx);
+        } else if let Some((inst, _)) = self.program.as_ref().and_then(|(p, _)| p.object(object)) {
+            let source = &mut self.state.source;
+            if source.instance != inst.name {
+                source.instance = inst.name.clone();
+                source.file = inst.script.file.clone();
+                source.text = Arc::new(self.scripts.get(&source.file).cloned().unwrap_or_default());
+                source.features = code_edit::rows(inst);
+                source.selected = None;
+                let tab = source.tabs.iter().find(|t| t.file == source.file);
+                source.problem = tab.and_then(|t| t.problem.clone());
+                source.sites = tab.map(|t| t.sites.clone()).unwrap_or_default();
+                self.drop_ghost();
+            }
+            fab::ui::test_prints::show_rows(&mut self.state);
+        }
+    }
+
     /// A test print's row in the Test prints editor clicked: its part selected (the tree shows that
     /// script), and that one picked.
     fn pick_test_print(&mut self, cx: &mut Cx, name: &str) {
         let Some(object) = self.state.test_prints.iter().find(|t| t.name == name).map(|t| t.object.clone()) else { return };
-        if let Some(e) = self.state.plate.parts.iter().find(|p| p.object == object).and_then(|p| p.element) {
-            self.dispatch(cx, &ShellAction::SelectOnly(e));
-        }
-        self.follow_selection(cx);
+        self.focus_whole_object(cx, &object);
         let id = fab::ui::code::FeatureRow::test_print(name, &object).id;
         self.source_action(cx, &fab::ui::code::SourceAction::Select { id, reveal: false });
     }
@@ -5376,8 +5559,9 @@ impl App {
         let edit = match a {
             A::Pick { name } => return self.pick_test_print(cx, name),
             A::Add { object } => {
-                let Some(part) = self.state.plate.parts.iter().find(|p| p.object == *object) else { return };
+                let Some(part) = self.state.plate.whole_parts().iter().find(|p| p.object == *object) else { return };
                 let (lo, hi) = (part.min_mm, part.max_mm);
+                self.focus_whole_object(cx, object);
                 let taken: Vec<String> = self.state.test_prints.iter().map(|t| t.name.clone()).collect();
                 let name = fab_model::project::next_test_name(&taken);
                 self.select_after = Some(fab::ui::code::FeatureRow::test_print(&name, object).id);
@@ -5543,7 +5727,8 @@ impl MatchEvent for App {
                 changed |= self.dispatch(cx, a);
                 follow |= shows_workspace(a);
             }
-            follow |= action.downcast_ref::<fab::print::PrintAction>().is_some() || action.downcast_ref::<print::PrintEvent>().is_some();
+            follow |= action.downcast_ref::<fab::print::PrintAction>().is_some_and(|a|
+                !matches!(a, fab::print::PrintAction::StartJob { ticket, .. } if ticket.printer != self.state.print.links.picked));
             if let Some(FileDialogAction::SaveFileSelected { id, path }) = action.downcast_ref::<FileDialogAction>() {
                 if *id == live_id!(fab_save_as) {
                     self.model_command("save", &[("path", json::s(path.to_string_lossy()))], false);
@@ -5739,19 +5924,10 @@ impl MatchEvent for App {
                     }
                 }
             }
-            // The Calibrate panel follows the job's printer and first filament.
-            {
-                let st = &self.state.print;
-                let filament = st.settings.materials.first().map(|f| f.preset.as_str()).unwrap_or("");
-                if st.calibrate.steps.is_empty() || st.calibrate.printer != st.settings.machine || st.calibrate.filament != filament {
-                    let (printer, filament) = (st.settings.machine.clone(), filament.to_string());
-                    self.calibrate.refresh(&mut self.state.print.calibrate, &printer, &filament);
-                }
-            }
+            self.sync_calibrate_panel();
             if let Some(a) = action.downcast_ref::<fab::print::calibrate::CalibrateAction>() {
                 let colour = self.state.print.settings.materials.first().map(|f| f.color).unwrap_or([0.8, 0.8, 0.8, 1.0]);
-                let setup = self.printing.check_setup(&self.state.print);
-                if self.calibrate.action(&mut self.state.print.calibrate, a, setup, colour, self.host.as_mut()) {
+                if self.calibrate.action(&mut self.state.print, a, &mut self.printing, colour, self.host.as_mut()) {
                     cx.redraw_all();
                 }
             }
@@ -5763,7 +5939,7 @@ impl MatchEvent for App {
                 }
                 if let (Ok((coupon, colour)), Some(host)) = (made, &mut self.host) {
                     self.demo_card = None;
-                    self.calibration_job = Some(host.calibration(coupon.clone(), *colour));
+                    self.calibration_job = Some(host.calibration(coupon.coupon.clone(), *colour));
                 }
                 cx.redraw_all();
             }
@@ -5780,11 +5956,46 @@ impl MatchEvent for App {
                     }
                     self.calls.finish(*id, chat::Answer { ok: error.is_none(), text: fab_ai::out::text(&value), images: Vec::new() });
                 }
-                if self.printing.event(&mut self.state.print, ev) {
+                let outcome = self.printing.event(&mut self.state.print, ev);
+                follow |= outcome == print::PrintOutcome::Target || !matches!(ev, print::PrintEvent::Packaged { .. } | print::PrintEvent::JobChecked { .. } | print::PrintEvent::CalibrationResolved { .. } | print::PrintEvent::CalibrationWritten { .. });
+                if let print::PrintEvent::CalibrationWritten { outcome, .. } = ev {
+                    let p = &mut self.state.print;
+                    let filament = p.settings.materials.first().map_or("", |m| m.preset.as_str());
+                    self.calibrate.written(&mut p.calibrate, outcome, self.printing.requested_calibration_owner(), &p.settings.machine, filament);
+                    cx.redraw_all();
+                }
+                if let print::PrintOutcome::Calibration { setup_changed, slice_changed } = outcome {
+                    self.sync_calibrate_panel();
+                    if setup_changed || self.printing.setup_deferred() {
+                        self.state.print.bump();
+                        self.push_print_setup();
+                    }
+                    if !self.printing.calibration_pending() {
+                        if let Some((step, colour)) = self.calibrate.take_pending_make() {
+                            if let Some(host) = &mut self.host {
+                                host.make_calibration(step, self.printing.check_setup(&self.state.print), colour);
+                            } else {
+                                self.calibrate.made(&mut self.state.print.calibrate, &Err("The model worker is not ready yet.".into()));
+                            }
+                        }
+                    }
+                    self.printing.sync_calibration_plate(&mut self.state.print, self.plate.as_deref(), self.host.is_some());
+                    let before = self.state.print.sending.len();
+                    if slice_changed || !self.state.print.can_send() {
+                        self.request_reslice();
+                    } else if self.printing.resume_asked(&mut self.state.print, self.plate.as_ref()) {
+                        self.state.print.bump();
+                    }
+                    if self.state.print.sending.len() > before { cx.action(ShellAction::SetWorkspace(Workspace::Monitor)); }
+                    cx.redraw_all();
+                }
+                if matches!(outcome, print::PrintOutcome::JobRows | print::PrintOutcome::JobPreview) {
+                    cx.redraw_all();
+                } else if matches!(outcome, print::PrintOutcome::Target | print::PrintOutcome::RestoredTarget) {
                     self.state.print.bump();
-                    if matches!(ev, print::PrintEvent::Catalog(_) | print::PrintEvent::ProfilesImported { .. }) {
-                        if let Some(host) = &mut self.host { host.print_setup(self.printing.check_setup(&self.state.print)); }
-                        live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
+                    self.printing.sync_calibration(&mut self.state.print);
+                    if outcome == print::PrintOutcome::RestoredTarget || matches!(ev, print::PrintEvent::Catalog(_) | print::PrintEvent::ProfilesImported { .. }) {
+                        self.push_print_setup();
                         self.request_reslice();
                     }
                     self.remap();
@@ -5852,14 +6063,14 @@ impl MatchEvent for App {
                 cx.redraw_all();
                 if self.live_view.is_none() && self.printing.live_toolpaths(&mut self.state.print, *revision) {
                     self.state.print.bump();
-                    fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+                    fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
                 }
             }
             if let Some(live_slice::LiveAction::Failed { revision, error }) = action.downcast_ref::<live_slice::LiveAction>() {
                 self.printing.live_failed(&mut self.state.print, *revision, error);
                 self.state.print.bump();
                 // Slice failure is shown by the stage, slice/job/printer panels and caption.
-                fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+                fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
             }
             if let Some(a) = action.downcast_ref::<xr::FabXrAction>() {
                 self.xr_action(cx, a);
@@ -5989,7 +6200,10 @@ impl MatchEvent for App {
                             host.grown_settled(settled.clone());
                         }
                     }
-                    HostAction::DocsLanded { bed, docs } => {
+                    HostAction::DocsLanded { bed, docs, all } => {
+                        if *bed == self.status.switched {
+                            self.status.docs = all.clone();
+                        }
                         if let Some(elec) = self.elec.as_mut() {
                             elec.docs_landed(*bed, docs);
                         }
@@ -6093,7 +6307,7 @@ impl MatchEvent for App {
                 makepad_widgets::JobAction::Next(job) => self.next_step(cx, *job),
             }
         }
-        let caption = self.ui.widget(cx, ids!(caption));
+        let caption = self.ui.widget(cx, ids!(caption_label.caption));
         fab::ui::topbar::handle_actions(cx, &caption, actions, &self.state);
         // The plate's Add menu, then the selected part's Modify menu (the 3D view's bar).
         fab::ui::parts::part_add_menu(cx, actions);
@@ -6282,14 +6496,32 @@ fn electronics_actor(caller: ChatCaller, call: u64) -> fab_elec_design::By {
     }
 }
 
-/// A tool argument as the Splash text an electronics action reads: a string as it is, a number
-/// or a flag as its text, a list as `[a b]` of its items.
+/// A tool argument as the text an electronics action reads: a string verbatim (Splash or
+/// plain text), any other JSON value (number, bool, null, array, object) as strict JSON.
 fn splash_arg(value: &Value) -> String {
     match value {
         Value::Str(text) => text.clone(),
-        Value::Arr(items) => format!("[{}]", items.iter().map(splash_arg).collect::<Vec<_>>().join(" ")),
         other => other.to_json(),
     }
+}
+
+#[test]
+fn splash_arg_preserves_strings_and_serializes_arrays_as_json() {
+    use makepad_strict_json::{obj, parse, s};
+    for text in ["[12mm 30mm]", r#"ledctl.mcu.dbg.pin("1")"#, "{v: 3.3V width: 1ms}"] {
+        assert_eq!(splash_arg(&s(text)), text, "top-level Splash source must pass through verbatim");
+    }
+    assert_eq!(splash_arg(&Value::Arr(vec![s("x y"), s("3V3")])), r#"["x y","3V3"]"#,
+        "net names must keep their quotes and item boundaries");
+    let numbers = |values: &[i64]| Value::Arr(values.iter().copied().map(Value::Int).collect());
+    assert_eq!(splash_arg(&numbers(&[10, 0, -8])), "[10,0,-8]", "a negative coordinate must remain a separate item");
+    assert_eq!(splash_arg(&Value::Arr(vec![numbers(&[10, 20]), numbers(&[30, 40])])), "[[10,20],[30,40]]",
+        "each waypoint must keep its coordinates and its position in the list");
+    let edits = Value::Arr(vec![
+        obj(vec![("doc", s("a.req.splash")), ("op", s("create")), ("text", s("brief(\"a\")\n"))]),
+        obj(vec![("doc", s("b.req.splash")), ("op", s("replace")), ("text", s("wish(\"b\")\n"))]),
+    ]);
+    assert_eq!(parse(splash_arg(&edits).as_bytes()), Ok(edits), "both edits must retain the exact document text, quotes and newlines");
 }
 
 /// An AI call that puts another document on the bed.
@@ -6319,6 +6551,7 @@ fn exact_detail_of(c: &fab::api::Camera) -> f64 {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        makepad_widgets_sheets::register();
         #[cfg(feature = "tweaker")]
         makepad_widgets_tweaker::link(vm);
         // Standalone (no window manager handing its sheet down) Fab wears its
@@ -6408,19 +6641,20 @@ impl AppMain for App {
             self.state.print.stale = self.state.print.preview.is_some();
             self.state.print.stale_parts = None;
             self.state.print.bump();
-            fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+            fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
         }
         // The system's audio devices: Listen opens the default output while anything is heard.
         if let Event::AudioDevices(devices) = event {
             fab_elec_view::live::listen::audio_devices(cx, devices);
         }
         if let Some(elec) = &mut self.elec {
-            if elec.event(cx, event) && self.state.ui.shows(Family::Electronics) {
+            if elec.event_with_flow(cx, event, &mut self.last_accepted_slot) && self.state.ui.shows(Family::Electronics) {
                 fab::ui::redraw_now(cx, &self.ui, &[ids!(viewport)]);
             }
             // The slice figures the requirements read (`print.time`, `print.filament`).
             elec.set_print(cx, self.state.print.whole_figures);
         }
+        self.next_stage_event(cx, event);
         let file = self.status.path.as_deref().filter(|_| !self.status.bed.as_ref().is_some_and(|(_, demo)| *demo));
         self.mic.handle_event(cx, event, self.elec.as_mut().and_then(elec_host::ElecHost::sim_mut), self.status.switched, file);
         if let Some(elec) = &mut self.elec {
@@ -6554,27 +6788,27 @@ impl AppMain for App {
                 self.register_loaders();
                 let driven = std::env::args().any(|a| a == "--remote");
                 // a driven run (tests) starts from no preference unless one is named
-                if !driven || std::env::var_os("FAB_VIEW_PREFS").is_some() {
-                    self.state.apply_view_prefs();
-                }
-                part_models::set_sources(self.state.model_sources.bits());
+                let load_view = !driven || std::env::var_os("FAB_VIEW_PREFS").is_some();
+                self.apply_startup_prefs(fab::api::StartupPrefs::load(load_view));
                 self.model_choices = (fab_elec_parts::model_board::choices_changed(), kicad_models::load_choices());
                 // A lane's test instance is not the person: it neither brings back nor changes the
                 // machine's plates, unless it asks for a plate store of its own (`FAB_PLATES=1`,
                 // under a home of its own).
                 let test_lane = std::env::var_os("MAKEPAD_TEST_LANE").is_some();
                 let own_plates = std::env::var_os("FAB_PLATES").is_some_and(|v| v == "1");
-                let mut host = ModelHost::start(cx, (!driven && !test_lane) || own_plates);
+                let mut host = ModelHost::start_in(cx, (!driven && !test_lane) || own_plates, &self.dirs);
                 host.colour_mode(self.state.view.colours, self.state.print.target_printer().is_some());
                 self.host = Some(host);
                 // a plate still building keeps the remote's `settled` false
                 cx.register_async_load_probe("build", model_host::builds_in_flight);
                 self.state.units = fab::model::Units { source_to_meters: 1.0, precision: 1, ..fab::model::Units::millimeters() };
                 live_slice::init(cx);
-                live_slice::open_slice_cache(&makepad_fab_settings::home::user_home().join(".makepad").join("fab").join("cache").join("slices"));
+                live_slice::open_slice_cache(&self.dirs.app_data.join("cache").join("slices"));
                 self.live = Some(sdf_live::LiveWorker::start(cx));
                 self.patterns = Some(pattern_live::PatternLive::start());
+                self.printing.dirs = self.dirs.clone();
                 self.printing.start(&mut self.state.print);
+                self.printing.sync_calibration(&mut self.state.print);
                 self.ghosts = Some(ghost::GhostWorker::start(cx, self.printing.machine().expect("Fab defaults have a valid machine").clone()));
                 live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
                 // The AI column starts folded: the header's spark button opens it.
@@ -6738,28 +6972,19 @@ impl AppMain for App {
         switch_watch::mark("before the app's actions");
         self.match_event(cx, event);
         switch_watch::mark("the app's actions");
-        if self.printing.poll_printer(&mut self.state.print) {
+        let polled = self.printing.poll_printer(&mut self.state.print);
+        if polled.target {
             self.state.print.bump();
             self.remap();
-            self.follow_printer(cx);
-            cx.redraw_all();
         }
+        if polled.target || polled.shown { self.follow_printer(cx); }
+        if polled.target || polled.others { cx.redraw_all(); }
         self.resume_monitor(cx);
         self.printing.sync_jobs(&mut self.state.print);
         self.frame_shown_job(cx);
         // The confirm card says what stops Start print as it is now, before this event's draw (a
         // resin printer's card asks its own).
-        if self.state.print.confirm_print && self.state.print.resin.is_none() {
-            if self.printing.confirm_slice(&mut self.state.print, self.plate.as_ref()) {
-                self.state.print.bump();
-                cx.redraw_all();
-            }
-            let blocked = self.printing.send_blocked(&self.state.print);
-            if blocked != self.state.print.send_blocked {
-                self.state.print.send_blocked = blocked;
-                cx.redraw_all();
-            }
-        }
+        if self.sync_confirm_card() { cx.redraw_all(); }
         if matches!(event, Event::LiveEdit | Event::ScriptReapply) { self.caption = None; }
         switch_watch::mark("before the widgets");
         self.ui
@@ -6786,7 +7011,19 @@ impl AppMain for App {
                 xr.set_voice(row);
             }
             self.release_held_layout(cx);
+            if let Some(elec) = &mut self.elec {
+                if let Some(spec) = elec.take_draft_say() {
+                    let receipt = self.chat.outbox().say_tracked(spec.prompt.into());
+                    elec.start_draft(spec, receipt);
+                }
+            }
             shell_chat::pump(self, cx);
+            if let Some(elec) = &mut self.elec {
+                let panel = self.chat.panel(cx, &self.ui);
+                let chat = panel.as_ref().and_then(|p| p.borrow::<makepad_app_aichat::AiChatPanel>());
+                let state = chat.as_ref().and_then(|c| c.state());
+                elec.sync_draft(cx, req_draft::admit(state), state.map(|s| (&s.status, s.model_secs)));
+            }
             self.pump_review(cx);
             self.pump_xr(cx);
         }
@@ -6807,11 +7044,11 @@ impl AppMain for App {
                 || requirements.map(Arc::as_ptr) != self.caption_requirements.as_ref().map(Arc::as_ptr);
             if report_changed {
                 self.caption_requirements = requirements.cloned();
-                let bar = self.ui.widget(cx, ids!(caption));
+                let bar = self.ui.widget(cx, ids!(caption_label.caption));
                 fab::ui::topbar::sync_requirements(cx, &bar, self.caption_requirements.as_deref());
             }
             if self.caption.as_ref() != Some(&caption) {
-                let bar = self.ui.widget(cx, ids!(caption));
+                let bar = self.ui.widget(cx, ids!(caption_label.caption));
                 fab::ui::topbar::sync(cx, &bar, &caption);
                 self.caption = Some(caption);
             }
@@ -6926,8 +7163,8 @@ impl App {
         if let (fab::print::SliceStatus::Done { seconds }, Some(_)) = (&p.status, sliced) {
             fields.push(("slice_seconds", out::n(*seconds)));
         }
-        if let fab::print::SliceStatus::Failed(error) = &p.status {
-            fields.push(("error", out::s(error.lines().next().unwrap_or("internal slicer error"))));
+        if let fab::print::SliceStatus::Failed(_) = &p.status {
+            if let Some(error) = self.printing.external_slice_error(p) { fields.push(("error", out::s(error))); }
         }
         chat::Answer { ok: true, text: out::text(&out::obj(fields)), images: Vec::new() }
     }
@@ -7282,7 +7519,7 @@ impl App {
         }
         if let Err(refused) = fab_ai::check_arguments(&tool, &args) {
             self.calls.pending.insert(id, tool);
-            self.calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&refused)), images: Vec::new() });
+            self.refuse_tool_call(id, &refused);
             return;
         }
         // Another document for the bed: what the person typed or is dragging lands on this one first.
@@ -7400,7 +7637,7 @@ impl App {
             }
             match &p.status {
                 fab::print::SliceStatus::Running { stage, .. } => fields.push(("stage", out::s(stage.clone()))),
-                fab::print::SliceStatus::Failed(error) => fields.push(("error", out::s(error.lines().next().unwrap_or("internal slicer error")))),
+                fab::print::SliceStatus::Failed(_) => { if let Some(error) = self.printing.external_slice_error(p) { fields.push(("error", out::s(error))); } }
                 _ => {}
             }
             if args.get("drawn").and_then(Value::as_bool) == Some(true) {
@@ -7497,6 +7734,11 @@ impl ChatHost for App {
         let id = host.reserve_call_id();
         if let Some(plate) = &self.status.journal { plate.attach(&cx.thread_spawner()); }
         self.calls.begin(self.status.journal.as_ref(), electronics_actor(caller, id), id, tool, &args);
+        if let (ChatCaller::Turn(turn), Some(draft)) = (caller, self.elec.as_mut().and_then(|e| e.draft.as_mut())) {
+            let propose = chat::short_tool(tool) == "elec_edit"
+                && args.get("action").and_then(Value::as_str) == Some(fab_elec_host::step_actions::PROPOSE.name);
+            draft.call(id, turn, propose);
+        }
         self.dispatch_tool(cx, id, tool, args);
         self.chat_caller = previous;
         if weighs {
@@ -7509,7 +7751,14 @@ impl ChatHost for App {
         id
     }
 
-    fn chat_turn_started(&mut self, cx: &mut Cx, _turn: u64) {
+    fn chat_said(&mut self, _cx: &mut Cx, receipt: u64, said: shell_chat::ChatSaid) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()).filter(|d| d.receipt() == receipt) {
+            draft.said(said);
+        }
+    }
+
+    fn chat_turn_started(&mut self, cx: &mut Cx, turn: u64) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()) { draft.turn_started(turn); }
         self.mass_turn_started(cx);
         // the line took what the person changed: the next one tells what comes after
         self.since.mark(&self.status.steps, true);
@@ -7551,6 +7800,7 @@ impl ChatHost for App {
     fn chat_cancel(&mut self, _cx: &mut Cx, id: u64) {
         self.calls.cancel(id);
         if let Some(elec) = &mut self.elec {
+            if let Some(draft) = &mut elec.draft { draft.cancelled(id); }
             if elec.cancel_call(id) {
                 self.elec_answers();
             }
@@ -7747,6 +7997,92 @@ impl ChatHost for App {
     fn chat_marks_sent(&mut self, cx: &mut Cx, line: usize) {
         self.marks_sent(cx, line);
     }
+}
+
+#[test]
+fn app_construction_skips_shell_prefs_and_startup_prefs_apply_before_first_draw() {
+    use fab::{
+        fab_sdf_tiles::trace::DragDetail,
+        firmware_net::{FirmwareNet, TokenEntry},
+        model_sources::{ModelSource, ModelSources},
+        ui::stage::PART_SIDE_W,
+        view_prefs::ViewPrefs,
+    };
+
+    struct RestoreSources(u8);
+    impl Drop for RestoreSources {
+        fn drop(&mut self) {
+            part_models::set_sources(self.0);
+        }
+    }
+
+    let _cx = crate::cx_owned();
+    let _sources = RestoreSources(ModelSource::ALL.iter().fold(0, |bits, &source| {
+        if part_models::source_on(source) { bits | source.bit() } else { bits }
+    }));
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let mut app = cx.with_vm(App::script_new);
+    let details = |s: &AppState| (s.view.drag_detail, s.view.sliced_detail, s.view.traced_detail, s.view.soldered);
+    let navigation = |s: &AppState| (s.ui.nav, s.ui.invert_wheel, s.ui.part_side_w);
+    for state in [&AppState::default(), &app.state] {
+        assert_eq!(state.model_sources, ModelSources::default());
+        assert_eq!(state.firmware_net, FirmwareNet::default());
+        assert_eq!(state.firmware_tokens, Ok(Vec::new()));
+        assert_eq!(state.view.look, fab::view_prefs::default_look());
+        assert_eq!(details(state), (DragDetail::Realtime, SlicedDetail::Fast, TracedDetail::Fast, true));
+        assert_eq!(navigation(state), (NavScheme::Fab, false, PART_SIDE_W));
+        assert!(state.ui.code_shown());
+        assert!(!state.view.camera(state.view.lead_plate()).ortho);
+    }
+
+    let mut firmware_net = FirmwareNet::default();
+    firmware_net.turn_on("project", &["api.example.org".into()], 1);
+    let prefs = StartupPrefs {
+        view: Some(ViewPrefs::from_text(
+            "look=Mesh\ndrag_detail=full\nsliced_detail=exact\ntraced_detail=exact\nsoldered=off\nnav=blender\ninvert_wheel=1\npart_side_w=420\northo=1",
+            Workspaces::default(),
+        )),
+        model_sources: ModelSources { kicad_download: false, ..Default::default() },
+        firmware_net,
+        firmware_tokens: Ok(vec![TokenEntry { name: "api".into(), host: "api.example.org".into() }]),
+    };
+    let pane = app.state.view.lead_plate();
+    app.apply_startup_prefs(prefs.clone());
+    assert_eq!(app.state.view.look, PartLook::Mesh);
+    assert_eq!(details(&app.state), (DragDetail::Full, SlicedDetail::Exact, TracedDetail::Exact, false));
+    assert_eq!(navigation(&app.state), (NavScheme::Blender, true, 420.0));
+    assert!(app.state.view.camera(pane).ortho);
+    assert_eq!(app.state.ui.workspaces.rev, 1);
+    assert_eq!(app.state.ui.workspaces.instance_rev, 1);
+    assert!(app.state.ui.workspaces.list.iter().all(|def| def.shape == 1));
+    assert_eq!(app.state.model_sources, prefs.model_sources);
+    assert!(!part_models::source_on(ModelSource::KicadDownload));
+    assert_eq!(app.state.firmware_net, prefs.firmware_net);
+    assert_eq!(app.state.firmware_tokens, prefs.firmware_tokens);
+
+    app.keep_view = true;
+    fab::nav::orbit::set_ortho(app.state.view.camera_mut(pane), false);
+    app.apply_startup_prefs(prefs);
+    assert!(!app.state.view.camera(pane).ortho, "a restored camera survives startup preferences");
+
+    let workspaces = app.state.ui.workspaces.clone();
+    app.apply_startup_prefs(StartupPrefs {
+        view: None,
+        model_sources: ModelSources::default(),
+        firmware_net: FirmwareNet::default(),
+        firmware_tokens: Ok(Vec::new()),
+    });
+    assert_eq!(app.state.view.look, PartLook::Mesh);
+    assert_eq!(details(&app.state), (DragDetail::Full, SlicedDetail::Exact, TracedDetail::Exact, false));
+    assert_eq!(navigation(&app.state), (NavScheme::Blender, true, 420.0));
+    assert!(!app.state.view.camera(pane).ortho);
+    assert_eq!(app.state.ui.workspaces.rev, workspaces.rev);
+    assert_eq!(app.state.ui.workspaces.instance_rev, workspaces.instance_rev);
+    assert_eq!(app.state.ui.workspaces.list, workspaces.list);
+    assert_eq!(app.state.model_sources, ModelSources::default());
+    assert!(part_models::source_on(ModelSource::KicadDownload));
+    assert_eq!(app.state.firmware_net, FirmwareNet::default());
+    assert_eq!(app.state.firmware_tokens, Ok(Vec::new()));
 }
 
 #[cfg(test)]

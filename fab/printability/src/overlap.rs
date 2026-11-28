@@ -10,13 +10,52 @@ use std::collections::HashSet;
 /// The side (mm) under which the test of an exact surface splits a box no further.
 const CELL: f64 = 0.5;
 
+/// The surface used to judge a part for overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Judged {
+    Field,
+    Mesh,
+    Neither,
+}
+
+impl Judged {
+    fn of(part: &Part, field: Option<PartField<'_>>) -> Self {
+        if field.is_some() {
+            Self::Field
+        } else if part.mesh.triangles.is_empty() {
+            Self::Neither
+        } else {
+            Self::Mesh
+        }
+    }
+}
+
+/// A plate's overlap issues ([`overlaps`]) and how the check judged each part whose box met
+/// another's: what a later check of the same parts, unmoved, reuses when it judges them alike.
+#[derive(Clone, Debug, Default)]
+pub struct Overlaps {
+    pub issues: Vec<Issue>,
+    /// None for a part whose box never met another box checked against it.
+    judged: Vec<Option<Judged>>,
+}
+
+impl Overlaps {
+    /// Whether the same kinds of surfaces would be used again. The caller vouches
+    /// that `plate` holds the same parts, unmoved.
+    pub fn judged_alike<'f>(&self, plate: &Plate, field: &dyn Fn(usize) -> Option<PartField<'f>>) -> bool {
+        self.judged.len() == plate.parts.len() && self.judged.iter().enumerate().all(|(k, judged)| {
+            judged.is_none_or(|j| j == Judged::of(&plate.parts[k], field(k)))
+        })
+    }
+}
+
 /// An error for each two objects of `plate` whose bodies meet deeper than [`COVER`] (parts that
 /// only touch don't), naming both. Bodies of one object ([`Plate::groups`]) print as one, and
 /// parts fused by design ([`fab_plate::Part::fused`]) may share space: neither is checked. A
 /// part is judged by `field` (its exact surface) when it gives one, else by its closed mesh; a
 /// part with neither is not judged. None once `stop` is true (asked as
 /// [`crate::analyse_plate_with`] asks it).
-pub(crate) fn overlap_issues<'f>(plate: &Plate, field: &dyn Fn(usize) -> Option<PartField<'f>>, stop: &dyn Fn() -> bool) -> Option<Vec<Issue>> {
+pub fn overlaps<'f>(plate: &Plate, field: &dyn Fn(usize) -> Option<PartField<'f>>, stop: &dyn Fn() -> bool) -> Option<Overlaps> {
     let boxes: Vec<Bounds> = plate.parts.iter().map(Part::bounds).collect();
     // built the first time a part's box meets another's
     let mut solids: Vec<Option<Option<Solid>>> = (0..plate.parts.len()).map(|_| None).collect();
@@ -41,10 +80,11 @@ pub(crate) fn overlap_issues<'f>(plate: &Plate, field: &dyn Fn(usize) -> Option<
             for k in [i, j] {
                 if solids[k].is_none() {
                     let p = &plate.parts[k];
-                    solids[k] = Some(match field(k) {
-                        Some(f) => Some(Solid::Field(f)),
-                        None if !p.mesh.triangles.is_empty() => Some(Solid::Mesh(MeshSolid::new(&p.mesh))),
-                        None => None,
+                    let exact = field(k);
+                    solids[k] = Some(match Judged::of(p, exact) {
+                        Judged::Field => exact.map(Solid::Field),
+                        Judged::Mesh => Some(Solid::Mesh(MeshSolid::new(&p.mesh))),
+                        Judged::Neither => None,
                     });
                 }
             }
@@ -61,7 +101,12 @@ pub(crate) fn overlap_issues<'f>(plate: &Plate, field: &dyn Fn(usize) -> Option<
             named.push(pair);
         }
     }
-    Some(out)
+    let judged = solids.iter().map(|entry| entry.as_ref().map(|solid| match solid {
+        Some(Solid::Field(_)) => Judged::Field,
+        Some(Solid::Mesh(_)) => Judged::Mesh,
+        None => Judged::Neither,
+    })).collect();
+    Some(Overlaps { issues: out, judged })
 }
 
 /// Where two boxes meet, when they meet more than [`COVER`] along every axis: footprints first.

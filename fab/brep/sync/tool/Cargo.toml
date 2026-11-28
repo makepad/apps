@@ -1,0 +1,10 @@
+[package]
+name = "makepad-solidsync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Syncs Fab's B-rep kernel from upstream solidcore at a pinned commit (fab/brep/SYNC.md)"
+publish = false
+
+[dependencies]
+relax-lex = { workspace = true }

@@ -5,9 +5,14 @@
 
 pub use makepad_bounded_http::{
     etag_matches, if_range_matches, parse_head, parse_range, reason, BodyError, BodyState,
-    ChunkPhase, Conn, Head, HeadError, Method, RangeSpec, MAX_DRAIN_BYTES, MAX_HEADERS,
+    ChunkPhase, Head, HeadError, Method, RangeSpec, MAX_DRAIN_BYTES, MAX_HEADERS,
     MAX_HEADER_LINE, MAX_HEAD_BYTES, MAX_QUERY_PAIRS, MAX_TARGET_BYTES,
 };
+
+#[cfg(not(test))]
+pub type Conn = makepad_bounded_http::Conn<std::net::TcpStream>;
+#[cfg(test)]
+pub type Conn = makepad_bounded_http::Conn<super::server::tests::ProbeTransport>;
 
 use super::json;
 use std::ops::{Deref, DerefMut};

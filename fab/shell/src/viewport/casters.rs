@@ -25,7 +25,7 @@ script_mod! {
         draw_list: uniform_buffer(draw.DrawListUniforms)
         alpha_blend: false
         depth_write: true
-        backface_culling: false
+        cull_mode: @None
         color_format: @Rf32
         sun_rx: uniform(vec4(1.0, 0.0, 0.0, 0.0))
         sun_ry: uniform(vec4(0.0, 1.0, 0.0, 0.0))

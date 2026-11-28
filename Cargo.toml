@@ -2,8 +2,8 @@
 #
 # `fab/` is Fab: the 3D modeler and slicer (design, mechanics, slicing and printing) and its
 # electronics suite (schematic, board, routing, simulation, firmware and the bench). The app is
-# `makepad-fab` (fab/app). `create/` is Makepad Work, where two people and their AIs finish
-# Makepad apps together (`makepad-work`, create/app; its core without UI is `makepad-work-core`, create/core). `synth/` is
+# `makepad-fab` (fab/app). `create/` is Makepad Town, where two people and their AIs finish
+# Makepad apps together (`makepad-town`, create/app; its core without UI is `makepad-town-core`, create/core). `synth/` is
 # Makepad Synth. `engine/` and `libs/` hold the shared crates Fab and other apps use: the HDRI and
 # atmosphere engine, the asset data model, the model scripts, the app shell, the explorer's motion
 # kit and the studio registry, and Story's engine (Motion and the asset stack), which
@@ -27,8 +27,8 @@ publish = false
 
 [target.'cfg(any())'.dependencies]
 makepad-asset-data    = { path = "engine/asset/data" }
-makepad-work-core     = { path = "create/core" }
-makepad-work          = { path = "create/app" }
+makepad-town-core     = { path = "create/core" }
+makepad-town          = { path = "create/app" }
 makepad-hdri-engine   = { path = "engine/hdri" }
 makepad-graph-layout  = { path = "libs/graph_layout" }
 makepad-ink-shapes    = { path = "libs/ink_shapes" }
@@ -95,6 +95,16 @@ fab-loader-gltf       = { path = "fab/loaders/gltf" }
 fab-loose             = { path = "fab/loose" }
 fab-materials         = { path = "fab/materials" }
 fab-model             = { path = "fab/model" }
+# Fab's exact B-rep kernel (solidcore, Apache-2.0; fab/brep/SYNC.md) and its model layer, and the
+# UV unwrapper's corpus, which measures it on B-rep parts.
+makepad-csg-brep      = { path = "fab/brep/upstream/kernel" }
+makepad-csg-brep-model = { path = "fab/brep/model" }
+makepad-uv-unwrap-corpus = { path = "fab/tools/uv_unwrap_corpus" }
+# Stand-ins for thiserror, serde and spade, under those names, so the synced kernel compiles unchanged.
+makepad-solidsync-thiserror = { path = "fab/brep/sync/shims/thiserror" }
+makepad-solidsync-serde = { path = "fab/brep/sync/shims/serde" }
+makepad-solidsync-spade = { path = "fab/brep/sync/shims/spade" }
+makepad-solidsync = { path = "fab/brep/sync/tool" }
 fab-optimise          = { path = "fab/optimise" }
 makepad-fab-package   = { path = "fab/package" }
 fab-paint-field       = { path = "fab/paint_field" }
@@ -118,7 +128,7 @@ makepad-app-synth     = { path = "synth" }
 makepad-explore-kit   = { path = "libs/explore_kit" }
 makepad-studio-api    = { path = "libs/studio_api" }
 
-# Makepad Story's crates and the engine crates it shares with Stage and Work, moved here with Story:
+# Makepad Story's crates and the engine crates it shares with Stage and Town, moved here with Story:
 # the motion engine with its fonts, kits and renderers, the asset stack and the Stage libraries.
 # Storyboards: the 2D board the edit is made from, its diffs and incremental edit updates.
 makepad-story-storyboard = { path = "story/libs/storyboard" }
@@ -138,7 +148,9 @@ makepad-stage-audio-wave = { path = "stage/libs/audio_wave" }
 makepad-stage-render-kit = { path = "engine/render_kit" }
 # Motion graphics: AI-authored Splash documents drawn on the GPU.
 makepad-motion        = { path = "engine/motion" }
+makepad-motion-plain  = { path = "engine/motion_plain" }
 # The document font table: families, files, licences, where the files are.
+makepad-doc-font-names = { path = "engine/font_names" }
 makepad-doc-fonts     = { path = "engine/fonts" }
 # Drawing Motion frames (installed effect packs' presets, and Scene3D behind a feature).
 makepad-motion-draw   = { path = "engine/motion_draw" }
@@ -151,7 +163,7 @@ makepad-stage-motion3d = { path = "engine/motion3d" }
 makepad-content-packs = { path = "engine/content_packs" }
 
 # Moved from the private repository with Story (REPOMOVE): the motion engine, its fonts, kits and
-# renderers, the asset stack and the Stage libraries Story and Work build on.
+# renderers, the asset stack and the Stage libraries Story and Town build on.
 makepad-app-asset-server = { path = "stage/apps/asset-server" }
 makepad-flow-assets   = { path = "engine/flow_assets" }
 # The asset store connection and host the product windows share.

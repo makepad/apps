@@ -20,6 +20,10 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_script::syntax::{self, Node};
 use makepad_strict_json::Value;
@@ -127,9 +131,10 @@ fn wait_node(app: &TestApp, role: Role, name: &str) {
 
 /// Pick a part in the parts list, then shape it (its handles).
 fn pick_part(app: &TestApp, name: &str) {
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name(name)).wait_visible().click();
     app.locator(Selector::id("t_shape")).wait_visible().click();
+    part_editor::open(app);
 }
 
 /// "Rebuilding…" (the chip and the view's sweep) shows for a mesh part only, and ends once
@@ -279,8 +284,8 @@ place("vase", at: [222mm 165mm], name: "Bud vase")"#;
     wait_for(&app, "the handle's box to open", || boxes(&app) > rows);
     app.type_text("nope * 2");
     wait_for(&app, "the box to say why it cannot read the text", || refusing(&app));
-    // (the row's label: nothing there to pick or press)
-    app.locator(Selector::role(Role::StaticText).name("Thickness")).click_at_center();
+    // (the Part editor's title: nothing there to pick or press)
+    app.locator(Selector::path("bar.title").name("Shelf bracket")).wait_visible().click_at_center();
     wait_for(&app, "the reason to stay at the handle once the box closes", || tip(&app));
     assert!(!refusing(&app), "a press elsewhere closes the box");
     assert_eq!(param(&app, "bracket/thickness"), t1, "a refused value commits nothing");

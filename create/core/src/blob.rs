@@ -1,9 +1,9 @@
-//! Blob identities, per-room storage and messages for the blob lane.
+//! Blob identities, per-town storage and messages for the blob lane.
 //!
-//! The store worker owns one room directory exclusively. Both sidecars start with the size
+//! The store worker owns one town directory exclusively. Both sidecars start with the size
 //! (u64 BE) and root (32 bytes), bound to the filename by the blob id. Leaves are 32-byte
 //! slots in chunk order. Zero and unwritten slots are absent. A tree holds all levels,
-//! leaves through root, with widths derived from the size and the room's chunk length.
+//! leaves through root, with widths derived from the size and the town's chunk length.
 //!
 //! Recovery table. D is the final data filename, P is `.part`, T is `.tree`, L is `.leaves`.
 //! Every nonzero L slot is rehashed against the data. “Check” completes only with all slots
@@ -24,7 +24,10 @@
 //! can supply missing metadata before it is discarded or replaced. Interrupted `add-*.tmp`
 //! staging files are removed. Unrelated directory entries are left alone.
 
-use crate::event::{Id, RoomId};
+pub mod lane;
+pub mod refs;
+
+use crate::event::{Id, TownId};
 use crate::key::label;
 use makepad_network::digest::Sha256;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -225,11 +228,12 @@ pub enum Body<'a> {
     Chunk { index: u64, proof: &'a [Hash], bytes: &'a [u8] },
     Missing,
     Have,
+    Ready,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Message<'a> {
-    pub room: RoomId,
+    pub town: TownId,
     pub id: Id,
     pub body: Body<'a>,
 }
@@ -243,7 +247,11 @@ impl<'a> Message<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<Self, CodecError> {
         let header = CodecError("incomplete blob message header");
         let (&kind, rest) = bytes.split_first().ok_or(header)?;
-        let (&room, rest) = rest.split_first_chunk().ok_or(header)?;
+        let (&town, rest) = rest.split_first_chunk().ok_or(header)?;
+        if kind == 5 {
+            if !rest.is_empty() { return Err(CodecError("trailing bytes after town READY")); }
+            return Ok(Self { town, id: [0; 32], body: Body::Ready });
+        }
         let (&id, body) = rest.split_first_chunk().ok_or(header)?;
         let body = match kind {
             1 => {
@@ -276,7 +284,7 @@ impl<'a> Message<'a> {
             3 | 4 => return Err(CodecError("trailing bytes after blob status")),
             _ => return Err(CodecError("unknown blob message kind")),
         };
-        Ok(Self { room, id, body })
+        Ok(Self { town, id, body })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
@@ -294,12 +302,18 @@ impl<'a> Message<'a> {
             }
             Body::Missing => (3, 0),
             Body::Have => (4, 0),
+            Body::Ready => {
+                let mut out = Vec::with_capacity(33);
+                out.push(5);
+                out.extend_from_slice(&self.town);
+                return Ok(out);
+            }
         };
         let len = usize::try_from(65 + body_len).map_err(|_| CodecError("blob message too large"))?;
         let mut out = Vec::new();
         out.try_reserve_exact(len).map_err(|_| CodecError("cannot allocate blob message"))?;
         out.push(kind);
-        out.extend_from_slice(&self.room);
+        out.extend_from_slice(&self.town);
         out.extend_from_slice(&self.id);
         match self.body {
             Body::Want(ranges) => {
@@ -315,7 +329,7 @@ impl<'a> Message<'a> {
                 out.extend_from_slice(proof.as_flattened());
                 out.extend_from_slice(bytes);
             }
-            Body::Missing | Body::Have => {}
+            Body::Missing | Body::Have | Body::Ready => {}
         }
         Ok(out)
     }
@@ -387,9 +401,14 @@ struct Paths {
     new_tree: PathBuf,
 }
 
+/// The verified data file for a blob in its town's store directory.
+pub fn data_path(town_dir: &Path, id: &Id) -> PathBuf {
+    town_dir.join(crate::hex(id))
+}
+
 impl Paths {
     fn new(dir: &Path, id: &Id) -> Self {
-        let data = dir.join(crate::hex(id));
+        let data = data_path(dir, id);
         Self { part: data.with_extension("part"), leaves: data.with_extension("leaves"),
             tree: data.with_extension("tree"), new_tree: data.with_extension("tree.new"), data }
     }
@@ -487,11 +506,11 @@ pub struct OpenReport {
     pub completions_finished: usize,
     pub demotions_finished: usize,
     /// Blobs whose tidy failed (a full disk, a read error, a non-file under a blob name).
-    /// Their files are left as they are, the rest of the room opens, and `begin` retries them.
+    /// Their files are left as they are, the rest of the town opens, and `begin` retries them.
     pub failed: Vec<(Id, io::Error)>,
 }
 
-pub struct RoomStore {
+pub struct TownStore {
     dir: PathBuf,
     chunk: usize,
     entries: HashMap<Id, Entry>,
@@ -526,7 +545,7 @@ impl fmt::Display for WriteError {
 impl std::error::Error for WriteError {}
 
 fn unknown() -> io::Error {
-    io::Error::new(io::ErrorKind::NotFound, "unknown room blob")
+    io::Error::new(io::ErrorKind::NotFound, "unknown town blob")
 }
 
 // A short read is a damaged chunk. An I/O error must leave the slot alone for retry.
@@ -906,8 +925,8 @@ fn recover(dir: &Path, name: &Id, chunk: usize, known: Option<Info>, report: &mu
     Ok(Some(Entry { paths, info, holding }))
 }
 
-impl RoomStore {
-    /// Open the directory for a single room under the home's blobs directory.
+impl TownStore {
+    /// Open the directory for a single town under the home's blobs directory.
     pub fn open(dir: impl AsRef<Path>, chunk: usize) -> io::Result<(Self, OpenReport)> {
         if chunk == 0 { return Err(invalid("zero blob chunk length")); }
         let dir = dir.as_ref().to_path_buf();
@@ -932,7 +951,7 @@ impl RoomStore {
         }
         let mut store = Self { dir, chunk, entries: HashMap::new(), dirty: HashSet::new(),
             dirty_bytes: 0, last_flush: Instant::now() };
-        // One blob's failure never closes the room: its files stay as they are.
+        // One blob's failure never closes the town: its files stay as they are.
         for name in names {
             match recover(&store.dir, &name, chunk, None, &mut report) {
                 Ok(Some(entry)) => {
@@ -965,6 +984,24 @@ impl RoomStore {
     fn ready(&mut self, name: &Id) -> io::Result<()> {
         if let Some(entry) = self.entries.get(name) {
             if matches!(entry.holding, Holding::Recover) { self.recover_known(*name, entry.info)?; }
+        }
+        Ok(())
+    }
+
+    /// Town-local holdings established by recovery or a successful completion.
+    pub fn complete_ids<'a>(&'a self) -> impl Iterator<Item = Id> + 'a {
+        self.entries.iter().filter_map(|(id, entry)| matches!(entry.holding, Holding::Complete).then_some(*id))
+    }
+
+    pub fn is_complete(&self, id: &Id) -> bool {
+        self.entries.get(id).is_some_and(|entry| matches!(entry.holding, Holding::Complete))
+    }
+
+    /// Retry one failed startup check. A signed begin or add may already have recovered it.
+    pub fn retry_recovery(&mut self, id: Id) -> io::Result<()> {
+        if self.entries.contains_key(&id) { return self.ready(&id); }
+        if let Some(entry) = recover(&self.dir, &id, self.chunk, None, &mut OpenReport::default())? {
+            self.entries.insert(id, entry);
         }
         Ok(())
     }
@@ -1147,7 +1184,7 @@ mod tests {
     use crate::event::{fields, kind, Content, FieldWriter, Key, Value};
     use crate::log::tests::temp_dir;
 
-    fn assert_serves(store: &mut RoomStore, data: &[u8], tree: &Tree) {
+    fn assert_serves(store: &mut TownStore, data: &[u8], tree: &Tree) {
         let name = id(data.len() as u64, &tree.root());
         let chunk = store.chunk;
         for i in 0..data.len().div_ceil(chunk).max(1) {
@@ -1162,7 +1199,7 @@ mod tests {
     #[test]
     fn out_of_order_fetch_completes_and_proofs_use_only_the_tree() {
         let dir = temp_dir("blob-fetch");
-        let (mut store, _) = RoomStore::open(&dir, 4).unwrap();
+        let (mut store, _) = TownStore::open(&dir, 4).unwrap();
         let data: Vec<u8> = (0..65).collect();
         let tree = Tree::new(&data, 4).unwrap();
         let name = store.begin(65, tree.root()).unwrap();
@@ -1201,16 +1238,16 @@ mod tests {
         // A hostile signed size does not allocate slots or data at begin or reopen.
         let huge = store.begin(u64::MAX, [7; 32]).unwrap();
         drop(store);
-        let (mut store, report) = RoomStore::open(&dir, 4).unwrap();
+        let (mut store, report) = TownStore::open(&dir, 4).unwrap();
         assert_eq!((report.complete, report.partial, report.slots_checked), (2, 1, 0));
         assert_eq!(store.absent(&huge).unwrap(), [0..u64::MAX.div_ceil(4)]);
         drop(store);
 
         // A blob that can't be tidied (here a directory under its name) is reported, and the
-        // rest of the room still opens and serves.
+        // rest of the town still opens and serves.
         let blocked = Paths::new(&dir, &[9; 32]);
         fs::create_dir(&blocked.part).unwrap();
-        let (mut store, report) = RoomStore::open(&dir, 4).unwrap();
+        let (mut store, report) = TownStore::open(&dir, 4).unwrap();
         assert_eq!(report.failed.len(), 1, "the blocked blob is reported");
         assert_eq!(report.failed[0].0, [9; 32]);
         assert_eq!((report.complete, report.partial), (2, 1), "the other blobs still open");
@@ -1227,21 +1264,21 @@ mod tests {
         let info = Info { size: data.len() as u64, root: tree.root() };
         let name = id(info.size, &info.root);
         let slots = [info.header().as_slice(), tree.leaves().as_flattened()].concat();
-        let (mut seed, _) = RoomStore::open(dir.join("seed"), 3).unwrap();
+        let (mut seed, _) = TownStore::open(dir.join("seed"), 3).unwrap();
         assert_eq!(seed.add((&data[..2]).chain(&data[2..])).unwrap(), (info.size, info.root));
         let sidecar = fs::read(Paths::new(&seed.dir, &name).tree).unwrap();
         drop(seed);
         // Cross the four persistent names with .tree.new. This includes the cuts before and
         // after every rename and unlink, and the intact-data branch of the ambiguous state.
         for mask in 0..32 {
-            let room = dir.join(mask.to_string());
-            fs::create_dir(&room).unwrap();
-            let p = Paths::new(&room, &name);
+            let town = dir.join(mask.to_string());
+            fs::create_dir(&town).unwrap();
+            let p = Paths::new(&town, &name);
             for (bit, path, bytes) in [(1, &p.data, &data[..]), (2, &p.part, data),
                 (4, &p.leaves, &slots), (8, &p.tree, &sidecar), (16, &p.new_tree, &sidecar)] {
                 if mask & bit != 0 { fs::write(path, bytes).unwrap(); }
             }
-            let (mut store, _) = RoomStore::open(&room, 3).unwrap();
+            let (mut store, _) = TownStore::open(&town, 3).unwrap();
             store.begin(info.size, info.root).unwrap();
             if mask & 3 != 0 {
                 assert!(store.absent(&name).unwrap().is_empty(), "complete, mask {mask}");
@@ -1257,9 +1294,9 @@ mod tests {
         // Cut demotion immediately after each of its three steps. The data mismatch also
         // resolves D+T+L when the stale slot is nonzero.
         for cut in 0..4 {
-            let room = dir.join(format!("demote-{cut}"));
-            fs::create_dir(&room).unwrap();
-            let p = Paths::new(&room, &name);
+            let town = dir.join(format!("demote-{cut}"));
+            fs::create_dir(&town).unwrap();
+            let p = Paths::new(&town, &name);
             let mut damaged = *data;
             damaged[4] ^= 1;
             fs::write(if cut == 3 { &p.part } else { &p.data }, damaged).unwrap();
@@ -1267,7 +1304,7 @@ mod tests {
             let mut disk = slots.clone();
             if cut != 0 { disk[72..104].fill(0); }
             fs::write(&p.leaves, disk).unwrap();
-            let (mut store, report) = RoomStore::open(&room, 3).unwrap();
+            let (mut store, report) = TownStore::open(&town, 3).unwrap();
             assert_eq!((report.complete, report.partial), (0, 1));
             assert_eq!(store.absent(&name).unwrap(), [1..2], "damaged chunk at demotion cut {cut}");
             assert!(matches!(store.serve(&name, 1).unwrap(), Served::Missing));
@@ -1276,21 +1313,21 @@ mod tests {
             assert_serves(&mut store, data, &tree);
         }
 
-        let room = dir.join("interrupted-arrival");
-        fs::create_dir(&room).unwrap();
-        let p = Paths::new(&room, &name);
+        let town = dir.join("interrupted-arrival");
+        fs::create_dir(&town).unwrap();
+        let p = Paths::new(&town, &name);
         fs::write(&p.part, &data[..9]).unwrap(); // the last slot has no data
         let mut disk = slots.clone();
         disk[40..72].fill(0); // first chunk has data without a slot
         disk[104..136].fill(0x77); // third slot is garbage
         fs::write(&p.leaves, disk).unwrap();
         fs::write(&p.new_tree, &sidecar[..19]).unwrap();
-        fs::write(room.join("add-unfinished.tmp"), b"scratch").unwrap();
-        fs::write(room.join("other.tmp"), b"keep").unwrap();
-        let (mut store, report) = RoomStore::open(&room, 3).unwrap();
+        fs::write(town.join("add-unfinished.tmp"), b"scratch").unwrap();
+        fs::write(town.join("other.tmp"), b"keep").unwrap();
+        let (mut store, report) = TownStore::open(&town, 3).unwrap();
         assert_eq!((report.slots_checked, report.slots_cleared, report.temporary_removed), (3, 2, 1));
         assert_eq!(store.absent(&name).unwrap(), [0..1, 2..4]);
-        assert!(room.join("other.tmp").exists() && !p.new_tree.exists());
+        assert!(town.join("other.tmp").exists() && !p.new_tree.exists());
         for i in [2usize, 3, 0] {
             store.write_chunk(&name, i as u64, &tree.proof(i as u64).unwrap(),
                 &data[i * 3..data.len().min(i * 3 + 3)]).unwrap();
@@ -1300,11 +1337,11 @@ mod tests {
         // P using the tree. A zero beside D instead commits demotion, even for intact bytes.
         drop(store);
         fs::write(&p.leaves, &slots[..slots.len() - 32]).unwrap();
-        let (mut store, _) = RoomStore::open(&room, 3).unwrap();
+        let (mut store, _) = TownStore::open(&town, 3).unwrap();
         assert_eq!(store.absent(&name).unwrap(), [3..4], "zero slot beside final data demotes");
         drop(store);
         fs::write(&p.tree, &sidecar).unwrap();
-        let (mut store, _) = RoomStore::open(&room, 3).unwrap();
+        let (mut store, _) = TownStore::open(&town, 3).unwrap();
         assert_serves(&mut store, data, &tree);
         drop(store);
         fs::remove_dir_all(dir).unwrap();
@@ -1313,7 +1350,7 @@ mod tests {
     #[test]
     fn corrupt_complete_chunk_is_demoted_and_repair_is_retryable() {
         let dir = temp_dir("blob-demote");
-        let (mut store, _) = RoomStore::open(&dir, 3).unwrap();
+        let (mut store, _) = TownStore::open(&dir, 3).unwrap();
         let data = b"abcDEFghi!";
         let tree = Tree::new(data, 3).unwrap();
         let (size, root) = store.add(&data[..]).unwrap();
@@ -1324,7 +1361,7 @@ mod tests {
         assert_eq!(store.absent(&name).unwrap(), [2..3]);
         assert!(p.part.exists() && p.leaves.exists() && !p.tree.exists() && !p.data.exists());
         assert!(matches!(store.serve(&name, 0).unwrap(), Served::Missing), "partial never serves");
-        let (mut store, _) = RoomStore::open(&dir, 3).unwrap();
+        let (mut store, _) = TownStore::open(&dir, 3).unwrap();
         assert_eq!(store.absent(&name).unwrap(), [2..3]);
         // A storage error before the slot write preserves both the wanted range and earlier
         // verified bytes. A failed local import also cleans up its own scratch.
@@ -1427,7 +1464,7 @@ mod tests {
     fn signed_blob_reference_has_a_big_endian_size_and_root() {
         let root = [0x55; 32];
         let size = 0x0102_0304_0506_0708;
-        let content = Content::Entity {
+        let content = Content::Entity { copied_from: vec![],
             kind: Key::Name("Card".into()), project: None, derive: None,
             fields: vec![(Key::Number(1), Value::Blob { size, root })],
         };
@@ -1445,10 +1482,10 @@ mod tests {
 
     #[test]
     fn lane_message_vectors_and_malformed_frames() {
-        let room = [0x31; 32];
+        let town = [0x31; 32];
         let id = [0x42; 32];
-        let header = |kind| [&[kind][..], &room, &id].concat();
-        let encode = |body| Message { room, id, body }.encode().unwrap();
+        let header = |kind| [&[kind][..], &town, &id].concat();
+        let encode = |body| Message { town, id, body }.encode().unwrap();
 
         for (kind, body) in [(3, Body::Missing), (4, Body::Have)] {
             let mut wire = encode(body);
@@ -1461,6 +1498,11 @@ mod tests {
             assert!(Message::decode(&wire).is_err(), "status with trailing byte");
         }
         assert!(Message::decode(&header(0)).is_err(), "unknown kind");
+
+        let ready = encode(Body::Ready);
+        assert_eq!(ready, [&[5][..], &town].concat());
+        assert!(matches!(Message::decode(&ready).unwrap().body, Body::Ready));
+        assert!(Message::decode(&ready[..32]).is_err() && Message::decode(&header(5)).is_err());
 
         let ranges = [0..2, 2..0x102, 800..u64::MAX];
         let mut want = encode(Body::Want(Ranges::Local(&ranges)));

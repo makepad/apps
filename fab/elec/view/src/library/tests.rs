@@ -41,13 +41,43 @@ fn standard_library_row_symbols_and_details() {
     let mut bare = (**entry("r 10kohm 0402").part.as_ref().unwrap()).clone();
     bare.symbol.units.clear();
     assert!(symbol::symbol_svg(&bare).is_none(), "even a familiar family needs a symbol unit");
+
+    let ctx = ShortlistContext { pinned: &[], used_parts: &BTreeSet::new(), imported_ids: &BTreeSet::new() };
+    let mut e = entry("r 10kohm 0402").clone();
+    use fab_elec_parts::Lifecycle::{Active, Nrnd, Obsolete};
+    for (approved, lifecycle, badges) in [
+        (false, None, ""), (false, Some(Active), ""), (true, None, "approved"),
+        (true, Some(Active), "approved"), (false, Some(Nrnd), "NRND"),
+        (true, Some(Obsolete), "approved · obsolete"),
+    ] {
+        let part = Arc::make_mut(e.part.as_mut().unwrap());
+        part.approved = approved;
+        part.lifecycle = lifecycle;
+        let ranked = rank::rank_with_context(std::slice::from_ref(&e), "", &ctx, &Prices::default());
+        let text = row_text(&e, &ranked[0], true);
+        assert_eq!(text.badges, badges, "the first line must keep approval and lifecycle together");
+        assert_eq!(text.meta, "std · unpriced · 0402, 10k · +0 alt", "the second line must keep provenance, price, package and alternatives");
+    }
+    e.lib = "imported".into();
+    let ranked = rank::rank_with_context(std::slice::from_ref(&e), "", &ctx, &Prices::default());
+    let placeable = can_place(ranked[0].index, 0);
+    assert!(!placeable && row_text(&e, &ranked[0], placeable).detail.contains(IMPORT_NOTE),
+        "a cache-only part must stay unarmed and explain in its detail and preview how it can be used");
+}
+
+fn build_rows(entries: &[CatalogEntry], query: &str, pinned: &[EntryKey], recent: &[EntryKey],
+    used: &HashSet<String>, folded: &HashSet<Section>) -> (Vec<Row>, [String; Section::ALL.len()]) {
+    let keys = pinned.iter().map(|key| (key.lib.clone(), key.name.clone())).collect::<Vec<_>>();
+    let ctx = ShortlistContext { pinned: &keys, used_parts: &used.iter().cloned().collect(), imported_ids: &BTreeSet::new() };
+    let matches = rank::rank_with_context(entries, query, &ctx, &Prices::default());
+    rows_from_matches(entries, &matches, query, pinned, recent, used, folded)
 }
 
 #[test]
 fn library_tree_shortcuts_categories_and_ranked_search() {
     let part = |name: &str, kind| Arc::new(PartDef {
         name: name.into(), kind, symbol: Default::default(), footprint: None, body: None,
-        pins: Vec::new(), fields: Default::default(), emitter: None, gpio: None,
+        pins: Vec::new(), fields: Default::default(), emitter: None, gpio: None, lifecycle: None, approved: false,
     });
     let entry = |name: &str, kind, part| CatalogEntry {
         lib: "test".into(), name: name.into(), kind, title: name.into(), summary: String::new(),

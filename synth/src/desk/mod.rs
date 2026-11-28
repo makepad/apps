@@ -46,9 +46,11 @@ use makepad_edit_values::{apply_splices, normalize_splices, Edit};
 use makepad_editor_panel::EditorPanelWidgetRefExt;
 use makepad_score_live::model::ScoreDoc;
 use makepad_score_live::{source, LiveConfig, LiveScore, Status};
-use makepad_score_live::model::{LoadResult, RevisionLoad, RevisionLoads};
+use makepad_score_live::model::{LoadActivity, LoadProgress, LoadResult, RevisionLoad, RevisionLoads};
 use makepad_widgets::*;
 use makepad_widgets::value_input::ValueInputWidgetRefExt;
+use std::task::Poll;
+use std::time::Duration;
 use tabs::{PaneTabs, TabsAction};
 
 script_mod! {
@@ -292,6 +294,22 @@ const BPM_JOIN: f64 = 0.8;
 /// The pause after typing before the text is applied.
 const SETTLE: f64 = 0.35;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadCaption {
+    Running(LoadActivity),
+    Stopped,
+}
+
+impl LoadCaption {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Running(LoadActivity::Evaluating) => "Still evaluating…",
+            Self::Running(LoadActivity::Initialising) => "Still initialising…",
+            Self::Stopped => "Evaluation stopped",
+        }
+    }
+}
+
 /// An audition's render: (what it auditions, the clip and when, or why not).
 type Audition = (String, Result<(Vec<f32>, Vec<f32>, f32, Option<f64>), String>);
 
@@ -310,8 +328,8 @@ pub struct Desk {
     load_pool: Option<TaskPool>,
     loads: RevisionLoads<FrameJob<LoadResult>>,
     loading: Option<RevisionLoad>,
-    initialising: bool,
-    executing_since: Option<f64>,
+    load_progress: LoadProgress,
+    shown_activity: Option<LoadCaption>,
     overruns: u64,
     /// While a melody variant auditions: the score with that part played
     /// instead, what the composer plays (the document stays as it is); any
@@ -414,13 +432,13 @@ pub struct Desk {
     side: Side,
 }
 
-/// How long an init runs before the status says so (a quick one never shows).
+/// Short evaluations and shader inits finish before their status appears.
 const INIT_STATUS_DELAY: f64 = 0.2;
 
 impl Default for Desk {
     fn default() -> Self {
         Desk {
-            engine: Engine::default(), live: None, module: None, source: String::new(), revision: 0, music_open_error: None, applied_title: String::new(), load_pool: None, loads: RevisionLoads::default(), loading: None, initialising: false, executing_since: None, overruns: 0, variant_live: None, variant_shaders: None, played: String::new(), retry_played: false,
+            engine: Engine::default(), live: None, module: None, source: String::new(), revision: 0, music_open_error: None, applied_title: String::new(), load_pool: None, loads: RevisionLoads::default(), loading: None, load_progress: LoadProgress::default(), shown_activity: None, overruns: 0, variant_live: None, variant_shaders: None, played: String::new(), retry_played: false,
             doc: None, status: Status::default(), typed: false, timer: Timer::default(), frame: NextFrame::default(), midi_stamp: 0, idle: Timer::default(),
             started: false, code_shown: 0, slot: audio::slot(), note_version: (0, 0), note_fields: Vec::new(), note_marks: Vec::new(), loops_shown: Vec::new(), folds: Folds::default(), menu: false, arrangement: transport::Arrangement::default(), arranged: 0, looping: None,
             bpm_written: None, bpm_shown: None, bpm_typed_at: f64::NEG_INFINITY, document: Document::default(), gesture: 0, panel: panel::ScorePanel::default(), vary: vary::VaryDesk::default(),
@@ -592,8 +610,7 @@ impl Desk {
             self.frame = cx.new_next_frame();
         }
         if ui.button(cx, ids!(score_stop)).clicked(actions) {
-            self.transport(false);
-            self.seek(0.0, 0.0);
+            self.stop(cx, ui);
         }
         // The caption's tempo: written to the score's clock, a scrub's steps
         // one undo step, each sounding as it lands.
@@ -917,11 +934,11 @@ impl Desk {
         self.pump_library(cx, ui);
         self.pump_gm(cx, ui);
         self.pump_audition(cx);
-        self.poll_load(cx);
+        if self.poll_load(cx) { self.document.keep(&self.source); }
         self.pump_panel_actions(cx, ui);
         self.pump_generation(cx, ui);
         self.pump_audio(&pool);
-        self.update_audio_status(cx, ui);
+        self.update_audio_status(cx, ui, Cx::time_now());
         let Some(live) = &self.live else {
             if self.jobs.busy() { self.frame = cx.new_next_frame(); }
             return;
@@ -965,7 +982,8 @@ impl Desk {
             (Some(_), true) => (Some(p.amber), "Edited".to_string(), "Changed since it was saved".to_string()),
             (Some(_), false) => (None, "Saved".to_string(), "As saved in the library".to_string()),
         };
-        let state = if self.status.document_diags(&self.loads).is_empty() && !self.note_fields.is_empty() {
+        let state = if self.loads.applied.as_ref().is_some_and(|load| load.revision == self.revision)
+            && self.status.document_diags(&self.loads).is_empty() && !self.note_fields.is_empty() {
             format!("Loaded · {state}")
         } else { state };
         let (dot, state, tip) = match &self.music_open_error {
@@ -1087,7 +1105,7 @@ impl Desk {
         let wants = self.doc.as_ref().is_some_and(|doc| doc.plays_gm_font());
         let have = *self.gm_known.get_or_insert_with(gm_font::installed);
         if wants && have && !gm_font::registered() && self.samples_asked.insert(gm_font::FONT.to_string()) {
-            self.jobs.spawn(cx, Class::Visible, None, || gm_font::ensure().map(|()| makepad_strict_json::obj(vec![("loaded", makepad_strict_json::Value::Int(1))])));
+            self.jobs.spawn(cx, Class::Visible, || gm_font::ensure().map(|()| makepad_strict_json::obj(vec![("loaded", makepad_strict_json::Value::Int(1))])));
         }
         let missing = wants && !have;
         if ui.view(cx, ids!(score_gm)).visible() != missing {
@@ -1145,17 +1163,11 @@ impl Desk {
         }
     }
 
-    fn update_audio_status(&mut self, cx: &mut Cx, ui: &WidgetRef) {
-        // Shown once an init has run for a moment, so a quick one never flashes.
-        let executing = self.loading.as_ref().is_some_and(RevisionLoad::executing) || self.slot.initialising();
-        let now = Cx::time_now();
-        let since = if executing { *self.executing_since.get_or_insert(now) } else { self.executing_since = None; now };
-        let initialising = now - since >= INIT_STATUS_DELAY;
-        if initialising != self.initialising {
-            self.initialising = initialising;
-            ui.widget(cx, ids!(score_init)).set_visible(cx, initialising);
-            ui.widget(cx, ids!(score_state)).set_visible(cx, !initialising);
-        }
+    fn update_audio_status(&mut self, cx: &mut Cx, ui: &WidgetRef, now: f64) {
+        let activity = self.load_progress.sample(self.loading.as_ref(), self.slot.initialising(), now, INIT_STATUS_DELAY);
+        let caption = activity.map(LoadCaption::Running)
+            .or_else(|| self.loads.stopped(self.revision).then_some(LoadCaption::Stopped));
+        self.show_load_caption(cx, ui, caption);
         let overruns = makepad_widgets::makepad_platform::audio_deadline::audio_overruns();
         if overruns != self.overruns {
             self.overruns = overruns;
@@ -1163,29 +1175,47 @@ impl Desk {
         }
     }
 
+    fn show_load_caption(&mut self, cx: &mut Cx, ui: &WidgetRef, caption: Option<LoadCaption>) {
+        if caption != self.shown_activity {
+            self.shown_activity = caption;
+            if let Some(caption) = caption {
+                ui.label(cx, ids!(score_init)).set_text(cx, caption.text());
+            }
+            ui.widget(cx, ids!(score_init)).set_visible(cx, caption.is_some());
+            ui.widget(cx, ids!(score_state)).set_visible(cx, caption.is_none());
+        }
+    }
+
+    fn revision_steps(request: RevisionLoad, slice: Duration) -> impl FnMut() -> Poll<LoadResult> {
+        let revision = request.revision;
+        let mut step = request.steps(slice);
+        move || {
+            let result = step();
+            if matches!(result, Poll::Ready(LoadResult::Cancelled)) {
+                log!("score: load of revision {} cancelled", revision);
+            }
+            result
+        }
+    }
+
     fn start_load(&mut self) {
         let Some(pool) = &self.load_pool else { return };
         self.loads.start(|request| {
             let worker = request.clone();
-            match pool.submit_frame_job(Class::Visible, move || {
-                let result = worker.run();
-                if matches!(result, LoadResult::Cancelled) {
-                    log!("score: load of revision {} cancelled", worker.revision);
-                }
-                result
-            }) {
+            match pool.submit_stepped_frame_job(Class::Visible, move || { let mut step = Self::revision_steps(worker, makepad_score_live::EVAL_SLICE); std::future::poll_fn(move |_| step()) }) {
                 Ok(job) => { self.loading = Some(request); Some(job) }
                 Err(error) => { log!("score load: {error}"); None }
             }
         });
     }
 
-    fn poll_load(&mut self, cx: &mut Cx) {
+    /// Apply a finished revision. A newly loaded document may have given the draft a title to keep.
+    fn poll_load(&mut self, cx: &mut Cx) -> bool {
         if self.retry_played {
             self.send_played();
             if self.retry_played { self.frame = cx.new_next_frame(); }
         }
-        if !self.loads.pending() { return; }
+        if !self.loads.pending() { return false; }
         self.start_load();
         let doc = self.loads.take(|job| Some(match job.try_take()? {
             Ok(result) => result,
@@ -1196,10 +1226,11 @@ impl Desk {
         }));
         if self.loads.pending() {
             self.frame = cx.new_next_frame();
-            return;
+            return false;
         }
         self.loading = None;
         self.code_shown = 0;
+        let loaded = doc.is_some();
         if let Some(doc) = doc {
             self.arranged = 0;
             self.note_version.1 = 0;
@@ -1212,7 +1243,7 @@ impl Desk {
             let missing: Vec<_> = makepad_score_live::render::missing_samples(&doc).into_iter().chain(makepad_score_live::render::missing_files(&doc))
                 .filter(|asset| self.samples_asked.insert(makepad_score_live::player::sample_name(asset))).collect();
             if !missing.is_empty() {
-                self.jobs.spawn(cx, Class::Visible, None, move || run::load_samples(missing));
+                self.jobs.spawn(cx, Class::Visible, move || run::load_samples(missing));
             }
             self.module = Some(doc.clone());
             self.panel.stats.modules_sent += 1;
@@ -1223,9 +1254,11 @@ impl Desk {
             self.played.clear();
             self.send_played();
             if self.retry_played { self.frame = cx.new_next_frame(); }
-            self.document.keep(&self.source);
         }
-        self.applied_title.clone_from(&self.document.title);
+        if self.loads.applied.as_ref().is_some_and(|load| load.revision == self.revision) {
+            self.applied_title.clone_from(&self.document.title);
+        }
+        loaded
     }
 
     /// Replace the source (a template, an import, the AI, a lens): the code
@@ -1265,6 +1298,16 @@ impl Desk {
             }
         }
         self.engine.set_playing(play);
+    }
+
+    fn stop(&mut self, cx: &mut Cx, ui: &WidgetRef) {
+        self.transport(false);
+        self.seek(0.0, 0.0);
+        if self.shown_activity == Some(LoadCaption::Running(LoadActivity::Evaluating)) && self.loads.pending() {
+            self.loads.stop(|job| job.cancel());
+            self.loading = None;
+            self.show_load_caption(cx, ui, Some(LoadCaption::Stopped));
+        }
     }
 
     /// Start the piece over from scratch at beat 0; playing or stopped it
@@ -1419,8 +1462,8 @@ impl Desk {
             self.panel.preview = None;
             if let Some((_, mut previous)) = self.audition_job.take() { previous.cancel(); }
             let control = makepad_score_live::PrepareControl::default();
-            match run::RequestJob::submit(cx, control, move |control| {
-                let rendered = audition::render_key(&choice, &held, 48_000.0, control);
+            match run::RequestJob::submit(cx, control, move |control| async move {
+                let rendered = audition::render_key_async(&choice, &held, 48_000.0, &control).await;
                 (format!("key:{node}"), rendered.map(|(l, r, rate)| (l, r, rate, None)))
             }) {
                 Ok(job) => self.audition_job = Some((self.revision, job)),
@@ -1477,11 +1520,11 @@ impl Desk {
                 let seconds = (2.0 * bar * 60.0 / bpm).min(8.0);
                 let (source, node, c) = (self.source.clone(), node.clone(), c.clone());
                 let control = makepad_score_live::PrepareControl::default();
-                match run::RequestJob::submit(cx, control, move |control| {
-                    let rendered = match audition::in_place(&source, &node, &c, ahead.map(|(song, _)| song), control) {
-                        Ok(Some((candidate, start))) => audition::render_in_place(&candidate, start, seconds, 48_000.0, control),
+                match run::RequestJob::submit(cx, control, move |control| async move {
+                    let rendered = match audition::in_place_async(&source, &node, &c, ahead.map(|(song, _)| song), &control).await {
+                        Ok(Some((candidate, start))) => audition::render_in_place_async(&candidate, start, seconds, 48_000.0, &control).await,
                         Err(reason) => Err(reason),
-                        Ok(None) => audition::render_phrase(&c, 48_000.0, control),
+                        Ok(None) => audition::render_phrase_async(&c, 48_000.0, &control).await,
                     };
                     (key, rendered.map(|(l, r, rate)| (l, r, rate, ahead.map(|(_, at)| at))))
                 }) {

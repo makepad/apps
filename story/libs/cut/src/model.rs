@@ -550,6 +550,8 @@ pub enum CameraDevice {
     /// The first camera whose name contains this text (any case); the first
     /// camera when none does.
     Name(String),
+    /// A generated test pattern (colour bars and a moving marker); no camera is opened.
+    TestPattern,
 }
 
 impl CameraDevice {
@@ -557,6 +559,7 @@ impl CameraDevice {
     pub fn pick<'n>(&self, names: impl IntoIterator<Item = &'n str>) -> Option<usize> {
         let mut names = names.into_iter();
         match self {
+            Self::TestPattern => None,
             Self::First => names.next().map(|_| 0),
             Self::Index(at) => names.nth(*at as usize).map(|_| *at as usize),
             Self::Name(wanted) => {
@@ -570,6 +573,7 @@ impl CameraDevice {
     /// How the device is written in a source and shown in a placeholder.
     pub fn label(&self) -> String {
         match self {
+            Self::TestPattern => "test pattern".into(),
             Self::First => "first camera".into(),
             Self::Index(at) => format!("camera {at}"),
             Self::Name(name) => name.clone(),

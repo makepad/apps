@@ -10,6 +10,8 @@
 mod picture;
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/parts_tab.rs"]
+mod parts_tab;
 use idle_wait::wait_poll;
 use makepad_script::syntax::{self, Node};
 use makepad_strict_json::Value;
@@ -253,7 +255,7 @@ fn the_brush_paints_mesh_field_and_exact_parts_and_a_flood_and_noise_show(app: T
     // Zoom to the vase first (on the whole plate its paint covers too few pixels), and grab it
     // before the flood: the flood is the blue that was not there.
     app.press_key(KeyCode::Escape);
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).name("Bud vase")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
@@ -273,7 +275,7 @@ fn the_brush_paints_mesh_field_and_exact_parts_and_a_flood_and_noise_show(app: T
     // Procedural paint: the noise vase demo, two filaments mixed by a Splash noise field. Zoom to
     // the part first: on the whole plate its paint covers too few pixels.
     open_example(&app, "example noise vase", "noise_vase.cad.splash");
-    app.locator(Selector::role(Role::Tab).name("Parts")).click();
+    parts_tab::open(&app);
     app.locator(Selector::role(Role::TreeItem).nth(0)).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();

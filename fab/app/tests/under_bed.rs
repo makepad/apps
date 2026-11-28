@@ -13,6 +13,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
@@ -241,8 +243,7 @@ fn an_orbit_turns_on_under_the_bed_and_the_floor_goes() {
         check_under(&app, "Normal");
 
         // Sliced: the same camera; the first layer's beads show from under the bed.
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the whole slice", || call(&app, "slice", "{}").is_ok_and(|t| whole_slice(&t)));
         check_under(&app, "Sliced");
 

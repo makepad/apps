@@ -205,7 +205,7 @@ pub fn register_document(registry: &mut Registry) -> Result<(), String> {
                 ident("fit", "fit", "How the code picture sits in the output: @fit letterboxes, @fill crops to cover, @none places 1:1 centred.")],
             vec![], vec![output("frame", FRAME)]),
         node("Camera", "A live camera a deck hosts, as a layer: a document camera, a phone under it, a webcam. DECK opens the device when the slide is next and streams it only while the slide shows. Outside DECK it is a placeholder frame naming the device; a cut never opens a camera. Crop, turn, mirror and adjust run on the GPU as the picture is placed.",
-            vec![param("device", Literal::Null, "Part of the camera's name (\"OBSBOT\"), its number (0, 1, ...), or nil for the first camera."),
+            vec![param("device", Literal::Null, "Part of the camera's name (\"OBSBOT\"), its number (0, 1, ...), @test_pattern for generated colour bars, or nil for the first camera."),
                 num("width", 1280.0, "The capture width asked for, in pixels (the nearest the camera offers is used)."),
                 num("height", 720.0, "The capture height asked for, in pixels."),
                 num("fps", 30.0, "The capture rate asked for."),

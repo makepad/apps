@@ -1,11 +1,15 @@
 //! World-space records and spatial queries shared by board drawing and input.
 
 pub mod canvas;
+pub(crate) mod design;
+mod design_picture;
 pub mod gesture;
 pub mod index;
+pub mod live;
+mod look;
+pub mod media;
 pub mod page;
 pub mod schema;
-pub mod tabs;
 pub(crate) mod tree;
 pub mod view;
 
@@ -15,7 +19,7 @@ pub use view::{touched_by, BoardItem, BoardView};
 #[cfg(test)]
 mod tests;
 
-use makepad_work_core::{event::Id, fold::State};
+use makepad_town_core::{event::Id, fold::State};
 use std::collections::HashMap;
 
 /// The tabs use the exact board ids displayed with their titles. Remember the
@@ -52,7 +56,7 @@ impl BoardPicker {
 
     pub fn refresh(&mut self, state: &State, project: Option<Id>)
         -> Option<usize> {
-        use makepad_work_core::entity::{field, kind, project_entities};
+        use makepad_town_core::entity::{field, kind, project_entities};
         self.boards.clear();
         self.labels.clear();
         let project = project?;
@@ -66,26 +70,5 @@ impl BoardPicker {
             .or_else(|| (!self.boards.is_empty()).then_some(0))?;
         self.choices.insert(project, self.boards[index]);
         Some(index)
-    }
-
-    pub fn rename(&self, board: Id, title: &str) -> Option<crate::model::Action> {
-        use makepad_work_core::{entity::field, event::{Change, Value}};
-        let index = self.boards.iter().position(|id| *id == board)?;
-        let title = title.trim();
-        if title.is_empty() || title == self.labels[index] { return None }
-        Some(crate::model::Action::SetFields {
-            changes: vec![Change { entity: board, field: field::TITLE, value: Value::Text(title.into()) }],
-            label: Some("rename board".into()),
-        })
-    }
-
-    pub fn next_title(&self) -> String {
-        if self.boards.is_empty() { return "Board".into() }
-        let mut number = self.boards.len() + 1;
-        loop {
-            let title = format!("Board {number}");
-            if !self.labels.contains(&title) { return title }
-            number += 1;
-        }
     }
 }

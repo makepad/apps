@@ -14,6 +14,12 @@
 //!   slice's revision and plan as they were;
 //! - a build that fails while it slices stops the slice only until the build is over.
 
+#[path = "common/view_menu.rs"]
+mod view_menu;
+#[path = "common/export_print.rs"]
+mod export_print;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/picture.rs"]
 mod picture;
@@ -136,10 +142,8 @@ fn assert_camera(app: &TestApp, before: &Camera, step: &str) {
 
 /// The slice's state (`fab.slice`); the render mode must stay as selected (`sliced`).
 fn slice_state(app: &TestApp, sliced: bool) -> String {
-    let nodes = app.widget_snapshot().nodes();
-    for (id, selected) in [("rm_normal", !sliced), ("rm_slice", sliced)] {
-        let mode = nodes.iter().find(|n| n.visible() && n.path.ends_with(id)).expect("render mode radio");
-        assert_eq!(mode.checked(), Some(selected), "render mode: {id} must stay as selected");
+    for (mode, selected) in [("Normal", !sliced), ("Sliced", sliced)] {
+        assert_eq!(render_mode::shown(app, mode), selected, "render mode: {mode} must stay as selected");
     }
     let state = common::slice_state(app);
     assert_ne!(state, "Failed", "the slice failed");
@@ -215,10 +219,6 @@ fn capture(app: &TestApp) -> Pixels {
 /// With Code on, the Program panel is a real editor, not a gutter squeezed against the view.
 fn assert_code_panel(snapshot: &UiSnapshot, mode: &str, picture: &Path) {
     let nodes = snapshot.nodes();
-    let toggle = nodes.iter().find(|n| n.visible() && n.role == Role::ToggleButton && n.name == "Code").expect("Code toggle");
-    if toggle.checked() != Some(true) {
-        return;
-    }
     // Program's `code` widget is CodeView. Its semantic role is TextArea, not a code role.
     let editor = nodes.iter().find(|n| n.visible() && n.role == Role::TextArea && (n.class == "CodeView" || n.path.ends_with("code")))
         .unwrap_or_else(|| panic!("code panel in {mode}: Code is on: the Program panel must have a visible code editor"));
@@ -257,13 +257,17 @@ fn slicing_is_on_demand_and_the_camera_and_the_colours_stay(app: TestApp) {
     let edits = "color(\"Orange\", rgb: #xe2672b)\nplace(\"block\", at: [175mm 160mm], color: \"Orange\")";
     let batch = format!(r#"{{"request_id":"place","expected":{head:?},"edits":{}}}"#, Value::Str(edits.to_string()).to_json());
     call(&app, "place", &batch).expect("place");
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     wait_until(&app, "the plate reads Off in Normal", || slice_state(&app, false) == "Off");
 
     app.locator(Selector::role(Role::Tab).name("Slicer")).select();
     let height = || Selector::role(Role::SpinButton).name(control_name(fab_plate::print_setting("layer_height").unwrap()));
     let old_height = app.locator(height()).wait_visible().snapshot().range.expect("layer height range").now;
     let (first, second) = if (old_height - 0.3).abs() < 0.001 { ("0.25", "0.3") } else { ("0.3", "0.25") };
+    // Exercise the editor-width and gutter assertions in both render modes.
+    if app.locator(Selector::id("code")).count() == 0 {
+        view_menu::pick(&app, "Code");
+    }
     let fitted = settled_camera(&app);
     // A wheel zoom changes the fit distance, so an unwanted FrameBox cannot be invisible.
     let (x, y) = app.locator(Selector::id("viewport")).snapshot().bounds.center();
@@ -289,8 +293,7 @@ fn slicing_is_on_demand_and_the_camera_and_the_colours_stay(app: TestApp) {
     let normal_widgets = app.widget_snapshot();
 
     // Opening Sliced slices right away.
-    app.locator(Selector::id("rm_slice")).select();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     assert_stays(&app, &before, "the switch to Sliced slices", true, None);
     let sliced = capture(&app);
     let sliced_widgets = app.widget_snapshot();
@@ -321,16 +324,17 @@ fn slicing_is_on_demand_and_the_camera_and_the_colours_stay(app: TestApp) {
     wait_until(&app, "the layer-height edit in Sliced to commit", || committed(&app, second));
     assert_stays(&app, &before, "a layer-height edit reslices in Sliced", true, Some(from));
 
-    app.locator(Selector::id("rm_normal")).select();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     assert_stays(&app, &before, "the switch back to Normal", false, None);
 
     // In Normal again: an edit reads Off, and Export asks for its own slice and writes it.
     app.locator(height()).set_value(first);
     wait_until(&app, "the edit in Normal to read Off", || slice_state(&app, false) == "Off" && committed(&app, first));
     // Export at once: the edited plate evaluates under its slice, which goes on with the new plate
-    app.locator(Selector::role(Role::Tab).name("Job")).select();
-    app.locator(Selector::id("export")).wait_visible().click();
+    export_print::request(&app);
+    // In Normal the Slice editor can be opened from the area menu to read the result.
+    app.locator(Selector::role(Role::Button).name("Slicer: area menu")).wait_visible().click_at_center();
+    app.locator(Selector::role(Role::MenuItem).name("Slice")).wait_visible().press();
     wait_until(&app, "Export to slice the plate in Normal and write it", || {
         assert_camera(&app, &before, "Export in Normal");
         slice_state(&app, false) == "Sliced" && app.widget_snapshot().nodes().iter().any(|n| n.visible() && n.node.name.contains(" Wrote "))
@@ -392,14 +396,13 @@ fn while_it_slices(app: &TestApp, what: &str, mut set_up: impl FnMut(), mut duri
     app.locator(height()).wait_visible();
     let mut landed = false;
     for (round, layer) in ["0.08", "0.1", "0.08", "0.1"].into_iter().enumerate() {
-        app.locator(Selector::id("rm_normal")).wait_checked(true);
+        render_mode::wait_shown(app, "Normal");
         app.locator(height()).set_value(layer);
         wait_until(app, "the layer height to commit", || committed(app, layer));
         // Its answer comes after the work the commit queued (the print setup's rebuild).
         call(app, "inspect", "{}").expect("inspect");
         set_up();
-        app.locator(Selector::id("rm_slice")).select();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(app, "Sliced");
         let mut state = String::new();
         wait_until(app, "Sliced to slice", || {
             state = slice_state(app, true);
@@ -420,7 +423,7 @@ fn while_it_slices(app: &TestApp, what: &str, mut set_up: impl FnMut(), mut duri
         if landed {
             break;
         }
-        app.locator(Selector::id("rm_normal")).select();
+        render_mode::pick(app, "Normal");
     }
     assert!(landed, "every {what} came after its slice was done: the tower's slice must be longer");
 }
@@ -495,8 +498,7 @@ fn a_zoom_never_rebuilds_or_reslices_an_exact_part(app: TestApp) {
     call(&app, "place", &batch).expect("place");
     let edges = call(&app, "edges", r#"{"object":"drum/drum"}"#).expect("edges");
     assert_eq!(edges.field("exact").and_then(|f| f.value.ident()), Some("true"), "the drum is an exact body: {edges:?}");
-    app.locator(Selector::id("rm_slice")).select();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     wait_until(&app, "the drum to be Sliced", || slice_state(&app, true) == "Sliced");
     // Sliced shows with the toolpaths; the slice's checks go on after them, and only their end
     // serves the revision. What the zoom must leave is the slice served whole.

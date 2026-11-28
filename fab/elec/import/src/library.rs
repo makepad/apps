@@ -182,6 +182,21 @@ impl Library {
         meshes
     }
 
+    /// Converted part documents already on disk, in canonical part-number order.
+    /// Refused and incomplete entries are never offered. This does not run the converter.
+    pub fn parts(&self, source: &dyn Source) -> Vec<(String, PathBuf)> {
+        let Ok(items) = std::fs::read_dir(self.root.join(source.folder())) else { return Vec::new() };
+        let mut parts: Vec<_> = items.flatten().filter_map(|item| {
+            let number = item.file_name().into_string().ok()?;
+            canonical(source, &number).ok().filter(|canonical| *canonical == number)?;
+            let dir = item.path();
+            let part = dir.join(format!("{number}.part.splash"));
+            (part.is_file() && !dir.join(REFUSED).exists()).then_some((number, part))
+        }).collect();
+        parts.sort_unstable();
+        parts
+    }
+
     /// The part for what a person typed: from the library when it is there (converted again when this
     /// converter's version differs), else fetched once through `fetch` and stored.
     pub fn import(&self, source: &dyn Source, text: &str, fetch: &mut dyn Fetch) -> Result<Entry, ImportError> {

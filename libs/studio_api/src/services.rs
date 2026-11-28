@@ -79,7 +79,7 @@ The storyboard is the plan the cut is made from. Before writing a Splash documen
         with: &[],
         with_prefix: &["cut_panel_"],
         without: DECK_TOOLS,
-        without_prefix: &["gen_", "lights_"],
+        without_prefix: &["gen_", "lights_", "vj_video_", "vj_show_", "vj_deck_"],
     },
     Target {
         id: MOTION,
@@ -150,10 +150,13 @@ Reuse what the library already has (search_library) instead of generating it twi
         label: "VJ",
         brief: "Stage's VJ page: the video decks and the effects that run on them, and the show palette, the four colours (ground, primary, secondary, tertiary) every show-following effect draws with. \
 vj_palette_set picks the palette and what it follows (the person gets a settings card first); vj_palette_animate sets the palette animator's loop of colour keyframes. \
-list_effects and read_effect show the effects and transitions that exist; write_effect authors one (read a similar one first, check it with effect_strip). Reuse library clips (search_library, import_media) instead of making them twice.",
+list_effects and read_effect show the effects and transitions that exist; write_effect authors one (read a similar one first, check it with effect_strip). Reuse library clips (search_library, import_media) instead of making them twice. \
+For a themed VJ show, call vj_show_start. Stage continuously generates clips and mixes them on the beat. Use vj_show_steer to change direction, vj_show_status for progress and vj_show_stop to end it. \
+To generate new video clips, call vj_video_generate: it opens one settings card for a single clip or a batch and publishes each finished clip straight into the VJ library. Call vj_video_status to inspect a batch or see which video models and hub nodes are ready, and vj_video_cancel to stop one clip or the whole batch. \
+Use vj_deck_transport to control deck A, deck B, or both (forward, reverse, bounce, single, play/pause, speed, beat loops, IN/OUT, restart, seek), and vj_deck_status to read accepted deck transport state.",
         families: &[Family::Effects, Family::Session],
         with: LIBRARY,
-        with_prefix: &[],
+        with_prefix: &["vj_video_", "vj_show_", "vj_deck_"],
         without: &[],
         without_prefix: &[],
     },
@@ -305,6 +308,32 @@ mod tests {
             let manifest = target.manifest(TOOLS.iter()).unwrap_or_else(|error| panic!("{}: {error}", target.id));
             assert!(!manifest.tools.is_empty(), "{}", target.id);
             assert!(manifest.tools.len() <= MAX_TOOLS && manifest.tools.len() < TOOLS.len() * 2 / 3, "{}: {} of {} tools", target.id, manifest.tools.len(), TOOLS.len());
+        }
+    }
+
+    #[test]
+    fn vj_service_manifest_exposes_vj_video_tools_and_not_flow_gen() {
+        let manifest = target(VJ).unwrap().manifest(TOOLS).unwrap();
+        for (name, risk, has_layout) in [
+            ("vj_video_generate", Risk::Request, true),
+            ("vj_video_status", Risk::Read, false),
+            ("vj_video_cancel", Risk::Act, false),
+            ("vj_show_start", Risk::Request, true),
+            ("vj_show_steer", Risk::Act, false),
+            ("vj_show_stop", Risk::Act, false),
+            ("vj_show_status", Risk::Read, false),
+            ("vj_deck_transport", Risk::Act, false),
+            ("vj_deck_status", Risk::Read, false),
+        ] {
+            let tool = manifest.tool(name).unwrap_or_else(|| panic!("VJ is missing {name}"));
+            assert_eq!((tool.risk, tool.layout.is_some()), (risk, has_layout), "{name}");
+        }
+        assert!(manifest.tools.iter().all(|tool| !tool.name.starts_with("gen_")));
+        for other in TARGETS.iter().filter(|t| t.id != VJ) {
+            let manifest = other.manifest(TOOLS).unwrap();
+            assert!(manifest.tools.iter().all(|tool| !tool.name.starts_with("vj_video_")), "{} offers VJ video tools", other.id);
+            assert!(manifest.tools.iter().all(|tool| !tool.name.starts_with("vj_deck_")), "{} offers VJ deck tools", other.id);
+            assert!(manifest.tools.iter().all(|tool| !tool.name.starts_with("vj_show_")), "{} offers VJ show tools", other.id);
         }
     }
 

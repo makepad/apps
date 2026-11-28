@@ -1,13 +1,69 @@
-use makepad_work_core::entity::{field, kind, Entity};
-use makepad_work_core::event::{Change, Id, Key, Value};
-use makepad_work_core::fold::State;
+use makepad_town_core::entity::{field, kind, Entity};
+use makepad_town_core::event::{Change, Id, Key, Value};
+use makepad_town_core::fold::State;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(crate) fn board_kind(kind: &Key) -> bool {
     match kind {
         Key::Number(id) => super::schema::Vocabulary::Board.schema().item(*id).is_some(),
-        Key::Name(_) => true,
+        Key::Name(name) => name != super::schema::STEP,
     }
+}
+
+/// A presenting step: a child of a board, outside its items.
+pub(crate) fn step_kind(kind: &Key) -> bool {
+    matches!(kind, Key::Name(name) if name == super::schema::STEP)
+}
+
+/// The live steps whose parent is `board`, in path order.
+pub(crate) fn steps(state: &State, board: Id) -> Vec<&Entity> {
+    let mut steps: Vec<&Entity> = state.entities.values()
+        .filter(|e| step_kind(&e.kind) && live(e) && parent(e) == Some(board))
+        .collect();
+    steps.sort_unstable_by(|a, b| a.order_key().cmp(&b.order_key()).then_with(|| a.id.cmp(&b.id)));
+    steps
+}
+
+/// Where a step of a board's path leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The whole board.
+    Board,
+    /// A live item (or section) on this board.
+    Item(Id),
+    /// An item of this board that is deleted or archived: skipped while presenting and struck
+    /// through in the list.
+    Gone(Id),
+    /// No target, or an id that is not an item of this board (another board's item, a task).
+    Unknown(Option<Id>),
+}
+
+/// One step of a board's presenting path, in path order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub id: Id,
+    pub target: Target,
+    pub title: String,
+}
+
+/// The board's presenting path: its live steps in order key order (the same order on every
+/// side), each with where it leads. A step is never an error: a missing target is a state.
+pub(crate) fn path(state: &State, board: Id) -> Vec<Step> {
+    let mut tree = BoardTree::new(state);
+    steps(state, board).into_iter().map(|step| {
+        let target = match id_value(step.value(field::TO)) {
+            None => Target::Unknown(None),
+            Some(id) if id == board => Target::Board,
+            // Placement follows the parent chain, so a deleted item still has a place: its own
+            // flag decides whether the step can show it.
+            Some(id) => match state.entities.get(&id).filter(|e| board_kind(&e.kind)).map(|e| (e, tree.placement(e))) {
+                Some((item, Some(p))) if p.board == board && live(item) => Target::Item(id),
+                Some((_, Some(p))) if p.board == board => Target::Gone(id),
+                _ => Target::Unknown(Some(id)),
+            },
+        };
+        Step { id: step.id, target, title: step.text(field::TITLE).to_owned() }
+    }).collect()
 }
 
 fn id_value(value: Option<&Value>) -> Option<Id> {

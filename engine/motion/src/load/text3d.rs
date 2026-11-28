@@ -2,6 +2,7 @@
 //! [`crate::text3d::Text3dSpec`], lowered to the `text3d` input of a
 //! motion3d scene (the preset run in Splash) that draws like a Scene3D layer.
 
+use crate::plain::GroupProps;
 use super::{At, Reader};
 use crate::layers::Text3D;
 use crate::model::*;
@@ -113,7 +114,7 @@ impl Text3D {
                 let presets = text3d::presets().iter().map(|p| format!("@{}", p.name)).collect::<Vec<_>>().join(" ");
                 let hint = (!presets.is_empty()).then(|| format!("`Text3D{{preset: @chrome_title text: \"TITLE\"}}`; presets: {presets}"));
                 c.err(at, field, message, hint.as_deref());
-                LayerKind::Group { layers: Vec::new(), mask: None, mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None, post: Default::default(), glyphs: false }
+                LayerKind::Group { layers: Vec::new(), mask: None, props: GroupProps { mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None }, post: Default::default(), glyphs: false }
             }
         }
     }

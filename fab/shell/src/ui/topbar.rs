@@ -49,7 +49,6 @@ script_mod! {
         width: 28
         height: 26
         padding: Inset{left: 6 right: 6 top: 5 bottom: 5}
-        draw_icon +: {color: fab.color_text}
     }
     // Between the caption's groups (history, the workspaces, the tools, Print).
     let CapRule = mod.widgets.FabVRule{height: 16 margin: Inset{left: 6 right: 6}}
@@ -64,7 +63,7 @@ script_mod! {
                 let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
                 let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
                 sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius_lg)
-                sdf.fill(theme.prop_field)
+                sdf.fill(fab.color_field)
                 return sdf.result
             }
         }

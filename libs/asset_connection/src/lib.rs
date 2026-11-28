@@ -428,9 +428,9 @@ mod tests {
     use makepad_asset_client::publish::{PublishFile, PublishRequest, PublishThumbnail};
     use makepad_asset_data::{AssetKind, FileRole, MediaType, ThumbnailMedia};
     use makepad_flow_assets::{AssetListQuery, AssetStoreConfig, AssetWorker, StoreLocator};
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// An app prefix whose library folder does not exist: no publisher.
     const PREFIX: &str = "STTAKEOVER";
@@ -453,12 +453,22 @@ mod tests {
         }
     }
 
+    fn host_log_tail(path: &Path) -> std::io::Result<String> {
+        let mut file = fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(8 * 1024);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     #[test]
     fn takeover_host_child() {
         let Some(root) = std::env::var_os("ST_TAKEOVER_ROOT") else { return };
         let resolved = embed::resolve_at(PREFIX, Path::new(&root), false, None);
         assert_eq!(resolved.mode, embed::StoreMode::Hosting, "{}", resolved.note);
-        std::thread::sleep(Duration::from_secs(60));
+        // The parent holds the pipe open until it kills us or exits.
+        std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
         drop(resolved);
     }
 
@@ -514,10 +524,19 @@ mod tests {
         let base = std::env::temp_dir().join(format!("stage-takeover-{}-{}", std::process::id(), makepad_asset_client::util::now_ms()));
         let root = base.join("store");
         std::fs::create_dir_all(base.join("home")).unwrap();
-        let mut host = Kill(child("tests::takeover_host_child", &root, None).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let log_path = base.join("host.log");
+        let log = fs::File::create(&log_path).unwrap();
+        let mut host = Kill(child("tests::takeover_host_child", &root, None)
+            .stdin(Stdio::piped())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap());
         while embed::store_served(&root, None) != Some("its server answers") {
-            assert!(Instant::now() < deadline, "the host never came up");
+            if let Some(status) = host.0.try_wait().unwrap() {
+                let tail = host_log_tail(&log_path).unwrap_or_else(|err| format!("could not read host output: {err}"));
+                panic!("the host exited before the store answered ({status}); {} tail:\n{tail}", log_path.display());
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         let mut stage = Kill(child("tests::takeover_stage_child", &root, Some(&base.join("home")))

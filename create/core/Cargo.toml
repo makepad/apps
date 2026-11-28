@@ -1,12 +1,17 @@
-# Makepad Create's core: the event log, its fold and the local AI queue, with no UI. Two people,
+# Makepad Town's core: the event log, its fold and the local AI queue, with no UI. Two people,
 # each with their own local AI, finish Makepad apps together; this crate is what they share and
 # what decides what each AI may see.
 [package]
-name = "makepad-work-core"
+name = "makepad-town-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+# Hooks for dependent crates' tests (makepad-town's crash/hold tests); no product build enables it.
+test-hooks = []
+
 [dependencies]
 makepad-network = { path = "../../../../platform/network" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }

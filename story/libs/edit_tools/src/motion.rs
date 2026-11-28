@@ -6,6 +6,7 @@
 //! when each is visible, scenes). Pure; with a resolver, assets are
 //! resolved (on a worker).
 
+use makepad_motion::plain::PrimitiveFrame;
 use crate::input::DocKind;
 use crate::inspect::{InspectOptions, InspectReport, Issue, Severity};
 use crate::timeline::{Block, Scene, Timeline};
@@ -58,7 +59,7 @@ fn from_diagnostic(diag: &motion::Diagnostic) -> Issue {
 /// shapes and media by their size, text by the 0.55 em estimate.
 fn item_bounds(item: &motion::Item) -> Option<[f64; 4]> {
     let (size, text_origin) = match &item.kind {
-        ItemKind::Text { text, size, align, valign, line_height, tracking, wrap, fit, .. } => {
+        ItemKind::Primitive(PrimitiveFrame::Text { text, size, align, valign, line_height, tracking, wrap, fit, .. }) => {
             // A Text's `size` is in points: its em is 4/3 of it in document
             // units ("Beacon" at 60 measures about 290 wide).
             let em = size * 4.0 / 3.0;
@@ -118,10 +119,10 @@ fn shows_content(item: &motion::Item, opacity: f64, w: f64, h: f64) -> bool {
     }
     match &item.kind {
         ItemKind::Group { children, .. } => children.iter().any(|child| shows_content(child, opacity, w, h)),
-        ItemKind::Text { text, reveal, units, .. } => {
+        ItemKind::Primitive(PrimitiveFrame::Text { text, reveal, units, .. }) => {
             !text.trim().is_empty() && reveal.is_none_or(|n| n > 0) && units.iter().any(|unit| unit.opacity * unit.color[3] > 0.05)
         }
-        ItemKind::Rect { .. } | ItemKind::Ellipse { .. } => match item_bounds(item) {
+        ItemKind::Primitive(PrimitiveFrame::Rect { .. }) | ItemKind::Primitive(PrimitiveFrame::Ellipse { .. }) => match item_bounds(item) {
             Some([x, y, bw, bh]) => {
                 let visible_w = (x + bw).min(w) - x.max(0.0);
                 let visible_h = (y + bh).min(h) - y.max(0.0);

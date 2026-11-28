@@ -14,6 +14,9 @@ use std::{cell::Cell, collections::{BTreeMap, BTreeSet}, sync::OnceLock, time::D
 pub(super) const NO_PICTURE_AFTER: Duration = Duration::from_secs(3);
 /// The sharer's own view needs to follow the app, not to match the guest's frame rate.
 const PREVIEW_FPS: u32 = 15;
+const SOUND_FRAME_MS: u32 = 10;
+const MAX_SOUND_DELAY_MS: u32 = 300;
+const MIN_SOUND_FRAMES: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareRole {
@@ -141,6 +144,13 @@ pub(super) struct Sharing {
     sound_on: bool,
     speaker: ShareSpeakerControl,
     playing: Option<Arc<ShareSound>>,
+    // Listener identity and the watcher-clock time of its first received audio.
+    sync_sound: Option<(Arc<ShareSound>, u64)>,
+    // The watched picture can outlive a listening interval, including while the app is silent.
+    sync_last_capture_us: Option<u64>,
+    sync_v_us: Option<f64>,
+    sync_target: Option<u32>,
+    sound_ahead_logged: bool,
     // Close watch clears the offer before the next poll logs the stop.
     playing_title: String,
     encoder: EncoderFormats,
@@ -176,6 +186,7 @@ impl Sharing {
         Self {
             decode_caps: share_codec::decode_caps(true, false), failed: MediaCaps::NONE,
             decode_probe: Default::default(), sound_on: true, speaker, playing: None, playing_title: String::new(),
+            sync_sound: None, sync_last_capture_us: None, sync_v_us: None, sync_target: None, sound_ahead_logged: false,
             encoder: EncoderFormats::local(),
             shown: Default::default(), events: Vec::new(), revokes: Vec::new(), picker: Default::default(),
             picker_dirty: false, record_presses: Vec::new(), clock: Default::default(), joined: BTreeSet::new(),
@@ -183,6 +194,52 @@ impl Sharing {
             sending: None, sent_views: BTreeMap::new(), sending_sound: None, sent_sound: BTreeMap::new(),
             receiving_peers: BTreeMap::new(), previewing: None,
             fresh: false, last_report: None, logged_keys: BTreeMap::new(), watch_started: None,
+        }
+    }
+
+    fn clear_sound_sync(&mut self) {
+        self.sync_sound = None;
+        self.sync_v_us = None;
+        self.sync_target = None;
+    }
+
+    fn update_sound_target(&mut self, arrival: Option<(&Arc<ShareSound>, i64)>, now_us: u64, picture_us: Option<u64>) {
+        let picture_us = picture_us.filter(|&us| self.sync_last_capture_us.is_none_or(|last| us > last));
+        if picture_us.is_some() { self.sync_last_capture_us = picture_us; }
+        let Some((sound, base_us)) = arrival else { return };
+        let first_us = match &self.sync_sound {
+            Some((previous, first)) if Arc::ptr_eq(previous, sound) => *first,
+            _ => {
+                self.sync_sound = Some((sound.clone(), now_us));
+                self.sync_v_us = None;
+                self.sync_target = None;
+                now_us
+            }
+        };
+        if let Some(capture_us) = picture_us {
+            let sample = (i128::from(now_us) - i128::from(capture_us)) as f64;
+            self.sync_v_us = Some(self.sync_v_us.map_or(sample, |old| old + (sample - old) / 8.0));
+        }
+        let target = if let Some(video) = self.sync_v_us {
+            // Both delays include the same offset between the app and watcher clocks.
+            let delay_ms = (video - base_us as f64) / 1_000.0;
+            if delay_ms > f64::from(MAX_SOUND_DELAY_MS) && !self.sound_ahead_logged {
+                if let Some(offer) = self.shown.watched() {
+                    let ms = delay_ms.ceil() as u64;
+                    log!("Share {}: the picture runs {ms} ms behind the sound; the sound waits at most {MAX_SOUND_DELAY_MS} ms, so it plays {} ms ahead of the picture",
+                        offer.title, ms - u64::from(MAX_SOUND_DELAY_MS));
+                    self.sound_ahead_logged = true;
+                }
+            }
+            ((delay_ms / f64::from(SOUND_FRAME_MS)).ceil() as u32).clamp(MIN_SOUND_FRAMES, MAX_SOUND_DELAY_MS / SOUND_FRAME_MS)
+        } else if now_us - first_us >= 500_000 {
+            MIN_SOUND_FRAMES
+        } else {
+            return
+        };
+        if self.sync_target != Some(target) {
+            self.speaker.set_target(target);
+            self.sync_target = Some(target);
         }
     }
 
@@ -1156,6 +1213,8 @@ impl CallController {
             call.watch_share(pid, View::default());
         }
         self.send_views();
+        self.sharing.clear_sound_sync();
+        self.sharing.sync_last_capture_us = None;
         self.sharing.shown.watching = None;
         self.sharing.shown.watching_sharer = None;
         self.sharing.shown.control.allowed = None;
@@ -1174,6 +1233,7 @@ impl CallController {
         let stopped = offer.stopped_line.is_some();
         if let Some(previous) = self.sharing.shown.watching { self.close_watch(previous); }
         self.clear_decode_problem(session);
+        self.sharing.sound_ahead_logged = false;
         self.sharing.shown.watching = Some(session);
         self.sharing.shown.watching_sharer = Some(sharer);
         self.sharing.fresh = true;
@@ -1357,9 +1417,11 @@ impl CallController {
     pub(super) fn sync_share_speaker(&mut self, host: &mut dyn AudioHost) -> bool {
         self.sharing.speaker.tick();
         let wanted = self.watched_peer_id().filter(|_| self.sharing.sound_on)
-            .and_then(|id| self.current.as_ref()?.share_sound(id))
-            .filter(|sound| sound.counts().frames > 0);
+            .and_then(|id| self.current.as_ref()?.share_sound(id));
         let share = &mut self.sharing;
+        if wanted.is_none() && share.sync_sound.is_some() { share.clear_sound_sync(); }
+        let wanted = wanted.filter(|sound| share.sync_target.is_some()
+            && share.sync_sound.as_ref().is_some_and(|(tracked, _)| Arc::ptr_eq(tracked, sound)));
         let was_playing = share.wants_speaker();
         match wanted {
             Some(sound) if !share.playing.as_ref().is_some_and(|old| Arc::ptr_eq(old, sound)) => {
@@ -1412,11 +1474,13 @@ impl CallController {
             }
         }
         let Some(session) = self.sharing.shown.watching else { return changed };
-        let Some(call) = &mut self.current else { return changed };
+        let Some(call) = &self.current else { return changed };
+        let mut fresh_capture_us = None;
         if self.sharing.shown.offer(session).is_some_and(|o| o.stopped_line.is_none()) {
             let slot = peer_id.and_then(|id| call.share_picture(id));
             let picture = slot.and_then(|s| s.picture.as_ref());
             if slot.is_some_and(|s| s.fresh) || (picture.is_none() && self.sharing.shown.picture.is_some()) {
+                fresh_capture_us = slot.filter(|s| s.fresh && s.picture.is_some()).map(|s| s.capture_us);
                 let size = picture.map(|p| (p.width, p.height));
                 if size != self.sharing.shown.picture.as_ref().map(|p| (p.width, p.height)) {
                     if let (Some((w, h)), Some(watch)) = (size, self.sharing.watch_started.take()) {
@@ -1426,6 +1490,11 @@ impl CallController {
                 self.sharing.shown.picture = picture.cloned();
                 self.sharing.fresh = true;
             }
+        }
+        let arrival = peer_id.filter(|_| self.sharing.sound_on).and_then(|id| call.share_sound(id))
+            .filter(|sound| sound.counts().frames > 0).and_then(|sound| sound.arrival_base_us().map(|base| (sound, base)));
+        if fresh_capture_us.is_some() || arrival.is_some() {
+            self.sharing.update_sound_target(arrival, self.now().mono_us, fresh_capture_us);
         }
         if self.sharing.shown.picture.is_some() { changed |= self.clear_decode_problem(session); }
         self.send_views();
@@ -1521,8 +1590,9 @@ impl CallController {
             if let Some(sound) = &self.sharing.playing {
                 let counts = sound.counts();
                 let speaker = &self.sharing.speaker;
-                log!("Share audio: frames {}, restarts {}, bad {}, concealed {}, resets {}, level {:.3}",
-                    counts.frames, counts.restarts, counts.bad, speaker.concealed(), speaker.resets(), speaker.level());
+                log!("Share audio: frames {}, restarts {}, bad {}, concealed {}, resets {}, target {}, level {:.3}",
+                    counts.frames, counts.restarts, counts.bad, speaker.concealed(), speaker.resets(),
+                    self.sharing.sync_target.unwrap_or(MIN_SOUND_FRAMES), speaker.level());
             }
             self.sharing.last_report = Some(Instant::now());
         }

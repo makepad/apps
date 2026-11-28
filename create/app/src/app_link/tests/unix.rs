@@ -533,6 +533,10 @@ impl Rig {
     pub(crate) fn video_formats(&self) -> Vec<StreamFormat> { self.fake.data.lock().unwrap().video_formats.clone() }
     pub(crate) fn refuse_format(&self, format: StreamFormat) { self.fake.data.lock().unwrap().refuse_format = Some(format); }
     pub(crate) fn present(&self, window: usize) { self.fake.present(window); }
+    pub(crate) fn present_at(&self, window: usize, t_ns: u64) {
+        let clock = self.fake.data.lock().unwrap().clock;
+        self.fake.present_after(window, t_ns - clock);
+    }
     pub(crate) fn wide_window(&self) { self.fake.data.lock().unwrap().wide_window = true; }
     pub(crate) fn refuse_next_still(&self) { self.fake.data.lock().unwrap().refuse_still = true; }
     pub(crate) fn hold_input(&self, hold: bool) {

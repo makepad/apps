@@ -2164,9 +2164,70 @@ fn linked_share_carries_the_apps_sound_without_a_call() {
         "the sharer reports when app sound stops");
 }
 
+#[test]
+fn share_sound_target_tracks_new_captures_and_caps_once_per_watch() {
+    use makepad_widgets::makepad_platform::log_ring;
+    let start = Instant::now();
+    Cx::init_log();
+    let mut ctl = CallController::default();
+    let session = [7; 16];
+    let title = "Sync unit window";
+    ctl.begin_offer(session, MESH_TOWN, title.into(), ShareRole::Viewer { sharer: [2; 65] }, (24., 16.));
+    ctl.watch(session);
+    let sound = Arc::new(ShareSound::default());
+    // The app clock is one second ahead of the watcher at the earliest audio arrival.
+    let arrival = Some((&sound, -1_000_000));
+    let share = &mut ctl.sharing;
+    share.update_sound_target(None, 0, Some(1_000_000));
+    share.update_sound_target(arrival, 1_000, None);
+    share.update_sound_target(arrival, 500_999, Some(1_000_000));
+    assert_eq!((share.sync_v_us, share.sync_target), (None, None), "an idle window's repeated picture cannot start the speaker before 500 ms");
+    share.update_sound_target(arrival, 501_000, None);
+    assert_eq!(share.sync_target, Some(2), "at 500 ms an idle window starts at the minimum target");
+
+    share.update_sound_target(arrival, 600_000, Some(1_600_000));
+    assert_eq!(share.sync_target, Some(2), "zero relative delay is clamped to two frames");
+    share.update_sound_target(arrival, 1_000_000, Some(1_839_992));
+    assert_eq!((share.sync_v_us, share.sync_target), (Some(-979_999.0), Some(3)), "the 1/8 EMA leaves 20,001 us, rounded up to three frames");
+    share.update_sound_target(arrival, 1_200_000, Some(1_839_992));
+    share.update_sound_target(arrival, 1_300_000, Some(1_800_000));
+    assert_eq!((share.sync_v_us, share.sync_target), (Some(-979_999.0), Some(3)), "equal and older captures leave the estimate unchanged");
+
+    let cursor = log_ring::read_since(0, 0).newest;
+    let prefix = format!("Share {title}: the picture runs ");
+    let expected = format!("{prefix}500 ms behind the sound; the sound waits at most 300 ms, so it plays 200 ms ahead of the picture");
+    let late = Arc::new(ShareSound::default());
+    for watch in 1..=2 {
+        if watch == 2 {
+            ctl.close_watch(session);
+            ctl.watch(session);
+        }
+        for now in [2_000_000, 2_600_000] {
+            ctl.sharing.update_sound_target(Some((&late, -1_000_000)), now, Some(now + 500_000));
+            assert_eq!(ctl.sharing.sync_target, Some(30), "each late picture keeps the 300 ms target");
+        }
+        // The sink publishes asynchronously. Observe a later line before counting all warnings.
+        let end = format!("{title} finished watch {watch}");
+        log!("{end}");
+        let began = Instant::now();
+        let log = loop {
+            let log = log_ring::read_since(cursor, log_ring::CAP);
+            if log.lines.iter().any(|line| line.text.ends_with(&end)) { break log }
+            assert!(began.elapsed() < Duration::from_secs(1), "the log sink publishes the end of this watch");
+            thread::yield_now();
+        };
+        let warnings: Vec<_> = log.lines.iter().filter(|line| line.text.contains(&prefix)).collect();
+        assert_eq!(warnings.len(), watch, "each watch reports its excess delay exactly once");
+        assert!(warnings.last().unwrap().text.ends_with(&expected), "the warning names both the measured delay and the excess over 300 ms");
+    }
+    eprintln!("Share sync unit: {} us", start.elapsed().as_micros());
+}
+
 #[cfg(unix)]
 #[test]
-fn a_watcher_with_no_call_opens_the_speaker_only_while_sound_plays() {
+fn share_sound_waits_for_its_picture() {
+    let start = Instant::now();
+    let app_ns = |now: Instant| 1_000_000_000 + now.duration_since(start).as_nanos() as u64;
     #[derive(Default)]
     struct RecordingHost {
         outputs: Vec<Vec<AudioDeviceId>>,
@@ -2192,40 +2253,85 @@ fn a_watcher_with_no_call_opens_the_speaker_only_while_sound_plays() {
     let output = AudioDeviceId(LiveId::from_str("watcher_speaker"));
     m.ctl[1].audio_devices(&mut m.hosts[1], &[AudioDeviceDesc { device_id: output, device_type: AudioDeviceType::Output,
         name: "Watcher speaker".into(), is_default: true, has_failed: false, channel_count: 2 }]);
-    let (s, link) = m.app_window();
+    let linked = start.elapsed();
+    m.ctl[1].codecs = Arc::new(TestCodecs::with_decode_delay(Duration::from_millis(60)));
+    m.ctl[1].sharing.sound_on = false;
+    let (s, _) = m.app_window();
     m.watch(1, s);
-    m.until("the watched app to open its sound channel", |m| m.rig.as_ref().unwrap().audio_channels_open() == 1);
-    m.rig.as_mut().unwrap().barrier(link);
-    let pid = m.ctl[1].links[&m.key(0)].peer_id;
-    let tick = Duration::from_millis(10);
-    let mut record = 0;
-    let mut next_block = Instant::now();
-    let mut send_block = |m: &ShareMesh<RecordingHost>| {
-        m.rig.as_ref().unwrap().send_sound(record * 480, 480, 1_000_000_000 + record * 10_000_000);
-        record += 1;
+    let sharer = m.key(0);
+    let pid = m.ctl[1].links[&sharer].peer_id;
+    let watch_at = start.elapsed();
+    let mut next_picture = Instant::now();
+    let interval = Duration::from_millis(100);
+    let mut presents = [None; 2];
+    let mut present_due = |m: &ShareMesh<RecordingHost>, now| {
+        if now >= next_picture {
+            let ns = app_ns(now);
+            m.rig.as_ref().unwrap().present_at(3, ns);
+            presents = [presents[1], Some(ns / 1000)];
+            next_picture = now + interval;
+        }
+        presents
     };
-    m.until("the watcher's first app sound frame", |m| {
-        if m.ctl[1].current.as_ref().and_then(|c| c.share_sound(pid)).is_some_and(|s| s.counts().frames > 0) { return true }
-        assert!(m.hosts[1].outputs.iter().all(Vec::is_empty), "the output stays closed until sound arrives");
-        if Instant::now() >= next_block {
-            send_block(m);
-            next_block += tick;
+    let mut last_capture = None;
+    m.until("two consecutive 100 ms captures with sound off", |m| {
+        let [previous, newest] = present_due(m, Instant::now());
+        let Some(picture) = m.ctl[1].current.as_ref().and_then(|c| c.share_picture(pid)) else { return false };
+        if !picture.fresh || picture.picture.is_none() || last_capture.is_some_and(|old| picture.capture_us <= old) { return false }
+        let old = last_capture.replace(picture.capture_us);
+        old.is_some() && old == previous && Some(picture.capture_us) == newest
+    });
+    let warm = start.elapsed();
+    let watcher = &mut m.ctl[1];
+    watcher.sharing.sound_on = true;
+    watcher.current.as_mut().unwrap().listen_share(pid, true);
+    watcher.send_watch_view(sharer, s, watcher.share_subscription());
+
+    let mut next_block = None;
+    let mut first_frame = 0;
+    let mut pictures = 0;
+    let mut arrived = None;
+    let mut target_at = None;
+    m.until("audible synced share sound on the chosen output", |m| {
+        let now = Instant::now();
+        present_due(m, now);
+        let rig = m.rig.as_ref().unwrap();
+        if rig.audio_channels_open() == 1 {
+            let due = next_block.get_or_insert(now);
+            if now >= *due {
+                rig.send_sound(first_frame, 480, app_ns(*due));
+                first_frame += 480;
+                *due += Duration::from_millis(10);
+                if target_at.is_some() && m.hosts[1].render_block() { return true }
+            }
+        }
+        let watcher = &m.ctl[1];
+        let call = watcher.current.as_ref().unwrap();
+        if call.share_sound(pid).is_none_or(|s| s.counts().frames == 0) {
+            assert!(m.hosts[1].outputs.iter().all(Vec::is_empty), "the output stays closed until sound arrives");
+            return false
+        }
+        arrived.get_or_insert(start.elapsed());
+        let picture = call.share_picture(pid).unwrap();
+        if picture.fresh && last_capture.is_none_or(|old| picture.capture_us > old) {
+            pictures += 1;
+            last_capture = Some(picture.capture_us);
+            eprintln!("Share sync picture {pictures}: age {} us, v_us {:?}, base {:?}, target {:?}",
+                app_ns(now) / 1000 - picture.capture_us, watcher.sharing.sync_v_us,
+                call.share_sound(pid).unwrap().arrival_base_us(), watcher.sharing.sync_target);
+        }
+        if target_at.is_none() {
+            if matches!(watcher.sharing.sync_target, Some(5..=7)) && watcher.sharing.wants_speaker() {
+                target_at = Some(start.elapsed());
+            } else {
+                assert!(pictures < 5, "by the fifth fresh picture a 60 ms decode gives 6 ± 1 frames and playing sound; got {:?}, playing {}",
+                    watcher.sharing.sync_target, watcher.sharing.wants_speaker());
+            }
         }
         false
     });
-    assert!(m.ctl[1].sharing.wants_speaker(), "the first received sound requests playback");
-    assert_eq!(m.hosts[1].outputs.last().map(Vec::as_slice), Some([output].as_slice()), "the first sound opens the chosen output");
-    let start = Instant::now();
-    loop {
-        m.pump();
-        assert!(start.elapsed() < Duration::from_secs(1), "the device renders audible app sound within one second");
-        if Instant::now() >= next_block {
-            send_block(&m);
-            next_block += tick;
-            if m.hosts[1].render_block() { break }
-        }
-        thread::yield_now();
-    }
+    let target = m.ctl[1].sharing.sync_target;
+    assert_eq!(m.hosts[1].outputs.last().map(Vec::as_slice), Some([output].as_slice()), "share sound opens the chosen output");
     assert!(m.ctl[1].sharing.speaker.level() > 0.0, "the share meter registers the audible device block");
     for ctl in &m.ctl[..2] {
         assert!(!ctl.want_output, "sharing leaves the call's output request off");
@@ -2238,6 +2344,9 @@ fn a_watcher_with_no_call_opens_the_speaker_only_while_sound_plays() {
     assert!(!m.ctl[1].sharing.wants_speaker(), "a closed watch releases its speaker");
     assert!((0..3).any(|_| !m.hosts[1].render_block()), "the speaker renders silence within a few blocks of Close watch");
     assert_eq!(m.ctl[1].sharing.speaker.level(), 0.0, "the share meter returns to zero on the silent device block");
+    drop(m);
+    eprintln!("Share sync: linked {linked:?}, Watch {watch_at:?}, two captures {warm:?}, first sound {:?}, target {target:?} at {:?}, total {:?}",
+        arrived.unwrap(), target_at.unwrap(), start.elapsed());
 }
 
 #[cfg(unix)]

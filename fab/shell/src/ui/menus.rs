@@ -50,6 +50,7 @@ pub(crate) fn file_menu(state: &AppState) -> Vec<MenuItem> {
     items.extend([
         MenuItem::new(live_id!(file_plates), "Browse Plates…").key(&keymap::shortcut(Key::Plates)),
         MenuItem::new(live_id!(file_save_plate), "Save Plate").key(&keymap::shortcut(Key::Save)),
+        MenuItem::new(live_id!(file_save_as), "Save Plate As…").key(&keymap::shortcut(Key::SaveAs)),
         MenuItem::new(live_id!(file_import_profiles), "Import Profiles…"),
         MenuItem::sep(),
         MenuItem::new(live_id!(file_export_3mf), "Export 3MF").key(&keymap::shortcut(Key::Export3mf)),
@@ -316,6 +317,7 @@ pub(crate) fn action_for(state: &AppState, id: LiveId) -> Option<ShellAction> {
             // The plate's commands: the app runs them by name (main.rs `run_command`).
             _ if id == live_id!(file_new_plate) => Some(ShellAction::Command("new plate".into())),
             _ if id == live_id!(file_save_plate) => Some(ShellAction::Command("save plate".into())),
+            _ if id == live_id!(file_save_as) => Some(ShellAction::SaveAsDialog),
             _ if id == live_id!(file_export_3mf) => Some(ShellAction::Command("export 3mf".into())),
             _ if id == live_id!(file_export_stl) => Some(ShellAction::Command("export stl".into())),
             _ if id == live_id!(file_reslice) => Some(ShellAction::Command("slice".into())),

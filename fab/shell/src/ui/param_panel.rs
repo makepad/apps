@@ -80,7 +80,7 @@ script_mod! {
             label +: {width: #(LABEL_W)}
             value +: {
                 flow: Right align: Align{y: 0.5}
-                text := mod.widgets.FabLabelSmall{width: Fill text: "" max_lines: 1}
+                text := mod.widgets.FabPropValue{width: Fill text: "" max_lines: 1}
                 pause := mod.widgets.FabFlatButton{text: "Pause" a11y: {label: "Pause growth"}}
             }
         }
@@ -108,7 +108,8 @@ script_mod! {
             }
             editor := mod.widgets.FabProfileEditor{}
         }
-        Derived := PropRow{label +: {width: #(LABEL_W)} value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
+        // (its value in the label's size: one baseline)
+        Derived := PropRow{label +: {width: #(LABEL_W)} value +: {align: Align{y: 0.5} text := mod.widgets.FabPropValue{width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis}}}
         Hint := View{
             width: Fill height: Fit
             // (under the fields, which start at the row's left now their names are inside them)

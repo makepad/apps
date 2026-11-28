@@ -28,9 +28,8 @@ use crate::api::*;
 use crate::api::PaneId;
 use crate::params::AreaKind;
 use crate::ui::keymap::{self, ShortcutId as Key};
-use crate::print::panel::slice_status;
 use crate::print::timeline::{layer_span, shown_top_layer};
-use crate::print::{format_time, PrintAction, SliceStatus};
+use crate::print::{format_time, PrintAction};
 use crate::ui::parts::active_part;
 use crate::ui::popover::{dropdown_clicked, menu_picked, open_menu, speed_in_menu, speed_label, speed_menu, speed_pick, MenuItem, MenuPlace, SpeedMenuKind};
 use crate::ui::editors::Editor;
@@ -121,30 +120,6 @@ script_mod! {
             color: fab.color_text
             color_active: fab.color_text_on_accent
             text_style: theme.font_regular{font_size: fab.font_size_small}
-        }
-    }
-    // A pill of the view pie: its name on the floating cards' ground, lit (the accent, black
-    // ink) while the pointer points at it (`hot`).
-    let PiePill = View{
-        width: #(PIE_PILL.x) height: #(PIE_PILL.y)
-        align: Align{x: 0.5 y: 0.5}
-        show_bg: true
-        draw_bg +: {
-            hot: instance(0.0)
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, self.rect_size.y * 0.5 - 0.5)
-                sdf.fill_keep(mix(fab.color_float, fab.color_accent, self.hot))
-                sdf.stroke(fab.color_float_border, 1.0)
-                return sdf.result
-            }
-        }
-        label := mod.widgets.FabLabel{
-            text: ""
-            draw_text +: {
-                hot: instance(0.0)
-                get_color: fn() { return mix(fab.color_text, fab.color_text_on_accent, self.hot) }
-            }
         }
     }
     let ViewToggle = mod.widgets.FabIconCheck{
@@ -554,15 +529,7 @@ script_mod! {
                 height: Fill
                 flow: Down
                 Filler{}
-                // Why the plate does not slice, in every workspace with the model.
-                slice_failed := Float{
-                    visible: false
-                    width: Fit
-                    height: Fit
-                    margin: Inset{left: 10 bottom: 6}
-                    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
-                    slice_failed_text := mod.widgets.FabLabel{ text: "" a11y: {label: "Why the plate does not slice"} }
-                }
+                // (why the plate does not slice is the status bar's: `statusbar::slice_line`)
                 // The part shows as it was at a step of its build (the Steps editor's marker).
                 step_shown := Float{
                     visible: false
@@ -708,25 +675,7 @@ script_mod! {
                     }
                 }
             }
-            // The slice's state over the view: never a modal, the view
-            // stays live (an out-of-date slice shows faded under it).
-            chip_layer := View{
-                // (shown with something to say: `slice_status`)
-                visible: false
-                width: Fill
-                height: Fit
-                flow: Down
-                align: Align{x: 0.5}
-                padding: Inset{top: 46}
-                chip := Float{
-                    flow: Right
-                    align: Align{y: 0.5}
-                    spacing: 10
-                    padding: Inset{left: 14 right: 14 top: 7 bottom: 7}
-                    chip_text := mod.widgets.FabLabel{ text: "" }
-                    chip_bar := mod.widgets.FabProgress{ width: 90 height: 4 visible: false }
-                }
-            }
+            // (the slice's state is the status bar's: `statusbar::slice_line`)
         }
 
         // ---- Monitor: a job Fab has no slice of ----
@@ -918,37 +867,8 @@ script_mod! {
                 gizmo := FabNavGizmo{ width: 96 }
             }
         }
-        // The view pie (Q held): the views round the pointer, each where the view looks from (Top
-        // up, Right right, …), Frame selected low right, Frame all low left; releasing Q there
-        // takes it (`FabStage::pie`)
-        pie_layer := View{
-            visible: false
-            width: Fill height: Fill flow: Overlay
-            pie_hub := View{
-                width: #(PIE_HUB) height: #(PIE_HUB)
-                show_bg: true
-                draw_bg +: {
-                    pixel: fn() {
-                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                        let r = self.rect_size.x * 0.5
-                        sdf.circle(r, r, r - 1.0)
-                        sdf.fill_keep(fab.color_float)
-                        sdf.stroke(fab.color_float_border, 1.0)
-                        sdf.circle(r, r, 2.5)
-                        sdf.fill(fab.color_text)
-                        return sdf.result
-                    }
-                }
-            }
-            pie0 := PiePill{ label +: { text: "Top" } }
-            pie1 := PiePill{ label +: { text: "Back" } }
-            pie2 := PiePill{ label +: { text: "Right" } }
-            pie3 := PiePill{ label +: { text: "Frame selected" } }
-            pie4 := PiePill{ label +: { text: "Bottom" } }
-            pie5 := PiePill{ label +: { text: "Frame all" } }
-            pie6 := PiePill{ label +: { text: "Left" } }
-            pie7 := PiePill{ label +: { text: "Front" } }
-        }
+        // The view pie (Q held over this view): `view_pie::FabViewPie`
+        pie_layer := mod.widgets.FabViewPie{}
         // View options' flyout: a card under its button at the toolbar's right end, a grid of
         // tiles (icon and name, lit while on); what the slice shows and the board only when they
         // apply. A press outside it, Escape or the button again closes it.
@@ -1198,12 +1118,6 @@ pub struct FabStage {
     /// View options' flyout is open.
     #[rust]
     options_open: bool,
-    /// The view pie while Q is held: its centre (window points) and the slot pointed at.
-    #[rust]
-    pie: Option<(DVec2, Option<u8>)>,
-    /// The pointer's last place over the window, where the pie opens.
-    #[rust]
-    pointer: DVec2,
     /// The step line over the view as last set: the step and the part's step count.
     #[rust]
     step_line: Option<(usize, usize)>,
@@ -1241,38 +1155,6 @@ pub struct FabStage {
 }
 
 const OWN_VIEWPORT: &[LiveId] = ids!(viewport);
-
-/// The view pie's pills (points), the hub's side, how far the pills stand from the centre, and
-/// how far the pointer goes from it before a direction counts.
-const PIE_PILL: DVec2 = DVec2 { x: 112.0, y: 26.0 };
-const PIE_HUB: f64 = 26.0;
-const PIE_RADIUS: f64 = 92.0;
-const PIE_DEAD: f64 = 16.0;
-
-/// The view pie's slot the pointer points at from `centre`: none in the dead zone, else the
-/// nearest of the eight compass directions (0 north, clockwise).
-fn pie_hot(centre: DVec2, pointer: DVec2) -> Option<u8> {
-    let d = pointer - centre;
-    if d.length() < PIE_DEAD {
-        return None;
-    }
-    Some(((d.x.atan2(-d.y) / std::f64::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as u8)
-}
-
-/// What the view pie's slot does: the view from where it stands (Top up, Right right, …), Front
-/// and Back the upper diagonals, the framings the lower ones.
-fn pie_action(slot: u8) -> ShellAction {
-    match slot {
-        0 => ShellAction::PresetView(PresetView::Top),
-        1 => ShellAction::PresetView(PresetView::Back),
-        2 => ShellAction::PresetView(PresetView::Right),
-        3 => ShellAction::FrameSelected,
-        4 => ShellAction::PresetView(PresetView::Bottom),
-        5 => ShellAction::FrameAll,
-        6 => ShellAction::PresetView(PresetView::Left),
-        _ => ShellAction::PresetView(PresetView::Front),
-    }
-}
 
 /// View options' Tool rails: this Plate view's rails on or off (the shell keeps them per view).
 #[derive(Clone, Copy, Debug)]
@@ -1361,6 +1243,7 @@ impl FabStage {
         if let Some(mut w) = v.widget(cx, ids!(design_overlay.force_editor)).borrow_mut::<crate::tools::force_edit::FabForceEditor>() { w.pane = pane; }
         if let Some(mut w) = v.widget(cx, ids!(mech_grab)).borrow_mut::<crate::tools::mech_grab::FabMechGrab>() { w.pane = pane; }
         if let Some(mut w) = v.widget(cx, ids!(nav_col.gizmo)).borrow_mut::<crate::nav::gizmo::FabNavGizmo>() { w.pane = pane; }
+        if let Some(mut w) = v.widget(cx, ids!(pie_layer)).borrow_mut::<crate::ui::view_pie::FabViewPie>() { w.pane = Some(pane); }
         self.view.redraw(cx);
     }
 
@@ -1390,86 +1273,6 @@ impl FabStage {
             }
             if let Some(mut viewport) = self.view.widget(cx, path).borrow_mut::<crate::viewport::FabViewport>() {
                 viewport.handle_hidden(cx, event, scope);
-            }
-        }
-    }
-
-    /// The view pie's events: Q pressed over this view opens it round the pointer (kept inside
-    /// the view), the pointer aims it, Q released takes the slot aimed at (none: nothing), Escape
-    /// or a press closes it. Whether the event was the pie's alone (a press while it is open).
-    fn pie_event(&mut self, cx: &mut Cx, event: &Event) -> bool {
-        match event {
-            Event::MouseMove(e) => {
-                self.pointer = e.abs;
-                if let Some((centre, hot)) = &mut self.pie {
-                    let aimed = pie_hot(*centre, e.abs);
-                    if aimed != *hot {
-                        *hot = aimed;
-                        self.view.redraw(cx);
-                    }
-                }
-                false
-            }
-            Event::Actions(actions) if actions.iter().any(|a| matches!(a.downcast_ref::<StageAction>(), Some(StageAction::ViewPie))) => {
-                let view = self.view.area().rect(cx);
-                if self.pie.is_none() && view.contains(self.pointer) {
-                    // round the pointer, the ring kept inside the view
-                    let reach = dvec2(PIE_RADIUS + PIE_PILL.x * 0.5 + 6.0, PIE_RADIUS + PIE_PILL.y * 0.5 + 6.0);
-                    let lo = view.pos + reach;
-                    let hi = view.pos + view.size - reach;
-                    let centre = dvec2(self.pointer.x.clamp(lo.x, hi.x.max(lo.x)), self.pointer.y.clamp(lo.y, hi.y.max(lo.y)));
-                    self.pie = Some((centre, pie_hot(centre, self.pointer)));
-                    self.view.redraw(cx);
-                }
-                false
-            }
-            Event::KeyUp(ke) if ke.key_code == KeyCode::KeyQ => {
-                if let Some((_, hot)) = self.pie.take() {
-                    if let Some(slot) = hot {
-                        cx.action(pie_action(slot));
-                    }
-                    self.view.redraw(cx);
-                }
-                false
-            }
-            Event::KeyDown(ke) if ke.key_code == KeyCode::Escape && self.pie.is_some() => {
-                self.pie = None;
-                self.view.redraw(cx);
-                true
-            }
-            Event::MouseDown(_) if self.pie.is_some() => {
-                self.pie = None;
-                self.view.redraw(cx);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The view pie's layer as it draws: shown while open, its pills round its centre, the one
-    /// aimed at lit. Ten lookups while it is open.
-    fn sync_pie(&mut self, cx: &mut Cx) {
-        let layer = self.view.view(cx, ids!(pie_layer));
-        if layer.visible() != self.pie.is_some() {
-            layer.set_visible(cx, self.pie.is_some());
-        }
-        let Some((centre, hot)) = self.pie else { return };
-        if let Some(mut hub) = self.view.widget(cx, ids!(pie_layer.pie_hub)).borrow_mut::<View>() {
-            hub.walk.abs_pos = Some(centre - DVec2::all(PIE_HUB * 0.5));
-        }
-        let pills = [ids!(pie_layer.pie0), ids!(pie_layer.pie1), ids!(pie_layer.pie2), ids!(pie_layer.pie3),
-            ids!(pie_layer.pie4), ids!(pie_layer.pie5), ids!(pie_layer.pie6), ids!(pie_layer.pie7)];
-        for (k, path) in pills.into_iter().enumerate() {
-            let angle = k as f64 * std::f64::consts::FRAC_PI_4;
-            let at = centre + dvec2(angle.sin(), -angle.cos()) * PIE_RADIUS - PIE_PILL * 0.5;
-            let lit = if hot == Some(k as u8) { 1.0 } else { 0.0 };
-            let pill = self.view.widget(cx, path);
-            if let Some(mut view) = pill.borrow_mut::<View>() {
-                view.walk.abs_pos = Some(at);
-                view.draw_bg.set_dyn_instance(cx, live_id!(hot), &[lit]);
-            }
-            if let Some(mut label) = pill.label(cx, ids!(label)).borrow_mut() {
-                label.draw_text.set_dyn_instance(cx, live_id!(hot), &[lit]);
             }
         }
     }
@@ -1928,7 +1731,7 @@ pub fn apply(state: &mut AppState, action: &StageAction) {
             crate::view_prefs::save_invert_wheel(*on);
         }
         StageAction::PartSidebar(on) => state.ui.part_sidebar = *on,
-        // (the Plate view under the pointer opens its pie: `FabStage::pie_event`)
+        // (the view under the pointer opens its pie: `view_pie::FabViewPie`)
         StageAction::ViewPie => {}
         StageAction::PaintRadius(r) => state.ui.paint_radius = r.clamp(crate::tools::paint::MIN_RADIUS, crate::tools::paint::MAX_RADIUS),
         StageAction::PaintColor(i) => {
@@ -2001,8 +1804,12 @@ impl Widget for FabStage {
             return;
         }
         // the view pie: open on Q over this view, aim with the pointer, release Q to take it
-        if self.pie_event(cx, event) {
-            return;
+        if let Some(state) = scope.data.get_mut::<AppState>() {
+            if let Some(mut pie) = self.view.widget(cx, ids!(pie_layer)).borrow_mut::<crate::ui::view_pie::FabViewPie>() {
+                if pie.take_event(cx, event, state) {
+                    return;
+                }
+            }
         }
         // View options' flyout closes on a press outside it (its button toggles it) and on Escape
         if self.options_open {
@@ -2870,11 +2677,6 @@ impl Widget for FabStage {
             let print_key = (p.revision, state.plate.revision, plate_mode, slice, checking, lead);
             if self.print_revision != Some(print_key) {
                 self.print_revision = Some(print_key);
-                let failed = v.view(cx, ids!(model_ui.bottom.slice_failed));
-                failed.set_visible(cx, lead && matches!(p.status, SliceStatus::Failed(_)));
-                if matches!(p.status, SliceStatus::Failed(_)) {
-                    failed.label(cx, ids!(slice_failed_text)).set_text(cx, &slice_status(p).0);
-                }
 
                 let has_job_card = crate::print::job_card::job_view(p, Cx::time_now()).is_some();
                 v.view(cx, ids!(monitor_job)).set_visible(cx, lead && state.ui.in_mode(PlateMode::Monitor) && (has_job_card || !p.follow.jobs.is_empty()));
@@ -2919,54 +2721,6 @@ impl Widget for FabStage {
                     row.button(cx, ids!(print_pause)).set_visible(cx, playable && p.play.playing);
                     row.button(cx, ids!(to_start)).set_visible(cx, playable);
                     row.button(cx, ids!(to_end)).set_visible(cx, playable);
-                    // The slice's state, as a chip over the view.
-                    let (status, progress) = slice_status(p);
-                    let running = matches!(p.status, SliceStatus::Running { .. });
-                    let mut checking: Option<f32> = None;
-                    let chip = if held {
-                        // The plate's slice is not this view's business.
-                        None
-                    } else if let Some(r) = p.resin_shown() {
-                        // a resin stack being cut, or why it can't be
-                        (!r.note.is_empty()).then(|| r.note.clone())
-                    } else if running {
-                        Some(match (&p.status, progress) {
-                            (SliceStatus::Running { stage, .. }, _) if stage.starts_with(crate::print::GROWING) => format!("{stage}…"),
-                            (SliceStatus::Running { stage, .. }, Some(f)) if stage == crate::print::PLANNING_SUPPORTS => format!("{stage}… {:.0}%", f * 100.0),
-                            (_, Some(f)) => format!("Slicing… {:.0}%", f * 100.0),
-                            (_, None) => "Slicing…".to_string(),
-                        })
-                    } else if matches!(p.status, SliceStatus::Failed(_)) {
-                        Some(status)
-                    } else if state.plate.parts.is_empty() && p.preview.is_none() {
-                        // Empty plates have neither model parts nor a slice.
-                        Some("There is nothing on the plate yet.".to_string())
-                    } else if p.preview.is_none() && state.plate.parts.iter().all(|part| part.is_board()) {
-                        // A board alone: it is never printed, so no slice comes.
-                        Some("Nothing to print yet: a board is not printed.".to_string())
-                    } else if p.preview.is_none() || p.stale {
-                        Some("Waiting to slice…".to_string())
-                    } else if let Some((done, total)) = p.streamed.as_ref().and_then(|s| s.checking()) {
-                        // The sliced printability streams in after the slice: a small note, the
-                        // preview stays usable.
-                        checking = Some(done as f32 / total.max(1) as f32);
-                        Some(format!("Checking printability… {done}/{total} layers"))
-                    } else {
-                        // A part that won't fit the printer sliced anyway: the slice says so.
-                        p.fit_warning.clone()
-                    };
-                    sv.view(cx, ids!(chip_layer)).set_visible(cx, chip.is_some());
-                    if let Some(text) = chip {
-                        let c = sv.view(cx, ids!(chip_layer.chip));
-                        c.label(cx, ids!(chip_text)).set_text(cx, &text);
-                        let bar = c.view(cx, ids!(chip_bar));
-                        bar.set_visible(cx, running || checking.is_some());
-                        if let Some(f) = progress.or(checking) {
-                            if let Some(mut bar) = bar.borrow_mut() {
-                                bar.draw_bg.set_dyn_instance(cx, live_id!(progress), &[f]);
-                            }
-                        }
-                    }
                 }
             }
             let playback = slice.then_some(PlaybackKey {
@@ -3017,7 +2771,6 @@ impl Widget for FabStage {
                 }
             }
         }
-        self.sync_pie(cx);
         while self.view.draw_walk(cx, scope, walk).is_step() {}
         DrawStep::done()
     }

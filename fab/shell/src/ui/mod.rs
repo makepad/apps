@@ -41,9 +41,11 @@ pub mod popover;
 pub mod shell;
 pub mod slice_panel;
 pub mod stage;
+pub mod view_pie;
 pub mod steps;
 pub mod job_strip;
 pub mod topbar;
+pub mod statusbar;
 pub mod workspace_tabs;
 pub mod workspace_tool;
 pub mod overrides;
@@ -72,6 +74,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     workspace_tabs::script_mod(vm);
     job_strip::script_mod(vm);
     topbar::script_mod(vm);
+    statusbar::script_mod(vm);
     param_panel::script_mod(vm);
     code::script_mod(vm);
     steps::script_mod(vm);
@@ -87,6 +90,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     force::script_mod(vm);
     mech_actions::script_mod(vm);
     progress_card::script_mod(vm);
+    view_pie::script_mod(vm);
     stage::script_mod(vm);
     device3d::script_mod(vm);
     slice_panel::script_mod(vm);

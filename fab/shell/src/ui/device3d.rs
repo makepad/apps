@@ -1,6 +1,6 @@
 //! The Electronics device editor. Its viewport keeps its camera when the dock parks the body.
 
-use crate::api::{aabb_empty, aabb_is_empty, aabb_union, Aabb, AppState, Camera, DeviceRestore, ElementId, PaneId, PaneLease, PaneMode, PanePoses, PaneRole, PoseSetId, PresetView, ShellAction, TraceProgress};
+use crate::api::{aabb_empty, aabb_is_empty, aabb_union, Aabb, AppState, Camera, DeviceRestore, ElementId, PaneId, PaneLease, PaneMode, PanePoses, PaneRole, PoseSetId, ShellAction, TraceProgress};
 use crate::model::{aabb_union_point, state::pose_apply};
 use crate::tools::section::box_corners;
 use crate::tools::transform::mm_to_world;
@@ -28,19 +28,11 @@ script_mod! {
         width: Fill height: Fill flow: Down
         event_order: EventOrder.Up
         // the editor's toolbar, as every editor's (its area's selector at the left end): how the
-        // product shows (assembled or as a kit), the camera's presets, the case and the shot
+        // product shows (assembled or as a kit), the case and the shot. Its camera is the Plate
+        // view's: the axis gizmo, the view pie (Q), the numpad, Home and the View menu.
         editor_bar := mod.widgets.FabEditorBar{
             assembled := Segment{text: "Assembled"}
             kit := Segment{text: "Kit"}
-            mod.widgets.FabVRule{}
-            reset := mod.widgets.FabFlatButton{
-                text: "Reset" height: 22
-                padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-                draw_text +: {color: fab.color_text_dim}
-            }
-            iso := ViewButton{text: "Iso"}
-            top := ViewButton{text: "Top"}
-            front := ViewButton{text: "Front"}
             mod.widgets.FabVRule{}
             case := Segment{
                 text: "Case" independent: true
@@ -68,6 +60,8 @@ script_mod! {
                 right := View{
                     width: Fit height: Fit flow: Down spacing: 4
                     align: Align{x: 1.0}
+                    // the Plate view's axis gizmo, for this view's camera
+                    gizmo := mod.widgets.FabNavGizmo{ width: 96 }
                     // the shot's progress while it traces
                     shot_row := mod.widgets.FabFloat{
                         visible: false
@@ -85,6 +79,8 @@ script_mod! {
                     }
                 }
             }
+            // the view pie (Q held over this view), as the Plate view's
+            pie_layer := mod.widgets.FabViewPie{}
         }
     }
 }
@@ -112,9 +108,6 @@ pub struct FabDevice3d {
     /// Kit, Case, the build step, the step names (address, count), and the pane's mode and trace
     /// progress last shown.
     shown_controls: Option<(bool, bool, Option<usize>, usize, usize, PaneMode, TraceProgress)>,
-    /// The side the framing looks from: a preset, or the editor's own three-quarter view.
-    #[rust]
-    look: Option<PresetView>,
 }
 
 impl ScriptHook for FabDevice3d {
@@ -135,9 +128,12 @@ impl FabDevice3d {
         let lease = state.lease_pane(PaneRole::Device);
         let pane = lease.id();
         viewport.set_pane(&lease);
+        drop(viewport);
         state.set_pane_poses(pane, PanePoses::Set(PoseSetId::DEVICE));
         state.device.pane = Some(pane);
         self.lease = Some(lease);
+        if let Some(mut w) = self.view.widget(cx, ids!(corners.right.gizmo)).borrow_mut::<crate::nav::gizmo::FabNavGizmo>() { w.pane = pane; }
+        if let Some(mut w) = self.view.widget(cx, ids!(pie_layer)).borrow_mut::<crate::ui::view_pie::FabViewPie>() { w.pane = Some(pane); }
         Some(pane)
     }
 
@@ -198,14 +194,8 @@ impl FabDevice3d {
         let (sin_az, cos_az) = 30.0_f32.to_radians().sin_cos();
         let camera = state.view.camera_mut(pane);
         *camera = Camera::default();
-        match self.look {
-            None => camera.eye = camera.target + vec3(-sin_az * cos_el, -cos_az * cos_el, sin_el),
-            Some(preset) => {
-                let (along, up) = preset.look_dir_and_up();
-                camera.up = up;
-                camera.eye = camera.target - along;
-            }
-        }
+        // the editor's own three-quarter view (the gizmo and the pie take it to the presets)
+        camera.eye = camera.target + vec3(-sin_az * cos_el, -cos_az * cos_el, sin_el);
         camera.frame_bounds(&bounds, aspect);
         fit_projected_box(camera, &bounds, aspect);
         let at = state.device.position;
@@ -299,7 +289,8 @@ fn fit_projected_box(camera: &mut Camera, bounds: &Aabb, aspect: f32) {
     camera.ortho_height = 2.0 * distance * (camera.fov_y_deg.to_radians() * 0.5).tan();
 }
 
-fn device_bounds(state: &AppState, pane: PaneId) -> Aabb {
+/// The device as `pane` poses it: its case and boards (empty without either).
+pub fn device_bounds(state: &AppState, pane: PaneId) -> Aabb {
     let mut bounds = aabb_empty();
     let mut include = |id: Option<ElementId>, b: Aabb| {
         if aabb_is_empty(&b) { return; }
@@ -330,6 +321,12 @@ impl Widget for FabDevice3d {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if let Some(state) = scope.data.get_mut::<AppState>() {
             let Some(pane) = self.pane(cx, state) else { return };
+            // the view pie first: a press while it is open is its alone
+            if let Some(mut pie) = self.view.widget(cx, ids!(pie_layer)).borrow_mut::<crate::ui::view_pie::FabViewPie>() {
+                if pie.take_event(cx, event, state) {
+                    return;
+                }
+            }
             self.sync_controls(cx, state, pane);
             if state.view.pane(pane).mode == PaneMode::Traced {
                 // a traced view held or moving draws coarse until it rests (as the stage's panes)
@@ -359,17 +356,6 @@ impl Widget for FabDevice3d {
                 }
                 if self.view.radio_button(cx, ids!(case)).clicked(actions) {
                     cx.action(ShellAction::SetPaneCase { pane, shown: state.view.pane(pane).case_hidden });
-                }
-                if self.view.button(cx, ids!(reset)).clicked(actions) {
-                    self.set_framing(state, Framing::Pending);
-                    self.view.redraw(cx);
-                }
-                for (id, look) in [(ids!(iso), None), (ids!(top), Some(PresetView::Top)), (ids!(front), Some(PresetView::Front))] {
-                    if self.view.button(cx, id).clicked(actions) {
-                        self.look = look;
-                        self.set_framing(state, Framing::Pending);
-                        self.view.redraw(cx);
-                    }
                 }
             }
         }

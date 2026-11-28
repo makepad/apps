@@ -235,6 +235,11 @@ fn framed_centre(state: &AppState, pane: PaneId, rect: Rect, element: ElementId)
 }
 
 /// One numpad-orbit step, in the same screen units the drag path uses.
+/// A held orbit key's speed once up to it (steps of 15° a second), and how long it takes to
+/// get there (seconds).
+const HELD_ORBIT_STEPS: f32 = 6.0;
+const HELD_ORBIT_RAMP: f64 = 0.35;
+
 fn orbit_step_points() -> f32 {
     (15.0f32).to_radians() / orbit::ORBIT_SENS
 }
@@ -298,6 +303,12 @@ pub struct Navigator {
     /// straight back (the view untouched since), the camera before comes back to the bit: worked
     /// back from the orthographic height in f32 the eye can land a step off.
     switched: Option<(Camera, Camera)>,
+    /// The orbit keys held (numpad 4/6/8/2), each with its step's direction: a press turns the
+    /// view a step; held on past the step's glide, the view keeps turning, easing up to
+    /// `HELD_ORBIT_STEPS` steps a second, until the key comes up.
+    held_orbit: Vec<(KeyCode, (f32, f32))>,
+    /// When the held orbit began turning on its own (the frame time after the step's glide).
+    held_since: Option<f64>,
 }
 
 impl Default for Navigator {
@@ -326,6 +337,8 @@ impl Default for Navigator {
             emulate_numpad: true,
             marquee: None,
             switched: None,
+            held_orbit: Vec::new(),
+            held_since: None,
         }
     }
 }
@@ -388,6 +401,7 @@ impl Navigator {
     /// (it is still in flight: [`NavController::is_animating`]); its next move or release asks.
     pub fn needs_frames(&self) -> bool {
         self.anim.is_some()
+            || !self.held_orbit.is_empty()
             || self.inertia.is_some()
             || (self.drag.is_some() && (!self.resting || self.move_accum != DVec2::default()))
     }
@@ -401,6 +415,15 @@ impl Navigator {
         self.opening = None;
         self.anim = None;
         self.inertia = None;
+        self.held_orbit.clear();
+        self.held_since = None;
+    }
+
+    /// The orbit keys held are let go (their release goes elsewhere: the focus or the window
+    /// went).
+    pub fn release_keys(&mut self) {
+        self.held_orbit.clear();
+        self.held_since = None;
     }
 
     fn aspect(&self) -> f32 {
@@ -791,6 +814,14 @@ impl Navigator {
             ViewportInputKind::KeyDown { key, mods, repeat } => {
                 self.handle_orbit_key(cx, state, key, mods, repeat)
             }
+            ViewportInputKind::KeyUp { key, .. } => {
+                let held = self.held_orbit.len();
+                self.held_orbit.retain(|(k, _)| *k != key);
+                if self.held_orbit.is_empty() {
+                    self.held_since = None;
+                }
+                InputResponse { consumed: held != self.held_orbit.len(), ..Default::default() }
+            }
             _ => InputResponse::default(),
         }
     }
@@ -823,12 +854,17 @@ impl Navigator {
             return InputResponse::default();
         }
         if let Some((dx, dy)) = self.orbit_step_for_key(key) {
-            let style = state.view.orbit_style;
+            // 4 and 6 turn the view about its own vertical axis, 8 and 2 about its own horizontal
+            // one: the screen's axes, whatever the drag's orbit style (a turntable's step from
+            // the top view spins the plate instead)
             let preset = state.view.pane(self.pane).preset;
             let mut to = self.heading(state);
             self.break_auto_ortho(&mut to, preset);
-            self.apply_orbit(&mut to, style, dx, dy);
+            orbit::orbit_trackball(&mut to, dx, dy);
             self.glide(state, to, ANIM_FAST, None);
+            if !self.held_orbit.iter().any(|(k, _)| *k == key) {
+                self.held_orbit.push((key, (dx, dy)));
+            }
             return InputResponse {
                 consumed: true,
                 redraw: true,
@@ -843,7 +879,7 @@ impl Navigator {
                 InputResponse::consumed()
             }
             KeyCode::Home => {
-                let b = state.frame_all_bounds();
+                let b = state.frame_all_bounds_in(self.pane);
                 self.frame(cx, state, b, true);
                 InputResponse {
                     consumed: true,
@@ -865,7 +901,7 @@ impl Navigator {
             KeyCode::Period | KeyCode::NumpadDecimal => {
                 let b = state
                     .selection_bounds()
-                    .unwrap_or_else(|| state.frame_all_bounds());
+                    .unwrap_or_else(|| state.frame_all_bounds_in(self.pane));
                 self.frame(cx, state, b, true);
                 InputResponse {
                     consumed: true,
@@ -1022,6 +1058,20 @@ impl Navigator {
             } else {
                 wants = true;
             }
+            redraw = true;
+        } else if !self.held_orbit.is_empty() && self.drag.is_none() {
+            // an orbit key held past its step: the view keeps turning, easing up to speed
+            let since = *self.held_since.get_or_insert(time);
+            let ramp = ((time - since) / HELD_ORBIT_RAMP).clamp(0.0, 1.0) as f32;
+            let ease = ramp * ramp * (3.0 - 2.0 * ramp);
+            let (dx, dy) = self.held_orbit.iter().fold((0.0, 0.0), |(x, y), (_, (dx, dy))| (x + dx.signum(), y + dy.signum()));
+            let rate = orbit_step_points() * HELD_ORBIT_STEPS * ease * dt;
+            let preset = state.view.pane(self.pane).preset;
+            let mut cam = *state.view.camera(self.pane);
+            self.break_auto_ortho(&mut cam, preset);
+            orbit::orbit_trackball(&mut cam, dx * rate, dy * rate);
+            self.commit(state, cam, None);
+            wants = true;
             redraw = true;
         } else if let Some((drag, vel)) = self.inertia {
             let step = vel * dt as f64;
@@ -1668,6 +1718,37 @@ mod tests {
     /// View: Front glide framed the part along the glide's direction of the moment, degrees off
     /// the front; View: Front during a framing's glide took only part of the framing's look
     /// point and distance; a key's turn by a step during another's turned less than two steps.
+    /// A numpad orbit key held turns the view on past its step, easing up to speed, and stops
+    /// when it comes up; a tap is one step.
+    #[test]
+    fn a_held_orbit_key_keeps_turning_until_released() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let pane = PaneId::PRIMARY;
+        let mut state = AppState::default();
+        let mut nav = Navigator::default();
+        nav.pane = pane;
+        let start = *state.view.camera(pane);
+        send(&mut nav, &mut cx, &mut state, ViewportInputKind::KeyDown { key: KeyCode::Numpad6, mods: KeyModifiers::default(), repeat: false });
+        let mut time = 0.0;
+        let mut frame = |nav: &mut Navigator, cx: &mut Cx, state: &mut AppState, time: &mut f64| {
+            *time += 1.0 / 60.0;
+            send(nav, cx, state, ViewportInputKind::Frame { dt: 1.0 / 60.0, time: *time });
+        };
+        for _ in 0..30 { frame(&mut nav, &mut cx, &mut state, &mut time); }
+        let after_step = *state.view.camera(pane);
+        for _ in 0..60 { frame(&mut nav, &mut cx, &mut state, &mut time); }
+        let held = *state.view.camera(pane);
+        assert!((held.eye - after_step.eye).length() > 1e-3, "held, the view turned on past its step");
+        assert!(nav.needs_frames(), "held, it asks for frames");
+        send(&mut nav, &mut cx, &mut state, ViewportInputKind::KeyUp { key: KeyCode::Numpad6, mods: KeyModifiers::default() });
+        frame(&mut nav, &mut cx, &mut state, &mut time);
+        let released = *state.view.camera(pane);
+        for _ in 0..30 { frame(&mut nav, &mut cx, &mut state, &mut time); }
+        assert!((state.view.camera(pane).eye - released.eye).length() < 1e-6, "released, it stops");
+        assert!(!nav.needs_frames(), "released, it asks for no frames");
+        assert!((start.eye - released.eye).length() > 1e-3);
+    }
+
     #[test]
     fn a_move_during_a_glide_ends_where_it_would_after_the_glide() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -1677,6 +1758,8 @@ mod tests {
         let framed = |nav: &mut Navigator, cx: &mut Cx, state: &mut AppState| nav.frame(cx, state, part, true);
         let step = |nav: &mut Navigator, cx: &mut Cx, state: &mut AppState| {
             send(nav, cx, state, ViewportInputKind::KeyDown { key: KeyCode::Numpad6, mods: KeyModifiers::default(), repeat: false });
+            // (a tap: held, the view would go on turning)
+            send(nav, cx, state, ViewportInputKind::KeyUp { key: KeyCode::Numpad6, mods: KeyModifiers::default() });
         };
         let cases: [(&str, Move, Move); 3] = [
             ("Frame Selected during the View: Front glide", &front, &framed),

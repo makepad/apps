@@ -19,7 +19,6 @@
 
 use crate::api::*;
 use crate::ui::keymap::{self, ShortcutId as Key};
-use crate::ui::job_strip::JOB_LINE_CHARS;
 use crate::print::PrintAction;
 use crate::ui::menus::{action_for as menu_action_for, edit_menu, file_menu, help_menu, view_menu};
 use crate::ui::popover::{menu_picked, open_menu, ui_actions, FabUiAction, MenuItem, MenuPlace};
@@ -71,7 +70,8 @@ script_mod! {
         }
     }
 
-    let JobsSlot = #(FabJobsSlot::register_widget(vm))
+    // the job strip's slot (the status bar's)
+    mod.widgets.FabJobsSlotBase = #(FabJobsSlot::register_widget(vm))
 
     mod.widgets.FabTopBar = View{
         width: Fill
@@ -104,19 +104,7 @@ script_mod! {
                         }
                     }
                 }
-                // The job strip, its line in a tooltip; while the app saves on quit, the save's
-                // status holds the slot instead.
-                jobs := JobsSlot{
-                    width: Fit height: Fill
-                    align: Align{y: 0.5}
-                    jobs_tip := FabTip{wrap_width: 360 height: Fill flow: Right align: Align{y: 0.5}
-                        quit_line := Label{
-                            visible: false width: Fit height: Fit
-                            draw_text +: {color: fab.color_text text_style: theme.font_regular{font_size: fab.font_size_small}}
-                        }
-                        strip := mod.widgets.FabJobStrip{max_chars: #(JOB_LINE_CHARS)}
-                    }
-                }
+                // (the job strip is the status bar's: `statusbar`)
                 // Always this size, icon or not, so nothing moves when it comes and goes.
                 also_slot := View{width: 28 height: 26
                     also_tip := FabTip{ text: "This plate is also open in another Fab window."
@@ -489,10 +477,10 @@ pub fn sync_requirements(cx: &mut Cx, bar: &WidgetRef, shown: Option<&ReqShown>)
     }
 }
 
-/// Pin the save status in the caption's job slot. Clearing it restores
-/// the strip's ordinary job selection and tooltip.
+/// Pin the save status in the status bar's job slot (`bar` is the `FabStatusBar`). Clearing it
+/// restores the strip's ordinary job selection and tooltip.
 pub fn quit_status(cx: &mut Cx, bar: &WidgetRef, text: Option<&str>) {
-    let slot = bar.widget(cx, ids!(right.jobs));
+    let slot = bar.widget(cx, ids!(jobs));
     let Some(mut slot) = slot.borrow_mut::<FabJobsSlot>() else { return };
     let tip = slot.view.widget(cx, ids!(jobs_tip));
     let line = tip.child(id!(quit_line));
@@ -511,7 +499,8 @@ pub fn quit_status(cx: &mut Cx, bar: &WidgetRef, text: Option<&str>) {
 /// Bring the caption up to date with its model (before a draw).
 pub fn sync(cx: &mut Cx, bar: &WidgetRef, caption: &Caption) {
     bar.label(cx, ids!(middle.title.doc_name)).set_text(cx, &caption.title);
-    bar.label(cx, ids!(middle.title.doc_state)).set_text(cx, &caption.info);
+    // (what is on the plate is the status bar's to say)
+    bar.label(cx, ids!(middle.title.doc_state)).set_text(cx, "");
     bar.widget(cx, ids!(also)).set_visible(cx, caption.also_open);
     if let Some(mut tabs) = bar.widget(cx, ids!(workspaces)).borrow_mut::<FabWorkspaceTabs>() {
         tabs.set(cx, caption.tabs.clone(), caption.current, caption.temp.clone());

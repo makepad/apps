@@ -44,6 +44,15 @@ script_mod! {
         }
     }
 
+    // A property row's read-only value: in the row label's size and line, so the two share a
+    // baseline (a smaller face centred beside it sits off the label's), in the second voice.
+    mod.widgets.FabPropValue = mod.widgets.FabLabel{
+        draw_text +: {
+            color: fab.color_text_dim
+            text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}
+        }
+    }
+
     mod.widgets.FabLabelMuted = mod.widgets.FabLabel{
         draw_text +: {
             color: fab.color_text_muted
@@ -1322,7 +1331,20 @@ script_mod! {
         header +: {hdr +: {
             margin: Inset{left: theme.prop_pad right: theme.prop_pad}
             padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}
-            draw_bg +: {color: fab.color_section color_hover: fab.color_section radius: 0.0}
+            // subtly rounded, as the fields are, at all four corners open or shut (no body card
+            // hangs under it here, so its foot never squares off)
+            draw_bg +: {
+                color: fab.color_section color_hover: fab.color_section radius: fab.radius
+                pixel: fn() {
+                    let dpi = self.draw_pass.dpi_factor
+                    let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
+                    let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, self.radius)
+                    sdf.fill(self.color.mix(self.color_hover, self.hover))
+                    return sdf.result
+                }
+            }
             title +: {draw_text +: {text_style: theme.font_bold{font_size: theme.prop_font_size}}}
             grip +: {cursor: MouseCursor.Move}
         }}

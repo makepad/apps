@@ -1263,19 +1263,16 @@ impl Widget for FabToolOverlay {
                     if vs.overlays.section_planes {
                         self.draw_section(cx, state, &proj);
                     }
-                    // The tool's one-line feedback, under the view's top edge and right of the rail
-                    // (and of a tool's strip beside it).
+                    // Measure Fit's reading, under the view's top edge and right of the rail (and of
+                    // a tool's strip beside it); the tool's hint is the status bar's
+                    // (`statusbar::tool_hint`)
                     let fitting = super::fit::in_pane(state, self.pane);
                     let hint = if fitting {
                         self.draw_fit(cx, state, &proj, rect);
                         session::with(|s| s.fit.label(&state.units))
-                    } else { session::with(|s| match (s.hint.is_empty(), s.draft.is_empty()) {
-                        (true, false) if !crate::tools::picks::active(state) => format!("{} ({})", s.draft, crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::Shape)),
-                        (true, _) => s.draft.clone(),
-                        (false, _) => s.hint.clone(),
-                    }) };
-                    // wrapped at the lines' width, so a long hint never runs under the gizmo
-                    if (fitting || !hint.is_empty()) && line_width > 0.0 {
+                    } else { String::new() };
+                    // wrapped at the lines' width, so a long reading never runs under the gizmo
+                    if fitting && !hint.is_empty() && line_width > 0.0 {
                         let walk = Walk::new(Size::Fixed(line_width), Size::fit()).with_abs_pos(rect.pos + dvec2(left, line_y));
                         self.draw_text_small.color = self.color_measure;
                         let drawn = self.draw_text_small.draw_walk_with_wrap(cx, walk, Align::default(), true, &hint);
@@ -1284,18 +1281,7 @@ impl Widget for FabToolOverlay {
                 }
                 self.notice_revision = state.ui.notices.revision;
                 self.preview_shown = state.plate.preview;
-                if let Some(notice) = state.ui.notices.get(NoticeView::Plate) {
-                    if line_width > 0.0 {
-                        let walk = Walk::new(Size::Fixed(line_width), Size::fit()).with_abs_pos(rect.pos + dvec2(left, line_y));
-                        self.draw_text_small.color = if notice.standing { self.color_notice_warn } else { self.color_measure };
-                        let max_lines = self.draw_text_small.max_lines;
-                        self.draw_text_small.max_lines = 3;
-                        let drawn = self.draw_text_small.draw_walk_with_wrap(cx, walk, Align::default(), true, &notice.text);
-                        self.draw_text_small.max_lines = max_lines;
-                        self.notice_shown = Some((notice.text.clone(), Rect { pos: rect.pos + dvec2(left, line_y), size: drawn.size }));
-                        line_y += (drawn.size.y + 4.0).max(20.0);
-                    }
-                }
+                // (the plate notice is the status bar's: `statusbar`)
                 // The Force render mode's loads, key and state (whatever the tool)
                 if !mechanics && state.force_shown() {
                     self.draw_force(cx, state, &proj, rect, rect.pos + dvec2(left, line_y));

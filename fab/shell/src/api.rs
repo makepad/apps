@@ -632,6 +632,12 @@ pub struct ViewportState {
     pub hover: Option<RayHit>,
     /// The Plate pane last pressed ([`Self::active_plate`]).
     pub pressed_plate: PaneId,
+    /// The 3D view (a Plate view, the Product view) last pressed, or whose view pie or gizmo
+    /// was last used ([`Self::camera_pane`]).
+    pub pressed_pane: Option<PaneId>,
+    /// The 3D view the pointer is over, if any (the view pie's Q works over it whatever holds
+    /// the keyboard).
+    pub pointer_pane: Option<PaneId>,
     /// The panes of the Plate views on screen, by instance number: the first is the lead
     /// ([`Self::lead_plate`]). The shell publishes it with each change of what the dock shows.
     pub shown_plates: Vec<PaneId>,
@@ -666,6 +672,8 @@ impl Default for ViewportState {
             glass: true,
             hover: None,
             pressed_plate: PaneId::PLATE_ZERO,
+            pressed_pane: None,
+            pointer_pane: None,
             shown_plates: Vec::new(),
             plate_instances: Vec::new(),
             saved_plates: Vec::new(),
@@ -961,6 +969,19 @@ impl ViewportState {
     /// the Plate last pressed while it is on screen, else the lead. O(Plates on screen).
     pub fn active_plate(&self) -> PaneId {
         if self.shown_plates.contains(&self.pressed_plate) { self.pressed_plate } else { self.lead_plate() }
+    }
+
+    /// The 3D view the camera commands act on (presets, Frame all, the View menu, the view pie,
+    /// the gizmo): the one last pressed or used while it is on screen (the Product view as
+    /// a Plate view), else the active Plate.
+    pub fn camera_pane(&self) -> PaneId {
+        let shown = |id: PaneId| match self.panes.get(id.0 as usize).and_then(Option::as_ref) {
+            Some(p) if p.parked => false,
+            Some(p) if p.role == PaneRole::Device => true,
+            Some(_) => self.shown_plates.contains(&id),
+            None => false,
+        };
+        self.pressed_pane.filter(|id| shown(*id)).unwrap_or_else(|| self.active_plate())
     }
 
     /// The Plate that does one-per-window work, shows the one-per-window chrome (the slice bars,
@@ -1528,6 +1549,8 @@ pub struct UiState {
     pub command_palette_open: bool,
     pub keymap_help_open: bool,
     pub about_open: bool,
+    /// The plates the Trash question is open for (`FabTrashAsk`); none: it is closed.
+    pub trash_ask: Vec<String>,
     /// The page the Model sources editor shows.
     pub sources_page: SourcesPage,
     /// An editor shown alone over the workspace (Edit › 3D Model Sources…), until Back or
@@ -1732,6 +1755,7 @@ impl Default for UiState {
             command_palette_open: false,
             keymap_help_open: false,
             about_open: false,
+            trash_ask: Vec::new(),
             sources_page: SourcesPage::Settings,
             page: None,
             document_name: String::new(),
@@ -4369,6 +4393,11 @@ impl AppState {
 
     /// Design's slice view shows the toolpaths in the parts' place: the parts stay selectable
     /// and editable, and only inserts are drawn (unless "Show parts" is on).
+    /// Whether a shown pane path-traces the plate.
+    pub fn any_traced(&self) -> bool {
+        self.view.panes.iter().flatten().any(|p| !p.parked && p.mode == PaneMode::Traced)
+    }
+
     pub fn parts_under_slice(&self) -> bool {
         self.ui.in_mode(PlateMode::Design) && self.print.showing().is_some() && !self.print.play.show_model
     }
@@ -4759,6 +4788,18 @@ impl AppState {
     }
 
     /// Bounds of the current selection, if any element in it has geometry.
+    /// What Frame all frames in `pane`: the Product view's device (its case and boards, as
+    /// posed there) when it has one, else the plate ([`Self::frame_all_bounds`]).
+    pub fn frame_all_bounds_in(&self, pane: PaneId) -> Aabb {
+        if self.view.panes.get(pane.0 as usize).and_then(Option::as_ref).is_some_and(|p| p.role == PaneRole::Device) {
+            let device = crate::ui::device3d::device_bounds(self, pane);
+            if !aabb_is_empty(&device) {
+                return device;
+            }
+        }
+        self.frame_all_bounds()
+    }
+
     pub fn selection_bounds(&self) -> Option<Aabb> {
         self.scene
             .bounds_of(self.scene_state.selection.set.iter().copied())
@@ -5111,6 +5152,10 @@ impl AppState {
             }
             ShowAbout(open) => {
                 self.ui.about_open = *open;
+                true
+            }
+            AskTrashPlates(plates) => {
+                self.ui.trash_ask = plates.clone();
                 true
             }
             ShowModelSources(page) => {
@@ -5514,6 +5559,9 @@ pub enum ShellAction {
     RemovePlate(String),
     /// Move a plate's files to the trash (the person confirmed it).
     DeletePlate(String),
+    /// Ask whether to move plates' files to the Trash (a dialog at the window's centre), or
+    /// close the question (none).
+    AskTrashPlates(Vec<String>),
     /// The progress card of a job that failed was closed.
     CloseProgressCard,
     LoadStarted(PathBuf),
@@ -5631,6 +5679,9 @@ pub enum ShellAction {
     ShowPlates,
     /// The system's open dialog (File > Open…), with Fab's file filters; its answer is `OpenFile`.
     OpenDialog,
+    /// The system's save dialog (File > Save Plate As…); the plate is saved where it says and
+    /// later saves go there.
+    SaveAsDialog,
     ImportDialog,
     ImportProfilesDialog,
     ImageToPartDialog,

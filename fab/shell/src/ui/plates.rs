@@ -5,7 +5,9 @@
 //! then the demos. A click puts a plate on the bed (the one it replaces keeps every edit); a
 //! demo opens as it ships and its first edit makes the person's own plate. A plate's menu
 //! (right-click or its ⋯) duplicates it, renames it, takes it off the list with its files kept,
-//! or, after a confirm in its row, moves its files to the Trash. Under Demos, the demos without a
+//! or, after a confirm in a dialog at the window's centre (`FabTrashAsk`), moves its files to the
+//! Trash. A marquee over the cards (or Cmd/Shift-click) marks several plates: Delete, or a marked
+//! card's Move to Trash, asks to move them all. Under Demos, the demos without a
 //! group come first, then each group ("Studio") under a head of its own, in the demos' order.
 //!
 //! The list is the model worker's (`AppState::plates`): the pictures are the ones saved with
@@ -156,12 +158,14 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             selected: instance(0.0)
+            // in the marquee's selection (`FabPlatesPanel::marked`)
+            marked: instance(0.0)
             hover: instance(0.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
-                sdf.stroke(vec4(fab.color_accent.xyz, self.selected), 1.0)
+                sdf.fill_keep(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, max(self.selected, self.marked)))
+                sdf.stroke(vec4(fab.color_accent.xyz, max(self.selected, self.marked * 0.7)), 1.0)
                 return sdf.result
             }
         }
@@ -221,14 +225,55 @@ script_mod! {
         rename := mod.widgets.FabInput{ width: Fill height: 22 visible: false a11y: {label: "Rename plate"} }
         // cut short, it shows in full in its tooltip (the panel's: see `hover_tip`)
         info := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
-        confirm := View{
-            width: Fill
-            height: Fit
-            visible: false
-            flow: Down
-            spacing: 3
-            trash := mod.widgets.FabButton{ width: Fill text: "Move to Trash" }
-            keep := mod.widgets.FabButton{ width: Fill text: "Cancel" }
+    }
+
+    // Whether to move a plate's files to the Trash: a dialog at the window's centre, over
+    // everything (a layer of the shell), its plate named; Esc or a press outside keeps it.
+    mod.widgets.FabTrashAskBase = #(FabTrashAsk::register_widget(vm))
+    mod.widgets.FabTrashAsk = set_type_default() do mod.widgets.FabTrashAskBase{
+        width: Fill
+        height: Fill
+        modal := Modal{
+            a11y: {label: "Move to Trash"}
+            content +: {
+                width: 400
+                height: Fit
+                View{
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    padding: 16
+                    spacing: 10
+                    show_bg: true
+                    draw_bg +: {
+                        pixel: fn() {
+                            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
+                            sdf.fill_keep(fab.color_popover)
+                            sdf.stroke(fab.color_popover_border, 1.0)
+                            return sdf.result
+                        }
+                    }
+                    title := mod.widgets.FabTitleLabel{ width: Fill text: "" max_lines: 2 }
+                    text := mod.widgets.FabLabel{
+                        width: Fill
+                        height: Fit
+                        flow: Right{wrap: true}
+                        text: ""
+                    }
+                    View{
+                        width: Fill
+                        height: Fit
+                        flow: Right
+                        spacing: 8
+                        margin: Inset{top: 6}
+                        align: Align{x: 0.0 y: 0.5}
+                        Filler{}
+                        keep := mod.widgets.FabButton{ text: "Cancel" }
+                        trash := mod.widgets.FabButtonAccent{ text: "Move to Trash" }
+                    }
+                }
+            }
         }
     }
 
@@ -240,6 +285,16 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         draw_shade: mod.draw.FabScrollShade{}
+        // the marquee over the cards while it is dragged: a faint accent wash, its edge
+        draw_marquee +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, 2.0)
+                sdf.fill_keep(vec4(fab.color_accent.xyz, 0.12))
+                sdf.stroke(vec4(fab.color_accent.xyz, 0.8), 1.0)
+                return sdf.result
+            }
+        }
         // the toolbar: the area's editor selector, then New plate and the search
         tools := mod.widgets.FabEditorBar{
             new := mod.widgets.FabButtonAccent{ text: "New plate" a11y: {label: "New plate"} }
@@ -319,6 +374,16 @@ pub struct FabPlatesPanel {
     /// The shadow under the toolbar while the list is scrolled down.
     #[live]
     draw_shade: DrawQuad,
+    #[live]
+    draw_marquee: DrawQuad,
+    /// The plates picked together (a marquee over the cards, or Cmd/Shift-click): Delete, or a
+    /// marked card's Move to Trash, asks to move them all to the Trash.
+    #[rust]
+    marked: std::collections::HashSet<String>,
+    /// A marquee being dragged over the cards: where it started, where the pointer is, the
+    /// marks it adds to (Cmd/Shift held), and whether it has travelled yet.
+    #[rust]
+    marquee: Option<(DVec2, DVec2, std::collections::HashSet<String>, bool)>,
     /// The search, as typed.
     #[rust]
     query: String,
@@ -335,9 +400,6 @@ pub struct FabPlatesPanel {
     /// The plate whose name is being edited (its id, and whether the field still needs focus).
     #[rust]
     rename: Option<(String, bool)>,
-    /// The plate whose row asks whether to move its files to the Trash.
-    #[rust]
-    confirm: Option<String>,
     /// The plate the open menu is for.
     #[rust]
     menu_for: Option<String>,
@@ -383,15 +445,96 @@ impl FabPlatesPanel {
             return;
         }
         self.menu_for = Some(card.id.clone());
+        let trash_label = if self.marked.contains(&card.id) && self.marked.len() > 1 {
+            format!("Move {} Plates to Trash…", self.marked.len())
+        } else {
+            "Move to Trash…".to_string()
+        };
         let items = vec![
             MenuItem::new(live_id!(plate_open), "Open"),
             MenuItem::new(live_id!(plate_duplicate), "Duplicate"),
             MenuItem::new(live_id!(plate_rename), "Rename"),
             MenuItem::sep(),
             MenuItem::new(live_id!(plate_remove), "Remove from List"),
-            MenuItem::new(live_id!(plate_delete), "Move to Trash…"),
+            MenuItem::new(live_id!(plate_delete), &trash_label),
         ];
         open_menu(cx, PLATE_MENU, items, anchor, MenuPlace::At);
+    }
+
+    /// The marked plates in the list's order.
+    fn marked_in_order(&self) -> Vec<String> {
+        self.cards.iter().filter(|c| !c.demo && self.marked.contains(&c.id)).map(|c| c.id.clone()).collect()
+    }
+
+    /// The marquee's rectangle, its corners in either order.
+    fn marquee_rect(from: DVec2, to: DVec2) -> Rect {
+        let lo = dvec2(from.x.min(to.x), from.y.min(to.y));
+        Rect { pos: lo, size: dvec2((from.x - to.x).abs(), (from.y - to.y).abs()) }
+    }
+
+    /// The marquee's raw pointer events: a primary press on the list's empty space starts it,
+    /// a move marks the plates (not demos) whose cards it touches, the release ends it (one
+    /// without travel clears the marks). Whether the event was its.
+    fn marquee_event(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        match event {
+            Event::MouseDown(e) if e.button.is_primary() => {
+                let list = self.view.widget(cx, ids!(list)).area().clipped_rect(cx);
+                if !list.contains(e.abs) {
+                    return false;
+                }
+                // the keyboard comes here, for Delete
+                cx.set_key_focus(self.view.area());
+                let on_card = self.visible.iter().any(|&l| self.card(l).is_some() && self.shown.get(l).and_then(|s| s.rect(cx)).is_some_and(|r| r.contains(e.abs)));
+                if on_card {
+                    return false;
+                }
+                let keep = e.modifiers.shift || e.modifiers.is_primary();
+                let base = if keep { self.marked.clone() } else { Default::default() };
+                self.marquee = Some((e.abs, e.abs, base, false));
+                true
+            }
+            Event::MouseMove(e) if self.marquee.is_some() => {
+                let Some((from, to, base, travelled)) = &mut self.marquee else { return false };
+                *to = e.abs;
+                *travelled |= (*to - *from).length() >= crate::nav::DRAG_THRESHOLD_PT;
+                if *travelled {
+                    let rect = Self::marquee_rect(*from, *to);
+                    let mut marked = base.clone();
+                    for &l in &self.visible {
+                        let Some(card) = self.card(l) else { continue };
+                        if card.demo { continue; }
+                        if self.shown.get(l).and_then(|s| s.rect(cx)).is_some_and(|r| r.intersects(rect)) {
+                            marked.insert(card.id.clone());
+                        }
+                    }
+                    self.marked = marked;
+                    self.view.redraw(cx);
+                }
+                true
+            }
+            Event::MouseUp(_) if self.marquee.is_some() => {
+                if let Some((_, _, base, travelled)) = self.marquee.take() {
+                    if !travelled {
+                        self.marked = base;
+                    }
+                }
+                self.view.redraw(cx);
+                true
+            }
+            Event::KeyDown(ke) if !self.marked.is_empty() && cx.has_key_focus(self.view.area()) => match ke.key_code {
+                KeyCode::Delete | KeyCode::Backspace => {
+                    cx.action(ShellAction::AskTrashPlates(self.marked_in_order()));
+                    true
+                }
+                KeyCode::Escape => {
+                    self.marked.clear();
+                    self.view.redraw(cx);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn picked(&mut self, cx: &mut Cx, id: LiveId) {
@@ -401,13 +544,18 @@ impl FabPlatesPanel {
         } else if id == live_id!(plate_duplicate) {
             cx.action(ShellAction::DuplicatePlate(plate));
         } else if id == live_id!(plate_rename) {
-            self.confirm = None;
             self.rename = Some((plate, true));
         } else if id == live_id!(plate_remove) {
             cx.action(ShellAction::RemovePlate(plate));
         } else if id == live_id!(plate_delete) {
             self.rename = None;
-            self.confirm = Some(plate);
+            // a marked card's Trash takes every marked plate with it
+            let plates = if self.marked.contains(&plate) && self.marked.len() > 1 {
+                self.marked_in_order()
+            } else {
+                vec![plate]
+            };
+            cx.action(ShellAction::AskTrashPlates(plates));
         }
         self.view.redraw(cx);
     }
@@ -436,11 +584,9 @@ impl FabPlatesPanel {
             self.lines = lines(&state.plates, &self.query);
         }
         let live = |id: &str| state.plates.plates.iter().any(|p| p.id == id);
+        self.marked.retain(|id| live(id));
         if self.rename.as_ref().is_some_and(|(id, _)| !live(id)) {
             self.rename = None;
-        }
-        if self.confirm.as_ref().is_some_and(|id| !live(id)) {
-            self.confirm = None;
         }
         self.shown.resize(self.lines.len(), Shown::default());
     }
@@ -502,6 +648,9 @@ impl Widget for FabPlatesPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.marquee_event(cx, event) {
+            return;
+        }
         self.view.handle_event(cx, event, scope);
         match event {
             Event::MouseMove(e) => {
@@ -550,28 +699,21 @@ impl Widget for FabPlatesPanel {
                 }
                 continue;
             }
-            if self.confirm.as_deref() == Some(card.id.as_str()) && !card.demo {
-                if item.button(cx, ids!(confirm.trash)).clicked(actions) {
-                    self.confirm = None;
-                    cx.action(ShellAction::DeletePlate(card.id.clone()));
-                    self.view.redraw(cx);
-                    continue;
-                }
-                if item.button(cx, ids!(confirm.keep)).clicked(actions) {
-                    self.confirm = None;
-                    self.view.redraw(cx);
-                    continue;
-                }
-            }
             if item.button(cx, ids!(pic.corner.more)).clicked(actions) {
                 let r = item.widget(cx, ids!(pic.corner.more)).area().rect(cx);
                 self.open_menu_for(cx, &card, Rect { pos: r.pos + dvec2(0.0, r.size.y), size: dvec2(0.0, 0.0) });
                 continue;
             }
             if let Some(up) = item.as_view().finger_up(actions) {
-                if !up.cancelled && up.is_over && up.device.is_primary_hit() {
+                if !up.cancelled && up.is_over && up.device.is_primary_hit() && !card.demo && (up.modifiers.shift || up.modifiers.is_primary()) {
+                    // Cmd/Shift-click: the card in or out of the marked plates
+                    if !self.marked.remove(&card.id) {
+                        self.marked.insert(card.id.clone());
+                    }
+                    self.view.redraw(cx);
+                } else if !up.cancelled && up.is_over && up.device.is_primary_hit() {
+                    self.marked.clear();
                     if up.tap_count == 2 && !card.demo {
-                        self.confirm = None;
                         self.rename = Some((card.id.clone(), true));
                         self.view.redraw(cx);
                     } else {
@@ -650,15 +792,13 @@ impl Widget for FabPlatesPanel {
                             let on_bed = bed.0.as_deref() == Some(card.id.as_str()) && bed.1 == card.demo;
                             if let Some(mut view) = item.borrow_mut::<View>() {
                                 view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[if on_bed { 1.0 } else { 0.0 }]);
+                                view.draw_bg.set_dyn_instance(cx, live_id!(marked), &[if self.marked.contains(&card.id) && !card.demo { 1.0 } else { 0.0 }]);
                             }
                             item.label(cx, ids!(name)).set_text(cx, &card.title());
                             item.label(cx, ids!(info)).set_text(cx, &info(card));
                             let renaming = self.rename.as_ref().filter(|(id, _)| *id == card.id && !card.demo).map(|(_, focus)| *focus);
-                            let confirming = !card.demo && self.confirm.as_deref() == Some(card.id.as_str());
                             item.widget(cx, ids!(name)).set_visible(cx, renaming.is_none());
                             item.widget(cx, ids!(rename)).set_visible(cx, renaming.is_some());
-                            item.widget(cx, ids!(info)).set_visible(cx, !confirming);
-                            item.widget(cx, ids!(confirm)).set_visible(cx, confirming);
                             item.widget(cx, ids!(pic.corner.more)).set_visible(cx, !card.demo);
                             if renaming == Some(true) {
                                 item.text_input(cx, ids!(rename)).set_text(cx, &card.name);
@@ -684,10 +824,9 @@ impl Widget for FabPlatesPanel {
                         row.draw_all(cx, &mut Scope::empty());
                         for (k, &line) in ls.iter().enumerate() {
                             let item = row.widget(cx, slot(k));
-                            let confirming = self.card(line).is_some_and(|c| !c.demo && self.confirm.as_deref() == Some(c.id.as_str()));
                             if let Some(shown) = self.shown.get_mut(line) {
                                 shown.row = item.area();
-                                shown.line = if confirming { Area::Empty } else { item.widget(cx, ids!(info)).area() };
+                                shown.line = item.widget(cx, ids!(info)).area();
                             }
                         }
                         if let Some(k) = focus_line {
@@ -708,6 +847,15 @@ impl Widget for FabPlatesPanel {
         let list = self.view.portal_list(cx, ids!(list));
         let (first_id, first_scroll) = (list.first_id(), list.scroll_position());
         crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, list.area().rect(cx), first_id, first_scroll);
+        if let Some((from, to, _, true)) = &self.marquee {
+            let clip = list.area().clipped_rect(cx);
+            let r = Self::marquee_rect(*from, *to);
+            let lo = dvec2(r.pos.x.max(clip.pos.x), r.pos.y.max(clip.pos.y));
+            let hi = dvec2((r.pos.x + r.size.x).min(clip.pos.x + clip.size.x), (r.pos.y + r.size.y).min(clip.pos.y + clip.size.y));
+            if hi.x > lo.x && hi.y > lo.y {
+                self.draw_marquee.draw_abs(cx, Rect { pos: lo, size: hi - lo });
+            }
+        }
         DrawStep::done()
     }
 }
@@ -734,5 +882,76 @@ mod tests {
         let g = |s: &str| Line::Group(s.to_string());
         assert_eq!(lines(&list, ""), vec![Line::Head("Plates"), Line::Card(0), Line::Head("Demos"), Line::Card(1), Line::Card(4), g("Studio"), Line::Card(2), Line::Card(5), g("Showpieces"), Line::Card(3)]);
         assert_eq!(lines(&list, "puppet"), vec![Line::Head("Plates"), Line::Note("No plate matches."), Line::Head("Demos"), g("Studio"), Line::Card(5)]);
+    }
+}
+
+/// The Trash question for `UiState::trash_ask`'s plates: Move to Trash deletes them
+/// (`ShellAction::DeletePlate` each), Enter too; Cancel, Esc or a press outside closes it.
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabTrashAsk {
+    #[deref]
+    view: View,
+    /// The plates the dialog is open for.
+    #[rust]
+    shown: Vec<String>,
+}
+
+impl FabTrashAsk {
+    fn trash(&self, cx: &mut Cx) {
+        for id in &self.shown {
+            cx.action(ShellAction::DeletePlate(id.clone()));
+        }
+        cx.action(ShellAction::AskTrashPlates(Vec::new()));
+    }
+}
+
+impl Widget for FabTrashAsk {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            let modal = self.view.modal(cx, ids!(modal));
+            if self.view.button(cx, ids!(modal.trash)).clicked(actions) {
+                self.trash(cx);
+            } else if modal.dismissed(actions) || self.view.button(cx, ids!(modal.keep)).clicked(actions) {
+                cx.action(ShellAction::AskTrashPlates(Vec::new()));
+            }
+        }
+        if let Event::KeyDown(ke) = event {
+            if !self.shown.is_empty() && ke.key_code == KeyCode::ReturnKey {
+                self.trash(cx);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if let Some(state) = scope.data.get::<AppState>() {
+            // (a plate gone from the list meanwhile is not asked about)
+            let ask: Vec<String> = state.ui.trash_ask.iter().filter(|id| state.plates.plates.iter().any(|p| p.id == **id)).cloned().collect();
+            if ask != self.shown {
+                let modal = self.view.modal(cx, ids!(modal));
+                if ask.is_empty() {
+                    modal.close(cx);
+                } else {
+                    let title = match ask.as_slice() {
+                        [one] => {
+                            let name = state.plates.plates.iter().find(|p| p.id == *one).map(|p| p.name.clone()).unwrap_or_default();
+                            format!("Move \u{201c}{name}\u{201d} to the Trash?")
+                        }
+                        many => format!("Move {} plates to the Trash?", many.len()),
+                    };
+                    self.view.label(cx, ids!(modal.title)).set_text(cx, &title);
+                    self.view.label(cx, ids!(modal.text)).set_text(cx, if ask.len() == 1 {
+                        "Its files go to the Trash and it leaves the list. You can put them back from the Trash."
+                    } else {
+                        "Their files go to the Trash and they leave the list. You can put them back from the Trash."
+                    });
+                    if self.shown.is_empty() {
+                        modal.open(cx);
+                    }
+                }
+                self.shown = ask;
+            }
+        }
+        self.view.draw_walk(cx, scope, walk)
     }
 }

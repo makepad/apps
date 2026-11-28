@@ -1,4 +1,4 @@
-//! The F3 command palette: fuzzy search over the commands the app can
+//! The command palette (Cmd/Ctrl+Shift+P): fuzzy search over the commands the app can
 //! actually run, Enter (or a click) fires the highlighted one.
 //!
 //! **The list is the inventory, not a wish list.** Every row here maps to a
@@ -42,6 +42,7 @@ pub const COMMANDS: &[(&str, &str, Option<Key>)] = &[
     ("import", "Import…", Some(Key::Import)),
     ("browse plates", "Browse Plates…", Some(Key::Plates)),
     ("save plate", "Save Plate", Some(Key::Save)),
+    ("save as", "Save Plate As…", Some(Key::SaveAs)),
     ("export 3mf", "Export 3MF", Some(Key::Export3mf)),
     ("export stl", "Export STL", Some(Key::ExportStl)),
     ("slice", "Slice the Plate", Some(Key::Slice)),

@@ -194,10 +194,10 @@ fn head_of(reply: &str) -> String {
 /// block, its top filleted.
 const EXACT: &str = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\nlet block = m.brep.extrude({sketch: Rect{size: [120mm 120mm] corner: 10mm} height: 20mm})\nlet housing = m.brep.fillet(block, 3mm, {edges: {top: true}})\nobject(housing)\n";
 
-/// The example opened from the command palette (F3), once its script is in the project.
+/// The example opened from the command palette (Cmd/Ctrl+Shift+P), once its script is in the project.
 fn open_example(app: &TestApp, query: &str, file: &str) {
     app.press_key(KeyCode::Escape);
-    app.press_key(KeyCode::F3);
+    app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
     app.type_text(query);
     app.press_key(KeyCode::ReturnKey);
     wait(app, file, || sources(app).contains(file).then_some(()));

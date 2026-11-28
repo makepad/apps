@@ -51,8 +51,9 @@ struct MeshPart {
 impl MeshPart {
     fn of_under(state: &AppState, poses: PanePoses, part: &PlatePart) -> Option<Self> {
         let element = part.element?;
+        // (a shot shows the parts whatever the plate view shows: its slice hiding them leaves
+        // them in the shot)
         if !state.is_visible(element) || state.is_ghost_under(poses, element) || state.drawn_by_link.contains(&element)
-            || (state.parts_under_slice() && !part.insert)
             || state.embed_waits(element)
             || state.plate.part_of(element).is_some_and(|i| state.part_unposed(i))
         {

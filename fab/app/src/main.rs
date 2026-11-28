@@ -190,6 +190,8 @@ script_mod! {
                             ai_chat := AiChatPanel{width: Fill height: Fill web_research: true}
                         }
                     }
+                    // what comes and goes: notices, hints, the slice, the jobs, the plate's counts
+                    status_bar := mod.widgets.FabStatusBar{}
                     // Offscreen review passes for fab.render (1x1, invisible).
                     review := mod.widgets.FabReviewRenderer{}
                     // The headset's view, in a process that serves one (1x1, invisible).
@@ -858,6 +860,10 @@ impl App {
             self.open_dialog(cx);
             return true;
         }
+        if let ShellAction::SaveAsDialog = action {
+            self.save_as_dialog(cx);
+            return true;
+        }
         if let ShellAction::ImportDialog = action {
             self.import_dialog(cx);
             return true;
@@ -1337,7 +1343,7 @@ impl App {
         self.models_from = None;
     }
 
-    /// The F3 palette / menus speak in command names.
+    /// The command palette / menus speak in command names.
     fn run_command(&mut self, cx: &mut Cx, name: &str) {
         enum CommandResult {
             Handled,
@@ -1377,6 +1383,7 @@ impl App {
             "measure fit" => Action(ShellAction::SetTool(Tool::MeasureFit)),
             "measure faces" => Action(ShellAction::SetTool(Tool::Measure(MeasureKind::FaceDistance))),
             "open" => Action(ShellAction::OpenDialog),
+            "save as" | "save plate as" => Action(ShellAction::SaveAsDialog),
             "import" => Action(ShellAction::ImportDialog),
             "plates" | "browse plates" => Action(ShellAction::ShowPlates),
             "reload plate" => {
@@ -1414,7 +1421,7 @@ impl App {
                 Handled
             }
             "new plate" | "new" => {
-                self.new_plate();
+                self.new_plate(cx);
                 Handled
             }
             "chat" | "toggle chat" | "ai" => {
@@ -1522,7 +1529,8 @@ impl App {
         if !ke.is_repeat {
             let action = match ke.key_code {
                 KeyCode::F1 => Some(ShellAction::ShowKeymapHelp(!self.state.ui.keymap_help_open)),
-                KeyCode::F3 => Some(ShellAction::ToggleCommandPalette),
+                KeyCode::KeyP if m.is_primary() && m.shift => Some(ShellAction::ToggleCommandPalette),
+                KeyCode::KeyS if m.is_primary() && m.shift => Some(ShellAction::SaveAsDialog),
                 KeyCode::KeyS if m.is_primary() => {
                     self.model_command("save", &[], false);
                     return true;
@@ -1550,7 +1558,7 @@ impl App {
                     return true;
                 }
                 KeyCode::KeyN if m.is_primary() => {
-                    self.new_plate();
+                    self.new_plate(cx);
                     return true;
                 }
                 KeyCode::KeyO if m.is_primary() && m.shift => Some(ShellAction::OpenDemo("demo".into())),
@@ -1571,6 +1579,7 @@ impl App {
         // these are bare letters and would swallow typing.
         let modal_open = self.state.ui.keymap_help_open
             || self.state.ui.about_open
+            || !self.state.ui.trash_ask.is_empty()
             || self.state.ui.command_palette_open;
         if !modal_open && !cx.key_focus_takes_text()
             && !ke.is_repeat && ke.key_code == KeyCode::KeyD && m.is_primary() && !m.alt
@@ -1578,6 +1587,14 @@ impl App {
             && self.parts_have_focus(cx)
         {
             fab::ui::parts::duplicate_selected(cx, &self.state, m.shift);
+            return true;
+        }
+        // Q over a 3D view opens its pie even while a text field (the code, a search) keeps the
+        // keyboard: the view under the pointer is what the person is at
+        if !modal_open && !ke.is_repeat && ke.key_code == KeyCode::KeyQ
+            && !m.control && !m.alt && !m.shift && !m.logo && self.state.view.pointer_pane.is_some()
+        {
+            cx.action(fab::ui::stage::StageAction::ViewPie);
             return true;
         }
         if modal_open || cx.key_focus_takes_text() {
@@ -1912,6 +1929,28 @@ impl App {
             _ => dialog,
         };
         cx.open_select_file_dialog(dialog);
+    }
+
+    /// File > Save Plate As…: the system's save dialog, in the plate's folder (else Documents),
+    /// named as the plate. Its answer (`fab_save_as`, see `handle_actions`) saves the plate
+    /// there; the save tool makes the name end in `.fab.splash`.
+    fn save_as_dialog(&mut self, cx: &mut Cx) {
+        let name = match self.status.name.trim() {
+            "" => "Untitled".to_string(),
+            n => n.to_string(),
+        };
+        let stem = name.split('.').next().unwrap_or(&name).to_string();
+        let dialog = FileDialog::new().set_title("Save plate as".into()).set_id(live_id!(fab_save_as))
+            .set_filename(format!("{stem}.fab.splash"))
+            .add_filter("Fab plates".into(), vec!["splash".into()]);
+        let folder = self.status.path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| d.is_dir())
+            .or_else(|| Some(model_host::documents_dir()).filter(|d| d.is_dir()));
+        let dialog = match folder {
+            Some(dir) => dialog.set_location(dir),
+            None => dialog,
+        };
+        cx.open_save_file_dialog(dialog);
     }
 
     fn import_dialog(&mut self, cx: &mut Cx) {
@@ -3505,7 +3544,7 @@ impl App {
     fn poll_quit(&mut self, cx: &mut Cx) {
         let now = std::time::Instant::now();
         if let Some(line) = self.journal_quit.saving_line(now) {
-            let bar = self.ui.widget(cx, ids!(caption));
+            let bar = self.ui.widget(cx, ids!(status_bar));
             fab::ui::topbar::quit_status(cx, &bar, Some(&line));
         }
         if self.journal_quit.ready(cx, now) { cx.quit(); }
@@ -4858,10 +4897,22 @@ impl App {
 
     /// File > New Plate: the plate on the bed is saved (it stays in Open Recent), an empty one
     /// takes its place.
-    fn new_plate(&mut self) {
+    /// A new plate, in a fresh workspace: a temporary layout goes back, and the shown
+    /// workspace returns to its own layout and mode (one step its menu's "Undo layout change"
+    /// takes back).
+    fn new_plate(&mut self, cx: &mut Cx) {
         self.bed_asked();
         self.send_typing();
         self.model_command("new", &[], false);
+        // a fresh layout has no Program beside the plate (its toggle off, its width kept)
+        let (_, width) = fab::view_prefs::load_code();
+        fab::view_prefs::save_code(false, width);
+        let list = &self.state.ui.workspaces;
+        let shown = list.after_dismiss();
+        if list.temp_shown() {
+            cx.action(ShellAction::EditWorkspaces(fab::workspaces::ListOp::Dismiss));
+        }
+        cx.action(ShellAction::EditWorkspaces(fab::workspaces::ListOp::Reset(shown)));
     }
 
     /// A demo plate, by key ([`demo_part::DEMOS`]).
@@ -5493,6 +5544,11 @@ impl MatchEvent for App {
                 follow |= shows_workspace(a);
             }
             follow |= action.downcast_ref::<fab::print::PrintAction>().is_some() || action.downcast_ref::<print::PrintEvent>().is_some();
+            if let Some(FileDialogAction::SaveFileSelected { id, path }) = action.downcast_ref::<FileDialogAction>() {
+                if *id == live_id!(fab_save_as) {
+                    self.model_command("save", &[("path", json::s(path.to_string_lossy()))], false);
+                }
+            }
             if let Some(FileDialogAction::FileSelected { id, paths }) = action.downcast_ref::<FileDialogAction>() {
                 if *id == live_id!(fab_import) {
                     for path in paths { cx.action(ShellAction::ImportFile(path.clone())); }
@@ -5820,7 +5876,7 @@ impl MatchEvent for App {
                                 self.journal_quit.answered();
                                 None
                             };
-                            let bar = self.ui.widget(cx, ids!(caption));
+                            let bar = self.ui.widget(cx, ids!(status_bar));
                             fab::ui::topbar::quit_status(cx, &bar, status);
                             self.poll_quit(cx);
                         }
@@ -6071,8 +6127,10 @@ impl MatchEvent for App {
             self.follow_printer(cx);
         }
         self.slice_view_follow(cx);
-        // Field parts have meshes only while the view shows meshes.
-        let meshes = self.state.view.look == fab::api::PartLook::Mesh;
+        // Field parts have meshes only while the view shows meshes, or a pane path-traces the
+        // plate: the tracer takes triangles alone, so without them a field part (a vase, a
+        // lattice) is missing from the shot.
+        let meshes = self.state.view.look == fab::api::PartLook::Mesh || self.state.any_traced();
         if meshes != self.meshing_fields {
             if let Some(host) = &mut self.host {
                 self.meshing_fields = meshes;
@@ -6427,6 +6485,8 @@ impl AppMain for App {
                 Some(ids!(command_palette))
             } else if self.state.ui.about_open {
                 Some(ids!(about))
+            } else if !self.state.ui.trash_ask.is_empty() {
+                Some(ids!(trash_ask))
             } else if self.state.ui.keymap_help_open {
                 Some(ids!(keymap_help))
             } else {
@@ -6739,6 +6799,8 @@ impl AppMain for App {
         if !matches!(event, Event::Draw(_)) {
             // the second-window icon (a worker raises the signal when the flag flips)
             self.state.ui.also_open = self.status.journal.as_ref().is_some_and(|p| p.elsewhere());
+            let status_bar = self.ui.widget(cx, ids!(status_bar));
+            fab::ui::statusbar::sync(cx, &status_bar, &self.state);
             let caption = Caption::of(&self.state);
             let requirements = cx.get_global_ref::<fab_elec_view::ElecLive>().and_then(|live| live.requirements.as_ref());
             let report_changed = self.caption.is_none()

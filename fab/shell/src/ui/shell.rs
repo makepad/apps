@@ -647,6 +647,7 @@ script_mod! {
         camera_float := mod.widgets.FabCameraFloat{}
         keymap_help := FabKeymapHelp{}
         about := FabAbout{}
+        trash_ask := FabTrashAsk{}
         command_palette := FabCommandPalette{}
         // Menus sit under the tooltip layer and over everything else:
         // children handle events in reverse order, so only a top-of-shell

@@ -436,6 +436,12 @@ impl FabAreaNotches {
             return;
         }
         self.notice_revision = Some(notices.revision);
+        // (the notices are the status bar's now: `statusbar`; an area keeps none of its own)
+        if !self.notice_items.is_empty() {
+            self.notice_items.clear();
+            cx.redraw_all();
+        }
+        if !SHOW_AREA_NOTICES { return; }
         let Some(template) = self.templates.get(&live_id!(Notice)) else { return };
         for area in &self.areas {
             let notice = notice_view(area.kind).filter(|view| *view != NoticeView::Plate).and_then(|view| notices.get(view));
@@ -836,3 +842,6 @@ impl Widget for FabAreaNotches {
         DrawStep::done()
     }
 }
+
+/// The editors' notices once showed as chips at their areas' feet; the status bar says them now.
+const SHOW_AREA_NOTICES: bool = false;

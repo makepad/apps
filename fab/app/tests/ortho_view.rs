@@ -25,7 +25,7 @@
 //! Each step's picture is kept (`DEVHUB_KEEP`). HAL offscreen, native GPU, no window.
 
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, KeyCode, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyModifiers, Selector, TestApp, TestConfig};
 use makepad_widgets::{vec3, vec4, Vec3f};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
@@ -238,7 +238,7 @@ fn finished_grab(app: &TestApp, name: &str) -> Grab {
 fn command(app: &TestApp, text: &str) {
     let before = camera_json(app);
     app.press_key(KeyCode::Escape);
-    app.press_key(KeyCode::F3);
+    app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
     app.type_text(text);
     app.press_key(KeyCode::ReturnKey);
     wait_until(app, &format!("{text}: the camera"), || camera_json(app) != before);

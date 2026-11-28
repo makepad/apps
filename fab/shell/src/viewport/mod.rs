@@ -4172,12 +4172,17 @@ impl Widget for FabViewport {
         }
         if matches!(event, Event::WindowLostFocus(_) | Event::Pause | Event::Background) {
             self.release_press(cx);
+            // a key held to orbit never comes up here
+            self.navigator.release_keys();
         }
 
         if let Event::Actions(actions) = event {
             for action in shell_actions(actions) {
                 let camera_command = camera_command(action);
-                if camera_command && self.pane == state.view.active_plate() { state.scene_gpu.borrow_mut().navigation_pane = Some(self.pane); }
+                // the person's own camera commands act on the view they last used; the document's
+                // (a plate opening, its view put back, a workspace switch) on the active Plate
+                let target = if person_camera_command(action) { state.view.camera_pane() } else { state.view.active_plate() };
+                if camera_command && self.pane == target { state.scene_gpu.borrow_mut().navigation_pane = Some(self.pane); }
                 if camera_jump(action) {
                     self.ssao_reset = true;
                 }
@@ -4190,8 +4195,8 @@ impl Widget for FabViewport {
                 if restored && state.view.plate_number(self.pane).is_some() && state.view.camera_root(self.pane) == self.pane {
                     self.navigator.check_camera();
                 }
-                if self.pane != state.view.active_plate() && camera_command {
-                    // Menu and document camera commands act on the active Plate once.
+                if self.pane != target && camera_command {
+                    // Menu and document camera commands act on one view once: the camera pane.
                     // This pane's own pointer/key navigation goes through deliver.
                     self.navigator.stop_motion();
                     self.area.redraw(cx);
@@ -4199,7 +4204,7 @@ impl Widget for FabViewport {
                 }
                 match action {
                     ShellAction::FrameAll => {
-                        let b = state.frame_all_bounds();
+                        let b = state.frame_all_bounds_in(self.pane);
                         self.navigator.frame(cx, state, b, true);
                         self.area.redraw(cx);
                     }
@@ -4451,6 +4456,8 @@ impl Widget for FabViewport {
                 let rect = self.area.rect(cx);
                 let pos = self.pane_point(fe.abs, rect);
                 cx.set_key_focus(self.area);
+                // the view pressed is the one the camera commands act on
+                state.view.pressed_pane = Some(self.pane);
                 if self.role == PaneRole::Plate {
                     state.ui.set_plate_key(self.pane, self.area);
                     // the Plate pressed is the one the commands without a pointer act on
@@ -4677,6 +4684,7 @@ impl Widget for FabViewport {
                 }
             }
             Hit::FingerHoverIn(fh) | Hit::FingerHoverOver(fh) => {
+                state.view.pointer_pane = Some(self.pane);
                 let rect = self.area.rect(cx);
                 let pos = self.pane_point(fh.abs, rect);
                 let delta = self.last_pointer.map(|p| pos - p).unwrap_or_default();
@@ -4740,6 +4748,9 @@ impl Widget for FabViewport {
                 }
             }
             Hit::FingerHoverOut(fh) => {
+                if state.view.pointer_pane == Some(self.pane) {
+                    state.view.pointer_pane = None;
+                }
                 self.last_pointer = None;
                 self.hover_seen = None;
                 self.show_control_tip(cx, None, fh.abs);
@@ -4787,6 +4798,8 @@ impl Widget for FabViewport {
                     None,
                 );
             }
+            // the key focus gone, a held orbit key's release goes elsewhere
+            Hit::KeyFocusLost(_) => self.navigator.release_keys(),
             Hit::KeyUp(ke) => {
                 self.deliver(
                     cx,
@@ -5864,6 +5877,15 @@ fn camera_command(action: &ShellAction) -> bool {
         | ShellAction::SetWorkspace(_) | ShellAction::OrbitAroundSelection | ShellAction::FrameSelected
         | ShellAction::FrameBox(_) | ShellAction::FrameFrom { .. } | ShellAction::PresetView(_)
         | ShellAction::ToggleOrtho | ShellAction::OrbitBy(_, _)
+    )
+}
+
+/// The camera commands a person gives (the View menu, the view pie, the gizmo, the palette):
+/// they act on the view last used ([`ViewportState::camera_pane`]), the Product view too.
+fn person_camera_command(action: &ShellAction) -> bool {
+    matches!(action,
+        ShellAction::FrameAll | ShellAction::OrbitAroundSelection | ShellAction::FrameSelected
+        | ShellAction::PresetView(_) | ShellAction::ToggleOrtho | ShellAction::OrbitBy(_, _)
     )
 }
 

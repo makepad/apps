@@ -154,11 +154,12 @@ keymap! {
     Redo => ("Cmd/Ctrl+Shift+Z", "Redo", "App", Global),
     New => ("Cmd/Ctrl+N", "New plate", "App", Global),
     Save => ("Cmd/Ctrl+S", "Save the plate", "App", Global),
+    SaveAs => ("Cmd/Ctrl+Shift+S", "Save the plate as a new file", "App", Global),
     Export3mf => ("Cmd/Ctrl+E", "Export 3MF", "App", Global),
     ExportStl => ("Cmd/Ctrl+Shift+E", "Export STL", "App", Global),
     Slice => ("Cmd/Ctrl+R", "Slice the plate", "App", Global),
     Chat => ("Cmd/Ctrl+K", "Ask the AI", "App", Global),
-    Palette => ("F3", "Command palette", "App", Global),
+    Palette => ("Cmd/Ctrl+Shift+P", "Command palette", "App", Global),
     Open => ("Cmd/Ctrl+O", "Open", "App", Global),
     Import => ("Cmd/Ctrl+I", "Import meshes", "App", Global),
     Plates => ("Cmd/Ctrl+Shift+M", "Browse plates", "App", Global),
@@ -432,32 +433,26 @@ script_mod! {
                             return sdf.result
                         }
                     }
+                    // the heading, how to rebind, the filter (opening leftward from its
+                    // magnifier) and the close button, on one row
                     title_row := View{
                         width: Fill
-                        height: Fit
+                        height: 28
                         flow: Right
                         align: Align{x: 0.0 y: 0.5}
                         spacing: 8
                         mod.widgets.FabTitleLabel{ text: "Keymap" }
-                        Filler{}
-                        mod.widgets.FabLabelMuted{ text: #(format!("{} closes · click a key to change it", shortcut(ShortcutId::Help))) }
-                    }
-                    // the toolbar: the filter, as every editor's
-                    bar := View{
-                        width: Fill height: 36 flow: Right align: Align{y: 0.5}
+                        mod.widgets.FabLabelMuted{ text: "Click a key to change it" }
                         search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+                        close := mod.widgets.FabIconButton{
+                            width: 24 height: 22
+                            a11y: {label: "Close keymap"}
+                            draw_icon +: {color: fab.color_text_dim svg: crate_resource("self://resources/icons/close.svg")}
+                        }
                     }
                     body := mod.widgets.FabScroll{
                         height: 520
                         sections := mod.widgets.FabKeymapSections{}
-                    }
-                    View{
-                        width: Fill
-                        height: Fit
-                        flow: Right
-                        align: Align{x: 0.0 y: 0.5}
-                        Filler{}
-                        close := mod.widgets.FabButton{ text: "Close" }
                     }
                 }
             }
@@ -478,10 +473,10 @@ impl Widget for FabKeymapHelp {
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
             let modal = self.view.modal(cx, ids!(modal));
-            if modal.dismissed(actions) || self.view.button(cx, ids!(modal.close)).clicked(actions) {
+            if modal.dismissed(actions) || self.view.button(cx, ids!(modal.title_row.close)).clicked(actions) {
                 cx.action(ShellAction::ShowKeymapHelp(false));
             }
-            if self.view.text_input(cx, ids!(modal.bar.search.row.input)).changed(actions).is_some() {
+            if self.view.text_input(cx, ids!(modal.title_row.search.row.input)).changed(actions).is_some() {
                 self.view.redraw(cx);
             }
         }
@@ -495,7 +490,7 @@ impl Widget for FabKeymapHelp {
                 if self.shown { modal.open(cx); } else { modal.close(cx); }
             }
         }
-        let query = self.view.text_input(cx, ids!(modal.bar.search.row.input)).text();
+        let query = self.view.text_input(cx, ids!(modal.title_row.search.row.input)).text();
         if let Some(mut sections) = self.view.widget(cx, ids!(modal.body.sections)).borrow_mut::<FabKeymapSections>() {
             sections.query = query;
         }

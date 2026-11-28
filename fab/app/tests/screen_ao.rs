@@ -35,7 +35,7 @@
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, KeyCode, Selector, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, KeyModifiers, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
 use makepad_zune_png::PngDecoder;
 use std::time::Duration;
@@ -338,7 +338,7 @@ fn an_inside_corner_reads_darker_than_the_open_face_in_both_views() {
         for command in ["View: Top", "Toggle Orthographic"] {
             let camera = recording(&app).get("camera").map(Value::to_json);
             app.press_key(KeyCode::Escape);
-            app.press_key(KeyCode::F3);
+            app.press_key_with_modifiers(KeyCode::KeyP, if cfg!(target_os = "macos") { KeyModifiers { shift: true, logo: true, ..Default::default() } } else { KeyModifiers { shift: true, control: true, ..Default::default() } });
             app.type_text(command);
             app.press_key(KeyCode::ReturnKey);
             wait_until(&app, &format!("{command}: the camera"), || recording(&app).get("camera").map(Value::to_json) != camera);

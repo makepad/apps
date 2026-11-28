@@ -250,9 +250,13 @@ impl WidgetNode for FabNavGizmo {
 }
 
 impl Widget for FabNavGizmo {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         match event.hits(cx, self.area) {
             Hit::FingerDown(fe) => {
+                // what it does acts on its own view
+                if let Some(state) = scope.data.get_mut::<AppState>() {
+                    state.view.pressed_pane = Some(self.pane);
+                }
                 self.drag_start = Some(fe.abs);
                 self.last_pos = Some(fe.abs);
                 self.dragged = false;

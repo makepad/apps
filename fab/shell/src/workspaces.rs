@@ -115,13 +115,13 @@ impl Origin {
         let plate = || T::area(Editor::Viewport);
         let tree = match self {
             Origin::Design => {
-                // left: the plates and the parts (in front), each part's features in its tree; the
+                // left: the plates (the parts list and the program are a person's to add); the
                 // picked part in the plate view's sidebar; right: the slicer and the printers over
-                // the overrides and strength; the program beside the plate
+                // the overrides and strength; the program beside the plate while its toggle is on
                 let (code, width) = code;
                 let plate = T::split(Vertical, FromB(STEPS_H), plate(), T::area(Editor::Steps));
                 let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate, T::area(Editor::Code)) } else { plate };
-                let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
+                let left = T::area(Editor::Plates);
                 let top = T::stack(&[Editor::Slicer, Editor::Printer], 0);
                 let below = T::stack(&[Editor::Overrides, Editor::Strength], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);
@@ -454,6 +454,15 @@ impl Workspaces {
             return Some(&mut self.list[at]);
         }
         self.temp.as_mut().map(|t| &mut t.def).filter(|d| d.id == id)
+    }
+
+    /// The workspace shown once the temporary layout goes (what it came over, else the
+    /// first); the shown one while none is open.
+    pub fn after_dismiss(&self) -> WorkspaceId {
+        match &self.temp {
+            Some(t) if t.def.id == self.current => if self.position(t.return_to).is_some() { t.return_to } else { self.list[0].id },
+            _ => self.current,
+        }
     }
 
     /// The temporary layout is the one shown.

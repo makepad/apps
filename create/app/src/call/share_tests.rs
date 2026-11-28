@@ -2285,8 +2285,32 @@ fn a_watcher_who_decodes_less_downgrades_the_share_and_its_leaving_upgrades_it()
     m.rig.as_ref().unwrap().present(3);
     m.until("Ben's next picture after the downgrade", |m| m.pts(1) > before);
 
+    // Bo's seat keeps its last known caps: a repeated View, a resized capless View and a
+    // closed View that reopens at once all leave the stream at H.264.
+    let upgrades = || log_ring::read_since(cursor, log_ring::CAP).lines.iter()
+        .filter(|line| line.text.ends_with(": H.265 · 4:2:0")).count();
     let close = Message::View { session: s, width: 0, height: 0, fps: 0, ext: Default::default() };
+    let resized = |width, height| Message::View { session: s, width, height, fps: 30, ext: Default::default() };
+    for (step, messages, width) in [
+        ("a repeated capless View", vec![old_view.encode(), resized(400, 225).encode()], 400),
+        ("a closed View reopened at once", vec![close.encode(), resized(640, 360).encode()], 640),
+    ] {
+        for bytes in messages { port.messages_in.try_send(bytes).unwrap(); }
+        m.until(step, |m| m.ctl[0].sharing.locals[&s].viewers.get(&legacy).is_some_and(|v| v.view.width == width));
+        // The log ring is ordered: once this mark shows, any format line before it shows too.
+        let mark = format!("test mark after {step}");
+        log!("{mark}");
+        m.until("the mark", |_| log_ring::read_since(cursor, log_ring::CAP).lines.iter().any(|line| line.text.ends_with(&mark)));
+        assert_eq!(upgrades(), 0, "{step} never lifts the stream to H.265");
+        assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "{step} reopens nothing");
+    }
     port.messages_in.try_send(close.encode()).unwrap();
+    m.until("Bo's closed View", |m| !m.ctl[0].sharing.locals[&s].viewers.contains_key(&legacy));
+    assert!(m.line(s).ends_with("H.264 · 4:2:0: Bo can't decode H.265 · 4:2:0."),
+        "a closed seat still holds the stream while Bo receives the share: {}", m.line(s));
+    assert_eq!(upgrades(), 0, "a closed seat never lifts the stream to H.265");
+
+    m.ctl[0].link_down(&mut m.hosts[0], legacy);
     m.until("HEVC to resume when Bo leaves", |m| m.line(s).ends_with("H.265 · 4:2:0."));
     assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264, F::HEVC], "Bo leaving causes one HEVC reopen");
     m.watch(2, s);

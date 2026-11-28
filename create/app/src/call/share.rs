@@ -204,6 +204,10 @@ struct LocalShare {
     town: TownId,
     recipients: BTreeSet<PublicKey>,
     viewers: BTreeMap<PublicKey, Viewer>,
+    /// The last known decode caps of each recipient that opened a View. The stream's format
+    /// follows these seats, not the open Views, so a View that repeats, carries no caps, or
+    /// closes and reopens never lifts it; a seat goes when its peer stops receiving the share.
+    seats: BTreeMap<PublicKey, MediaCaps>,
     format: StreamFormat,
     holders: Vec<PublicKey>,
     lost: Vec<StreamFormat>,
@@ -240,7 +244,7 @@ impl LocalShare {
 
     fn lost_limit(&self, encoder: EncoderFormats) -> Option<StreamFormat> {
         StreamFormat::ORDER.into_iter().take_while(|&f| f != self.format)
-            .find(|&f| self.lost.contains(&f) && encoder.makes(f) && self.viewers.values().all(|v| share_codec::decodes(v.caps, f)))
+            .find(|&f| self.lost.contains(&f) && encoder.makes(f) && self.seats.values().all(|&caps| share_codec::decodes(caps, f)))
     }
 }
 
@@ -643,7 +647,7 @@ impl CallController {
         let role = ShareRole::Sharer { link, window: window.id };
         self.sharing.locals.insert(session, LocalShare {
             rights: Arc::default(), rights_revision: 0,
-            source: OfferSource::new(caps, source), town, recipients: recipients.clone(), viewers: BTreeMap::new(),
+            source: OfferSource::new(caps, source), town, recipients: recipients.clone(), viewers: BTreeMap::new(), seats: BTreeMap::new(),
             format, holders: Vec::new(), lost: Vec::new(), picture: None, sound: None, app_name: String::new(), dpi: window.dpi,
             probe: None, stopped_problem: None,
             preview: None, preview_size: None, last_preview: None, subscribed_at: None, line_peer: String::new(), line_state: None,
@@ -894,7 +898,7 @@ impl CallController {
         let encoder = self.sharing.encoder;
         let Some(local) = self.sharing.locals.get_mut(&session) else { return };
         let Some(picture) = &local.picture else { return }; // Other sources supply H.264.
-        let (format, holders) = share_format(encoder, &local.lost, local.viewers.iter().map(|(&p, v)| (p, v.caps)));
+        let (format, holders) = share_format(encoder, &local.lost, local.seats.iter().map(|(&p, &caps)| (p, caps)));
         if holders != local.holders {
             local.holders = holders;
             local.line_state = None;
@@ -930,7 +934,8 @@ impl CallController {
 
     fn remove_viewer(&mut self, session: SessionId, peer: PublicKey, why: crate::call::control::EndReason) {
         let local = self.sharing.locals.get_mut(&session).unwrap();
-        let removed = local.viewers.remove(&peer).is_some();
+        local.viewers.remove(&peer);
+        let seat_left = !local.recipients.contains(&peer) && local.seats.remove(&peer).is_some();
         if local.viewers.is_empty() { local.subscribed_at = None; }
         self.sharing.shown.control.requests.retain(|(s, p, _)| (*s, *p) != (session, peer));
         self.takeover.new_watchers.retain(|entry| *entry != (session, peer));
@@ -939,7 +944,7 @@ impl CallController {
             use crate::call::control::EndReason;
             self.end_control(why, !matches!(why, EndReason::Disconnected | EndReason::ShareEnded));
         }
-        if removed { self.settle_format(session); }
+        if seat_left { self.settle_format(session); }
         self.refresh_watchers(session);
     }
 
@@ -1046,7 +1051,10 @@ impl CallController {
                         self.remove_viewer(old, sender, crate::call::control::EndReason::Released);
                     }
                     let local = self.sharing.locals.get_mut(&session).unwrap();
-                    let viewer = Viewer { view, caps: ext.media_caps.unwrap_or(MediaCaps::NONE), audio: ext.audio.unwrap_or(false) };
+                    // A View without caps is an older watcher's: H.264 4:2:0 only, or the seat's last known caps.
+                    let caps = ext.media_caps.or_else(|| local.seats.get(&sender).copied()).unwrap_or(MediaCaps::NONE);
+                    local.seats.insert(sender, caps);
+                    let viewer = Viewer { view, caps, audio: ext.audio.unwrap_or(false) };
                     let previous = local.viewers.insert(sender, viewer);
                     if previous == Some(viewer) { return false }
                     local.subscribed_at.get_or_insert_with(Instant::now);

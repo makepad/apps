@@ -382,6 +382,7 @@ pub(super) fn run((env, own, id, key, gate): Args, rx: Receiver<Command>, tx: Sy
             live: false,
             commands: VecDeque::new(),
             captures: HashMap::new(),
+            sound: None,
             input: VecDeque::new(),
             held: HeldInputs::default(),
             allow: None,
@@ -430,6 +431,7 @@ struct Worker<'a> {
     live: bool,
     commands: VecDeque<Command>,
     captures: HashMap<WindowId, capture::Capture>,
+    sound: Option<sound::SoundCapture>,
     input: VecDeque<(Receipt, String)>,
     held: HeldInputs,
     allow: Option<(u64, Instant, Option<u64>)>,
@@ -466,6 +468,7 @@ impl Worker<'_> {
             self.closing |= self.gate.closing.load(Ordering::Acquire);
             if self.closing {
                 self.captures.clear();
+                self.sound = None;
                 self.commands.clear();
                 self.input.clear();
                 // Finish any in-flight input on its original pipe: its reply determines
@@ -502,6 +505,15 @@ impl Worker<'_> {
                     }
                     !cap.slots.is_empty()
                 });
+                if let Some(sound) = &mut self.sound {
+                    if let Err(why) = sound.step() {
+                        makepad_widgets::log!("App sound: {why}");
+                        for slot in &sound.slots { slot.close_with(&why); }
+                        self.sound = None;
+                    } else if sound.slots.is_empty() {
+                        self.sound = None;
+                    }
+                }
             }
             out.flush();
             if std::mem::take(&mut out.published) || dirty {
@@ -511,6 +523,7 @@ impl Worker<'_> {
                 || self.activity.pending.is_some()
                 || self.stills.as_ref().is_some_and(|q| !q.pending.is_empty())
                 || !self.captures.is_empty()
+                || self.sound.is_some()
                 || !out.pending.is_empty()
                 || !self.commands.is_empty()
                 || !self.input.is_empty()
@@ -670,6 +683,9 @@ impl Worker<'_> {
                         e.insert(capture::Capture::new(self.conn.clone()));
                     }
                     self.captures.get_mut(&w.id).unwrap().add(slot);
+                }
+                Command::Sound(slot) => {
+                    self.sound.get_or_insert_with(|| sound::SoundCapture::new(self.conn.clone())).add(slot);
                 }
                 Command::Design(ticket, window, op) => match op.line(window) {
                     Ok(line) => return self.cmd.send(Pending::Design(ticket), line),

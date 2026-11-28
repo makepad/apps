@@ -7,8 +7,10 @@ pub const MULTIPARTY_CALL_LEVEL: u16 = 4;
 pub const DESIGN_LEVEL: u16 = MULTIPARTY_CALL_LEVEL + 1;
 /// Multi-viewer town-tagged shares and single-holder takeover.
 pub const MULTIPARTY_SHARE_LEVEL: u16 = DESIGN_LEVEL + 1;
+/// The tweak edit right is the call's control right. AskEdit and Asked are retired on the Tweak topic.
+pub const CONTROL_TWEAK_LEVEL: u16 = MULTIPARTY_SHARE_LEVEL + 1;
 /// Raise when a landing introduces behaviour that requires a level gate.
-pub const LEVEL: u16 = MULTIPARTY_SHARE_LEVEL;
+pub const LEVEL: u16 = CONTROL_TWEAK_LEVEL;
 /// Raise behind the fleet as support for older levels is retired.
 pub const MIN_PEER: u16 = 0;
 const SOURCES: u8 = 1;
@@ -159,6 +161,7 @@ mod tests {
         assert!(hello.level >= MULTIPARTY_SHARE_LEVEL, "the advertised level includes multi-viewer shares");
         assert!(MULTIPARTY_SHARE_LEVEL > MULTIPARTY_CALL_LEVEL, "voice-only copies recognize a newer greeting");
         assert!(MULTIPARTY_SHARE_LEVEL > DESIGN_LEVEL, "copies with design requests but no multi-viewer shares recognize a newer greeting");
+        assert!(CONTROL_TWEAK_LEVEL > MULTIPARTY_SHARE_LEVEL, "copies with separate tweak consent recognize a newer greeting");
         assert_eq!(hello.min_peer, MIN_PEER, "the greeting keeps the minimum peer level");
         assert_eq!(hello.media_caps, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1),
             "the greeting advertises both multi-party voice and multi-viewer shares");

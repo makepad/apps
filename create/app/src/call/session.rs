@@ -282,6 +282,7 @@ pub struct CallController {
     inlet: Inlet,
     next_epoch: u64,
     open_town: Option<(TownId, Vec<PublicKey>)>,
+    town_members: BTreeMap<TownId, BTreeSet<PublicKey>>,
     next_peer_id: PeerId,
     id_to_peer: BTreeMap<PeerId, PublicKey>,
     call_generation: u64,
@@ -322,7 +323,7 @@ impl Default for CallController {
             echo_cancel: platform_echo_cancel(),
             talking: Talking::default(), last_talking: Instant::now(), devices: Devices::default(), env: None,
             inlet: Inlet::new(), links: BTreeMap::new(), next_epoch: 0,
-            open_town: None, next_peer_id: 1, id_to_peer: BTreeMap::new(), call_generation: 0, current: None, stopping: Vec::new(), control,
+            open_town: None, town_members: BTreeMap::new(), next_peer_id: 1, id_to_peer: BTreeMap::new(), call_generation: 0, current: None, stopping: Vec::new(), control,
             uninstalled: Some((MicPort { input, blocks: blocks.clone() }, output)),
             blocks, unmute_at: 0, enumerated_or_requested: false, want_input: false,
             want_output: false, input: None, output: None, facts: Vec::new(), muted_sessions: Vec::new(),
@@ -378,6 +379,13 @@ impl CallController {
 
     pub fn set_town_peer_seats(&mut self, seats: BTreeMap<TownId, BTreeMap<PublicKey, Id>>) {
         self.flow.set_town_peer_seats(seats);
+    }
+
+    /// Supplies each loaded town's active peers, excluding this seat. A missing town
+    /// has unknown membership and keeps its named control Allows.
+    pub fn set_town_members(&mut self, members: BTreeMap<TownId, BTreeSet<PublicKey>>) -> bool {
+        self.town_members = members;
+        self.revoke_departed_control()
     }
 
     pub fn can_call_seat(&self, town: TownId, seat: Id) -> bool { self.flow.can_call_seat(town, seat) }

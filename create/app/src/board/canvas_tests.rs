@@ -4,6 +4,11 @@ use crate::model::{Action, ItemStyle, Model, Origin};
 use makepad_widgets::cx_draw::CxDraw;
 
 fn draw_pass(cx: &mut Cx, size: DVec2, pressure: f64) -> impl FnMut(&mut Cx, &mut BoardCanvas) {
+    draw_pass_with(cx, size, pressure, |_, _| {})
+}
+
+fn draw_pass_with(cx: &mut Cx, size: DVec2, pressure: f64, mut after: impl FnMut(&mut Cx2d, &mut BoardCanvas))
+    -> impl FnMut(&mut Cx, &mut BoardCanvas) {
     let pass = DrawPass::new(cx);
     let mut list = DrawList2d::new(cx);
     pass.set_size(cx, size);
@@ -17,6 +22,7 @@ fn draw_pass(cx: &mut Cx, size: DVec2, pressure: f64) -> impl FnMut(&mut Cx, &mu
         // Use the scenario's frame pressure, independent of time spent compiling the last draw.
         canvas.pressure = pressure;
         let _ = canvas.draw_walk(&mut cx, &mut Scope::empty(), Walk::fixed(size.x, size.y));
+        after(&mut cx, canvas);
         cx.end_pass_sized_turtle();
         list.end(&mut cx);
         cx.end_pass(&pass);
@@ -217,7 +223,7 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
 }
 
 #[test]
-fn a_future_constructor_has_a_readable_card_with_default_geometry() {
+fn a_future_constructor_and_unfinished_design_have_readable_cards() {
     use crate::board::tests::History;
     use makepad_town_core::{entity::field, event::{Content, Value}};
     let mut h = History::new();
@@ -260,6 +266,11 @@ fn a_future_constructor_has_a_readable_card_with_default_geometry() {
             (field::SRC, Value::Text("arbitrary unfinished Splash{".into()))] });
     canvas.applied(&mut cx, &h.state, &touched, true);
     draw(&mut cx, &mut canvas);
+    canvas.sync_media(&mut cx, [1; 32], Path::new("."), |_| (false, false, None));
+    draw(&mut cx, &mut canvas);
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| matches!(c.design_state(design), PictureState::Failed { .. }));
+    let PictureState::Failed { message } = canvas.design_state(design) else { unreachable!() };
+    assert!(!message.is_empty() && canvas.design_message(design) == Some(message.as_str()), "unfinished Splash shows its error");
     let scene = canvas.scene.as_ref().unwrap();
     let face = &scene.faces[&design];
     assert!(face.detail.body && face.layout.is_some(), "the design frame and its label draw");
@@ -1238,4 +1249,418 @@ fn the_board_page_navigates_by_wheel_trackpad_drags_hand_cluster_and_keys() {
     draw(&mut cx, &page);
     let card = on_screen(dvec2(260., 190.));
     assert_eq!(drag(&mut cx, MouseButton::PRIMARY, card, card + dvec2(30., 0.)), 1, "Select's drag moves the card");
+}
+
+const SLIDE: &str = r##"SolidView{width: Fill height: Fill draw_bg +: {color: #241f3a} flow: Down padding: 40 spacing: 16 H1{text: "Why Town is cool"} View{flow: Down spacing: 8 Label{text: "Peers, not servers"} Label{text: "Your AI at the table"}}}"##;
+
+thread_local! {
+    static WHOLE_DESIGN: std::cell::Cell<Option<TextureId>> = const { std::cell::Cell::new(None) };
+    static LOADS_IN_FLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn design_fixture(sources: &[&str]) -> (test_cx::PooledCx, BoardCanvas, crate::board::tests::History, Vec<Id>, DVec2) {
+    use crate::board::tests::{History, item};
+    use makepad_town_core::event::Content;
+    let mut h = History::new();
+    let board = h.board();
+    let mut ids = Vec::new();
+    for (i, &src) in sources.iter().enumerate() {
+        let mut design = item(kind::DESIGN, board, [400 * i as i64, 0, 390, 844], Some(i as u8 + 1));
+        let Content::Entity { fields, .. } = &mut design else { unreachable!() };
+        fields.push((field::SRC, Value::Text(src.to_owned())));
+        ids.push(h.push(design).0);
+    }
+    let size = dvec2(400. * sources.len() as f64, 850.);
+    let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+    let mut canvas = media_canvas(&mut cx, &h.state, board, size, [1; 32], Path::new("."));
+    WHOLE_DESIGN.with(|whole| whole.set(None));
+    canvas.designs.painted = Some(|_, id| WHOLE_DESIGN.with(|whole| whole.get() == Some(id)));
+    (cx, canvas, h, ids, size)
+}
+
+#[test]
+fn a_board_view_build_copies_no_design_source() {
+    use crate::board::view::DESIGN_READS;
+    use std::sync::Arc;
+    let huge = format!("SolidView{{Label{{text: \"{}\"}}}}", "Town ".repeat(1 << 18));
+    let (mut cx, mut canvas, mut h, ids, _) = design_fixture(&[&huge]);
+    let id = ids[0];
+    let src = |canvas: &BoardCanvas| canvas.scene.as_ref().unwrap().view.get(&id).unwrap().design.as_ref().unwrap().src.clone();
+    let reads = || DESIGN_READS.with(|reads| reads.get());
+    let first = src(&canvas);
+    let before = reads();
+    canvas.peer_snapshot(&mut cx, &h.state, true);
+    assert!(Arc::ptr_eq(&first, &src(&canvas)) && reads() == before, "a rebuilt view shares the design's text and does not hash it again");
+    use crate::board::tests::{change, set};
+    let (_, touched) = h.push(set(vec![change(id, field::X, Value::Int(64 * 64))]));
+    canvas.applied(&mut cx, &h.state, &touched, true);
+    assert!(Arc::ptr_eq(&first, &src(&canvas)) && reads() == before, "moving a design does not copy its text");
+    edit_design_source(&mut cx, &mut canvas, &mut h, id, "SolidView{}");
+    assert_eq!((&*src(&canvas), reads()), ("SolidView{}", before + 1), "a new revision is read once");
+    let second = src(&canvas);
+    canvas.peer_snapshot(&mut cx, &h.state, true);
+    assert!(Arc::ptr_eq(&second, &src(&canvas)) && reads() == before + 1, "and shared from then on");
+}
+
+fn design_wake(cx: &mut Cx, canvas: &mut BoardCanvas) {
+    let frame = canvas.design_frame;
+    assert_ne!(frame, NextFrame::default(), "design work must arm a frame after discovery ({})", canvas.designs.stage());
+    let event = Event::NextFrame(NextFrameEvent { set: [frame].into_iter().collect(), ..Default::default() });
+    canvas.handle_event(cx, &event, &mut Scope::empty());
+}
+
+fn advance_design(cx: &mut Cx, canvas: &mut BoardCanvas, draw: &mut impl FnMut(&mut Cx, &mut BoardCanvas),
+    until: impl Fn(&BoardCanvas) -> bool) {
+    for _ in 0..256 {
+        if until(canvas) { return }
+        design_wake(cx, canvas);
+        draw(cx, canvas);
+        assert!(canvas.designs.steps_this_frame <= 1, "only one design stage in a drawing");
+    }
+    panic!("design did not reach its expected state, last stage {}", canvas.designs.stage());
+}
+
+fn edit_design_source(cx: &mut Cx, canvas: &mut BoardCanvas, h: &mut crate::board::tests::History, id: Id, src: &str) {
+    use crate::board::tests::{change, set};
+    let (_, touched) = h.push(set(vec![change(id, field::SRC, Value::Text(src.to_owned()))]));
+    canvas.applied(cx, &h.state, &touched, true);
+}
+
+#[test]
+fn a_design_card_draws_its_splash_as_a_cached_picture() {
+    let (mut cx, mut canvas, mut h, ids, size) = design_fixture(&[SLIDE]);
+    let id = ids[0];
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    assert_eq!(canvas.design_state(id), PictureState::Rendering, "the first draw queued the phone slide");
+    let before = cx.frame_requests();
+    design_wake(&mut cx, &mut canvas);
+    assert!(cx.frame_requests() > before, "the design's own next-frame event redraws a settled board");
+    draw(&mut cx, &mut canvas);
+    // A glyph the drawing asked for is still loading: its picture would keep a blank there.
+    LOADS_IN_FLIGHT.with(|n| n.set(1));
+    cx.register_async_load_probe("design test load", |_| LOADS_IN_FLIGHT.with(|n| n.get()));
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| c.designs.drawings() >= 2);
+    assert!(canvas.designs.pending_paint().is_none() && canvas.designs.stage() == "Draw",
+        "a drawing made while a load is in flight is drawn again, never painted");
+    LOADS_IN_FLIGHT.with(|n| n.set(0));
+    // The pooled context outlives this test: leave its probe counting nothing.
+    cx.register_async_load_probe("design test load", |_| 0);
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| c.designs.pending_paint().is_some());
+    let (first, items) = canvas.designs.pending_paint().unwrap();
+    assert!(items > 0, "the slide recorded draw items into its own pass");
+    design_wake(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    assert_eq!(canvas.design_picture(id), None, "a pending or partial first paint stays hidden");
+    WHOLE_DESIGN.with(|w| w.set(Some(first)));
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| !c.designs.busy());
+    assert_eq!(canvas.design_state(id), PictureState::Ready { w: 390, h: 844 });
+    assert_eq!(canvas.design_picture(id), Some(first));
+    assert_eq!(canvas.design_frame, NextFrame::default());
+    let renders = canvas.designs.renders;
+    for i in 1..=10 {
+        canvas.pan(&mut cx, dvec2(i as f64, 0.));
+        draw(&mut cx, &mut canvas);
+        assert_eq!((canvas.designs.renders, canvas.designs.steps_this_frame, canvas.design_picture(id)), (renders, 0, Some(first)));
+    }
+    edit_design_source(&mut cx, &mut canvas, &mut h, id, "Label{text: \"second\"}");
+    draw(&mut cx, &mut canvas);
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| {
+        assert_eq!(c.design_picture(id), Some(first));
+        c.designs.pending_paint().is_some()
+    });
+    let stale = canvas.designs.pending_paint().unwrap().0;
+    edit_design_source(&mut cx, &mut canvas, &mut h, id, "Label{text: \"third\"}");
+    WHOLE_DESIGN.with(|w| w.set(Some(stale)));
+    draw(&mut cx, &mut canvas);
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| {
+        assert_eq!(c.design_picture(id), Some(first), "late completion cannot replace the displayed slide");
+        c.designs.pending_paint().is_some_and(|(tex, _)| tex != stale)
+    });
+    let third = canvas.designs.pending_paint().unwrap().0;
+    WHOLE_DESIGN.with(|w| w.set(Some(third)));
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| !c.designs.busy());
+    assert_ne!(third, first);
+    assert_eq!(canvas.design_picture(id), Some(third));
+    assert_eq!(canvas.designs.renders, renders + 1);
+    assert_eq!(canvas.design_frame, NextFrame::default());
+
+    edit_design_source(&mut cx, &mut canvas, &mut h, id, "");
+    draw(&mut cx, &mut canvas);
+    assert_eq!(canvas.design_state(id), PictureState::Ready { w: 0, h: 0 });
+    assert_eq!(canvas.design_picture(id), None, "an empty design returns to its frame");
+    assert_eq!(canvas.designs.renders, renders + 1, "clearing the source needs no renderer");
+    assert!(!canvas.designs.busy());
+    assert_eq!(canvas.design_frame, NextFrame::default());
+    assert_eq!(cx.draw_lists.release_bindings(&[third], &[]), 0, "clearing released the old recording's binding");
+}
+
+#[test]
+fn a_design_with_a_script_error_shows_it_on_the_card() {
+    let (mut cx, mut canvas, mut h, ids, size) = design_fixture(&["SolidView{width: )}", "SolidView{}\nmissing_slide_function()"]);
+    use crate::board::tests::{change, set};
+    let (_, touched) = h.push(set(vec![change(ids[1], field::W, Value::Int(128 * 64)), change(ids[1], field::H, Value::Int(32 * 64))]));
+    canvas.applied(&mut cx, &h.state, &touched, true);
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| ids.iter().all(|&id| matches!(c.design_state(id), PictureState::Failed { .. })));
+    for (&id, causes) in ids.iter().zip([&["parse", "unexpected", "expected", "unmatched"][..], &["missing_slide_function"][..]]) {
+        let PictureState::Failed { message } = canvas.design_state(id) else { unreachable!() };
+        assert!(causes.iter().any(|cause| message.to_lowercase().contains(cause)), "actionable diagnostic: {message}");
+        assert_eq!(canvas.design_message(id), Some(message.as_str()));
+        let ink = canvas.drawn_design(id).unwrap().error_area.unwrap().clipped_rect_union(&cx);
+        let frame = local_rect(&canvas.camera, canvas.scene.as_ref().unwrap().view.get(&id).unwrap().rect);
+        assert!(ink.size.x > 0. && ink.size.y > 0. && frame.contains(ink.pos) && frame.contains(ink.pos + ink.size),
+            "visible error glyphs {ink:?} fit the card {frame:?}");
+        assert_eq!(canvas.design_picture(id), None);
+    }
+    let messages: Vec<String> = ids.iter().map(|&id| canvas.design_message(id).unwrap().to_owned()).collect();
+    assert!(messages[0].starts_with("line 1: ") && messages[1].starts_with("line 2: "), "each error names its line in the design: {messages:?}");
+    assert!(!messages.iter().any(|message| ["(obj", "(fn", "EndStmt", "EmitOp", "CloseRound"].iter().any(|internal| message.contains(internal))),
+        "the errors show the script's names, not the interpreter's: {messages:?}");
+    // The message reads at one screen size at any zoom, still clipped to its card.
+    let centre = canvas.camera.view.center();
+    for zoom in [canvas.camera.scale, canvas.camera.scale / 8.] {
+        canvas.zoom(&mut cx, centre, zoom);
+        draw(&mut cx, &mut canvas);
+        for &id in &ids {
+            let face = canvas.drawn_design(id).expect("the error card draws");
+            let pt = face.error_pt.expect("its message draws");
+            assert!((pt - DESIGN_ERROR_PT).abs() < 0.01, "{pt} screen points at zoom {}", canvas.camera.scale);
+            let ink = face.error_area.unwrap().clipped_rect_union(&cx);
+            let frame = local_rect(&canvas.camera, canvas.scene.as_ref().unwrap().view.get(&id).unwrap().rect);
+            // A card a few pixels tall at overview zoom has no room for a line of it.
+            let seen = ink.size.x > 0. && ink.size.y > 0.;
+            assert!(seen || id != ids[0], "the slide-sized card shows its error at zoom {}", canvas.camera.scale);
+            assert!(!seen || frame.contains(ink.pos) && frame.contains(ink.pos + ink.size), "clipped to the card at zoom {}", canvas.camera.scale);
+        }
+    }
+}
+
+#[test]
+fn a_design_cannot_reach_files_network_or_the_host() {
+    use makepad_platform::script::HostGrants;
+    // The task pump repeats whenever a widget call was dequeued, including a call for
+    // a dead VM. A single round after retirement proves that its queue was already empty.
+    thread_local! { static PUMP_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    extern "C-unwind" fn count_round(_: *mut u8, _: &mut makepad_script::ScriptHostContext) -> bool {
+        PUMP_ROUNDS.with(|n| n.set(n.get() + 1));
+        false
+    }
+    let cases = [
+        (r#"fs.read("/card")"#, "storage"),
+        (r#"fs.write("/card", "x")"#, "storage"),
+        ("mod.net.http_request()", "net"),
+        ("Root{}", "Root"),
+        ("Markdown{}", "Markdown"),
+        (r#"mod.std.start_interval(60, || {})
+            host.request("card.probe", {}, fn(r){})
+            let pending = mod.std.task(|| {})
+            loop {}"#, "line 4: script instruction limit exceeded"),
+    ];
+    let sources: Vec<_> = cases.iter().map(|(src, _)| *src).collect();
+    let (mut cx, mut canvas, _, ids, size) = design_fixture(&sources);
+    let root = cx.with_vm(|vm| {
+        let value = script_eval!(vm, { use mod.widgets.* View{} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    makepad_widgets::widget_tree::set_ui_root(&mut cx, &root);
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    for (&id, (_, reason)) in ids.iter().zip(cases) {
+        advance_design(&mut cx, &mut canvas, &mut draw, |c| c.designs.stage() == "Eval");
+        let heap = canvas.designs.heap_before_eval(&mut cx).expect("registered design heap");
+        let mut tasks = None;
+        let mut callback = None;
+        assert!(cx.with_vm_of_heap(heap, &mut |vm| {
+            assert_eq!(vm.cx().script_std().grants(), HostGrants::NONE);
+            tasks = Some(Rc::downgrade(&vm.cx().script_std().data.tasks.tasks));
+            let source = vm.new_object();
+            let f = vm.eval(makepad_script::script! { || {} }).as_object().unwrap();
+            callback = Some((vm.new_object_ref(source), vm.heap_mut().new_fn_ref(f)));
+        }));
+        let (source, callback) = callback.unwrap();
+        cx.widget_to_script_call(WidgetUid(0), NIL, source, callback, &[]);
+        advance_design(&mut cx, &mut canvas, &mut draw, |c| matches!(c.design_state(id), PictureState::Failed { .. }));
+        let message = canvas.design_message(id).expect("the refusal is drawn on the card");
+        assert!(message.contains(reason), "wanted {reason:?} in {message:?}");
+        assert_eq!(canvas.design_picture(id), None);
+        assert_eq!(cx.widget_tree().root_uid(), root.widget_uid(), "the host still owns its root");
+        assert!(!cx.script_data.timers.timers.iter().any(|t| t.callback.heap_key() == heap));
+        assert!(!splash_host::take_splash_host_requests().iter().any(|r| r.heap_key == heap));
+        assert!(tasks.unwrap().upgrade().is_none_or(|tasks| tasks.borrow().is_empty()), "guest tasks retired");
+        assert!(!cx.with_vm_of_heap(heap, &mut |_| {}), "the heap was retired before deferred calls can be dispatched");
+        // SAFETY: the callback is static and ignores its null context.
+        let hook = unsafe { makepad_platform::script::std::CxScriptTaskPumpHook::new(std::ptr::null_mut(), count_round) };
+        cx.add_script_task_pump_hook(hook);
+        PUMP_ROUNDS.with(|n| n.set(0));
+        cx.with_vm_and_async(|_| {});
+        cx.script_std_mut().data.tasks.hooks.pump.pop();
+        assert_eq!(PUMP_ROUNDS.with(|n| n.get()), 1, "no queued widget call survived the guest heap");
+        assert_eq!(cx.widget_tree().root_uid(), root.widget_uid(), "the widget-call pump leaves the host tree intact");
+    }
+}
+
+#[test]
+fn design_renders_take_one_stage_per_frame_and_pan_costs_none() {
+    let slides: Vec<_> = (0..6).map(|i| SLIDE.replace("Why Town is cool", &format!("Slide {i}"))).collect();
+    let sources: Vec<_> = slides.iter().map(String::as_str).collect();
+    let (mut cx, mut canvas, _, ids, size) = design_fixture(&sources);
+    let mut draw = draw_pass_with(&mut cx, size, 1., |cx, canvas| {
+        let progress = |c: &BoardCanvas| (c.designs.stage(), c.designs.registration_steps(), c.designs.renders);
+        let before = progress(canvas);
+        assert!(!canvas.designs.step(cx), "a second call in one draw generation cannot publish");
+        assert_eq!(progress(canvas), before, "a second call in one draw generation cannot advance registration or a stage");
+    });
+    draw(&mut cx, &mut canvas);
+    let mut renders = 0;
+    for _ in 0..6 * 256 {
+        if renders == 6 { break }
+        if let Some((id, _)) = canvas.designs.pending_paint() { WHOLE_DESIGN.with(|whole| whole.set(Some(id))); }
+        design_wake(&mut cx, &mut canvas);
+        draw(&mut cx, &mut canvas);
+        assert!(canvas.designs.steps_this_frame <= 1, "registration, eval and draw each get their own generation");
+        if canvas.designs.renders != renders {
+            let times = canvas.designs.last_times.expect("a finished render has timings");
+            let prepare = if times.register_steps == 1 { "cold" } else { "warm" };
+            eprintln!("slide {} {prepare} prepare={:.3} ms {times:?} fuel={}", renders + 1, times.prepare_ms, times.fuel);
+            assert!(times.register_steps > 0 && times.fuel > 0, "staged registration and metered guest execution");
+            renders = canvas.designs.renders;
+        }
+    }
+    assert_eq!(renders, 6, "six finished slides, stage {}", canvas.designs.stage());
+    let pictures: Vec<_> = ids.iter().map(|&id| {
+        assert!(matches!(canvas.design_state(id), PictureState::Ready { .. }));
+        canvas.design_picture(id).expect("ready slide is bound")
+    }).collect();
+    for i in 1..=10 {
+        canvas.pan(&mut cx, dvec2(i as f64, 0.));
+        draw(&mut cx, &mut canvas);
+        assert_eq!(canvas.designs.steps_this_frame, 0);
+        assert_eq!(canvas.designs.renders, 6);
+        assert!(!canvas.designs.busy());
+        assert_eq!(canvas.design_frame, NextFrame::default());
+        for (&id, &tex) in ids.iter().zip(&pictures) { assert_eq!(canvas.design_picture(id), Some(tex)); }
+    }
+}
+
+fn finish_design_renders(cx: &mut Cx, canvas: &mut BoardCanvas, draw: &mut impl FnMut(&mut Cx, &mut BoardCanvas)) {
+    for _ in 0..256 {
+        if !canvas.designs.busy() { return }
+        if let Some((tex, _)) = canvas.designs.pending_paint() { WHOLE_DESIGN.with(|whole| whole.set(Some(tex))); }
+        design_wake(cx, canvas);
+        draw(cx, canvas);
+    }
+    panic!("design renders did not finish, stage {}", canvas.designs.stage());
+}
+
+fn design_settle(cx: &mut Cx, canvas: &mut BoardCanvas) {
+    let frame = canvas.design_settle;
+    assert_ne!(frame, NextFrame::default(), "a zoom or a pan arms the settle check");
+    let event = Event::NextFrame(NextFrameEvent { set: [frame].into_iter().collect(), ..Default::default() });
+    canvas.handle_event(cx, &event, &mut Scope::empty());
+}
+
+#[test]
+fn zooming_in_rerenders_a_design_once_at_the_settled_density() {
+    let (mut cx, mut canvas, _, ids, size) = design_fixture(&[SLIDE]);
+    let id = ids[0];
+    let max_side = cx.gpu_info().max_texture_size.clamp(1, 4096) as f64;
+    // The picture's width at a camera scale (dpi 1): the screen's density rounded up to a power
+    // of two, capped by the GPU's texture side.
+    let picture = |scale: f64| {
+        let density = 2f64.powf(scale.log2().ceil().max(-3.)).min(max_side / 844.);
+        let (w, h) = Cx::pass_pixel_size(dvec2(390., 844.), density);
+        PictureState::Ready { w: w as u32, h: h as u32 }
+    };
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    finish_design_renders(&mut cx, &mut canvas, &mut draw);
+    let scale = canvas.camera.scale;
+    let first = canvas.design_picture(id).expect("the first picture");
+    assert_eq!(canvas.design_state(id), picture(scale), "the first picture matches the card's density on screen");
+    assert_eq!(canvas.design_settle, NextFrame::default(), "opening the board arms no settle check");
+    let renders = canvas.designs.renders;
+
+    let centre = canvas.camera.view.center();
+    canvas.zoom(&mut cx, centre, scale * 3.);
+    let zoomed = canvas.camera.scale;
+    assert_ne!(picture(zoomed), picture(scale), "the zoom needs a denser picture ({zoomed} from {scale})");
+    for _ in 0..3 {
+        draw(&mut cx, &mut canvas);
+        assert_eq!((canvas.designs.renders, canvas.design_picture(id)), (renders, Some(first)), "zooming re-renders nothing");
+        assert!(!canvas.designs.busy(), "no render starts while the camera moves");
+    }
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    assert!(!canvas.designs.busy(), "the first settle check only sees the zoom's last frame");
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    assert!(canvas.designs.busy(), "a camera standing still for a frame upgrades the visible card");
+    advance_design(&mut cx, &mut canvas, &mut draw, |c| {
+        assert_eq!(c.design_picture(id), Some(first), "the old picture draws until the new one is whole");
+        c.designs.pending_paint().is_some()
+    });
+    finish_design_renders(&mut cx, &mut canvas, &mut draw);
+    let sharp = canvas.design_picture(id).unwrap();
+    assert_ne!(sharp, first);
+    assert_eq!(canvas.design_state(id), picture(zoomed), "the new picture matches the zoomed card");
+    assert_eq!(canvas.designs.renders, renders + 1, "one re-render for the settled zoom");
+    assert_eq!(canvas.design_settle, NextFrame::default());
+    for _ in 0..3 { draw(&mut cx, &mut canvas); }
+    assert_eq!((canvas.designs.renders, canvas.design_picture(id)), (renders + 1, Some(sharp)), "a settled board renders nothing more");
+
+    canvas.zoom(&mut cx, centre, zoomed / 4.);
+    draw(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    assert!(!canvas.designs.busy(), "zooming out re-renders nothing");
+    assert_eq!((canvas.designs.renders, canvas.design_picture(id)), (renders + 1, Some(sharp)), "zooming out keeps the sharper picture");
+}
+
+#[test]
+fn every_visible_design_ends_at_its_final_density() {
+    let (mut cx, mut canvas, _, ids, size) = design_fixture(&[SLIDE, SLIDE]);
+    let max_side = cx.gpu_info().max_texture_size.clamp(1, 4096) as f64;
+    let picture = |scale: f64| {
+        let density = 2f64.powf(scale.log2().ceil().max(-3.)).min(max_side / 844.);
+        let (w, h) = Cx::pass_pixel_size(dvec2(390., 844.), density);
+        PictureState::Ready { w: w as u32, h: h as u32 }
+    };
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    finish_design_renders(&mut cx, &mut canvas, &mut draw);
+    let scale = canvas.camera.scale;
+    let first = canvas.scene.as_ref().unwrap().view.get(&ids[0]).unwrap().rect;
+    let on_screen = |camera: &Camera, x: f64, y: f64| camera.local_to_screen(camera.world_to_local(dvec2(x, y)));
+    let anchor = on_screen(&canvas.camera, first.x0 + 20., first.y0 + 20.);
+    // A slow pinch: it pauses for a frame, so the card upgrades early, then zooms on.
+    canvas.zoom(&mut cx, anchor, scale * 2.);
+    draw(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    assert!(canvas.designs.busy(), "the pause upgrades the card on screen");
+    // The gesture zooms on while that render is under way, then stops.
+    canvas.zoom(&mut cx, anchor, scale * 8.);
+    let zoomed = canvas.camera.scale;
+    draw(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    finish_design_renders(&mut cx, &mut canvas, &mut draw);
+    assert_eq!(canvas.design_state(ids[0]), picture(zoomed), "the final stop leaves the card at the final density");
+    assert!(canvas.drawn_design(ids[1]).is_none(), "the second card is off screen at this zoom");
+    // A pan brings the second card in: it renders at the zoom it is now seen at.
+    let second = canvas.scene.as_ref().unwrap().view.get(&ids[1]).unwrap().rect;
+    let pan = canvas.camera.pan + anchor - on_screen(&canvas.camera, second.x0 + 20., second.y0 + 20.);
+    canvas.pan(&mut cx, pan);
+    draw(&mut cx, &mut canvas);
+    assert!(canvas.drawn_design(ids[1]).is_some(), "the pan shows the second card");
+    design_settle(&mut cx, &mut canvas);
+    design_settle(&mut cx, &mut canvas);
+    draw(&mut cx, &mut canvas);
+    finish_design_renders(&mut cx, &mut canvas, &mut draw);
+    assert_eq!(canvas.design_state(ids[1]), picture(zoomed), "the card a zoom left off screen ends at the final density too");
 }

@@ -28,6 +28,7 @@ fn guest_files_visual_issue_from_watched_picture() {
     use crate::{lists::{Live, Page, Pane, ViewData}, model::{tests::ShareHomes, Model}, view::{LocalClock, Workspace}};
     use makepad_town_core::{blob, entity::field, event::Value};
     use makepad_widgets::{makepad_draw::cx_draw::CxDraw, *};
+    use makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp};
 
     let homes = ShareHomes::new("guest-issue");
     let mut ben = Model::open(&homes.0.join("Ben")).unwrap().0;
@@ -59,35 +60,59 @@ fn guest_files_visual_issue_from_watched_picture() {
         nv12: vec![16,235,63,63, 128,200,63,63, 173,173,32,32, 173,173,32,32, 128,128,102,240, 42,26,240,118] }));
     data.sync_share_issue(&mut cx, &ui);
     assert!(button.visible(), "the first received picture reveals the guest control");
-    let press = Event::A11yAction(a11y_tree::ActionRequest { req: 0, node: a11y_tree::NodeId::widget(button.widget_uid().0),
-        action: a11y_tree::Actions::PRESS, arg: a11y_tree::ActionArg::None });
-    let actions = cx.capture_actions(|cx| ui.handle_event(cx, &press, &mut Scope::with_data(&mut data)));
+    let size = dvec2(640., 480.);
+    let pass = DrawPass::new(&mut cx);
+    pass.set_size(&mut cx, size);
+    let mut list = DrawList2d::new(&mut cx);
+    let mut draw = |cx: &mut Cx, data: &mut ViewData| {
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(cx, &event);
+        let mut frame = Cx2d::new(&mut draw);
+        frame.begin_pass(&pass, None);
+        list.begin_always(&mut frame);
+        frame.begin_root_turtle(size, Layout::flow_down());
+        ui.draw_all(&mut frame, &mut Scope::with_data(data));
+        frame.end_pass_sized_turtle();
+        list.end(&mut frame);
+        frame.end_pass(&pass);
+    };
+    // This fixture's Cx has an empty handler. Forward each settled focus change to the UI.
+    let settle_focus = |cx: &mut Cx, data: &mut ViewData| {
+        let prev = cx.keyboard.key_focus();
+        cx.handle_actions();
+        let focus = cx.keyboard.key_focus();
+        if prev != focus {
+            ui.handle_event(cx, &Event::KeyFocus(KeyFocusEvent { prev, focus }), &mut Scope::with_data(data));
+        }
+    };
+    draw(&mut cx, &mut data);
+    let abs = button.area().clipped_rect(&cx).center();
+    let window_id = WindowId(1, 1);
+    let primary = MouseButton::PRIMARY;
+    cx.dispatch_studio_msg(StudioToApp::MouseDown(RemoteMouseDown { x: abs.x, y: abs.y, time: 1.,
+        button_raw_bits: primary.bits(), ..Default::default() }), window_id, DVec2::default());
+    let down = Event::MouseDown(MouseDownEvent { abs, window_id, time: 1., button: primary,
+        handled: Default::default(), modifiers: Default::default() });
+    ui.handle_event(&mut cx, &down, &mut Scope::with_data(&mut data));
+    settle_focus(&mut cx, &mut data);
+    assert!(cx.has_key_focus(button.area()), "the mouse press focuses the guest control");
+    let up = Event::MouseUp(MouseUpEvent { abs, window_id, time: 1.1, button: primary, modifiers: Default::default() });
+    let actions = cx.capture_actions(|cx| ui.handle_event(cx, &up, &mut Scope::with_data(&mut data)));
+    cx.dispatch_studio_msg(StudioToApp::MouseUp(RemoteMouseUp { x: abs.x, y: abs.y, time: 1.1,
+        button_raw_bits: primary.bits(), ..Default::default() }), window_id, DVec2::default());
     let mut links = AppLinks::default();
     assert!(data.share_issue_input(&mut cx, &ui, &actions, &mut links, &mut ben), "the guest's press opens a draft");
     assert_eq!((data.page, data.pane, data.workspace.current), (Page::Issues, Pane::Page, Some(project)), "Issues opens in the current project");
     assert_eq!(data.issue_share(), data.watched_share(), "the draft keeps the original watch");
     assert!(ben.project_issues(project).is_empty(), "the draft opens before any issue is filed");
+    let share = ui.widget(&cx, ids!(live_share));
+    share.set_visible(&mut cx, false);
     let page = ui.widget(&cx, ids!(issues_page));
     page.set_visible(&mut cx, true);
     data.issues.sync(&mut cx, &ui, Some(project), &mut ben, &clock);
-    let size = dvec2(640., 480.);
-    let pass = DrawPass::new(&mut cx);
-    pass.set_size(&mut cx, size);
-    let mut list = DrawList2d::new(&mut cx);
-    {
-        let event = DrawEvent::default();
-        let mut draw = CxDraw::new(&mut cx, &event);
-        let mut frame = Cx2d::new(&mut draw);
-        frame.begin_pass(&pass, None);
-        list.begin_always(&mut frame);
-        frame.begin_root_turtle(size, Layout::flow_down());
-        page.draw_all(&mut frame, &mut Scope::with_data(&mut data));
-        frame.end_pass_sized_turtle();
-        list.end(&mut frame);
-        frame.end_pass(&pass);
-    }
+    draw(&mut cx, &mut data);
     cx.extend_actions(actions);
-    cx.handle_actions();
+    settle_focus(&mut cx, &mut data);
     let input = page.text_input(&cx, ids!(issue_input));
     assert!(!input.area().is_empty() && cx.has_key_focus(input.area()), "the drawn draft's note owns keyboard focus");
 
@@ -115,6 +140,14 @@ fn guest_files_visual_issue_from_watched_picture() {
         let got = &png.rgba[pixel * 4..pixel * 4 + 4];
         assert!(got.iter().zip(rgba).all(|(a,b)| a.abs_diff(b) <= 2), "pixel {pixel} has the display colour {rgba:?}, got {got:?}");
     }
+    data.page = Page::Live(Live::Share(session));
+    page.set_visible(&mut cx, false);
+    share.set_visible(&mut cx, true);
+    data.sync_live_share(&mut cx, &ui);
+    draw(&mut cx, &mut data);
+    let face = button.borrow::<Button>().unwrap();
+    assert!(face.animator_in_state(&cx, ids!(hover.off)), "the returning control has cleared its hover without a pointer move");
+    assert!(face.animator_in_state(&cx, ids!(focus.off)), "the returning control has no mouse focus ring");
     ben.stop_store();
     while !ben.store_stopped() {
         ben.drain_store();
@@ -980,6 +1013,8 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     wait(&mut pair, &mut app, |s, _| s[1].ctl.sharing.shown.control.active.is_some());
     let viewer = &mut pair.seats[1].ctl;
     assert_eq!(viewer.sharing.shown.control.allowed, Some(next), "a watcher outside a call learns its switch-given right");
+    assert_eq!((viewer.control_rights_revision(next), viewer.control_rights(next)), (None, None),
+        "only the sharer's call supplies tweak rights");
     let grant_id = viewer.sharing.shown.control.active.unwrap();
     viewer.panel_input(&PanelInput { session: next, grant: grant_id, event: AppInput::Text("watch grant".into()) });
     drain(&mut pair, &mut app, link);
@@ -992,8 +1027,16 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     assert_eq!(pair.seats[1].ctl.sharing.shown.control.allowed, None, "switch off withdraws a switch-only right");
     assert!(pair.seats[1].ctl.ask_control(next, true));
     wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requests.first().map(|r| r.0) == Some(next));
+    let revision = pair.seats[0].ctl.control_rights_revision(next).unwrap();
+    let check_rights = |call: &CallController, changes: u64, all, seats: &[PublicKey]| {
+        let expected = crate::tweak::ControlRights { all, seats: seats.iter().copied().collect() };
+        assert_eq!(call.control_rights(next), Some(expected));
+        assert_eq!(call.control_rights_revision(next), Some(revision + changes));
+    };
+    check_rights(&pair.seats[0].ctl, 0, false, &[]);
     let named = grant(&mut pair, &mut app, next);
     let sharer = &mut pair.seats[0];
+    check_rights(&sharer.ctl, 1, false, &[peer]);
     let revoke = {
         use makepad_widgets::*;
         let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
@@ -1026,10 +1069,17 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     };
     assert_eq!(revoke, CallAction::OnShare(next, Press::RevokeControl(peer)), "the × names this share and peer");
     assert!(sharer.ctl.allow_all_control(&mut app.app, next));
+    check_rights(&sharer.ctl, 2, true, &[peer]);
+    assert!(!sharer.ctl.allow_all_control(&mut app.app, next), "repeating Allow all leaves the right unchanged");
+    check_rights(&sharer.ctl, 2, true, &[peer]);
     assert!(sharer.ctl.call_actions(&mut sharer.host, CallAction::OnShare(next, Press::AllowAll(false))));
+    check_rights(&sharer.ctl, 3, false, &[peer]);
     assert!(sharer.ctl.sharing.shown.offer(next).unwrap().allowed().contains_key(&peer), "switch off keeps named rights");
     assert_eq!(sharer.ctl.sharing.shown.control.active, Some(named), "a still-authorized spell continues");
     assert!(sharer.ctl.call_actions(&mut sharer.host, revoke));
+    check_rights(&sharer.ctl, 4, false, &[]);
+    assert!(sharer.ctl.sharing.shown.control.active.is_none() && sharer.ctl.sharing.shown.control.holder.is_none(),
+        "revoking the current holder removes the right and ends the grant in the same call");
     wait(&mut pair, &mut app, |s, app| s[1].ctl.sharing.shown.control.active.is_none() && !app.app.state(link).unwrap().input_allowed);
     assert_eq!(pair.seats[1].ctl.sharing.shown.control.allowed, None, "removing the chip withdraws its right");
     assert!(pair.seats[1].ctl.sharing.shown.control.notice.as_deref().unwrap().contains("took back"), "removing the chip ends its spell with TakenBack");
@@ -1645,13 +1695,13 @@ struct MeshLink {
     voice_seq: Option<u64>,
 }
 
-struct ShareMesh {
+pub(crate) struct ShareMesh {
     keys: [Arc<makepad_town_core::key::DeviceKey>; 3],
-    ctl: [CallController; 3],
+    pub(crate) ctl: [CallController; 3],
     hosts: [Host; 3],
     apps: [AppLinks; 3],
     #[cfg(unix)]
-    rig: Option<crate::app_link::RecordingRig>,
+    pub(crate) rig: Option<crate::app_link::RecordingRig>,
     carriers: BTreeMap<(usize, usize), MeshLink>,
     networks: Arc<AtomicUsize>,
 }
@@ -1683,7 +1733,7 @@ impl ShareMesh {
         mesh
     }
 
-    fn key(&self, i: usize) -> PublicKey { self.keys[i].public() }
+    pub(crate) fn key(&self, i: usize) -> PublicKey { self.keys[i].public() }
 
     fn link(&mut self, a: usize, b: usize, caps_first: bool) {
         let (pair, _) = linked_pair(self.keys[a].clone(), self.keys[b].clone());
@@ -1758,19 +1808,71 @@ impl ShareMesh {
         (session, readings)
     }
 
-    fn watch(&mut self, i: usize, s: SessionId) {
+    pub(crate) fn watch(&mut self, i: usize, s: SessionId) {
         self.until("the town offer to reach the viewer", |m| m.ctl[i].sharing.shown.offer(s).is_some());
         assert!(self.ctl[i].call_opening_presses(&mut self.hosts[i], CallAction::OnShare(s, Press::Watch)), "the viewer opens the selected offer");
         self.ctl[i].share_panel_size(s, ShareSurface::Page, 320, 180);
     }
 
+    pub(crate) fn request_named_control(&mut self, viewer: usize, share: SessionId) {
+        let peer = self.key(viewer);
+        self.watch(viewer, share);
+        assert!(self.ctl[viewer].ask_control(share, true));
+        self.until("the viewer and their named control request", |m| {
+            m.ctl[0].is_viewer(share, &peer) && m.ctl[0].sharing.shown.control.requests.iter()
+                .any(|(s, p, _)| (*s, *p) == (share, peer))
+        });
+    }
+
     fn pts(&self, i: usize) -> Option<i64> { self.ctl[i].sharing.shown.picture.as_ref().map(|p| p.pts_100ns) }
 
-    fn barrier(&mut self, from: usize, to: usize) {
+    pub(crate) fn barrier(&mut self, from: usize, to: usize) {
         let key = self.key(to);
         self.ctl[from].send_peer_to(key, crate::call::topic::PROBE, vec![1]).unwrap();
         self.until("the reliable marker following the test messages", |m|
             m.ctl[to].take_peer_with_sender(crate::call::topic::PROBE).iter().any(|(p,_)| *p == m.key(from)));
+    }
+}
+
+#[test]
+fn a_named_allow_ends_when_its_seat_leaves_the_town() {
+    let mut mesh = ShareMesh::new(true);
+    let (share, _) = mesh.offer();
+    let (peer, other) = (mesh.key(1), mesh.key(2));
+    mesh.request_named_control(1, share);
+    assert!(mesh.ctl[0].allow_control(&mut mesh.apps[0], share, peer, NAMES[1]));
+    let named = crate::tweak::ControlRights { all: false, seats: [peer].into() };
+    let revision = mesh.ctl[0].control_rights_revision(share).unwrap();
+    mesh.disconnect(0, 1);
+    assert_eq!(mesh.ctl[0].control_rights(share).as_ref(), Some(&named), "losing the carrier preserves a named Allow");
+    mesh.link(0, 1, true);
+    assert_eq!(mesh.ctl[0].control_rights(share).as_ref(), Some(&named), "relink preserves a named Allow");
+    assert_eq!(mesh.ctl[0].control_rights_revision(share), Some(revision));
+
+    mesh.disconnect(0, 1);
+    mesh.ctl[0].set_town_members([(MESH_TOWN, [other].into())].into());
+    assert_eq!(mesh.ctl[0].control_rights(share), Some(Default::default()), "leaving the town withdraws the offline seat's named Allow");
+    assert!(mesh.ctl[0].control_rights_revision(share).unwrap() > revision);
+    mesh.link(0, 1, true);
+    assert_eq!(mesh.ctl[0].control_rights(share), Some(Default::default()), "a returning member needs a fresh Allow");
+}
+
+#[test]
+fn an_offline_member_keeps_a_named_allow() {
+    let mut mesh = ShareMesh::new(true);
+    let (share, _) = mesh.offer();
+    let (peer, other) = (mesh.key(1), mesh.key(2));
+    mesh.request_named_control(1, share);
+    assert!(mesh.ctl[0].allow_control(&mut mesh.apps[0], share, peer, NAMES[1]));
+    let named = crate::tweak::ControlRights { all: false, seats: [peer].into() };
+    let revision = mesh.ctl[0].control_rights_revision(share).unwrap();
+
+    mesh.disconnect(0, 1);
+    mesh.ctl[0].set_town_peers(&mut mesh.hosts[0], [(MESH_TOWN, [other].into())].into());
+    for members in [[(MESH_TOWN, [peer, other].into())].into(), BTreeMap::new()] {
+        assert!(!mesh.ctl[0].set_town_members(members));
+        assert_eq!(mesh.ctl[0].control_rights(share).as_ref(), Some(&named), "an offline member keeps the named Allow");
+        assert_eq!(mesh.ctl[0].control_rights_revision(share), Some(revision), "no revocation was announced");
     }
 }
 
@@ -1930,8 +2032,13 @@ fn decoder_open_failure_surfaces_in_preview_and_watched_share_ui() {
 }
 
 #[cfg(unix)]
+impl CallController {
+    pub(crate) fn linked_tweak_test_mesh() -> ShareMesh { ShareMesh::new(true) }
+}
+
+#[cfg(unix)]
 impl ShareMesh {
-    fn app_window(&mut self) -> (SessionId, LinkId) {
+    pub(crate) fn app_window(&mut self) -> (SessionId, LinkId) {
         let mut rig = crate::app_link::RecordingRig::new();
         rig.app.scan();
         rig.wait(|r| !r.app.apps().is_empty());
@@ -1943,7 +2050,7 @@ impl ShareMesh {
         (self.ctl[0].only_local_offer().unwrap(), link)
     }
 
-    fn grant_to(&mut self, s: SessionId, i: usize) -> crate::call::control::GrantId {
+    pub(crate) fn grant_to(&mut self, s: SessionId, i: usize) -> crate::call::control::GrantId {
         let peer = self.key(i);
         assert!(self.ctl[0].allow_control(&mut self.rig.as_mut().unwrap().app, s, peer, NAMES[i]), "the sharer grants the selected viewer control");
         assert_eq!(self.ctl[0].sharing.shown.control.holder, Some((peer, NAMES[i].into())), "the grant names the selected viewer");

@@ -1,6 +1,4 @@
-//! Listen: a running simulation's nets heard through the speakers, as the Scope monitors them (or,
-//! in an instance nobody hears, drained by a silent clock at the same rate, so a hidden run
-//! measures what a person would hear).
+//! Listen plays a running simulation's nets through the app's audio output as the Scope monitors them.
 //!
 //! What is heard is one set for the whole app: [`listen`] adds or takes out a net by its circuit
 //! name from any view (a Scope lane's speaker chip), [`listen_jack`] a board's output jack (a part
@@ -13,10 +11,8 @@
 //!
 //! The app holds one [`ElecAudio`] (a `Cx` global, made on the first [`listen`]): the sample ring
 //! the worker's tap fills (`fab_elec_sim::listen`), the one consumer that drains it and the heard
-//! set. The consumer is the audio device's callback in an instance a person hears, or a
-//! long-lived silent-clock thread in a hidden or muted one, which never opens the audio device.
-//! Either runs a `Player`: live while the run keeps up (its lead sized by measure), else the last
-//! rendered stretch round while the next renders, crossfaded at every switch.
+//! set. The platform's audio output callback runs a `Player` that plays live while the run keeps
+//! up. Otherwise it loops the last rendered stretch while the next renders, crossfading at each switch.
 //!
 //! Realtime rules: the consumer takes no lock, waits on nothing and allocates nothing (the
 //! player's two stretches are made with it). The UI thread reads a few atomics a frame. The worker
@@ -41,10 +37,9 @@ use makepad_widgets_core::*;
 use std::collections::HashMap;
 use std::fmt;
 use makepad_widgets_core::makepad_platform::audio::{AudioDeviceId, AudioDevicesEvent};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// The heard set's tap: its id in the host's sink set, a voice's full scale per volt (a 2.5 V
 /// swing round the net's rest is full scale), how far the worker starts ahead of the device (the
@@ -65,37 +60,19 @@ pub const JACK_TAP: u64 = 0x4a41_434b_0000_0001;
 /// than its latency target, so a slow frame of the solver is absorbed before anyone hears it.
 const RING_SECONDS: f64 = 0.5;
 
-/// The Listen ring's frames (`SimLive::listen_bus`): `RING_SECONDS` at the silent clock's rate.
-pub const RING_FRAMES: usize = (RING_SECONDS * SILENT_RATE as f64) as usize;
+/// The sample rate in Hz used to size the Listen ring.
+const RING_RATE: u32 = 48_000;
 
-/// The rate the silent clock drains at, and the ring is sized for.
-const SILENT_RATE: u32 = 48_000;
+/// The capacity in frames of the ring shared with `SimLive::listen_bus`.
+pub const RING_FRAMES: usize = (RING_SECONDS * RING_RATE as f64) as usize;
 
-/// The silent clock's tick: it pops a tick's worth of samples each time.
-const SILENT_TICK: Duration = Duration::from_millis(5);
-
-/// Where the ring's samples go.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AudioOut {
-    /// The audio device: a person hears it.
-    Device,
-    /// A silent clock at 48 kHz, with the reason nobody hears it (a hidden window, muted).
-    Silent(&'static str),
-}
-
-/// The app's one Listen output: its consumer (the device or the silent clock) and what it hears,
-/// over the app's Listen bus (`SimLive::listen_bus`: the ring, the queues, the shelf).
+/// The app's Listen output and the signals it plays from `SimLive::listen_bus`.
 pub struct ElecAudio {
     pub ring: Arc<SampleRing>,
     bus: Arc<ListenBus>,
-    pub out: AudioOut,
-    /// The device callback's calls and the frames it filled (a person's instance), and what the
-    /// output said since it last opened ([`frame`]).
+    /// The output callback's calls and frames, and what it reported since it last opened ([`frame`]).
     device: Arc<DeviceCounts>,
     opened: Option<Opened>,
-    /// The silent clock drains while this is set; while it is not, the clock blocks on `wake`.
-    silent_on: Arc<AtomicBool>,
-    wake: Option<SyncSender<()>>,
     /// The nets heard, in the order they were switched on; each net's level in dB (kept when it
     /// is no longer heard), the master level in dB and the mute.
     nets: Vec<String>,
@@ -142,8 +119,8 @@ pub enum SaveState {
 }
 
 impl ElecAudio {
-    /// The app's Listen output, made the first time (a person's instance registers the audio
-    /// device's callback here; the device runs only while anything is heard, [`use_output`]).
+    /// Registers the app's Listen callback on first use. [`use_output`] selects the output
+    /// while either ring is open.
     pub fn get(cx: &mut Cx) -> &ElecAudio {
         if !cx.has_global::<ElecAudio>() {
             let audio = ElecAudio::start(cx);
@@ -171,35 +148,13 @@ impl ElecAudio {
         let ring = bus.ring.clone();
         let speaker = Speaker { ring: bus.device_ring.clone(), mix: bus.device_mix.clone() };
         ring.set_realtime(cx.get_global_ref::<ElecLive>().is_some_and(|live| live.sim.status.realtime));
-        let silent_on = Arc::new(AtomicBool::new(false));
         let counts = Arc::new(DeviceCounts::default());
-        let silenced = device_silenced();
-        if silenced {
-            // the device runs and its callback fills every buffer; the platform then plays zeros
-            makepad_widgets_core::makepad_platform::audio_output_tap::set_program_output_silenced(true);
-            log!("[listen] the output device plays silence ({SILENCED_VAR}=silenced): its callback runs, nothing is heard");
-        }
-        let (out, wake) = match nobody_hears().filter(|_| !silenced) {
-            None => {
-                device(cx, ring.clone(), speaker, player_links, counts.clone());
-                (AudioOut::Device, None)
-            }
-            Some(why) => {
-                ring.set_device_rate(SILENT_RATE);
-                speaker.ring.set_device_rate(SILENT_RATE);
-                let (wake, woken) = mpsc::sync_channel(1);
-                silent_clock(cx, ring.clone(), speaker, silent_on.clone(), woken, player_links);
-                (AudioOut::Silent(why), Some(wake))
-            }
-        };
+        device(cx, ring.clone(), speaker, player_links, counts.clone());
         ElecAudio {
             ring,
             bus,
-            out,
             device: counts,
             opened: None,
-            silent_on,
-            wake,
             nets: Vec::new(),
             jacks: Vec::new(),
             speakers: Vec::new(),
@@ -236,8 +191,8 @@ impl ElecAudio {
     }
 
     /// Opens or closes the ring: open, the tap's backpressure paces the worker on the consumer;
-    /// closed, the tap never waits and the consumer plays silence. A person's instance opens the
-    /// default output device with it and closes it after (`use_output`). O(1).
+    /// closed, the tap never waits and the consumer plays silence. [`use_output`] selects the
+    /// default output while either ring is open. O(1).
     pub fn set_open(&mut self, open: bool) {
         let was = self.output_open();
         self.ring.set_open(open);
@@ -259,16 +214,11 @@ impl ElecAudio {
 
     fn output_changed(&mut self, was: bool) {
         let open = self.output_open();
-        if self.out == AudioOut::Device && open != was {
+        if open != was {
             // the rate is the device's to say again: the next open may be another device
             self.ring.set_device_rate(0);
             self.bus.device_ring.set_device_rate(0);
             self.opened = open.then(|| Opened { at: Instant::now(), first: None, counts_said: false, late_said: false });
-        }
-        self.silent_on.store(open, Ordering::Release);
-        if let (true, Some(wake)) = (open, &self.wake) {
-            // full: a wake is already queued
-            let _ = wake.try_send(());
         }
     }
 
@@ -292,9 +242,8 @@ impl ElecAudio {
 
 /// Hears `net` (a circuit net by its name on the sheet, such as "LINE") on the speakers from any
 /// view, or stops hearing it. The set is the app's: a Scope lane's speaker chip shows and changes
-/// the same one. The first net heard opens the output (the audio device in an instance a person
-/// hears, never in a hidden or muted one); the last one going closes it. While
-/// any net is heard, one tap of the set runs in the bench and keeps it running. O(nets heard).
+/// the same one. While any net is heard, the output is open and one tap of the set keeps the
+/// bench running. O(nets heard).
 pub fn listen(cx: &mut Cx, net: &str, on: bool) {
     if !on && cx.get_global_ref::<ElecAudio>().is_none() {
         return;
@@ -716,8 +665,7 @@ struct OutputDevices {
     used: Vec<AudioDeviceId>,
 }
 
-/// The system's audio devices changed (or were listed at startup): a person's instance that
-/// hears anything moves to the new default output. Call for every `Event::AudioDevices`. O(devices).
+/// Moves an open output to the new default. Call for every `Event::AudioDevices`. O(devices).
 pub fn audio_devices(cx: &mut Cx, event: &AudioDevicesEvent) {
     let default = event.default_output();
     if !cx.has_global::<OutputDevices>() {
@@ -728,10 +676,9 @@ pub fn audio_devices(cx: &mut Cx, event: &AudioDevicesEvent) {
     use_output(cx);
 }
 
-/// Asks the platform for the default output while a person's instance hears anything, and for
-/// none after. A hidden or muted instance never asks (its silent clock plays). O(devices).
+/// Selects the default output while either ring is open and deselects it after. O(devices).
 fn use_output(cx: &mut Cx) {
-    let open = cx.get_global_ref::<ElecAudio>().is_some_and(|audio| audio.out == AudioOut::Device && audio.output_open());
+    let open = cx.get_global_ref::<ElecAudio>().is_some_and(ElecAudio::output_open);
     if !cx.has_global::<OutputDevices>() {
         cx.set_global(OutputDevices::default());
     }
@@ -851,9 +798,8 @@ pub enum ListenMode {
 
 /// The output's state: its mode, the run's measured speed (audio seconds per second; 0 before
 /// the first measure), the sample rate the run steps on (0: none), the device's rate, the
-/// underruns counted, why nobody hears it in an
-/// instance a person does not, and while a take renders, the edit that started its run ("R7 =
-/// 22k"). `Display` gives the plain line; [`save_line`] adds the recording's save.
+/// underruns counted and, while a take renders, the edit that started its run ("R7 = 22k").
+/// `Display` gives the plain line and [`save_line`] adds the recording's save.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListenStatus {
     pub mode: ListenMode,
@@ -871,7 +817,6 @@ pub struct ListenStatus {
     pub recording_rate: f64,
     pub rate: Option<u32>,
     pub underruns: u64,
-    pub silent: Option<&'static str>,
     pub edit: Option<Arc<str>>,
 }
 
@@ -892,15 +837,11 @@ pub fn listen_status(cx: &Cx) -> Option<ListenStatus> {
         let starts_in_s = (st.speed > 0.0).then(|| (st.start_s - st.ready_s).max(0.0) / st.speed);
         ListenMode::Rendering { done_s: st.ready_s, length_s: st.window_s, starts_in_s }
     };
-    let silent = match audio.out {
-        AudioOut::Silent(why) => Some(why),
-        AudioOut::Device => None,
-    };
     // the rendering take's run: the edit that started it, if one did
     let edit = matches!(mode, ListenMode::Rendering { .. }).then(|| audio.bus.tapes.current(LISTEN_TAP)).flatten().and_then(|tape| tape.content.as_ref()?.edit.clone());
     let (sim_rate, recording_rate) = cx.get_global_ref::<ElecLive>().map_or((0.0, 0.0), |live| (live.sim.status.sample_rate, live.sim.status.recording_rate));
     Some(ListenStatus { mode, speed: st.speed, behind: st.behind, lead_ms: st.lead_ms, buffer_ms: st.buffer_ms,
-        jacks: audio.tap_jacks.clone(), sim_rate, recording_rate, rate: audio.rate(), underruns: audio.ring.underruns(), silent, edit })
+        jacks: audio.tap_jacks.clone(), sim_rate, recording_rate, rate: audio.rate(), underruns: audio.ring.underruns(), edit })
 }
 
 impl fmt::Display for ListenStatus {
@@ -935,9 +876,6 @@ impl fmt::Display for ListenStatus {
         }
         if self.speed > 0.0 && !matches!(self.mode, ListenMode::Waiting | ListenMode::Opening) {
             write!(f, " · x{:.2}", self.speed)?;
-        }
-        if let Some(why) = self.silent {
-            write!(f, " · silent ({why})")?;
         }
         Ok(())
     }
@@ -1033,29 +971,6 @@ pub fn hears_recording(cx: &Cx) -> bool {
     cx.get_global_ref::<ElecAudio>().is_some_and(|audio| audio.hears() && audio.ring.plays_recording())
 }
 
-/// The proof rig's variable: `silenced` takes a hidden or muted instance's Listen through
-/// the audio device with the platform's program output silenced, so the device path runs on a
-/// node and nothing reaches a speaker. Not offered in the UI.
-const SILENCED_VAR: &str = "FAB_LISTEN_DEVICE";
-
-fn device_silenced() -> bool {
-    std::env::var_os(SILENCED_VAR).is_some_and(|v| v == "silenced")
-}
-
-/// Why nobody hears this instance, or None when a person may: a hidden window or the mute switch
-/// keeps the audio device closed (an agent's instances are hidden). Remote control is no reason:
-/// a person's own window is often launched with `--remote` so it can be restarted for them.
-pub fn nobody_hears() -> Option<&'static str> {
-    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0");
-    if set("MAKEPAD_HIDE_WINDOWS") {
-        Some("hidden window")
-    } else if set("MAKEPAD_MUTE") {
-        Some("muted")
-    } else {
-        None
-    }
-}
-
 /// The device's callback: the player's samples on every channel. Per buffer: O(frames x
 /// channels), no lock, no allocation, no wait.
 fn device(cx: &mut Cx, ring: Arc<SampleRing>, speaker: Speaker, links: PlayerLinks, counts: Arc<DeviceCounts>) {
@@ -1130,7 +1045,7 @@ struct FirstCall {
 /// ask at which a device that has not called back is.
 const OPEN_PROOF_S: f64 = 2.0;
 
-/// A person's instance logs its output's open: the device's rate once its first callback says it,
+/// Logs the output's open: the device's rate once its first callback says it,
 /// then, `OPEN_PROOF_S` later, the callbacks, frames and samples the ring gave and its underruns;
 /// or, once, that no callback has run `OPEN_PROOF_S` after the ask (`no_device`: the system names
 /// no default output). O(1).
@@ -1165,49 +1080,5 @@ fn say_output(audio: &mut ElecAudio, no_device: bool) {
                 log!("[listen] output asked for, but its callback has not run in {s:.1} s{why}: nothing plays yet");
             }
         }
-    }
-}
-
-/// The silent clock: plays what a 48 kHz device would, on its own long-lived thread, while the
-/// ring is open; blocks on `woken` otherwise. Its player counts underruns and renders as the
-/// device's does.
-fn silent_clock(cx: &mut Cx, ring: Arc<SampleRing>, speaker: Speaker, on: Arc<AtomicBool>, woken: Receiver<()>, links: PlayerLinks) {
-    let spawned = cx.thread_spawner().spawn_worker(
-        ThreadOptions { name: Some("elec listen silent clock".into()), ..Default::default() },
-        Box::new(move || {
-            let mut player = Player::new(Some(links));
-            let mut device_player = DevicePlayer::new();
-            let mut scratch = vec![0.0f32; (SILENT_RATE as f64 * SILENT_TICK.as_secs_f64() * 4.0) as usize];
-            let mut device_scratch = vec![0.0f32; SPEAKER_SCRATCH];
-            let mut owed = 0.0f64;
-            let mut at = Instant::now();
-            loop {
-                if !on.load(Ordering::Acquire) {
-                    // closed: what the ring holds is drained unheard; wait for the next Listen
-                    // (the app keeps the sender while it runs)
-                    player.fill(&ring, &mut scratch, SILENT_RATE as f64);
-                    device_player.mix_into(&speaker.ring, &speaker.mix, &mut scratch, &mut device_scratch, SILENT_RATE as f64);
-                    if woken.recv().is_err() {
-                        return;
-                    }
-                    (owed, at) = (0.0, Instant::now());
-                    continue;
-                }
-                std::thread::sleep(SILENT_TICK);
-                let now = Instant::now();
-                owed += (now - at).as_secs_f64() * SILENT_RATE as f64;
-                at = now;
-                // a long stall of this thread is not made up at once: at most a few ticks
-                owed = owed.min(scratch.len() as f64);
-                let want = owed as usize;
-                owed -= want as f64;
-                player.fill(&ring, &mut scratch[..want], SILENT_RATE as f64);
-                device_player.mix_into(&speaker.ring, &speaker.mix, &mut scratch[..want], &mut device_scratch, SILENT_RATE as f64);
-            }
-        }),
-    );
-    match spawned {
-        Ok(handle) => handle.detach(),
-        Err(e) => log!("elec listen: no thread for the silent clock ({e:?}); Listen stays silent and unpaced"),
     }
 }

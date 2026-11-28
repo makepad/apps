@@ -1008,7 +1008,7 @@ const SCRUB_TOUCH: f64 = 0.12;
 /// with the playhead, and a scrub sounds a short touch at each new place.
 /// The edit's own mix (`engine::sound_mix`, played as the edit's viewer
 /// plays it); silent when the graphic is not placed in the edit or the
-/// page is not shown, and on a hidden or muted instance (`sound::muted`).
+/// page is not shown.
 fn play_sound(page: &mut VideoCut, cx: &mut Cx, shown: bool) {
     let start = page.motion.desk.session.as_ref().filter(|_| shown)
         .and_then(|session| session.node.as_deref())

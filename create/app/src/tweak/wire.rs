@@ -464,7 +464,7 @@ pub enum Request {
     Tree(TreeQuery),
     Theme(ThemeOp),
     Design(DesignRequest),
-    Select(Option<String>), AskEdit, Look, LookDone { look: RequestId, ok: bool },
+    Select(Option<String>), Look, LookDone { look: RequestId, ok: bool },
 }
 fn check_path(path: &str) -> Result<(), &'static str> {
     if path.is_empty() || path.chars().any(char::is_control) { Err("invalid widget path") } else { Ok(()) }
@@ -480,7 +480,7 @@ impl Request {
     fn tag(&self) -> u8 {
         match self {
             Self::Pick(At::Point { .. }) => 1, Self::Pick(At::Path(_)) => 2, Self::Props { .. } => 3,
-            Self::Set { .. } => 4, Self::Select(_) => 5, Self::AskEdit => 6,
+            Self::Set { .. } => 4, Self::Select(_) => 5,
             Self::Look => 21, Self::LookDone { .. } => 22,
             Self::Tree(_) => TAG_REQUEST_TREE, Self::Theme(_) => TAG_REQUEST_THEME,
             Self::Design(_) => TAG_REQUEST_DESIGN,
@@ -498,7 +498,7 @@ impl Request {
             Self::Set { path, prop, value } => for s in [path, prop, value] { string(out, s) },
             Self::Select(path) => option(out, path.as_deref(), string),
             Self::LookDone { look, ok } => { out.extend(look.to_le_bytes()); out.push(*ok as u8); }
-            Self::AskEdit | Self::Look => {}
+            Self::Look => {}
             Self::Tree(query) => query.encode(out),
             Self::Theme(op) => op.encode(out),
             Self::Design(request) => request.encode(out),
@@ -510,7 +510,7 @@ impl Request {
             1 => Self::Pick(At::Point { window: r.size()?, x: r.float()?, y: r.float()? }),
             2 => Self::Pick(At::Path(r.string()?)), 3 => Self::Props { path: r.string()? },
             4 => Self::Set { path: r.string()?, prop: r.string()?, value: r.string()? },
-            5 => Self::Select(r.path()?), 6 => Self::AskEdit,
+            5 => Self::Select(r.path()?),
             TAG_REQUEST_DESIGN => {
                 let Some(request) = DesignRequest::decode(r)? else { return Ok(None) };
                 Self::Design(request)
@@ -541,7 +541,7 @@ impl Request {
                 check_prop(prop)?;
                 path
             }
-            Self::Select(None) | Self::AskEdit | Self::Look | Self::LookDone { .. } => return Ok(()),
+            Self::Select(None) | Self::Look | Self::LookDone { .. } => return Ok(()),
         };
         check_path(path)
     }
@@ -549,7 +549,7 @@ impl Request {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Notice {
-    Asked, Allowed(bool),
+    Allowed(bool),
     Running(Request), Stopped(bool), Looked,
     Picture { png: Arc<[u8]>, size: [u32; 2] },
     Window { window: usize, size: [f64; 2] },
@@ -599,7 +599,7 @@ impl Packet {
         let tag = match &self.body {
             Body::Request(request) => request.tag(),
             Body::Notice { notice, .. } => match notice {
-                Notice::Asked => 7, Notice::Allowed(_) => 8, Notice::Picked { .. } => 9, Notice::Rows { .. } => 10,
+                Notice::Allowed(_) => 8, Notice::Picked { .. } => 9, Notice::Rows { .. } => 10,
                 Notice::Window { .. } => 16, Notice::Ended(_) => 17,
                 Notice::Tree { .. } => TAG_NOTICE_TREE, Notice::Theme { .. } => TAG_NOTICE_THEME,
                 Notice::Design(_) => TAG_NOTICE_DESIGN,
@@ -631,7 +631,7 @@ impl Packet {
                         out.extend((png.len() as u64).to_le_bytes());
                         out.extend_from_slice(png);
                     }
-                    Notice::Asked | Notice::Looked => {}
+                    Notice::Looked => {}
                     Notice::Allowed(yes) | Notice::Stopped(yes) => out.push(*yes as u8),
                     Notice::Running(request) => {
                         debug_assert!(!matches!(request, Request::Design(_)));
@@ -763,16 +763,16 @@ pub(super) fn decode_envelope(peer: Seat, bytes: &[u8]) -> Result<Option<Packet>
     let req = u128::from_le_bytes(r.bytes()?);
     let agent = if r.flag()? { Some(r.bytes()?) } else { None };
     let body = match tag {
-        1..=6 | 21 | 22 | TAG_REQUEST_TREE | TAG_REQUEST_THEME | TAG_REQUEST_DESIGN => {
+        1..=5 | 21 | 22 | TAG_REQUEST_TREE | TAG_REQUEST_THEME | TAG_REQUEST_DESIGN => {
             let Some(request) = Request::decode(tag, &mut r)? else { return Ok(None) };
             Body::Request(request)
         }
-        7..=13 | 16 | 17 | 19 | 20 | 23 | 24 | TAG_NOTICE_TREE | TAG_NOTICE_THEME | TAG_NOTICE_DESIGN => {
+        8..=13 | 16 | 17 | 19 | 20 | 23 | 24 | TAG_NOTICE_TREE | TAG_NOTICE_THEME | TAG_NOTICE_DESIGN => {
             let seat = r.bytes()?;
             let delivery = r.integer()?;
             if delivery == 0 { return Err("invalid delivery id") }
             let notice = match tag {
-                7 => Notice::Asked, 8 => Notice::Allowed(r.flag()?),
+                8 => Notice::Allowed(r.flag()?),
                 9 => Notice::Picked { path: r.string()?, ty: r.string()?, rect: r.rect()? },
                 10 => Notice::Rows { path: r.string()?, rows: r.string()? },
                 11 => Notice::Applied { path: r.string()?, prop: r.string()?, old: r.string()?, new: r.string()?, seq: r.integer()? },
@@ -797,7 +797,7 @@ pub(super) fn decode_envelope(peer: Seat, bytes: &[u8]) -> Result<Option<Packet>
                 19 => {
                     let [tag] = r.bytes()?;
                     let Some(request) = Request::decode(tag, &mut r)? else { return Ok(None) };
-                    if matches!(request, Request::Tree(_) | Request::Theme(_) | Request::Design(_) | Request::AskEdit | Request::Select(_) | Request::LookDone { .. }) { return Err("request cannot run in the app") }
+                    if matches!(request, Request::Tree(_) | Request::Theme(_) | Request::Design(_) | Request::Select(_) | Request::LookDone { .. }) { return Err("request cannot run in the app") }
                     if request == Request::Look && agent.is_none() { return Err("a look needs an AI") }
                     Notice::Running(request)
                 }

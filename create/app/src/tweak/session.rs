@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 pub use makepad_town_core::share::hello::DESIGN_LEVEL;
+pub const OLDER_SHARER_CONTROL: &str = "The sharer's copy of Makepad Town is older and still asks for a separate edit Allow. Tweaking starts when it updates.";
 const MAX_GATED_LEVEL: u16 = DESIGN_LEVEL;
 pub const OLDER_SHARER_DESIGN: &str = "The sharer's copy of Makepad Town is older and does not support structural design yet.";
 const OLDER_GUEST_DESIGN: &str = "This seat's copy of Makepad Town does not support structural design.";
@@ -25,7 +26,6 @@ pub struct Selection { pub path: String, pub rect: Option<Rect>, pub agent: Opti
 pub struct SeatView {
     pub(crate) design: design::DesignStateView,
     pub window: Option<(usize, [f64; 2])>,
-    pub asked: BTreeSet<Seat>,
     pub allowed: BTreeSet<Seat>,
     pub running: BTreeMap<(Seat, Option<Id>), (RequestId, Request)>,
     pub looking: BTreeMap<(Seat, Id), RequestId>,
@@ -87,9 +87,7 @@ impl SeatView {
             Notice::Design(DesignNotice::Status(text)) => {
                 if let Some(view) = design::DesignStateView::read(text) { self.design = view; }
             }
-            Notice::Asked => { self.asked.insert(who.seat); }
             Notice::Allowed(yes) => {
-                self.asked.remove(&who.seat);
                 if *yes { self.allowed.insert(who.seat); } else { self.allowed.remove(&who.seat); }
             }
             Notice::Picked { path, rect, .. } => {
@@ -161,7 +159,7 @@ struct Owner<L, T> {
     last_theme_install: Option<Arc<ThemeInstall>>,
     link: L,
     window: Option<WindowId>,
-    allowed: BTreeSet<Seat>,
+    rights: ControlRights,
     peer_levels: BTreeMap<Seat, u16>,
     agents: BTreeMap<Id, Agent>,
     profiles: BTreeMap<Seat, Profile>,
@@ -223,7 +221,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
 
     pub fn owner(town: Id, share: SessionId, item: Id, me: Seat, link: L) -> Result<Self, String> {
         let mut session = Self::peer(town, share, item, me, me)?;
-        session.owner = Some(Owner { design: Default::default(), design_ticket: None, unbaked_props: Default::default(), last_theme_install: None, link, window: None, allowed: BTreeSet::new(), agents: BTreeMap::new(), seen: BTreeSet::new(), queue: VecDeque::new(),
+        session.owner = Some(Owner { design: Default::default(), design_ticket: None, unbaked_props: Default::default(), last_theme_install: None, link, window: None, rights: ControlRights::default(), agents: BTreeMap::new(), seen: BTreeSet::new(), queue: VecDeque::new(),
             profiles: BTreeMap::new(), stopped: BTreeMap::new(), peer_levels: BTreeMap::new(),
             theme: None, theme_label: String::new(), theme_deltas: Default::default(),
             running: None, stills: Vec::new(), writes: VecDeque::new(), seq: 0, rects: BTreeMap::new(), listed: BTreeMap::new(), shader_fns: BTreeMap::new(), out: BTreeMap::new(), delivery: 0 });
@@ -237,6 +235,11 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         let status = owner.design.state_view().json().to_json();
         self.emit(Who { seat: self.me, req: 0, agent: None }, Notice::Design(DesignNotice::Status(status)));
         result
+    }
+
+    /// Until the sharer's Hello arrives, keep the normal controls visible.
+    pub fn supports_control_tweak(&self) -> bool {
+        self.owner.is_some() || self.sharer_level.is_none_or(|level| level >= makepad_town_core::share::hello::CONTROL_TWEAK_LEVEL)
     }
 
     pub fn supports_tree(&self) -> bool {
@@ -308,14 +311,17 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     pub fn set_members(&mut self, members: impl IntoIterator<Item = Seat>) {
         let Some(owner) = &mut self.owner else { return };
         let active: BTreeSet<_> = members.into_iter().filter(|seat| seat != &self.me).collect();
+        if active.iter().eq(owner.out.keys()) { return }
         let departed: Vec<_> = owner.out.keys().filter(|seat| !active.contains(*seat)).copied().collect();
         owner.out.retain(|seat, _| active.contains(seat));
         for seat in &departed { owner.peer_levels.remove(seat); }
         for seat in departed {
             self.refuse_looks(seat, "This seat left the share.");
-            self.refuse_matching(|who, r| (who.seat == seat && matches!(r, Request::Design(_))).then_some("This seat left the share."));
-            if self.view.allowed.contains(&seat) { let _ = self.consent(seat, false); }
-            self.view.asked.remove(&seat);
+            self.refuse_matching(|who, _| (who.seat == seat).then_some("This seat left the share."));
+            if self.view.allowed.contains(&seat) {
+                let req = self.req();
+                self.emit(Who { seat, req, agent: None }, Notice::Allowed(false));
+            }
             let req = self.req();
             self.emit(Who { seat, req, agent: None }, Notice::Selected { path: None, rect: None });
         }
@@ -330,7 +336,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 out.pending.insert(owner.delivery, Arc::new(packet.encode()));
             };
             if let Some((window, size)) = self.view.window { snapshot(self.me, None, 0, Notice::Window { window, size }); }
-            for &seat in &self.view.asked { snapshot(seat, None, 0, Notice::Asked); }
             for &seat in &self.view.allowed { snapshot(seat, None, 0, Notice::Allowed(true)); }
             for (&(seat, agent), &stopped) in &self.view.agents { snapshot(seat, Some(agent), 0, Notice::Stopped(stopped)); }
             for (&seat, s) in &self.view.selections {
@@ -356,6 +361,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             }
             owner.out.insert(peer, out);
         }
+        self.sync_allowed();
     }
 
     /// The sharer verifies each guest AI against the agents known in this share's town.
@@ -453,8 +459,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         Some(owner.delivery)
     }
 
-    /// A person's Allow covers their AIs. The sharer enforces its grants. A viewer uses the
-    /// last grants it received to decide whether to request a panel refresh.
+    /// The sharer enforces the call's control right for a person and their AIs. A guest uses
+    /// the last rights the sharer announced when deciding whether to refresh its panel.
     pub(super) fn may_act(&self, seat: &Seat, agent: Option<Id>, request: &Request) -> Result<(), &str> {
         if *request == Request::Look {
             if seat == &self.sharer { return Err(OWN_LOOK) }
@@ -467,12 +473,15 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 return Err("The sharer stopped this AI.")
             }
             if *request == Request::Look { return Ok(()) }
-        } else if matches!(request, Request::AskEdit | Request::Select(_)) {
+        } else if matches!(request, Request::Select(_)) {
             return Ok(())
         }
         if matches!(request, Request::Design(r) if r.is_read_only()) { return Ok(()); }
-        let allowed = self.owner.as_ref().map_or(&self.view.allowed, |owner| &owner.allowed);
-        if seat == &self.sharer || allowed.contains(seat) { Ok(()) } else { Err("Ask the owner to allow editing this share.") }
+        let allowed = match &self.owner {
+            Some(owner) => owner.rights.allows(seat),
+            None => self.view.allowed.contains(seat),
+        };
+        if seat == &self.sharer || allowed { Ok(()) } else { Err(NEEDS_CONTROL) }
     }
 
     /// The panel label and this computer's current grant. An AI needs that grant to edit or select.
@@ -540,7 +549,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 };
                 self.emit(who, notice);
             }
-            Request::AskEdit => self.emit(who, Notice::Asked),
             Request::Select(path) => {
                 let rect = path.as_ref().and_then(|path| owner.rects.get(path)).copied();
                 self.emit(who, Notice::Selected { path, rect });
@@ -572,20 +580,35 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         }
     }
 
-    pub(super) fn consent(&mut self, seat: Seat, yes: bool) -> Result<(), &'static str> {
-        if self.ended.is_some() || seat == self.me { return Err("no peer consent for this seat") }
-        let owner = self.owner.as_mut().ok_or("only the share owner can allow")?;
-        if yes {
-            if !owner.out.contains_key(&seat) { return Err("seat is not in this town") }
-            owner.allowed.insert(seat);
-        } else {
-            owner.allowed.remove(&seat);
-            self.refuse_matching(|who, req| (who.seat == seat && !matches!(req, Request::Design(r) if r.is_read_only()))
-                .then_some("Allow revoked. Ask the owner again."));
+    pub fn control_rights(&self) -> Option<&ControlRights> {
+        self.owner.as_ref().map(|owner| &owner.rights)
+    }
+
+    /// Reconcile the active members' edit permissions with the local share's call right.
+    pub fn set_control_rights(&mut self, rights: ControlRights) {
+        let Some(owner) = &mut self.owner else { return };
+        if self.ended.is_some() || owner.rights == rights { return }
+        owner.rights = rights;
+        self.sync_allowed();
+    }
+
+    fn sync_allowed(&mut self) {
+        let Some(owner) = &self.owner else { return };
+        let mut changes = Vec::new();
+        let mut denied = BTreeSet::new();
+        for seat in owner.out.keys() {
+            let yes = owner.rights.allows(seat);
+            if yes != self.view.allowed.contains(seat) { changes.push((*seat, yes)); }
+            if !yes { denied.insert(*seat); }
         }
-        let req = self.req();
-        self.emit(Who { seat, req, agent: None }, Notice::Allowed(yes));
-        Ok(())
+        if !denied.is_empty() {
+            self.refuse_matching(|who, request| (denied.contains(&who.seat) && !matches!(request, Request::Design(r) if r.is_read_only()))
+                .then_some(CONTROL_ENDED));
+        }
+        for (seat, yes) in changes {
+            let req = self.req();
+            self.emit(Who { seat, req, agent: None }, Notice::Allowed(yes));
+        }
     }
 
     pub(super) fn stop_agent(&mut self, seat: Seat, agent: Id, stop: bool) -> Result<(), &'static str> {
@@ -1087,7 +1110,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         if let Some(owner) = &mut self.owner {
             owner.design.abort(why);
             owner.running.take_if(|(_, w)| matches!(w.kind, WorkKind::ThemeRefresh));
-            let allowed = std::mem::take(&mut owner.allowed);
+            let allowed = std::mem::take(&mut self.view.allowed);
             // A local Leave can precede the final G11 Design event for a Set already applied.
             // Keep its ticket until Design or the terminal G11 Ended event.
             let queue = std::mem::take(&mut owner.queue);
@@ -1106,7 +1129,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         self.cancel_pending_looks(why);
         self.finish_end();
         self.view.allowed.clear();
-        self.view.asked.clear();
         self.view.running.clear();
         self.view.looking.clear();
         self.view.finished.clear();
@@ -1143,12 +1165,10 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             self.refuse_looks(peer, "The guest disconnected.");
             self.refuse_matching(|who, r| (who.seat == peer && matches!(r, Request::Design(_))).then_some("The guest disconnected."));
         }
-        if self.owner.as_ref().is_some_and(|o| o.allowed.contains(&peer)) { let _ = self.consent(peer, false); }
         if self.owner.is_none() && peer == self.sharer {
             self.cancel_pending_looks("The sharer disconnected.");
             self.view.looking.clear();
             self.ready = true;
-            self.view.allowed.remove(&self.me);
         }
     }
 
@@ -1183,7 +1203,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                     if seat == self.me && matches!(notice, Notice::Looked | Notice::Refused(_)) {
                         if let Some((_, Some(done))) = self.pending_looks.remove(&who.req) { self.requests.remove(&done); }
                     }
-                    if seat == self.me && matches!(notice, Notice::Asked | Notice::Selected { .. } | Notice::Picked { .. }
+                    if seat == self.me && matches!(notice, Notice::Selected { .. } | Notice::Picked { .. }
                         | Notice::Rows { .. } | Notice::Tree { .. } | Notice::Theme { .. } | Notice::Applied { .. } | Notice::Refused(_) | Notice::Looked
                         | Notice::Design(DesignNotice::Reply { .. } | DesignNotice::Mutated { .. })) { self.requests.remove(&who.req); }
                     if let Notice::Ended(why) = &notice {

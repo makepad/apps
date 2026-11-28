@@ -1,6 +1,10 @@
 use super::*;
 use makepad_call::driver::codec::{Packet, TestCodecs};
-use makepad_remote::{conn::ChannelTx, Conn, Endpoint, Event};
+use makepad_remote::{
+    audio::{encode_audio_record, AudioRecord},
+    conn::{ChannelTx, CLOSE_REFUSED, CLOSE_UNSUPPORTED},
+    Conn, Endpoint, Event,
+};
 use std::{
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
@@ -20,6 +24,9 @@ struct Data {
     hold_input: bool,
     input_waiting: bool,
     frames: Vec<Feed>,
+    audio_opens: usize,
+    audio_channels: Vec<ChannelTx>,
+    audio_refusal: Option<(u16, String)>,
     video_opens: Vec<(usize, f64, u32, u32)>,
     raw_opens: usize,
     controls: Vec<(usize, String)>,
@@ -327,8 +334,35 @@ impl Rig {
                 Ok(())
             }),
         );
-        // The process inspector serves cmd, watch, observe and prof. A standalone UI adds
-        // frames and app, and its HAL host adds gpuprof. Only cmd and frames are opened here.
+        let (tx, wakes) = mpsc::channel();
+        let audio_wake = tx.clone();
+        let f = fake.clone();
+        ep.register("audio", 1, Arc::new(move |_, open| {
+            assert!(open.args.is_empty(), "app-wide audio opens without arguments");
+            let mut d = f.data.lock().unwrap();
+            d.audio_opens += 1;
+            let refusal = d.audio_refusal.take();
+            if refusal.is_none() {
+                d.audio_channels.push(open.channel.tx());
+            }
+            f.release.notify_all();
+            let _ = audio_wake.send(());
+            drop(d);
+            if let Some(reason) = refusal { return Err(reason); }
+
+            let fake = f.clone();
+            let wake = audio_wake.clone();
+            thread::spawn(move || {
+                while let Some(event) = open.channel.recv() {
+                    if matches!(event, Event::Closed(..)) { break; }
+                }
+                fake.data.lock().unwrap().audio_channels.retain(|tx| tx.id() != open.channel.id());
+                fake.release.notify_all();
+                let _ = wake.send(());
+            });
+            Ok(())
+        }));
+        // Advertise the other services of a standalone app and its HAL host.
         ep.register_watch();
         for name in ["observe", "prof", "app", "gpuprof"] {
             ep.register(
@@ -370,7 +404,6 @@ impl Rig {
                 }
             }
         });
-        let (tx, wakes) = mpsc::channel();
         let signal: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = tx.send(());
         });
@@ -485,6 +518,25 @@ impl Rig {
         drop(self.fake.release.wait_while(data, |d| !d.input_waiting).unwrap());
     }
     pub(crate) fn input_lines(&self) -> Vec<String> { self.fake.inputs() }
+    pub(crate) fn send_sound(&self, first_frame: u64, frames: usize, t_ns: u64) {
+        let pcm = (0..frames).flat_map(|f| {
+            let left = ((first_frame + f as u64) % 30_000) as i16;
+            [left, -left]
+        }).collect();
+        self.send_raw_sound(encode_audio_record(&AudioRecord { first_frame, rate: 48_000, gen: 0, t_ns, pcm }));
+    }
+    pub(crate) fn send_raw_sound(&self, bytes: Vec<u8>) {
+        let channels = self.fake.data.lock().unwrap().audio_channels.clone();
+        for channel in channels { channel.send(bytes.clone()).unwrap(); }
+    }
+    pub(crate) fn audio_open_count(&self) -> usize { self.fake.data.lock().unwrap().audio_opens }
+    pub(crate) fn audio_channels_open(&self) -> usize { self.fake.data.lock().unwrap().audio_channels.len() }
+    fn link_app(&mut self) -> LinkId {
+        self.rescan();
+        let link = self.app.link(&self.app.apps()[0].key.clone());
+        self.live(link);
+        link
+    }
     pub(crate) fn local_input(&self) { self.fake.data.lock().unwrap().seq += 1; }
     pub(crate) fn live(&mut self, id: LinkId) {
         self.wait(|r| {
@@ -717,6 +769,106 @@ fn quit_waits_for_the_button_release_reply_and_a_second_close_can_force_exit() {
             assert_eq!(rig.app.state(id).unwrap().phase, LinkPhase::Live, "the recorder can still use the link");
         }
     }
+}
+
+#[test]
+fn a_share_sound_opens_the_apps_audio_once_and_relays_its_records_in_order() {
+    let mut rig = Rig::new();
+    let link = rig.link_app();
+    let first = rig.app.open_sound(link).unwrap();
+    rig.wait(|r| r.audio_channels_open() == 1);
+    assert_eq!(rig.audio_open_count(), 1, "the first holder opens one app-wide audio channel");
+    for i in 0..3 {
+        rig.send_sound(i * 480, 480, 1_000_000_000 + i * 10_000_000);
+    }
+    rig.wait(|_| first.stats().records == 3);
+    for i in 0..3 {
+        let record = first.pop().expect("all three records are queued");
+        assert_eq!((record.first_frame, record.t_ns), (i * 480, 1_000_000_000 + i * 10_000_000),
+            "the relay preserves record order and the app clock");
+        assert_eq!((record.rate, record.gen), (48_000, 0), "the source rate and generation survive");
+        let expected: Vec<_> = (i * 480..(i + 1) * 480).flat_map(|f| [f as i16, -(f as i16)]).collect();
+        assert_eq!(record.pcm, expected, "every stereo sample survives the relay");
+    }
+    assert_eq!(first.stats().frames, 1_440, "delivery counts stereo frames");
+    let second = rig.app.open_sound(link).unwrap();
+    rig.barrier(link); // The second subscription has reached the worker before the next record.
+    rig.send_sound(1_440, 480, 1_030_000_000);
+    rig.wait(|_| first.stats().records == 4 && second.stats().records == 1);
+    let next = first.pop().expect("the original holder received the next record");
+    assert_eq!(next.first_frame, 1_440, "the original holder continues in order");
+    assert_eq!(second.pop(), Some(next), "the second holder receives the same record");
+    assert_eq!(rig.audio_open_count(), 1, "both holders share one channel");
+    drop(first);
+    drop(second);
+    rig.wait(|r| r.audio_channels_open() == 0);
+    let _third = rig.app.open_sound(link).unwrap();
+    rig.wait(|r| r.audio_channels_open() == 1);
+    assert_eq!(rig.audio_open_count(), 2, "a later holder reopens the channel");
+}
+
+#[test]
+fn an_app_without_audio_ends_the_sound_with_the_reason_and_keeps_its_picture() {
+    let mut rig = Rig::new();
+    let link = rig.link_app();
+    rig.fake.data.lock().unwrap().audio_refusal = Some((CLOSE_UNSUPPORTED, "unknown service".into()));
+    let unsupported = rig.app.open_sound(link).unwrap();
+    rig.wait(|_| unsupported.ended());
+    assert!(unsupported.ended_why().unwrap().contains("has no audio service"), "an older app explains its silent share");
+    let picture = rig.app.open_picture(link, PictureWant {
+        window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100,
+    }).unwrap();
+    assert!(rig.packet(&picture).key, "the same link still delivers its picture");
+
+    let busy = "the app's audio taps are all in use";
+    rig.fake.data.lock().unwrap().audio_refusal = Some((CLOSE_REFUSED, busy.into()));
+    let refused = rig.app.open_sound(link).unwrap();
+    rig.wait(|_| refused.ended());
+    assert_eq!(refused.ended_why().as_deref(), Some(busy), "temporary refusal preserves the app's reason");
+    let retry = rig.app.open_sound(link).unwrap();
+    rig.wait(|r| r.audio_channels_open() == 1);
+    rig.send_sound(960, 480, 1_020_000_000);
+    rig.wait(|_| retry.stats().records == 1);
+    assert_eq!(retry.pop().unwrap().first_frame, 960, "a new holder receives sound after refusal");
+}
+
+#[test]
+fn a_holder_that_falls_behind_hears_the_newest_second() {
+    let mut rig = Rig::new();
+    let link = rig.link_app();
+    let sound = rig.app.open_sound(link).unwrap();
+    rig.wait(|r| r.audio_channels_open() == 1);
+    for i in 0..75 {
+        rig.send_sound(i * 1_920, 1_920, i * 40_000_000);
+    }
+    rig.wait(|_| sound.stats().records == 75);
+    let stats = sound.stats();
+    assert_eq!(stats.frames, 75 * 1_920, "all delivered frames count, including later evictions");
+    assert_eq!(stats.dropped_records, 50, "the oldest two seconds were evicted");
+    let mut frames = 0;
+    for i in 50..75 {
+        let record = sound.pop().expect("the entire newest second remains queued");
+        assert_eq!(record.first_frame, i * 1_920, "the retained records form an ordered suffix through the last send");
+        frames += record.pcm.len() / 2;
+    }
+    assert_eq!(frames, 48_000, "the holder retained one second of stereo frames");
+    assert!(sound.pop().is_none(), "no extra records exceed the frame budget");
+}
+
+#[test]
+fn a_bad_audio_record_ends_the_sound_with_its_error() {
+    let mut rig = Rig::new();
+    let link = rig.link_app();
+    let sound = rig.app.open_sound(link).unwrap();
+    rig.wait(|r| r.audio_channels_open() == 1);
+    rig.send_sound(0, 1, 42);
+    let mono = r#"{"first":1,"rate":48000,"ch":1,"gen":0,"t_ns":43}"#;
+    rig.send_raw_sound(makepad_remote::frames::encode_record(mono, &[0; 4]));
+    rig.wait(|_| sound.ended_why().is_some());
+    assert!(sound.ended_why().unwrap().contains("stereo"), "the holder sees the decoder's stereo error");
+    assert!(!sound.ended(), "a valid record preceding the error can still be drained");
+    assert_eq!(sound.pop().unwrap().t_ns, 42, "the valid record survives the error");
+    assert!(sound.ended() && sound.pop().is_none(), "the malformed record ends the stream without being relayed");
 }
 
 #[test]

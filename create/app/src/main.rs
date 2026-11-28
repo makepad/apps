@@ -364,6 +364,7 @@ impl App {
             .map(|offer| (offer.session, [offer.window_size.0, offer.window_size.1]));
         if self.tweaks.refresh_selections(model, picture, &mut share.overlay) {
             self.call.set_share_overlay(share.overlay.clone());
+            self.view.sync_share_select(cx, &self.ui);
             self.view.redraw_share_panels(cx, &self.ui);
         }
         let panel = self.ui.view(cx, ids!(tweak_panel));
@@ -1909,8 +1910,20 @@ impl MatchEvent for App {
                 }
             }
         }
+        if self.ui.button(cx, ids!(live_share.share_select)).clicked(actions) {
+            self.tweaks.toggle_select();
+        }
         if self.ui.button(cx, ids!(tweak_close)).clicked(actions) {
             self.tweaks.close_panel();
+        }
+        if self.ui.button(cx, ids!(tweak_ask)).clicked(actions) {
+            if let Some(share) = self.tweaks.panel_share() {
+                if self.call.ask_control(share, true) {
+                    self.show_call(cx);
+                } else if self.call.asking_for_control() != Some(share) {
+                    self.open_node(cx, makepad_create::lists::Node::Live(Live::Share(share)));
+                }
+            }
         }
         self.tweaks.actions(cx, &self.ui, actions);
         if self.view.page == Page::Board {

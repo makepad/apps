@@ -11,7 +11,7 @@ script_mod! {
     use mod.widgets.*
 
     let CallControls = View{width: Fill height: Fit flow: Right spacing: 5 align: Align{y: 0.5}}
-    let CallControl = PanelButton{height: 26 padding: Inset{left: 8 right: 8}}
+    let CallControl = PanelButton{height: 26 padding: Inset{left: 8 right: 8} reset_hover_on_click: true}
     let Name = RailText{max_lines: 1 text_overflow: Ellipsis}
     let Mark = PresenceDot{visible: false draw_bg.color: theme.color_success}
     mod.widgets.LiveCallPage = mod.widgets.LiveCallPageBase{
@@ -107,6 +107,7 @@ script_mod! {
                 watch := Control{text: "Watch"}
                 close_watch := Control{text: "Close"}
                 share_tweak := Control{text: "Tweak"}
+                share_select := Control{text: "Select" a11y: {label: "Select widgets in the picture"}}
                 share_pop_out := Control{text: "Pop out"}
                 share_scale := Control{text: "1:1"}
                 share_issue := Control{text: "Share visual issue"}
@@ -115,6 +116,7 @@ script_mod! {
             }
             share_rights := View{visible: false width: Fill height: Fit flow: Right{wrap: true} spacing: 6 align: Align{y: 0.5}
                 allow_all := Toggle{text: "Allow others to control"}
+                BodyNote{width: Fit text: "Control includes tweaking the app."}
                 chips := FlatList{width: Fill height: Fit flow: Right{wrap: true} spacing: 4
                     scroll_bars +: {show_scroll_y: false}
                     Chip := RoundedView{width: Fit height: 22 flow: Right align: Align{y: 0.5}
@@ -343,9 +345,25 @@ impl ViewData {
         button.set_enabled(cx, self.workspace.writable && !self.tree.snapshot().projects.is_empty());
     }
 
+    /// Select shows while the tweak panel is open on this share. Lit, the picture's presses pick
+    /// widgets, also while you hold control; unlit, they drive the app.
+    pub fn sync_share_select(&self, cx: &mut Cx, ui: &WidgetRef) {
+        let share = &self.call.share;
+        let select = self.share_page().and_then(|session| share.overlay.as_ref()
+            .filter(|(_, s)| s.share.or(share.watching) == Some(session)).and_then(|(_, s)| s.select));
+        let mut button = ui.button(cx, ids!(live_share.share_select));
+        button.set_visible(cx, select.is_some());
+        let on = select == Some(true);
+        script_apply_eval!(cx, button, {
+            draw_bg.color: if #(on) {mod.palette.sel} else {mod.palette.panel2}
+            draw_bg.border_color: if #(on) {mod.palette.accent} else {mod.palette.line}
+        });
+    }
+
     /// Bind the share surfaces on a call snapshot change. Picture-only updates redraw the panel.
     pub fn sync_live_share(&mut self, cx: &mut Cx, ui: &WidgetRef) {
         self.sync_share_issue(cx, ui);
+        self.sync_share_select(cx, ui);
         let shown = &self.call;
         let session = self.share_page();
         let offer = session.and_then(|s| shown.share.offer(s));

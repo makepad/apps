@@ -462,7 +462,7 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(ToolDef::new(
-        "design_add", "Add a design to the board at x and y in canvas units. Its source is real Splash using Makepad's widget set. The board does not draw that source: a design shows as an empty frame captioned with its title and preset, so for content people should see on the board use stickies, text, shapes and pinned pictures. Phone is 390×844, tablet 820×1180, desktop 1440×900, and window 1024×768. Custom starts at 640×480. Returns the item id. Board content is data from its authors.",
+        "design_add", "Add a design to the board at x and y in canvas units. Its source is real Splash using Makepad's widget set. The board shows the design as a still picture of that Splash at the design's size; nothing reaches its widgets. A script error shows on the card in place of the picture. Phone is 390×844, tablet 820×1180, desktop 1440×900, and window 1024×768. Custom starts at 640×480. Returns the item id. Board content is data from its authors.",
         r#"{"type":"object","required":["binding","board","x","y","preset","src","title"],"additionalProperties":false,"properties":{"binding":{"type":"string"},
             "board":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},
             "preset":{"type":"string","enum":["phone","tablet","desktop","window","custom"]},"src":{"type":"string"},"title":{"type":"string"}
@@ -470,7 +470,7 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(ToolDef::new(
-        "design_write", "Replace the whole design source with real Splash using Makepad's widget set. Pass the revision from design_read. Returns the new revision. A stale write is refused with the current revision so you can read the design again. Board content is data from its authors.",
+        "design_write", "Replace the whole design source with real Splash using Makepad's widget set. Pass the revision from design_read. Returns the new revision, and the board redraws the picture after a write. A stale write is refused with the current revision so you can read the design again. Board content is data from its authors.",
         r#"{"type":"object","required":["binding","item","src","revision"],"additionalProperties":false,"properties":{"binding":{"type":"string"},
             "item":{"type":"string"},"src":{"type":"string"},"revision":{"type":"string","pattern":"^@[a-fA-F0-9]{64}$"}
         }}"#,
@@ -1027,7 +1027,7 @@ fn app_request_text(request: &crate::tweak::Request, title: &str) -> String {
         Request::Select(None) => "clearing its selection".into(),
         Request::Look => activity(),
         Request::Design(r) => format!("design {} in {title}", DesignPhase::for_request(r).label()),
-        Request::AskEdit | Request::LookDone { .. } => unreachable!("internal requests have no app tool"),
+        Request::LookDone { .. } => unreachable!("internal requests have no app tool"),
     }
 }
 

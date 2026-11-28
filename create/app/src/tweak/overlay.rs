@@ -47,6 +47,9 @@ pub struct Selections {
     pub(crate) local_selection: Option<(String, super::Rect)>,
     ghost: Option<(super::Rect, String)>,
     pub(crate) caret: Option<DropHit>,
+    /// None while no tweak panel is open on this share. Some(on): the panel is open and its
+    /// Select toggle is on or off; while it is on, presses in the picture pick widgets.
+    pub select: Option<bool>,
     rings: Arc<[Ring]>,
     pub(super) revision: Option<(usize, u64)>,
 }
@@ -69,8 +72,11 @@ impl Selections {
             let rect = g.rect.filter(|r| r.window == window && r.valid())?;
             Some((rect, format!("{} · {}", who(state, &g.seat, None), g.label)))
         });
-        Self { window, window_size, share: None, build_mode: false, can_edit: false, local_selection: None, ghost, caret: None, focus: FocusState::default(), rings: rings.into(), revision: None }
+        Self { window, window_size, share: None, build_mode: false, can_edit: false, local_selection: None, ghost, caret: None, select: None, focus: FocusState::default(), rings: rings.into(), revision: None }
     }
+
+    /// Select mode: presses in the picture pick widgets, also while this seat holds control.
+    pub fn picking(&self) -> bool { self.select == Some(true) }
 
     pub fn with_focus(mut self, focus: FocusState) -> Self {
         self.focus = focus;

@@ -38,6 +38,7 @@ pub mod brief_ledctl {
         ("brief_ledctl.blocks.splash", include_str!("../brief_ledctl/stage4_schematic.blocks.splash")),
         ("brief_ledctl.ckt.splash", include_str!("../brief_ledctl/stage4_schematic.ckt.splash")),
     ];
+    pub const ROUTED: &str = include_str!("../brief_ledctl/stage5_routed.pcb.splash");
 }
 
 /// ledctl's documents.

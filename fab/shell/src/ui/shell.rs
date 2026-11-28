@@ -3719,6 +3719,30 @@ mod tests {
         design.apply(WorkspaceOp::Reveal { editor: Editor::Overrides, from: None }).expect("Overrides shows");
         assert!(design.showing(Editor::Overrides) == design.showing(Editor::Slicer) && front(&design, Editor::Slicer) == Some(Editor::Overrides),
             "Overrides joins its nearest neighbour's stack, in front");
+        let reveal_board = |tree: &mut AreaTree, above| {
+            tree.apply(WorkspaceOp::Reveal { editor: Editor::Board, from: None }).expect("Board opens");
+            let board = tree.showing(Editor::Board).expect("Board has its own area");
+            let (split, axis, align, below) = tree.parent_split(board).expect("the new Board area has a parent split");
+            assert!(axis == SplitterAxis::Vertical && matches!(align, SplitterAlign::Weighted(0.5)) && below
+                && tree.parts(split) == Some((axis, above, board)), "Board must get the lower half of area {above:?}");
+        };
+        let mut sheet = Origin::Schematic.tree().0;
+        let scope = sheet.showing(Editor::Scope).expect("Schematic has a Scope");
+        let recorder = sheet.showing(Editor::Transport).expect("Schematic has a recorder");
+        let recorder_split = |tree: &AreaTree| match tree.parent_split(recorder) {
+            Some((split, SplitterAxis::Vertical, SplitterAlign::FromB(height), true)) => (split, height),
+            other => panic!("the recorder must be pinned below its parent: {other:?}"),
+        };
+        let pinned = recorder_split(&sheet);
+        reveal_board(&mut sheet, scope);
+        assert!(sheet.showing(Editor::Transport) == Some(recorder) && recorder_split(&sheet) == pinned,
+            "revealing Board must preserve the recorder's area, parent and pinned height");
+        let mut design = Origin::Design.tree().0;
+        let last = design.last_area();
+        reveal_board(&mut design, last);
+        let mut recorder_only = AreaTree::area(Editor::Transport).numbered();
+        let last = recorder_only.last_area();
+        reveal_board(&mut recorder_only, last);
         // no neighbour on screen: the area it was asked from; a view's never (the last area splits)
         let mut scan = Origin::Scan.tree().0;
         let panel = scan.showing(Editor::Scan).expect("Scan's panel");

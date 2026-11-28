@@ -1,0 +1,13 @@
+[package]
+name = "makepad-solidsync-thiserror"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The subset of thiserror's derive that the synced solidcore crates use, syn-free (fab/brep/SYNC.md)"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+makepad-micro-proc-macro = { workspace = true }

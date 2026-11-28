@@ -50,6 +50,72 @@ fn ledctl_board_round_trips() {
 }
 
 #[test]
+fn repeated_pad_ends_round_trip_by_occurrence() {
+    use fab_elec_board::{BoardOp, Item, Track};
+    use fab_elec_circuit::{Circuit, Component, Net, NetKind};
+    use fab_elec_core::{NetId, PadIx, Path};
+    use std::sync::Arc;
+
+    let mut connector = fab_elec_design::fixture::parts::usb_c_power();
+    let part = Arc::make_mut(&mut connector);
+    let shield = part.pin("SHIELD").unwrap();
+    let footprint = Arc::make_mut(part.footprint.as_mut().unwrap());
+    let mut pads: Vec<_> = footprint.pads.iter().enumerate()
+        .filter(|(_, pad)| pad.no == "S1").map(|(i, _)| PadIx(i as u16)).collect();
+    assert_eq!(pads.len(), 4, "the connector has four shield pads");
+    for no in ["S1[1]", "A:B"] {
+        let mut pad = footprint.pads[pads.last().unwrap().ix()].clone();
+        pad.no = no.into();
+        pad.at.y += 3_000_000;
+        part.pins[shield.ix()].pads.push(no.into());
+        pads.push(PadIx(footprint.pads.len() as u16));
+        footprint.pads.push(pad);
+    }
+
+    let net = NetId(0);
+    let circuit = Circuit {
+        name: "usb".into(),
+        nets: vec![Net { id: net, name: "GND".into(), class: Default::default(), volts: None, kind: NetKind::Ground, scope: None }],
+        comps: vec![Component { id: Default::default(), path: "usb.j".into(), refdes: "J1".into(),
+            ref_kind: Default::default(), part: connector, value: None, conns: vec![(shield, net)], nc: vec![],
+            block: Default::default(), dnp: false, fields: Default::default() }],
+        ..Default::default()
+    };
+    let lower = |text: &str| board_doc::lower(DocId(0), text, &circuit, None);
+    let mut board = lower(r#"place("usb.j", [10mm, 10mm])"#).unwrap().board;
+    let placed = board.placed[0].id;
+    for pair in pads.chunks_exact(2) {
+        let ends = [pair[0], pair[1]].map(|pad| Anchor::Pad { placed, pad });
+        let [start, end] = ends.map(|anchor| board.anchor_pos(anchor).unwrap());
+        let track = Track { id: board.alloc_id(), net, layer: LayerId::F_CU, w: 200_000, widths: None,
+            path: Path::new(start).line(end), ends, locked: false, origin: Origin::Authored };
+        board.apply(&BoardOp::Add(Item::Track(track))).unwrap();
+        let text = write(&board, &circuit);
+        let reopened = lower(&text).expect("the saved track ends lower").board;
+        let track = reopened.tracks.last().unwrap();
+        assert_eq!(track.ends, ends, "each reopened end keeps its physical pad index");
+        assert_eq!([track.path.start, track.path.end()], [start, end], "each reopened end keeps its own pad's position");
+        assert_eq!(reopened.content_hash(), board.content_hash(), "saving and reopening preserves the board content");
+        assert_eq!(write(&reopened, &circuit), text, "the written endpoints are a text fixed point");
+    }
+    let text = write(&board, &circuit);
+    for index in 0..4 {
+        assert!(text.contains(&format!(r#""usb.j:S1"[{index}]"#)), "shield occurrence {index} is explicit");
+    }
+    assert!(text.contains(r#""usb.j:S1[1]", "usb.j:A:B"]"#), "both literal pad numbers stay inside the quotes");
+    let second = r#""usb.j:S1"[1]"#;
+    let legacy = lower(&text.replace(second, r#""usb.j:S1""#)).expect("a bare repeated pad still lowers").board;
+    assert_eq!(legacy.tracks[0].ends[1], Anchor::Pad { placed, pad: pads[0] }, "a bare repeated number selects its first pad");
+    let bad = lower(&text.replace(second, r#""usb.j:S1"[4]"#)).expect_err("a fifth occurrence must be refused");
+    assert!(bad[0].message.contains(r#""usb.j:S1"[4]: usb.j has 4 pads numbered S1 (index 4 is out of range)"#),
+        "the diagnostic gives the rejected occurrence and number of matches: {}", bad[0].message);
+    for index in ["-1", "1.5", "1mm"] {
+        let bad = lower(&text.replace(second, &format!(r#""usb.j:S1"[{index}]"#))).expect_err("an invalid occurrence must be refused");
+        assert!(bad[0].message.contains("pad index must be a nonnegative decimal integer"), "the diagnostic identifies the invalid index {index}");
+    }
+}
+
+#[test]
 fn every_statement_reads_back_and_errors_are_located() {
     let d = fab_elec_fixtures::ledctl();
     let circuit = &d.units[0].circuit;

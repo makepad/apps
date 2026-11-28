@@ -19,9 +19,8 @@
 //! renders tens of milliseconds ahead of a worklet) puts the rendered
 //! position ahead of the ear by that much; one that does not counts as heard
 //! when rendered.
-//! Where no device runs (before the browser's first gesture, a muted
-//! instance) the engine renders silently here, so the film moves the same
-//! way.
+//! Before the browser's first gesture, the engine renders silently here
+//! to keep the film moving.
 
 use makepad_stage_audio_media::pcm::TrackPcm;
 use makepad_stage_live_audio::clock;
@@ -105,17 +104,12 @@ impl Default for Transport {
 }
 
 impl Transport {
-    /// Open the device (once): the engine renders in its callback. A muted
-    /// or hidden instance (tests) opens none.
+    /// Register the engine's output callback once.
     fn open(&mut self, cx: &mut Cx) {
         if self.device {
             return;
         }
         self.device = true;
-        if makepad_story_edit_render::sound::muted() {
-            log!("makepad-story-doc-player: muted (MAKEPAD_MUTE / hidden windows): no audio device");
-            return;
-        }
         let engine = self.engine.clone();
         let device_at = self.device_at.clone();
         let heard_at = self.heard_at.clone();

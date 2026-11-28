@@ -230,6 +230,7 @@ pub(super) struct HookStep {
 #[derive(Default)]
 pub(super) struct Carriers {
     revision: Option<(PublicKey, u64)>,
+    town_members_revision: Option<(Id, usize, usize)>,
     wanted: Vec<Known>,
     wanted_devices: BTreeSet<PublicKey>,
     towns: BTreeSet<(PublicKey, Id)>,
@@ -1427,7 +1428,8 @@ impl App {
         let me = model.me();
         let mut towns = BTreeMap::new();
         let mut town_seats = BTreeMap::new();
-        for town in model.towns() {
+        let town_entries = model.towns();
+        for town in &town_entries {
             let members: BTreeSet<_> = self.carriers.calls.keys().copied()
                 .filter(|&peer| peer != me && model.peer_multiparty(&peer)
                     && model.verify_wire_town(town.id, Some(peer)).is_some()).collect();
@@ -1437,8 +1439,15 @@ impl App {
             if !members.is_empty() { towns.insert(town.id, members); }
         }
         self.call.set_town_peer_seats(town_seats);
-        changed |= self.call.set_town_peers(cx, towns);
         let open = model.open_id();
+        let revision = (open, model.open_event_count(), model.background_revision());
+        if self.carriers.town_members_revision != Some(revision) {
+            let members = town_entries.into_iter().filter(|town| model.loaded_town(town.id).is_some())
+                .map(|town| (town.id, model.active_town_peers(town.id).into_iter().collect())).collect();
+            changed |= self.call.set_town_members(members);
+            self.carriers.town_members_revision = Some(revision);
+        }
+        changed |= self.call.set_town_peers(cx, towns);
         let peers = model.linked_town_peers(open).into_iter().filter_map(|peer| {
             let at = self.carriers.calls.get(&peer)?;
             Some((peer, self.carriers.up[at].clone()))

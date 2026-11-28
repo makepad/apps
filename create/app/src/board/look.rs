@@ -21,6 +21,7 @@ pub(super) struct Look {
     pub frame: Vec4f,
     pub frame_line: Vec4f,
     pub caption: Vec4f,
+    pub error: Vec4f,
     pub shadow: Vec4f,
     /// Scales every shadow's alpha: a light skin casts lighter shadows.
     pub shadow_strength: f32,

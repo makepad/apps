@@ -80,12 +80,12 @@
   ported from MicroPython's `py/asmbase.h`, `py/asmxtensa.{c,h}` (Copyright (c) 2016 Damien P.
   George) and `py/asmrv32.{c,h}` (Copyright (c) 2024 Alessandro Gatti). MIT License, in full in each
   file. Modified: ported to Rust.
-- Exact geometry (`libs/csg/csg_brep`, the `m.brep` builders): derived from solidcore 1.0.1
+- Exact geometry (`fab/brep/upstream/kernel`, the `m.brep` builders): derived from solidcore 1.0.1
   (<https://github.com/tangency-labs/solidcore>, the solidcore contributors), a Rust port of the
   SMLib and SM_API components of USD BRep by NVIDIA
   (<https://github.com/NVIDIA-Omniverse/usd-brep>, (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES).
-  Apache License 2.0. Modified: see `libs/csg/csg_brep/NOTICE`. Licence and attribution in full:
-  `libs/csg/csg_brep/LICENSE`, `NOTICE` and `ATTRIBUTION.md`. Neither project is affiliated with
+  Apache License 2.0. Modified: see `fab/brep/upstream/kernel/NOTICE`. Licence and attribution in full:
+  `fab/brep/upstream/kernel/LICENSE`, `NOTICE` and `ATTRIBUTION.md`. Neither project is affiliated with
   or endorses Fab.
 - Chip LED light (`__led_walls` in `fab/elec/lang/std/std.part.splash`): the dome's shape, the
   150-degree viewing angle and the polar intensity points the std chip LEDs' emitting faces are

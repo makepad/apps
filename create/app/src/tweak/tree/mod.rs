@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(rows(&mut t), [(CARD.into(), 0), ("title".into(), 1)]);
         assert_eq!(t.expanded, expanded);
         let isolated = t.focus.clone();
-        for (req, why) in [(7, "Ask the owner to allow editing this share."), (8, "Allow revoked. Ask the owner again.")] {
+        for (req, why) in [(7, crate::tweak::NEEDS_CONTROL), (8, crate::tweak::CONTROL_ENDED)] {
             t.mark_sent(req, &reveal);
             assert_eq!(t.apply_refusal(req, why), Some(None));
             assert_eq!(t.focus, isolated, "a permission refusal must preserve isolation");

@@ -11,10 +11,6 @@
 //! The caption's master volume and mute act on the device sink: every
 //! buffer the device takes is scaled by the master as it leaves the flow
 //! ([`apply_master`]), so they reach the device on the next buffer.
-//!
-//! A hidden or muted instance (`MAKEPAD_HIDE_WINDOWS`, `MAKEPAD_MUTE=1`:
-//! tests and agents) opens no device: the feed's clock still runs (the
-//! edit renderer feeds silence then).
 
 use makepad_story_cut::mix::SAMPLE_RATE;
 use makepad_stage_live_audio::embedded::{embedded, EmbeddedAudio};
@@ -35,11 +31,8 @@ pub(crate) struct StorySound {
 }
 
 impl StorySound {
-    /// Open the device, unless muted (`MAKEPAD_MUTE`, hidden windows).
+    /// Open the sound flow and register its output callback.
     pub(crate) fn open(cx: &mut Cx) -> Result<Option<StorySound>, String> {
-        if makepad_story_edit_render::sound::muted() {
-            return Ok(None);
-        }
         let (mut host, mut engine) = embedded(FLOW, "story/sound.splash", Vec::new())?;
         // Prepared at the mix's rate; the device's own follows its first render.
         let (mut l, mut r) = ([0.0f32; 1], [0.0f32; 1]);

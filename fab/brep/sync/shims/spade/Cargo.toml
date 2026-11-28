@@ -1,0 +1,11 @@
+[package]
+name = "makepad-solidsync-spade"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The constrained Delaunay API the synced solidcore kernel uses, over makepad-csg-boolean's CDT (fab/brep/SYNC.md)"
+publish = false
+
+[dependencies]
+makepad-csg-boolean = { path = "../../../../../../../libs/csg/csg_boolean" }
+makepad-csg-math = { path = "../../../../../../../libs/csg/csg_math" }

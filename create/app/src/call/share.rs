@@ -165,6 +165,7 @@ struct LocalShare {
     viewers: BTreeMap<PublicKey, View>,
     stopped_problem: Option<Vec<u8>>,
     rights: Arc<ShareRights>,
+    rights_revision: u64,
     source: OfferSource,
     /// The offered stream's counts and end reason, independent of the session borrowing the stream.
     probe: Option<Box<dyn Fn() -> (u64, Option<Arc<str>>) + Send + Sync>>,
@@ -521,7 +522,7 @@ impl CallController {
         if !w.is_finite() || !h.is_finite() || w <= 0. || h <= 0. { return Err("The selected window has no usable picture size.".into()) }
         let role = ShareRole::Sharer { link, window: window.id };
         self.sharing.locals.insert(session, LocalShare {
-            rights: Arc::default(),
+            rights: Arc::default(), rights_revision: 0,
             source: OfferSource::new(caps, source), town, recipients: recipients.clone(), viewers: BTreeMap::new(),
             probe: None, stopped_problem: None,
             preview: None, preview_size: None, last_preview: None, subscribed_at: None, line_peer: String::new(), line_state: None,
@@ -1046,6 +1047,17 @@ impl CallController {
         changed
     }
 
+    pub fn asking_for_control(&self) -> Option<SessionId> { self.sharing.shown.control.asking }
+
+    pub fn control_rights_revision(&self, session: SessionId) -> Option<u64> {
+        Some(self.sharing.locals.get(&session)?.rights_revision)
+    }
+
+    pub fn control_rights(&self, session: SessionId) -> Option<crate::tweak::ControlRights> {
+        let rights = &self.sharing.locals.get(&session)?.rights;
+        Some(crate::tweak::ControlRights { all: rights.allow_all, seats: rights.allowed.keys().copied().collect() })
+    }
+
     pub(super) fn peer_can_control(&self, session: SessionId, peer: &PublicKey) -> bool {
         self.sharing.locals.get(&session).is_some_and(|local| local.rights.allows(peer))
     }
@@ -1074,6 +1086,21 @@ impl CallController {
         next.is_some_and(|peer| self.grant_control(apps, session, peer)) || changed
     }
 
+    pub(super) fn revoke_departed_control(&mut self) -> bool {
+        let mut departed = Vec::new();
+        for (&session, local) in &self.sharing.locals {
+            let Some(members) = self.town_members.get(&local.town) else { continue };
+            for &peer in local.rights.allowed.keys() {
+                if !members.contains(&peer) { departed.push((session, peer)); }
+            }
+        }
+        let mut changed = false;
+        for (session, peer) in departed {
+            changed |= self.change_rights(session, RightChange::Remove(peer));
+        }
+        changed
+    }
+
     fn change_rights(&mut self, session: SessionId, change: RightChange<'_>) -> bool {
         use crate::call::control::{ControlMessage, EndReason};
         let Some(local) = self.sharing.locals.get_mut(&session) else { return false };
@@ -1088,6 +1115,7 @@ impl CallController {
             }
             _ => return false,
         }
+        local.rights_revision += 1;
         self.sharing.shown.offer_mut(session).unwrap().rights = local.rights.clone();
         let updates: Vec<_> = local.viewers.keys().filter_map(|p| {
             let allowed = local.rights.allows(p);

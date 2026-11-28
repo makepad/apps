@@ -2,6 +2,7 @@
 
 pub mod canvas;
 pub(crate) mod design;
+mod design_picture;
 pub mod gesture;
 pub mod index;
 pub mod live;

@@ -7,6 +7,8 @@ use makepad_town_core::fold::State;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Resolve UNDO (including redo) through the event log, e.g. `|id| log.get(id)`.
 pub fn touched_by<'a>(mut event: &'a Event, lookup: impl Fn(&Id) -> Option<&'a Event>) -> Vec<Id> {
@@ -58,6 +60,35 @@ impl BoardImage {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct BoardDesign {
+    /// The event that last wrote SRC: the same revision has the same text.
+    pub revision: Option<Id>,
+    pub src: Arc<str>,
+    pub src_hash: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Design sources copied and hashed on this thread.
+    pub(super) static DESIGN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl BoardDesign {
+    /// A rebuild copies and hashes a design's source once per revision: `previous`, the same
+    /// item in the view being replaced, gives its text back while SRC is unchanged.
+    fn read(entity: &Entity, previous: Option<&BoardDesign>) -> Self {
+        let revision = entity.fields.get(&field::SRC).map(|f| f.writer);
+        if let Some(previous) = previous.filter(|p| p.revision == revision) { return previous.clone() }
+        #[cfg(test)]
+        DESIGN_READS.with(|reads| reads.set(reads.get() + 1));
+        let src = entity.text(field::SRC);
+        let mut hash = DefaultHasher::new();
+        src.hash(&mut hash);
+        Self { revision, src: Arc::from(src), src_hash: hash.finish() }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct BoardItem {
     pub id: Id,
@@ -72,6 +103,7 @@ pub struct BoardItem {
     pub parent_section: Option<Id>,
     pub colour: Option<u32>,
     pub(super) image: Option<Box<BoardImage>>,
+    pub(super) design: Option<Box<BoardDesign>>,
     pub z_key: Option<Box<[u8]>>,
     z_writer: Option<Id>,
 }
@@ -81,7 +113,7 @@ impl BoardItem {
         self.id
     }
 
-    fn read(entity: &Entity, parent_section: Option<Id>) -> Self {
+    fn read(entity: &Entity, parent_section: Option<Id>, previous: Option<&BoardItem>) -> Self {
         let coord = |field| match entity.value(field) {
             Some(Value::Int(value)) => i128::from(*value),
             _ => 0,
@@ -97,6 +129,8 @@ impl BoardItem {
         let z_key = entity.z_key().map(|(bytes, _)| Box::from(bytes));
         Self {
             id: entity.id,
+            design: (entity.kind == kind::DESIGN)
+                .then(|| Box::new(BoardDesign::read(entity, previous.and_then(|p| p.design.as_deref())))),
             image: (entity.kind == kind::IMAGE).then(|| Box::new(BoardImage::read(entity))),
             kind: entity.kind.clone(),
             rect: Rect::new(world(x), world(y), world(x + w), world(y + h)),
@@ -146,6 +180,11 @@ pub struct BoardView {
 
 impl BoardView {
     pub fn build(state: &State, board: Id) -> Self {
+        Self::rebuild(state, board, None)
+    }
+
+    /// [`Self::build`], taking each design's text from `previous` while its SRC is unchanged.
+    pub fn rebuild(state: &State, board: Id, previous: Option<&BoardView>) -> Self {
         let mut view = Self {
             board, board_live: state.entities.get(&board).is_some_and(|e| e.kind == kind::BOARD && live(e)),
             by_id: HashMap::new(), items: Vec::new(), free: Vec::new(),
@@ -160,7 +199,7 @@ impl BoardView {
             }
             if view.board_live && live(entity) {
                 if let Some(p) = tree.placement(entity).filter(|p| p.board == board) {
-                    let handle = view.insert(BoardItem::read(entity, p.section));
+                    let handle = view.insert(BoardItem::read(entity, p.section, previous.and_then(|v| v.get(&entity.id))));
                     view.order.push(handle);
                 }
             }
@@ -219,7 +258,8 @@ impl BoardView {
                 let board_live = state.entities.get(&id).is_some_and(|e| e.kind == kind::BOARD && live(e));
                 if self.board_live != board_live {
                     // Looped items can belong here without a parent path to the board.
-                    let old = std::mem::replace(self, Self::build(state, id));
+                    let next = Self::rebuild(state, id, Some(self));
+                    let old = std::mem::replace(self, next);
                     // Only the live side of this transition has records.
                     return old.by_id.into_keys().chain(self.by_id.keys().copied()).collect();
                 }
@@ -251,7 +291,7 @@ impl BoardView {
         affected.retain(|&id| {
             let item = state.entities.get(&id).filter(|e| self.board_live && board_kind(&e.kind) && live(e))
                 .and_then(|e| tree.placement(e).filter(|p| p.board == self.board)
-                    .map(|p| BoardItem::read(e, p.section)));
+                    .map(|p| BoardItem::read(e, p.section, self.get(&id))));
             match (self.by_id.get(&id).copied(), item) {
                 (Some(h), Some(item)) => {
                     let old = self.item(h);

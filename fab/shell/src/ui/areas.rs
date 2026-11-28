@@ -143,7 +143,8 @@ pub enum WorkspaceOp {
     /// came from); never an area a view fronts ([`Editor::keeps_corner`]), which it would cover.
     /// With neither, a panel opens as a side column ([`PANEL_W`] wide) at the right of `from` when
     /// a view fronts it, else of the workspace's first view; a view, or a workspace with no view,
-    /// splits the last area (the bottom or right one) down, the new half holding it.
+    /// splits the last area (the bottom or right one) down, the new half holding it. This skips
+    /// the Transport recorder's area unless it is the only area.
     Reveal { editor: Editor, from: Option<AreaId> },
     /// A drag dropped: `what` leaves its place (an area it empties closes) and lands `at` node
     /// `to`. A tab no area holds (a mode's tab the shell shows) lands as a new tab.
@@ -501,6 +502,14 @@ impl AreaTree {
         }
     }
 
+    fn last_area_without_transport(&self) -> Option<AreaId> {
+        match self {
+            AreaTree::Area { id, tabs, .. } =>
+                (!tabs.iter().any(|tab| tab.editor == Editor::Transport)).then_some(*id),
+            AreaTree::Split { a, b, .. } => b.last_area_without_transport().or_else(|| a.last_area_without_transport()),
+        }
+    }
+
     fn next_id(&self) -> AreaId {
         let mut max = 0;
         self.visit(&mut |node| max = max.max(node.id().0));
@@ -764,7 +773,7 @@ impl AreaTree {
                     None => {
                         let (at, side, align) = match view {
                             Some(area) => (area, Side::Right, Side::Right.panel()),
-                            None => (self.last_area(), Side::Down, SplitterAlign::Weighted(0.5)),
+                            None => (self.last_area_without_transport().unwrap_or_else(|| self.last_area()), Side::Down, SplitterAlign::Weighted(0.5)),
                         };
                         self.split_with(at, side, vec![instance], align);
                     }

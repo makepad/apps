@@ -218,7 +218,7 @@ impl TownApp {
     fn send(&mut self, request: Request) -> RequestId { self.session.request(None, request).unwrap() }
 }
 
-struct Copies { host: TownApp, ana: TownApp, ben: TownApp, app: FakeApp, records: Vec<AppEdit> }
+struct Copies { host: TownApp, ana: TownApp, ben: TownApp, rights: ControlRights, app: FakeApp, records: Vec<AppEdit> }
 impl Copies {
     fn new(owner: Seat, ana: Seat, item: [u8; 32]) -> Self {
         Self::in_town(TOWN, owner, ana, item)
@@ -230,6 +230,7 @@ impl Copies {
             relay: Endpoint { me, links, dropped: Vec::new(), net: net.clone() },
         };
         let mut s = Self { host: town(owner, vec![ana, BEN]), ana: town(ana, vec![owner]), ben: town(BEN, vec![owner]),
+            rights: ControlRights::default(),
             app: FakeApp { theme: THEME.into(), padding: "0".into(), props: ROWS.into(), tree: TREE.into(), ..Default::default() }, records: Vec::new() };
         s.host.session.set_members([owner, ana, BEN]);
         s.host.session.set_peer_level(ana, Some(THEME_LEVEL));
@@ -242,7 +243,11 @@ impl Copies {
     fn exchange(&mut self) {
         self.ana.poll(); self.ben.poll(); self.host.poll(); self.ana.poll(); self.ben.poll();
     }
-    fn allow(&mut self, seat: Seat, yes: bool) { self.host.session.consent(seat, yes).unwrap(); self.exchange(); }
+    fn allow(&mut self, seat: Seat, yes: bool) {
+        if yes { self.rights.seats.insert(seat); } else { self.rights.seats.remove(&seat); }
+        self.host.session.set_control_rights(self.rights.clone());
+        self.exchange();
+    }
     fn finish(&mut self) {
         self.app.answer(&mut self.host.session);
         while let Some(Action::RecordAppEdit { edit, .. }) = self.host.session.next_record() {
@@ -336,14 +341,132 @@ fn property_rows_leave_out_whole_object_dumps() {
 }
 
 #[test]
+fn control_right_is_the_tweak_right() {
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_agents(&ana_agent_state(OWNER));
+    s.list();
+    s.allow(ANA, true);
+    for guest in [&s.host, &s.ana, &s.ben] {
+        assert_eq!(guest.session.view.allowed, [ANA].into(), "the owner and guests see Ana's control right");
+    }
+    let applied = |town: &TownApp, req, value: &str| has(town, req, |n| matches!(n, Notice::Applied { new, .. } if new == value));
+    let refused = |town: &TownApp, req| has(town, req, |n| matches!(n, Notice::Refused(why) if why == "Ask for control to edit this share."));
+    let ana = s.ana.send(set("1"));
+    let ben = s.ben.send(set("2"));
+    s.one();
+    assert!(applied(&s.ana, ana, "1") && refused(&s.ben, ben), "only Ana can edit with individual control");
+    let ai = s.ana.session.request(Some(ANA_AGENT), set("3")).unwrap();
+    s.one();
+    assert!(applied(&s.ana, ai, "3"), "Ana's AI inherits her individual control");
+
+    s.rights = ControlRights { all: true, seats: Default::default() };
+    s.host.session.set_control_rights(s.rights.clone());
+    s.exchange();
+    for guest in [&s.host, &s.ana, &s.ben] {
+        assert_eq!(guest.session.view.allowed, [ANA, BEN].into(), "the owner and guests see Allow all");
+    }
+    let ben = s.ben.send(set("4"));
+    s.one();
+    assert!(applied(&s.ben, ben, "4"), "Allow all gives Ben control");
+    let ai = s.ana.session.request(Some(ANA_AGENT), set("5")).unwrap();
+    s.one();
+    assert!(applied(&s.ana, ai, "5"), "Allow all covers Ana's AI");
+
+    let queued = s.ana.send(set("6"));
+    s.exchange();
+    s.rights = ControlRights::default();
+    s.host.session.set_control_rights(s.rights.clone());
+    s.exchange();
+    for guest in [&s.host, &s.ana, &s.ben] {
+        assert!(guest.session.view.allowed.is_empty(), "the owner and guests see control end");
+        for seat in [ANA, BEN] {
+            assert!(guest.session.view.updates.iter().any(|(who, _, _, n)| *who == seat && *n == Notice::Allowed(false)),
+                "each seat's loss of control reaches both guests");
+        }
+    }
+    assert!(has(&s.ana, queued, |n| matches!(n, Notice::Refused(why) if why == "Control ended. Ask for control to edit this share.")),
+        "ending control refuses Ana's queued edit");
+    let ai = s.ana.session.request(Some(ANA_AGENT), set("7")).unwrap();
+    s.one();
+    assert!(refused(&s.ana, ai), "Ana's AI loses edit access when control ends");
+    assert_eq!(s.app.padding, "5", "the queued and refused edits never reached the app");
+}
+
+#[test]
+fn revoking_control_refuses_queued_edits_and_lets_the_running_one_finish() {
+    let fixture = DesignTestDir::new("control-revoke");
+    let disk = "script_mod! { mod.UI = View{ root := View{} } }";
+    let (mut s, _cx) = structural_share(&fixture.0, disk);
+    s.allow(ANA, true);
+    guest_design(&mut s, drag_into("/root"));
+    assert!(s.host.session.view.design.ghost.is_some());
+    s.list();
+    let running = s.ana.send(set("1"));
+    let queued = s.ana.send(set("2"));
+    s.exchange();
+    s.host.session.drive_app(&mut s.app);
+    s.allow(ANA, false);
+    let later = s.ana.send(set("3"));
+    s.finish();
+    settle_design(&mut s);
+    for town in [&s.host, &s.ana, &s.ben] {
+        let notices = &town.session.view.updates;
+        let refusal = notices.iter().position(|(seat, req, _, n)| *seat == ANA && *req == queued
+            && matches!(n, Notice::Refused(why) if why == "Control ended. Ask for control to edit this share.")).unwrap();
+        let revoked = notices.iter().position(|(seat, _, _, n)| *seat == ANA && *n == Notice::Allowed(false)).unwrap();
+        assert!(refusal < revoked, "queued edits are refused before loss of control is announced");
+        assert!(has(town, running, |n| matches!(n, Notice::Applied { new, .. } if new == "1")));
+        assert!(has(town, later, |n| matches!(n, Notice::Refused(why) if why == "Ask for control to edit this share.")));
+        assert!(town.session.view.design.ghost.is_none(), "revocation retracts the held ghost");
+    }
+    assert!(matches!(&s.records[..], [AppEdit { seat: ANA, change: Change::Applied { new, .. }, .. }] if new == "1"));
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk);
+}
+
+#[test]
+fn allow_all_covers_a_member_who_joins_later() {
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_members([OWNER, ANA]);
+    s.rights.all = true;
+    s.host.session.set_control_rights(s.rights.clone());
+    s.exchange();
+    assert_eq!(s.host.session.view.allowed, [ANA].into());
+    s.host.session.set_members([OWNER, ANA, BEN]);
+    s.exchange();
+    assert_eq!(s.ben.session.view.allowed, [ANA, BEN].into(), "the new member receives the snapshot and their own right");
+    s.list();
+    let edit = s.ben.send(set("9"));
+    s.one();
+    assert!(has(&s.ben, edit, |n| matches!(n, Notice::Applied { new, .. } if new == "9")));
+    s.rights.all = false;
+    s.allow(ANA, true);
+    assert_eq!(s.ben.session.view.allowed, [ANA].into());
+    assert!(s.ben.session.view.updates.iter().any(|(seat, _, _, n)| *seat == BEN && *n == Notice::Allowed(false)));
+}
+
+#[test]
+fn a_member_who_leaves_and_returns_follows_the_given_right() {
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.allow(ANA, true);
+    s.host.session.set_members([OWNER, BEN]);
+    s.exchange();
+    assert!(s.ben.session.view.allowed.is_empty());
+    s.host.session.set_members([OWNER, ANA, BEN]);
+    s.exchange();
+    let transitions: Vec<_> = s.ben.session.view.updates.iter().filter_map(|(seat, _, _, n)| match n {
+        Notice::Allowed(yes) if *seat == ANA => Some(*yes),
+        _ => None,
+    }).collect();
+    assert_eq!(transitions, [true, false, true], "one named right is reconciled against each roster");
+    assert_eq!(s.ana.session.view.allowed, [ANA].into());
+}
+
+#[test]
 fn three_seats_share_order_presence_consent_and_retry() {
     let mut s = Copies::new(OWNER, ANA, ITEM);
-    s.ana.send(Request::AskEdit);
-    s.ben.send(Request::AskEdit);
     let no_pick = s.ben.send(Request::Pick(At::Path(PATH.into())));
     let no_props = s.ben.send(Request::Props { path: PATH.into() });
     s.one();
-    assert_eq!(s.host.session.view.asked, [ANA, BEN].into(), "the owner sees both people asking");
     assert!(s.app.sent.is_empty(), "reading the running app requires Allow");
     for req in [no_pick, no_props] {
         assert!(has(&s.ben, req, |n| matches!(n, Notice::Refused(v) if v.contains("Ask"))), "denied reads explain how to ask");
@@ -351,7 +474,7 @@ fn three_seats_share_order_presence_consent_and_retry() {
     s.host.session.set_agents(&ana_agent_state(OWNER));
     let denied_ai = s.ana.session.request(Some(ANA_AGENT), Request::Props { path: PATH.into() }).unwrap();
     s.one();
-    assert!(has(&s.ana, denied_ai, |n| matches!(n, Notice::Refused(why) if why.contains("allow"))),
+    assert!(has(&s.ana, denied_ai, |n| matches!(n, Notice::Refused(why) if why == "Ask for control to edit this share.")),
         "a recognized AI needs its person's Allow to inspect the app");
     s.allow(ANA, true);
     for id in [[99; 32], ANA_AGENT] {
@@ -497,14 +620,10 @@ fn stopping_one_ai_preserves_personal_consent_and_reaches_late_joiners() {
     let select = || Request::Select(Some(PATH.into()));
     let actor = (ANA, ANA_AGENT);
     let no_select = ai(&mut s.ana, select());
-    let no_ask = ai(&mut s.ana, Request::AskEdit);
     s.exchange();
-    for req in [no_select, no_ask] {
-        assert!(has(&s.ana, req, |n| matches!(n, Notice::Refused(why) if why.contains("allow"))),
-            "even AI presence and AskEdit require the person's initial Allow");
-    }
+    assert!(has(&s.ana, no_select, |n| matches!(n, Notice::Refused(why) if why == "Ask for control to edit this share.")),
+        "AI presence requires its person's control right");
     assert_eq!(s.host.session.view.agents.get(&actor), Some(&false), "a verified first request introduces an idle AI");
-    assert!(s.host.session.view.asked.is_empty(), "a denied AI AskEdit creates no consent prompt");
     s.host.session.bind_window(WindowId(3));
     let personal_look = s.ana.send(Request::Look);
     let own_look = ai(&mut s.host, Request::Look);
@@ -564,7 +683,6 @@ fn stopping_one_ai_preserves_personal_consent_and_reaches_late_joiners() {
     assert!(s.ana.session.stop_agent(ANA, ANA_AGENT, true).is_err(), "a viewer cannot stop even its own AI on the share");
     s.host.session.stop_agent(ANA, ANA_AGENT, true).unwrap();
     let refused = ai(&mut s.ana, select());
-    let asked = ai(&mut s.ana, Request::AskEdit);
     let stopped_look = ai(&mut s.ana, Request::Look);
     let person_select = s.ana.send(select());
     s.exchange();
@@ -573,7 +691,7 @@ fn stopping_one_ai_preserves_personal_consent_and_reaches_late_joiners() {
         assert_eq!(town.session.view.running.get(&(ANA, Some(ANA_AGENT))), Some(&(running, set("4"))),
             "refusals for this AI's other requests preserve its in-flight Set");
         assert!(town.session.view.looking.is_empty(), "Stop clears the look on every seat");
-        for req in [queued, refused, asked, interrupted, stopped_look] {
+        for req in [queued, refused, interrupted, stopped_look] {
             assert!(has(town, req, |n| matches!(n, Notice::Refused(why) if why == "Walk A stopped Ana's AI.")),
                 "the queued Set and subsequent AI presence requests give the explicit Stop reason");
         }
@@ -612,7 +730,7 @@ fn stopping_one_ai_preserves_personal_consent_and_reaches_late_joiners() {
     let revoked = ai(&mut s.ana, select());
     let disconnected = ai(&mut s.ana, Request::Look);
     s.exchange();
-    assert!(has(&s.ana, revoked, |n| matches!(n, Notice::Refused(why) if why.contains("allow"))),
+    assert!(has(&s.ana, revoked, |n| matches!(n, Notice::Refused(why) if why == "Ask for control to edit this share.")),
         "allowing the AI cannot override a later personal revocation");
     s.host.session.peer_unlinked(ANA);
     s.exchange();
@@ -1052,7 +1170,7 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
         }
     }
     assert_trace(&waits, line, since, &[(Ink::Action, "proposing padding 18 on panel"),
-        (Ink::Warning, "app_set refused: Ask the owner to allow editing this share.")],
+        (Ink::Warning, "app_set refused: Ask for control to edit this share.")],
         "a sent but refused Set has one start and one warning");
 
     model.open_town(private).unwrap();
@@ -1193,7 +1311,7 @@ fn wire_design_roundtrip_and_unknown_subtag_skip() {
     let request = |r| packet(Body::Request(Request::Design(r)));
     let notice = |n| packet(Body::Notice { seat: ANA, delivery: 19, notice: n });
     let req_at = packet(Body::Ready).encode().len();
-    let notice_at = notice(Notice::Asked).encode().len();
+    let notice_at = notice(Notice::Looked).encode().len();
     let roundtrip = |p: Packet, tag, at: usize, subtag| {
         let mut bytes = p.encode();
         assert_eq!((bytes[1], bytes[at], wire::min_level(&bytes)), (tag, subtag, DESIGN_LEVEL));
@@ -1299,12 +1417,12 @@ fn wire_design_roundtrip_and_unknown_subtag_skip() {
 fn wire_round_trips_and_refuses_hostile_bodies() {
     let rect = Rect { window: 3, x: 2., y: 4., w: 6., h: 8. };
     let packet = |body| Packet { share: SHARE, sender: ANA, req: 7, agent: Some(ANA_AGENT), body };
-    let mut bodies: Vec<_> = [Request::AskEdit, Request::Select(None), Request::Select(Some(PATH.into())),
+    let mut bodies: Vec<_> = [Request::Select(None), Request::Select(Some(PATH.into())),
         Request::Pick(At::Point { window: 4, x: -1., y: 4.25 }), Request::Pick(At::Path(PATH.into())),
         Request::Props { path: PATH.into() }, set("8"), Request::Look, Request::LookDone { look: u128::MAX, ok: true },
         Request::LookDone { look: 15, ok: false }].into_iter().map(Body::Request).collect();
     bodies.push(Body::Notice { seat: ANA, delivery: 4, notice: Notice::Picture { png: [1, 2, 3].into(), size: [97, 51] } });
-    bodies.extend([Notice::Asked, Notice::Allowed(true), Notice::Running(set("8")), Notice::Stopped(true), Notice::Running(Request::Look), Notice::Looked,
+    bodies.extend([Notice::Allowed(true), Notice::Running(set("8")), Notice::Stopped(true), Notice::Running(Request::Look), Notice::Looked,
         Notice::Picked { path: PATH.into(), ty: "View".into(), rect },
         Notice::Rows { path: PATH.into(), rows: ROWS.into() }, Notice::Refused("ask".into()),
         Notice::Window { window: 3, size: [800., 600.] }, Notice::Ended("ended".into()),
@@ -1331,7 +1449,7 @@ fn wire_round_trips_and_refuses_hostile_bodies() {
         let mut extra = bytes.clone(); extra.push(0);
         assert!(wire::decode(ANA, &extra).is_err(), "trailing data refused");
     }
-    for request in [Request::Theme(ThemeOp::Get), Request::Select(None), Request::AskEdit, Request::LookDone { look: 1, ok: true }, Request::Props { path: String::new() },
+    for request in [Request::Theme(ThemeOp::Get), Request::Select(None), Request::LookDone { look: 1, ok: true }, Request::Props { path: String::new() },
         Request::Tree(TreeQuery::Reveal { path: PATH.into(), limit: wire::TREE_PAGE })] {
         let body = Body::Notice { seat: ANA, delivery: 1, notice: Notice::Running(request) };
         assert!(wire::decode(ANA, &packet(body).encode()).is_err(), "Running requires a valid app operation");
@@ -1367,10 +1485,10 @@ fn wire_round_trips_and_refuses_hostile_bodies() {
     let mut stopped = packet(Body::Notice { seat: ANA, delivery: 1, notice: Notice::Stopped(false) });
     stopped.agent = None;
     assert!(wire::decode(ANA, &stopped.encode()).is_err(), "only an AI can be stopped");
-    let mut person = packet(Body::Request(Request::AskEdit));
+    let mut person = packet(Body::Ready);
     person.agent = None;
     let mut header = person.encode();
-    assert_eq!(header.last(), Some(&0), "a person's request ends its header with the clear flag");
+    assert_eq!(header.last(), Some(&0), "a person's packet ends its header with the clear flag");
     assert_eq!(wire::decode(ANA, &header), Ok(Some(person)), "a person's identity round-trips without an id");
     *header.last_mut().unwrap() = 2;
     assert_eq!(wire::decode(ANA, &header), Err("invalid flag"), "only the two identity flags are valid");
@@ -1412,8 +1530,10 @@ fn tweak_wire_ignores_unknown_tags_and_tlv_tails() {
     assert_eq!(wire::decode(ANA, &known), Err("truncated tlv value"));
 
     let mut future = packet.encode();
-    future[1] = 15;
-    assert_eq!(wire::decode(ANA, &future), Ok(None));
+    for tag in [6, 7, 15] {
+        future[1] = tag;
+        assert_eq!(wire::decode(ANA, &future), Ok(None), "skip unassigned tweak tag {tag}");
+    }
     assert_eq!(wire::decode(BEN, &future), Err("sender differs from authenticated peer"));
     let mut bad_header = future.clone();
     *bad_header.last_mut().unwrap() = 2;
@@ -1480,7 +1600,7 @@ fn relay_controller() -> crate::call::CallController {
 }
 
 #[test]
-fn controller_relay_binds_messages_and_consent_to_the_link_epoch() {
+fn controller_relay_binds_messages_to_the_link_epoch_and_the_right_survives_a_relink() {
     let mut call = relay_controller();
     let cx = &mut Cx::new(Box::new(|_, _| {}));
     let port = call.link_up(cx, OWNER, ANA, "Peer").expect("proved first epoch");
@@ -1498,12 +1618,11 @@ fn controller_relay_binds_messages_and_consent_to_the_link_epoch() {
     assert_eq!(call.take(TWEAK), [(ANA, payload)],
         "the relay returns one reassembled body attributed to the proved seat");
     assert_eq!(call.take_peer_with_sender(crate::call::topic::PROBE), [(ANA, vec![9])], "the tweak drain leaves other topics for their consumers");
-    hub.sessions[0].consent(ANA, true).unwrap();
+    hub.sessions[0].set_control_rights(ControlRights { all: false, seats: [ANA].into() });
     let _second = call.link_up(cx, OWNER, ANA, "Peer").unwrap();
     assert!(call.take_peer_events().is_empty(), "a clean same-seat replacement produces no loss count");
     hub.poll_call(&mut call);
-    assert!(hub.sessions[0].view.allowed.is_empty(), "an empty queue on a same-seat relink still ends consent");
-    hub.sessions[0].consent(ANA, true).unwrap();
+    assert_eq!(hub.sessions[0].view.allowed, [ANA].into(), "control survives a same-seat relink");
     call.link_down(cx, ANA);
     let dropped = call.take_dropped(TWEAK);
     let [PeerUndelivered { peer: ANA, topic: TWEAK, count }] = dropped.as_slice() else {
@@ -1511,7 +1630,12 @@ fn controller_relay_binds_messages_and_consent_to_the_link_epoch() {
     };
     assert!(*count > 0, "the loss count covers queued notices");
     hub.poll_call(&mut call);
-    assert!(hub.sessions[0].view.allowed.is_empty(), "closing the link ends the replacement epoch's grant");
+    assert_eq!(hub.sessions[0].view.allowed, [ANA].into(), "closing the replacement link preserves control");
+    let _third = call.link_up(cx, OWNER, ANA, "Peer").unwrap();
+    hub.poll_call(&mut call);
+    assert_eq!(hub.sessions[0].view.allowed, [ANA].into(), "the same right survives a fresh link");
+    hub.sessions[0].set_control_rights(ControlRights::default());
+    assert!(hub.sessions[0].view.allowed.is_empty(), "only the call withdraws control");
 }
 
 #[test]
@@ -1556,13 +1680,15 @@ fn call_controller_relay_broadcasts_and_receives_across_three_peers() {
         let owner_port = owner.link_up(cx, OWNER, peer, "Guest").unwrap();
         let guest_port = call.link_up(cx, peer, OWNER, "Owner").unwrap();
         let mut session = Session::peer(TOWN, SHARE, ITEM, peer, OWNER).unwrap();
-        session.request(None, Request::AskEdit).unwrap();
+        session.request(None, Request::Select(Some(PATH.into()))).unwrap();
         Guest { call, session, owner_port, guest_port }
     });
     assert_eq!(owner.peers(), [ANA, BEN]);
     exchange(cx, &mut owner, &mut hub, &mut guests);
-    assert_eq!(hub.sessions[0].view.asked, [ANA, BEN].into(), "requests retain both authenticated senders");
-    for peer in [ANA, BEN] { hub.sessions[0].consent(peer, true).unwrap(); }
+    for peer in [ANA, BEN] {
+        assert_eq!(hub.sessions[0].view.selections[&peer].path, PATH, "selection retains its authenticated sender");
+    }
+    hub.sessions[0].set_control_rights(ControlRights { all: false, seats: [ANA, BEN].into() });
     exchange(cx, &mut owner, &mut hub, &mut guests);
     for guest in &guests { assert_eq!(guest.session.view.allowed, [ANA, BEN].into(), "both grants are broadcast"); }
 
@@ -1571,16 +1697,159 @@ fn call_controller_relay_broadcasts_and_receives_across_three_peers() {
     owner.send(ANA, INPUT, vec![2]).unwrap();
     assert!(owner.link_down(cx, ANA));
     hub.poll_call(&mut owner);
-    assert_eq!(hub.sessions[0].view.allowed, [BEN].into(), "only the disconnected seat loses consent");
+    assert_eq!(hub.sessions[0].view.allowed, [ANA, BEN].into(), "both seats keep control across the disconnect");
     assert_eq!(owner.peer_epochs().next(), Some(ben_epoch));
     assert_eq!(owner.take_peer_events(), [PeerEvent::PeerUndelivered { peer: ANA, topic: INPUT, count: 1 }],
         "Tweak consumed its own loss and left the input loss for its dispatcher");
 
-    guests[1].session.request(None, Request::Select(Some(PATH.into()))).unwrap();
+    let after = "/after-relink";
+    guests[1].session.request(None, Request::Select(Some(after.into()))).unwrap();
     exchange(cx, &mut owner, &mut hub, &mut guests[1..]);
-    assert_eq!(hub.sessions[0].view.selections[&BEN].path, PATH, "the surviving guest can still send requests");
-    assert_eq!(guests[1].session.view.selections[&BEN].path, PATH, "the surviving guest receives the resulting notice");
-    assert_eq!(guests[1].session.view.allowed, [BEN].into());
+    assert_eq!(hub.sessions[0].view.selections[&BEN].path, after, "the surviving guest can still send requests");
+    assert_eq!(guests[1].session.view.selections[&BEN].path, after, "the surviving guest receives the resulting notice");
+    assert_eq!(guests[1].session.view.allowed, [ANA, BEN].into());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_call_allow_is_the_only_way_to_the_tweak_right() {
+    use crate::call::{CallAction, CallController, Press};
+    use makepad_widgets::*;
+
+    let mut mesh = CallController::linked_tweak_test_mesh();
+    let (share, _) = mesh.app_window();
+    let [owner, ana, ben] = [0, 1, 2].map(|i| mesh.key(i));
+    mesh.watch(1, share);
+    assert!(mesh.ctl[1].ask_control(share, true));
+    mesh.barrier(1, 0);
+    let mut hub = Tweaks::default();
+    let mut host = Session::owner(TOWN, share, ITEM, owner, LINK).unwrap();
+    host.set_members([owner, ana, ben]);
+    let mut app = FakeApp { props: ROWS.into(), ..Default::default() };
+    host.request(None, Request::Props { path: PATH.into() }).unwrap();
+    host.drive_app(&mut app);
+    app.answer(&mut host);
+    hub.sessions.push(host);
+    let mut guests = [ana, ben].map(|peer| Session::<u64,u64>::peer(TOWN, share, ITEM, peer, owner).unwrap());
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 460} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut panel = test_panel();
+    let mut draw = draw_panel(cx, root.clone());
+
+    // The reliable marker places each Set in the owner's relay before the right changes.
+    for (step, peer, applies) in [
+        ("initial", 1, false), ("named", 1, true), ("other seat", 2, false),
+        ("take back", 1, true), ("chip revoke", 1, false), ("allow all", 2, true), ("all off", 2, false),
+    ] {
+        let guest = &mut guests[peer-1];
+        let value = (guest.view.updates.len() + 1).to_string();
+        let req = guest.request(None, set(&value)).unwrap();
+        assert!(poll_relay(std::slice::from_mut(guest), &mut mesh.ctl[peer]).is_empty());
+        mesh.barrier(peer, 0);
+        match step {
+            "named" => { mesh.grant_to(share, 1); }
+            "take back" => assert!(mesh.ctl[0].call_actions(cx, CallAction::OnShare(share, Press::TakeBack))),
+            "chip revoke" => {
+                let session = &hub.sessions[0];
+                panel.refresh(cx, &root, session, &Default::default(), &Default::default());
+                draw(cx);
+                let row = root.portal_list(cx, ids!(tweak_seats_list)).get_item(0).unwrap().1;
+                let button = row.widget(cx, ids!(tweak_revoke));
+                assert!(!button.is_empty() && button.visible(), "a named right has a Revoke button");
+                let (_, _, actions) = panel_click_at(cx, &root, button.area().rect(cx).center(), 1.);
+                let action = actions.iter().filter_map(|a| a.as_widget_action())
+                    .find_map(|a| a.action.downcast_ref::<CallAction>()).copied();
+                assert_eq!(action, Some(CallAction::OnShare(share, Press::RevokeControl(ana))));
+                assert!(mesh.ctl[0].call_actions(cx, action.unwrap()));
+            }
+            "allow all" => assert!(mesh.ctl[0].allow_all_control(&mut mesh.rig.as_mut().unwrap().app, share)),
+            "all off" => assert!(mesh.ctl[0].call_actions(cx, CallAction::OnShare(share, Press::AllowAll(false)))),
+            _ => {}
+        }
+        hub.poll_call(&mut mesh.ctl[0]);
+        let session = &mut hub.sessions[0];
+        session.drive_app(&mut app);
+        app.answer(session);
+        if applies {
+            assert!(matches!(session.next_record(), Some(crate::model::Action::RecordAppEdit { edit, .. }) if edit.seat == guest.me), "{step}");
+            session.record_saved();
+        } else {
+            assert!(session.next_record().is_none(), "{step} must not create a record");
+        }
+        if step == "allow all" {
+            panel.refresh(cx, &root, session, &Default::default(), &Default::default());
+            draw(cx);
+            for index in 0..2 {
+                let row = root.portal_list(cx, ids!(tweak_seats_list)).get_item(index).unwrap().1;
+                assert!(!row.widget(cx, ids!(tweak_revoke)).visible(), "Allow all alone has no per-seat revoke");
+            }
+        }
+        hub.poll_call(&mut mesh.ctl[0]);
+        mesh.barrier(0, peer);
+        assert!(poll_relay(std::slice::from_mut(guest), &mut mesh.ctl[peer]).is_empty());
+        assert!(guest.view.updates.iter().any(|(who, id, _, n)| *who == guest.me && *id == req && match n {
+            Notice::Applied { new, .. } => applies && new == &value,
+            Notice::Refused(why) => !applies && why == "Ask for control to edit this share.",
+            _ => false,
+        }), "{step}: the guest receives the outcome under the current call right");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_member_removed_from_the_town_loses_the_tweak_right_at_once() {
+    fn first_refusal(guest: &Session<u64, u64>, req: RequestId) -> Option<&str> {
+        guest.view.updates.iter().find_map(|(seat, id, _, notice)| match notice {
+            Notice::Refused(why) if *seat == guest.me && *id == req => Some(why.as_str()),
+            _ => None,
+        })
+    }
+
+    let mut mesh = crate::call::CallController::linked_tweak_test_mesh();
+    let (share, _) = mesh.app_window();
+    let town = mesh.ctl[0].open_town().unwrap().0;
+    let [owner, ana, ben] = [0, 1, 2].map(|i| mesh.key(i));
+    mesh.ctl[0].set_town_members([(town, [ana, ben].into())].into());
+    mesh.request_named_control(1, share);
+    mesh.grant_to(share, 1);
+
+    let mut hub = Tweaks::default();
+    let mut host = Session::owner(town, share, ITEM, owner, LINK).unwrap();
+    host.set_members([owner, ana, ben]);
+    let mut app = FakeApp { props: ROWS.into(), ..Default::default() };
+    host.request(None, Request::Props { path: PATH.into() }).unwrap();
+    host.drive_app(&mut app);
+    app.answer(&mut host);
+    hub.sessions.push(host);
+    let mut guest = Session::<u64, u64>::peer(town, share, ITEM, ana, owner).unwrap();
+    let queued = guest.request(None, set("12")).unwrap();
+    assert!(poll_relay(std::slice::from_mut(&mut guest), &mut mesh.ctl[1]).is_empty());
+    mesh.barrier(1, 0);
+    hub.poll_call(&mut mesh.ctl[0]);
+    assert!(hub.sessions[0].view.allowed.contains(&ana));
+
+    // The sharer's session has accepted the Set but has not dispatched it to the app.
+    mesh.ctl[0].set_town_members([(town, [ben].into())].into());
+    hub.poll_call(&mut mesh.ctl[0]);
+    assert!(!hub.sessions[0].view.allowed.contains(&ana), "one poll withdraws Ana's tweak right");
+    mesh.barrier(0, 1);
+    assert!(poll_relay(std::slice::from_mut(&mut guest), &mut mesh.ctl[1]).is_empty());
+    assert_eq!(first_refusal(&guest, queued), Some(CONTROL_ENDED), "one poll refuses the queued Set");
+    assert!(!guest.view.allowed.contains(&ana), "Ana sees that her Allow ended");
+    let fresh = guest.request(None, set("14")).unwrap();
+    assert!(poll_relay(std::slice::from_mut(&mut guest), &mut mesh.ctl[1]).is_empty());
+    mesh.barrier(1, 0);
+    hub.poll_call(&mut mesh.ctl[0]);
+    mesh.barrier(0, 1);
+    assert!(poll_relay(std::slice::from_mut(&mut guest), &mut mesh.ctl[1]).is_empty());
+    assert_eq!(first_refusal(&guest, fresh), Some(NEEDS_CONTROL), "a new Set requires a fresh Allow");
+    let sent = app.sent.len();
+    hub.sessions[0].drive_app(&mut app);
+    assert_eq!(app.sent.len(), sent, "neither Set reached the app");
 }
 
 #[test]
@@ -1663,17 +1932,17 @@ fn json_depth_refuses_one_delivery_and_the_peer_stream_continues() {
 
     // A peer can put JSON on the wire that this owner implementation would already have refused.
     let bad = s.ana.send(props());
-    let next = s.ana.send(Request::AskEdit);
+    let next = s.ana.send(Request::Select(None));
     let frame = |req, delivery, notice| Packet { share: SHARE, sender: OWNER, req, agent: None,
         body: Body::Notice { seat: ANA, delivery, notice } }.encode();
     let deep = frame(bad, 10, Notice::Rows { path: PATH.into(), rows: rows(300) });
-    let good = frame(next, 11, Notice::Asked);
+    let good = frame(next, 11, Notice::Selected { path: None, rect: None });
     assert_eq!(wire::decode(OWNER, &deep), Err(TOO_DEEP), "the wire decoder enforces the shared stack guard");
     s.ana.session.view.updates.clear();
     for body in [deep.clone(), deep, good] { s.host.relay.send(ANA, TWEAK, body).unwrap(); }
     s.ana.poll();
     let notices: Vec<_> = s.ana.session.view.updates.into_iter().map(|(_, req, _, n)| (req, n)).collect();
-    assert_eq!(notices, [(bad, Notice::Refused(TOO_DEEP.into())), (next, Notice::Asked)],
+    assert_eq!(notices, [(bad, Notice::Refused(TOO_DEEP.into())), (next, Notice::Selected { path: None, rect: None })],
         "an over-depth peer delivery is refused once across replay and the next notice arrives on the same stream");
 }
 
@@ -1727,7 +1996,7 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
     s.host.session.set_peer_level(BEN, current);
     let denied = s.ben.send(children());
     s.one();
-    assert!(has(&s.ben, denied, |n| matches!(n, Notice::Refused(why) if why.contains("Ask the owner"))), "Tree requires Allow");
+    assert!(has(&s.ben, denied, |n| matches!(n, Notice::Refused(why) if why.contains("Ask for control"))), "Tree requires Allow");
     assert!(!has(&s.ana, denied, |_| true) && !has(&s.host, denied, |_| true), "Allow refusal stays with its requester");
     assert_eq!(s.app.sent.len(), sent, "a denied seat cannot read the app");
 
@@ -1792,10 +2061,10 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
         expected.push((ANA, req, None, Notice::Refused(why.into())));
         for _ in 0..2 { corrupt.host.relay.send(ANA, TWEAK, bytes.clone()).unwrap(); }
     }
-    let req = corrupt.ana.send(Request::AskEdit);
+    let req = corrupt.ana.send(Request::Select(None));
     corrupt.host.relay.send(ANA, TWEAK, Packet { share: SHARE, sender: OWNER, agent: None, req,
-        body: Body::Notice { seat: ANA, delivery: 3, notice: Notice::Asked } }.encode()).unwrap();
-    expected.push((ANA, req, None, Notice::Asked));
+        body: Body::Notice { seat: ANA, delivery: 3, notice: Notice::Selected { path: None, rect: None } } }.encode()).unwrap();
+    expected.push((ANA, req, None, Notice::Selected { path: None, rect: None }));
     corrupt.ana.poll();
     assert_eq!(corrupt.ana.session.view.updates, expected, "bad pages each settle once and the next notice arrives");
     assert!(matches!(&corrupt.host.relay.take(TWEAK)[..], [(_, bytes)] if wire::decode(ANA, bytes).unwrap().expect("a known tweak packet").body == Body::Ack(3)),
@@ -1856,14 +2125,14 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
         "a current Hello releases the held request and subsequent Select");
 
     let drop_req = s.ana.send(search("card"));
-    let ask = s.ana.send(Request::AskEdit);
+    let select = s.ana.send(Request::Select(Some(card.into())));
     s.ana.poll();
     s.host.relay.take(TWEAK);
     s.ana.session.peer_unlinked(OWNER);
     s.ana.session.set_peer_level(OWNER, None);
     s.ana.poll();
     assert!(s.host.relay.take(TWEAK).iter().all(|(_, b)| matches!(b[1], 14 | 18)) && !has(&s.ana, drop_req, |_| true),
-        "a missing Hello preserves the pending search and Ask");
+        "a missing Hello preserves the pending search and Select");
     let waiting = s.ana.session.request(Some(ANA_AGENT), children()).expect("a new query queues while Hello is unknown");
     s.ana.session.set_peer_level(OWNER, older);
     assert!(s.ana.session.view.updates.contains(&(ANA, waiting, Some(ANA_AGENT), Notice::Refused(OLDER_SHARER_TREE.into()))),
@@ -1872,11 +2141,11 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
         "an older Hello immediately refuses the original request locally");
     s.ana.poll();
     let frames = s.host.relay.take(TWEAK);
-    assert!(matches!(&frames[..], [(_, b)] if b[1] == 6 && wire::decode(ANA, b).unwrap().expect("a known tweak packet").req == ask),
-        "the older sharer receives just the following Ask");
+    assert!(matches!(&frames[..], [(_, b)] if b[1] == 5 && wire::decode(ANA, b).unwrap().expect("a known tweak packet").req == select),
+        "the older sharer receives just the following Select");
     for (_, bytes) in frames { s.ana.relay.send(OWNER, TWEAK, bytes).unwrap(); }
     s.exchange();
-    assert!(s.host.session.view.asked.contains(&ANA), "the older sharer processes Ask after dropping Tree");
+    assert!(has(&s.host, select, |n| matches!(n, Notice::Selected { path: Some(p), .. } if p == card)), "the older sharer processes Select after dropping Tree");
 
     // Owner replay, with an unacked page followed by Select and another read still in the app.
     s.ana.session.set_peer_level(OWNER, current);
@@ -1913,6 +2182,7 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
     s.ana.relay.take(TWEAK);
     s.host.session.peer_unlinked(ANA);
     s.host.session.set_peer_level(ANA, None);
+    s.allow(ANA, false);
     s.host.poll();
     assert!(s.ana.relay.take(TWEAK).is_empty(), "the owner holds replay while awaiting the guest's Hello");
     s.host.session.set_peer_level(ANA, older);
@@ -1920,7 +2190,7 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
     let frames = s.ana.relay.take(TWEAK);
     assert!(!frames.is_empty() && frames.iter().all(|(_, b)| !matches!(b[1], 25 | 26)), "older guest receives no Tree tags during replay");
     assert!(frames.iter().any(|(_, b)| matches!(wire::decode(OWNER, b).unwrap().expect("a known tweak packet").body, Body::Notice { notice: Notice::Allowed(false), .. })),
-        "replay includes the disconnected seat's revoked grant");
+        "replay includes the call's control revocation");
     for (_, bytes) in frames { s.host.relay.send(ANA, TWEAK, bytes).unwrap(); }
     s.ana.poll();
     s.host.poll();
@@ -2065,7 +2335,7 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
     for op in [get(), set_token("color_primary", "#ccc"), install("Light")] {
         let id = s.ben.send(op);
         s.one();
-        assert!(has(&s.ben, id, |n| matches!(n, Notice::Refused(s) if s == "Ask the owner to allow editing this share.")),
+        assert!(has(&s.ben, id, |n| matches!(n, Notice::Refused(s) if s == "Ask for control to edit this share.")),
             "each theme operation requires Allow");
         assert!(!has(&s.ana, id, |_| true) && !has(&s.host, id, |_| true), "a denial is private");
     }
@@ -2117,16 +2387,17 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
         "a queued install is superseded for its actor");
     s.host.session.drive_app(&mut s.app);
     s.app.answer(&mut s.host.session);
+    s.allow(ANA, false);
     if let Some(Action::RecordAppEdit { edit, .. }) = s.host.session.next_record() {
         s.records.push(edit);
         s.host.session.record_saved();
     }
-    s.host.session.consent(ANA, false).unwrap();
     s.host.session.drive_app(&mut s.app);
     s.app.answer(&mut s.host.session);
     s.host.poll();
     let old_mail = s.ben.relay.take(TWEAK);
-    assert!(old_mail.iter().all(|(_, bytes)| wire::min_level(bytes) == 0), "the older guest receives only v1 notices");
+    assert!(!old_mail.is_empty() && old_mail.iter().all(|(_, bytes)| wire::min_level(bytes) == 0),
+        "the older guest receives only v1 notices");
     for (_, bytes) in old_mail { s.host.relay.send(BEN, TWEAK, bytes).unwrap(); }
     s.exchange();
     assert!(has(&s.ben, last, |n| matches!(n, Notice::Applied { prop, .. } if prop == "install")), "v1 observers receive install history");
@@ -2188,17 +2459,17 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
         assert!(r.host.relay.take(TWEAK).iter().any(|(_, b)| b[1] == 27), "original Get was in the lost transport");
         r.ana.session.peer_unlinked(OWNER);
         r.ana.session.set_peer_level(OWNER, None);
-        let ask = r.ana.send(Request::AskEdit);
+        let select = r.ana.send(Request::Select(None));
         r.ana.poll();
-        assert!(r.host.relay.take(TWEAK).iter().all(|(_, b)| matches!(b[1], 14 | 18)), "awaiting Hello holds Get and later Ask in order");
+        assert!(r.host.relay.take(TWEAK).iter().all(|(_, b)| matches!(b[1], 14 | 18)), "awaiting Hello holds Get and later Select in order");
         r.ana.session.set_peer_level(OWNER, level);
         r.one();
-        assert!(has(&r.ana, ask, |n| *n == Notice::Asked), "later v1 mail proceeds after Hello");
+        assert!(has(&r.ana, select, |n| matches!(n, Notice::Selected { path: None, rect: None })), "later v1 mail proceeds after Hello");
         if level == current {
             assert!(has(&r.ana, req, snapshot), "a capable sharer receives the replayed Get");
         } else {
             assert!(has(&r.ana, req, |n| n == &Notice::Refused(OLDER_SHARER_THEME.into())) && r.app.sent.is_empty(),
-                "downgrading settles Get locally before sending Ask");
+                "downgrading settles Get locally before sending Select");
         }
 
         let mut r = Copies::new(OWNER, ANA, ITEM);
@@ -2211,6 +2482,7 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
         assert!(r.ana.relay.take(TWEAK).iter().any(|(_, b)| b[1] == 28), "original snapshot was in the lost transport");
         r.host.session.peer_unlinked(ANA);
         r.host.session.set_peer_level(ANA, None);
+        r.allow(ANA, false);
         r.host.poll();
         assert!(r.ana.relay.take(TWEAK).is_empty(), "the owner holds snapshot and subsequent revocation while awaiting Hello");
         r.host.session.set_peer_level(ANA, level);
@@ -2297,6 +2569,33 @@ fn panel_click_at(cx: &mut Cx, root: &WidgetRef, abs: Vec2d, time: f64) -> (Even
     cx.action(());
     cx.handle_actions();
     (up, press, release)
+}
+
+#[test]
+fn guest_of_an_older_sharer_is_told_instead_of_offered_a_dead_ask() {
+    use makepad_town_core::share::hello::{CONTROL_TWEAK_LEVEL, MULTIPARTY_SHARE_LEVEL};
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut session = Session::<u64,u64>::peer(TOWN, SHARE, ITEM, ANA, OWNER).unwrap();
+    let mut panel = test_panel();
+    let update = "The sharer's copy of Makepad Town is older and still asks for a separate edit Allow. Tweaking starts when it updates.";
+    for (level, supported) in [(None, true), (Some(MULTIPARTY_SHARE_LEVEL), false), (Some(CONTROL_TWEAK_LEVEL), true)] {
+        session.set_peer_level(OWNER, level);
+        assert_eq!(session.supports_control_tweak(), supported);
+        panel.refresh(cx, &root, &session, &Default::default(), &Default::default());
+        assert_eq!(root.widget(cx, ids!(tweak_ask)).visible(), supported, "ask availability at {level:?}");
+        assert_eq!(root.label(cx, ids!(tweak_result)).text() == update, !supported, "explanation at {level:?}");
+    }
+    for (asking, label) in [(Some(SHARE), "Asking for control…"), (None, "Ask for control")] {
+        panel.asking = asking;
+        panel.refresh(cx, &root, &session, &Default::default(), &Default::default());
+        assert_eq!(root.button(cx, ids!(tweak_ask)).text(), label);
+    }
 }
 
 #[test]
@@ -2762,35 +3061,15 @@ fn panel_pick_rows_enter_and_collaborator_history() {
     assert_eq!(applied, [(PATH, "distribute", "Distribute.Start"), (PATH, "align.y", "0.5")],
         "one Centre press reaches the sharer as distribute followed by align.y");
 
-    s.ben.send(Request::AskEdit);
-    s.exchange();
     let mut owner_panel = test_panel();
     owner_panel.refresh(cx, &root, &s.host.session, &Default::default(), &Default::default());
     draw(cx);
     let chips = root.portal_list(cx, ids!(tweak_seats_list));
     let allowed = chips.get_item(0).unwrap().1;
-    let asked = chips.get_item(1).unwrap().1;
     assert_eq!(allowed.label(cx, ids!(tweak_status)).text(), "Allowed", "the first peer's chip shows its grant");
-    assert_eq!(asked.label(cx, ids!(tweak_status)).text(), "Asked", "the other peer's pending request has a separate chip");
-    let (up, clicks) = click(cx, asked.widget(cx, ids!(tweak_allow)));
-    owner_panel.local_input(cx, &Event::Startup, &root, &clicks, &mut s.host.session,
-        |_| panic!("a detached action must never ask for consent"));
-    assert!(!s.host.session.view.allowed.contains(&BEN), "detached clicks have no authority");
-    // The platform keeps its remote-input scope private. Supply the driver's provenance at the gate.
-    let injected = |test_home| matches!(crate::consent::decide(Some("walk".into()), test_home),
-        crate::consent::Consent::TestDriver(_));
-    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| injected(false));
-    assert!(s.host.session.view.asked.contains(&BEN) && !s.host.session.view.allowed.contains(&BEN),
-        "an injected Allow in an ordinary home leaves the painted seat Asked");
-    let (up, clicks) = click(cx, asked.widget(cx, ids!(tweak_allow)));
-    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| injected(true));
-    assert!(s.host.session.view.allowed.contains(&BEN), "a verified test home permits the driver to allow the painted seat");
-    let (up, clicks) = click(cx, allowed.widget(cx, ids!(tweak_revoke)));
-    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |cx| crate::consent::granted(cx, false));
-    assert!(!s.host.session.view.allowed.contains(&ANA) && s.host.session.view.allowed.contains(&BEN),
-        "revoke belongs to the pressed seat even across a roster update");
+    assert!(!allowed.widget(cx, ids!(tweak_allow)).visible() && !allowed.widget(cx, ids!(tweak_stop)).visible(),
+        "the person's control chip is informational");
 
-    s.allow(ANA, true);
     let mut roster = ana_agent_state(owner);
     roster.entities.insert(item, model.state.entities[&item].clone());
     s.host.session.set_agents(&roster);
@@ -2824,9 +3103,14 @@ fn panel_pick_rows_enter_and_collaborator_history() {
         assert_eq!(chip(1).widget(cx, ids!(tweak_stop)).visible(), town.session.me == owner, "only the sharer sees Stop");
     }
     let (up, clicks) = click(cx, chip(1).widget(cx, ids!(tweak_stop)));
-    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| false);
+    owner_panel.local_input(cx, &Event::Startup, &root, &clicks, &mut s.host.session,
+        |_| panic!("a detached Stop must never ask for consent"));
+    // Supply the remote driver's provenance at the same gate as the platform event.
+    let injected = |test_home| matches!(crate::consent::decide(Some("walk".into()), test_home),
+        crate::consent::Consent::TestDriver(_));
+    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| injected(false));
     assert_eq!(s.host.session.view.agents[&(ANA, ANA_AGENT)], false, "an unverified Stop press cannot change AI consent");
-    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| true);
+    owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| injected(true));
     s.finish();
     owner_panel.refresh(cx, &root, &s.host.session, &roster, &Default::default());
     draw(cx);
@@ -2836,7 +3120,7 @@ fn panel_pick_rows_enter_and_collaborator_history() {
         "an already dispatched Set that succeeds after Stop records its actual outcome and local minute");
     let (up, clicks) = click(cx, chip(1).widget(cx, ids!(tweak_allow)));
     owner_panel.local_input(cx, &up, &root, &clicks, &mut s.host.session, |_| true);
-    assert_eq!(s.host.session.view.agents[&(ANA, ANA_AGENT)], false, "the AI chip's Allow releases just its stop");
+    assert_eq!(s.host.session.view.agents[&(ANA, ANA_AGENT)], false, "the AI chip's Resume releases just its stop");
     assert!(s.host.session.view.allowed.contains(&ANA), "both AI controls preserve the person's grant");
 
     s.host.session.bind_window(super::WindowId(2));
@@ -2935,9 +3219,11 @@ fn panel_pick_rows_enter_and_collaborator_history() {
     hub.sessions.push(Session::owner(town, asking, item, owner, LINK).unwrap());
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     assert!(!root.visible(), "the sharer's own share alone leaves the panel closed");
-    hub.sessions.iter_mut().find(|s| s.share == asking).unwrap().view.updates.push_back((ANA, 1, None, Notice::Asked));
+    let shared = hub.sessions.iter_mut().find(|s| s.share == asking).unwrap();
+    shared.set_members([owner, ANA]);
+    shared.set_control_rights(ControlRights { all: false, seats: [ANA].into() });
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
-    assert!(root.visible(), "a guest asking to edit opens the panel so the sharer can answer");
+    assert!(!root.visible(), "granting control does not open the tweak panel");
     hub.share_ended(asking);
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     for id in [ids!(path), ids!(name), ids!(list), ids!(status)] {
@@ -3044,12 +3330,10 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     };
     let point = At::Point { window: 3, x: 9., y: 10. };
     let refused = watch.pick(SHARE, point.clone()).unwrap();
-    watch.sessions[0].request(None, Request::AskEdit).unwrap();
     exchange(&mut host, &mut watch, &mut net);
     assert!(watch.sessions[0].view.updates.iter().any(|(_, id, _, n)| *id == refused && matches!(n, Notice::Refused(_))),
         "the viewer's first pick requires Allow");
-    assert!(host.sessions[0].view.asked.contains(&peer), "the owner's panel has a request for this seat");
-    host.sessions[0].consent(peer, true).unwrap();
+    host.sessions[0].set_control_rights(ControlRights { all: false, seats: [peer].into() });
     exchange(&mut host, &mut watch, &mut net);
     let wrong_window = watch.pick(SHARE, At::Point { window: 9, x: 0., y: 0. }).unwrap();
     exchange(&mut host, &mut watch, &mut net);
@@ -3117,13 +3401,12 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     open(&mut model, other);
     host.sharer_started(&model, other, "Second".into(), second, WindowId(5), None).unwrap();
     assert_eq!(host.record(&mut model).len(), 1, "starting the share creates its own signed App item");
-    host.sessions[1].consent(peer, true).unwrap();
+    host.sessions[1].set_control_rights(ControlRights { all: false, seats: [peer].into() });
     host.link_events(&[AppLinkEvent::Restarted { ended: second, app: app.clone() }], &mut links);
     assert!(host.sessions[1].is_ended() && host.sessions[1].view.allowed.is_empty(), "Restarted closes only the replaced link");
     assert!(host.sessions[0].view.allowed.contains(&peer), "the first share keeps its grant");
     host.peer_unlinked(peer);
-    assert!(host.sessions[0].view.allowed.is_empty(), "unlink revokes a live grant");
-    host.sessions[0].consent(peer, true).unwrap();
+    assert!(host.sessions[0].view.allowed.contains(&peer), "unlink preserves the call control right");
     host.share_ended(SHARE);
     assert!(host.sessions[0].view.allowed.is_empty(), "S2 Ended releases consent");
 
@@ -3131,7 +3414,7 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     open(&mut model, last);
     host.sharer_started(&model, last, "Last".into(), link, WindowId(3), None).unwrap();
     assert_eq!(host.record(&mut model).len(), 1, "starting the share creates its own signed App item");
-    host.sessions[2].consent(peer, true).unwrap();
+    host.sessions[2].set_control_rights(ControlRights { all: false, seats: [peer].into() });
     host.link_events(&[AppLinkEvent::Ended { id: link, why: "closed".into() }], &mut links);
     assert!(host.sessions[2].is_ended() && host.sessions[2].view.allowed.is_empty(), "G11 Ended releases consent");
 
@@ -3142,7 +3425,7 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     crate::model::tests::exchange(&mut model, &mut viewer);
     watch.viewer_started(&viewer, departing, "Leaving".into()).unwrap();
     watch.resolve(&viewer);
-    host.sessions[3].consent(peer, true).unwrap();
+    host.sessions[3].set_control_rights(ControlRights { all: false, seats: [peer].into() });
     watch.sessions.last_mut().unwrap().request(None, Request::Props { path: PATH.into() }).unwrap();
     exchange(&mut host, &mut watch, &mut net);
     answer(&mut host, &mut links, ROWS);
@@ -3543,7 +3826,7 @@ fn shader_tab_edits_literal_inputs_live_and_saves_fn_changes_as_notes() {
     let (sent, recorded) = (s.app.sent.len(), s.records.len());
     let denied = s.ben.send(Request::Set { path: PATH.into(), prop: "draw_bg.pixel".into(), value: draft });
     s.one();
-    assert!(has(&s.ben, denied, |n| matches!(n, Notice::Refused(why) if why.contains("Ask the owner"))), "a peer needs Allow to propose shader changes");
+    assert!(has(&s.ben, denied, |n| matches!(n, Notice::Refused(why) if why.contains("Ask for control"))), "a peer needs Allow to propose shader changes");
     assert_eq!((s.app.sent.len(), s.records.len()), (sent, recorded), "a denied proposal neither touches the app nor records a note");
     s.app.props = r##"{"props":[{"name":"draw_icon.color","value":"#abcdef"}]}"##.into();
     s.ana.send(Request::Select(Some("older.widget".into())));
@@ -4003,7 +4286,7 @@ fn theme_tab_edits_tokens_switches_presets_and_saves_replaces_deletes_in_store()
     dispatch(cx, &mut panel, &mut s.ana);
     choose(cx, &mut panel, &mut s.ana, 0);
     settle(cx, &mut panel, &mut s);
-    assert!(msg.text().contains("Ask the owner") && pick.selected_label() == "my_sunset" && delete.visible(),
+    assert!(msg.text().contains("Ask for control") && pick.selected_label() == "my_sunset" && delete.visible(),
         "a refused install preserves the already worn saved theme and its delete button");
     s.allow(ANA, true);
     dispatch(cx, &mut panel, &mut s.ana);
@@ -4038,7 +4321,7 @@ fn theme_tab_edits_tokens_switches_presets_and_saves_replaces_deletes_in_store()
     choose(cx, &mut panel, &mut s.ana, 0);
     settle(cx, &mut panel, &mut s);
     draw(cx);
-    assert!(color.label(cx, ids!(refusal)).text().contains("Ask the owner") && msg.text().contains("Ask the owner") &&
+    assert!(color.label(cx, ids!(refusal)).text().contains("Ask for control") && msg.text().contains("Ask for control") &&
         before == (s.app.sent.len(), s.records.len()), "a denied guest cannot edit a token or install a preset");
 
     let mut older = Copies::new(OWNER, ANA, ITEM);
@@ -4499,7 +4782,7 @@ fn theme_ok(result: ThemeResult) -> json::Value {
 }
 
 #[test]
-fn app_theme_tools_read_edit_install_store_mix_and_build_under_consent() {
+fn app_theme_tools_read_edit_install_store_mix_and_build_under_control() {
     use makepad_ai_services::wire::ToolOutcome;
     use json::Value::{Bool, Int};
     let (_homes, owner, mut ana, mut s) = theme_agents("theme-ai");
@@ -4513,7 +4796,7 @@ fn app_theme_tools_read_edit_install_store_mix_and_build_under_consent() {
     let live: [(&str, &[(&str,json::Value)]);6] = [("get",&[]), ("set",&set), ("install",&preset), ("save",&name), ("mix",&random), ("build",&[])];
     for (op, args) in live {
         let result = ana.run(&mut s, op, args);
-        assert_eq!((result.outcome, result.text.as_str()), (ToolOutcome::Refused,"Ask the owner to allow editing this share."), "{op} requires Allow");
+        assert_eq!((result.outcome, result.text.as_str()), (ToolOutcome::Refused,"Ask for control to edit this share."), "{op} requires Allow");
         assert_eq!(ana.waits.traces.rows(&ana.line)[0].output.last().unwrap().ink, crate::ai_trace::Ink::Warning, "{op} records a warning");
     }
     assert!(s.app.sent.is_empty(), "denied tools never reach the app");
@@ -5567,7 +5850,7 @@ fn guest_structural_edit_requires_allow_consent_and_records_attribution() {
     assert!(!s.ben.session.view.agents.contains_key(&(ANA, ANA_AGENT)), "private read announced its AI");
     let denied = send(&mut s, insert("card", "#abc"));
     finish(&mut s);
-    assert!(has(&s.ana, denied, |n| matches!(n, Notice::Refused(v) if v.contains("allow editing"))));
+    assert!(has(&s.ana, denied, |n| matches!(n, Notice::Refused(v) if v.contains("Ask for control"))));
     assert!(!has(&s.ben, denied, |_| true));
     s.allow(ANA, true);
     let invalid = send(&mut s, insert("bad", "crate_resource(\"x\")"));
@@ -5695,7 +5978,7 @@ fn guest_structural_edit_requires_allow_consent_and_records_attribution() {
     }
     s.allow(ANA, false); // after Preview and before Verify: revert the previously unopened file
     finish(&mut s);
-    assert!(has(&s.ana, interrupted, |n| matches!(n, Notice::Refused(v) if v.contains("revoked"))));
+    assert!(has(&s.ana, interrupted, |n| matches!(n, Notice::Refused(v) if v.contains("Control ended"))));
     assert_eq!(s.records.len(), records);
     assert!(s.app.design_source.as_ref().unwrap().live.is_none());
     assert_eq!(std::fs::read_to_string(&path).unwrap(),disk);
@@ -5949,7 +6232,7 @@ fn build_tab_hides_commit_for_guest_and_disables_edits_until_allowed() {
     draw(cx);
     assert!(root.widget(cx, ids!(tweak_build_wrap)).visible());
     assert_eq!(root.label(cx, ids!(build_status)).text(), OLDER_SHARER_DESIGN);
-    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    s.ana.session.set_peer_level(OWNER, Some(makepad_town_core::share::hello::CONTROL_TWEAK_LEVEL));
     refresh(cx, &mut panel, &s.ana);
     assert!(root.widget(cx, ids!(tweak_ask)).visible() && !bake.borrow().unwrap().enabled());
     assert!(!commit.visible(), "a guest cannot commit dirty files");
@@ -6191,6 +6474,8 @@ fn theme_tab_routes_bake_to_app_or_d1_design() {
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     assert!(root.visible() && root.widget(cx, ids!(tweak_build_wrap)).visible(), "the board opens Build without a live share");
     cx.tweak_callback = callback;
+    let insert = root.button(cx, ids!(insert_inside));
+    board_frames_until(cx, &mut hub, &ui, &model, || insert.borrow().unwrap().enabled());
     let action = click(cx, ids!(tab_theme));
     hub.board_design_actions(cx, &ui, &action, &mut model);
     let action = click(cx, ids!(theme_bake));
@@ -6199,6 +6484,7 @@ fn theme_tab_routes_bake_to_app_or_d1_design() {
     assert_eq!(snapshot.revision, id);
     assert!(snapshot.src.contains("mod.theme +: {") && snapshot.src.contains("color_primary: #e6a294ff"), "baked source: {}", snapshot.src);
     assert!(snapshot.src.contains("title := Label{}"), "baking preserves widget source");
+    board_frames_until(cx, &mut hub, &ui, &model, || insert.borrow().unwrap().enabled());
     assert!(hub.board_design_actions(cx, &ui, &action, &mut model).is_none(), "rebaking the same theme emits no write");
     let action = click(cx, ids!(tab_build));
     hub.board_design_actions(cx, &ui, &action, &mut model);
@@ -6210,6 +6496,104 @@ fn theme_tab_routes_bake_to_app_or_d1_design() {
     hub.select_board_design(None);
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     assert!(!root.visible(), "deselecting the design closes its panel");
+}
+
+// Town delivers the frame to tick_theme, then paints model changes through update.
+fn board_frames_until(cx: &mut Cx, hub: &mut Tweaks<u64, u64>, ui: &WidgetRef, model: &Model,
+    mut installed: impl FnMut() -> bool) -> std::time::Duration {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let frame = cx.next_frame_id();
+        let event = Event::NextFrame(makepad_widgets::NextFrameEvent { frame, time: frame as f64 / 60., ..Default::default() });
+        let start = std::time::Instant::now();
+        hub.tick_theme(cx, ui, &event);
+        hub.update(cx, ui, model, &Default::default(), &mut Default::default(), |_| {});
+        let elapsed = start.elapsed();
+        if installed() { return elapsed }
+        assert!(cx.next_frame_id() > frame, "a pending widget index must request the next frame");
+        assert!(start < deadline, "the widget index did not finish");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn selecting_a_design_lists_its_widgets_off_the_ui_thread() {
+    use crate::model::Action;
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let ui = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* View{tweak_panel := AppTweakPanel{width: 360}} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let root = ui.widget(cx, ids!(tweak_panel));
+    let picker = root.drop_down(cx, ids!(board_widget));
+    let edit = root.button(cx, ids!(insert_inside));
+    let result = root.label(cx, ids!(tweak_result));
+    let homes = crate::model::tests::ShareHomes::new("board-widget-index");
+    let mut model = Model::open(&homes.0).unwrap().0;
+    let board = model.act(Action::AddBoard { project: model.project().id, title: "Board".into() }, Origin::Ui).unwrap();
+    let src = "View { title := Label{} }";
+    let item = model.act(Action::AddDesign { board, x: 0, y: 0, preset: "phone".into(),
+        title: "Card".into(), src: src.into() }, Origin::Ui).unwrap();
+    let write = |model: &mut Model, revision, src: String| model.act(Action::WriteDesign { item, revision, src }, Origin::Ui).unwrap();
+    let paths = |src| design::d1::list_widgets(src).unwrap().into_iter().map(|node| node.path).collect::<Vec<_>>();
+    let mut hub = Tweaks::<u64, u64>::default();
+    hub.set_themes_dir(homes.0.join("themes"));
+    let update = |cx: &mut Cx, hub: &mut Tweaks<u64, u64>, model: &Model| {
+        hub.update(cx, &ui, model, &Default::default(), &mut Default::default(), |_| {});
+    };
+    let before = panel::BOARD_INDEX_RUNS.with(|count| count.get());
+    hub.select_board_design(Some(item));
+    update(cx, &mut hub, &model);
+    assert_eq!(panel::BOARD_INDEX_RUNS.with(|count| count.get()), before, "selection parsed on the UI thread");
+    assert!(picker.has_labels(&[]) && !edit.borrow().unwrap().enabled(), "the initial picker is empty and editing is disabled");
+    let initial = paths(src);
+    board_frames_until(cx, &mut hub, &ui, &model, || edit.borrow().unwrap().enabled());
+    assert!(picker.has_labels(&initial), "the installed paths match the source index");
+
+    let stale = write(&mut model, item, "View { obsolete := Button{} }".into());
+    let frame = cx.next_frame_id();
+    update(cx, &mut hub, &model);
+    assert!(cx.next_frame_id() > frame, "submitting an index requests a frame without a later model event");
+    assert!(picker.has_labels(&initial) && !edit.borrow().unwrap().enabled(), "previous paths remain visible during indexing");
+    let current = "View { current := Button{} }";
+    let revision = write(&mut model, stale, current.into());
+    board_frames_until(cx, &mut hub, &ui, &model, || {
+        let enabled = edit.borrow().unwrap().enabled();
+        if !enabled { assert!(picker.has_labels(&initial), "a stale writer replaced the displayed paths"); }
+        enabled
+    });
+    assert!(picker.has_labels(&paths(current)), "only the current writer can enable editing");
+
+    let bad = "View {";
+    let error = design::d1::list_widgets(bad).unwrap_err().to_string();
+    let failed = write(&mut model, revision, bad.into());
+    update(cx, &mut hub, &model);
+    board_frames_until(cx, &mut hub, &ui, &model, || result.text() == error);
+    assert!(picker.has_labels(&[]) && !edit.borrow().unwrap().enabled(), "invalid source clears the picker");
+    hub.select_board_design(None);
+    update(cx, &mut hub, &model);
+    let frame = cx.next_frame_id();
+    hub.select_board_design(Some(item));
+    update(cx, &mut hub, &model);
+    assert_eq!(cx.next_frame_id(), frame, "reopening an unchanged parse failure must not schedule another index");
+    assert_eq!(result.text(), error);
+    hub.tick_theme(cx, &ui, &Event::NextFrame(NextFrameEvent::default()));
+    assert_eq!(cx.next_frame_id(), frame, "an idle board index stops requesting frames");
+
+    let block = format!("Label {{ text: \"{}\" }}\n", "x".repeat(1008));
+    let copies = 1_000_000_usize.div_ceil(block.len());
+    let large = format!("View {{\n{} }}", block.repeat(copies));
+    let bytes = large.len();
+    write(&mut model, failed, large);
+    let start = std::time::Instant::now();
+    update(cx, &mut hub, &model);
+    let submit = start.elapsed();
+    let install = board_frames_until(cx, &mut hub, &ui, &model, || edit.borrow().unwrap().enabled());
+    eprintln!("Board widget index ({bytes} bytes, {copies} labels) UI submit {submit:?}, install {install:?}");
+    assert!(result.text().is_empty(), "a valid new revision clears the parse error");
+    assert_eq!(panel::BOARD_INDEX_RUNS.with(|count| count.get()), before, "no board index ran on the UI thread");
 }
 
 impl ThemeAgent {
@@ -6494,7 +6878,7 @@ fn ai_design_mutating_tools_respect_allow_and_stop() {
     let insert = r#"{"path":"/panel","place":"inside","ty":"View","name":"card"}"#;
     let denied = ai.run_design(&mut s, "insert", insert);
     assert_eq!(denied.outcome, ToolOutcome::Refused);
-    assert!(denied.text.contains("allow editing") && s.app.sent.is_empty() && s.records.is_empty());
+    assert!(denied.text.contains("Ask for control") && s.app.sent.is_empty() && s.records.is_empty());
     let seat = ai.model.me();
     s.allow(seat, true);
     theme_ok(ai.run_design(&mut s, "insert", insert));

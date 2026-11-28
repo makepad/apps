@@ -4260,10 +4260,6 @@ impl VideoCut {
         let video = ui.video(cx, ids!(cut_lib_video));
         video.set_source(VideoDataSource::Filesystem { path: path.to_string_lossy().into_owned() });
         video.begin_playback(cx);
-        // Hidden test runs stay silent.
-        if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() {
-            video.mute_playback(cx);
-        }
         play.started = true;
         play.playing = true;
         // The player over the fitted picture.

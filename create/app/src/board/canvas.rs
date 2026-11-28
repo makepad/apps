@@ -1,5 +1,6 @@
 //! The board and its local interaction overlay. Fold events materialize text and shape handles alongside
 //! the spatial view. Drawing only borrows this projection and the camera.
+use super::design_picture::{DesignKey, DesignPictures, PictureState};
 use super::gesture::{scroll_nav, snap_rect, ticks, AlignTo, BoardTool, Gesture, Guide, Handle, NewItem, Placement, Preview, ScrollNav, Transform, DRAG_SLOP};
 use super::live::{Incoming, Outbox};
 use super::look::{self, Body, Lift, Look, Place, Surface, STEPS};
@@ -49,6 +50,15 @@ script_mod! {
         frame_color: palette.panel
         frame_line: palette.line
         caption_color: palette.muted
+        error_color: theme.color_error
+        // A child pass has already blended its pixels into transparent black.
+        design_image +: {pixel: fn() {
+            let picture = self.image_texture.sample(self.pos)
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.border_radius)
+            sdf.fill_keep_premul(picture)
+            return sdf.result
+        }}
         shadow_color: #x000000
         shadow_strength: 1.0
         shadow_softness: 1.0
@@ -199,9 +209,24 @@ struct Face {
     layout: Option<(MetricsKey, Rc<LaidoutText>)>,
     detail: Detail,
     media: Option<Box<MediaFace>>,
+    design: Option<Box<DesignFace>>,
     /// The font size, in points, the text fits its item at, and what it was fitted to.
     fit: Option<(FitKey, f32)>,
 }
+
+#[derive(Default)]
+struct DesignFace {
+    badge: Badge,
+    #[cfg(test)]
+    texture: Option<TextureId>,
+    #[cfg(test)]
+    error_area: Option<Area>,
+    #[cfg(test)]
+    error_pt: Option<f64>,
+}
+
+/// The size, in screen points, a design's error message reads at whatever the zoom.
+const DESIGN_ERROR_PT: f64 = 10.;
 
 #[derive(Default)]
 struct MediaFace {
@@ -227,6 +252,22 @@ struct DropGhost {
 }
 
 impl Badge {
+    fn draw_error(&mut self, cx: &mut Cx2d, label: &mut DrawText, r: Rect, message: &str, ink: Vec4f, pad: f64) {
+        let inset = dvec2(pad.min(r.size.x / 4.), pad.min(r.size.y / 4.));
+        let inner = Rect { pos: r.pos + inset, size: r.size - inset * 2. };
+        let style = &label.text_style;
+        let key = MetricsKey { width: inner.size.x as f32, font: style.font_family_id(), size: style.font_size,
+            spacing: style.line_spacing, centre: false, family_generation: cx.fonts.borrow().font_family_generation() };
+        if self.text != message || self.layout.as_ref().is_none_or(|(old, _)| *old != key) {
+            self.text = message.to_owned();
+            self.layout = Some((key, label.layout(cx, 0., 0., Some(inner.size.x as f32), true, Align::default(), message)));
+        }
+        label.color = ink;
+        cx.push_clip_rect(inner);
+        label.draw_walk_laidout(cx, Walk::abs_rect(inner), &self.layout.as_ref().unwrap().1);
+        cx.pop_clip_rect();
+    }
+
     fn draw(&mut self, cx: &mut Cx2d, label: &mut DrawText, surface: &mut DrawCanvasCard, look: &Look,
         r: Rect, text: &str, corner: bool) -> Rect {
         let style = &label.text_style;
@@ -255,6 +296,7 @@ impl Badge {
 impl Face {
     fn update(&mut self, item: &BoardItem, state: &State) -> bool {
         if item.image.is_some() { self.media.get_or_insert_with(Default::default); } else { self.media = None; }
+        if item.design.is_some() { self.design.get_or_insert_with(Default::default); } else { self.design = None; }
         let e = &state.entities[&item.text_handle()];
         self.open_writers.retain(|name, _| e.fields.contains_key(&Key::Name(name.clone())));
         for (name, register) in e.open_fields() {
@@ -548,6 +590,18 @@ pub struct BoardCanvas {
     card: DrawCanvasCard,
     #[live] image: DrawImage,
     #[rust] media: BoardMediaCache,
+    #[live] design_image: DrawImage,
+    #[live] error_color: Vec4f,
+    #[rust] designs: DesignPictures,
+    #[rust] design_keep: [HashSet<DesignKey>; 2],
+    #[rust] design_frame: NextFrame,
+    /// Once the camera stands still for a frame after a zoom or a pan, every visible design whose
+    /// picture is less dense than the screen re-renders: a pause mid-gesture may upgrade early,
+    /// the final stop checks again, and a pan reaches cards a zoom left off screen.
+    #[rust] design_settle: NextFrame,
+    #[rust] design_camera: Option<(f64, DVec2)>,
+    #[rust] design_zooming: bool,
+    #[rust] design_upgrade: bool,
     #[rust] media_town: Option<TownId>,
     #[rust] media_keep: HashSet<(TownId, Id)>,
     #[live]
@@ -675,6 +729,28 @@ impl BoardCanvas {
     #[cfg(test)]
     pub(crate) fn design_ghost(&self) -> &overlay::DrawDesignGhost { &self.design_ghost }
 
+    #[cfg(test)]
+    fn design_state(&self, id: Id) -> PictureState {
+        if self.drawn_design(id).is_some() && self.scene.as_ref().and_then(|s| s.view.get(&id)).is_some_and(|item|
+            item.design.as_ref().is_some_and(|d| d.src.is_empty()) || item.w <= 0 || item.h <= 0) {
+            return PictureState::Ready { w: 0, h: 0 };
+        }
+        self.media_town.map_or(PictureState::Missing, |town| self.designs.state((town, id)))
+    }
+    #[cfg(test)]
+    fn drawn_design(&self, id: Id) -> Option<&DesignFace> {
+        let key = (self.media_town?, id);
+        if !self.design_keep.iter().any(|keep| keep.contains(&key)) { return None }
+        self.scene.as_ref()?.faces.get(&id)?.design.as_deref()
+    }
+    #[cfg(test)]
+    fn design_picture(&self, id: Id) -> Option<TextureId> { self.drawn_design(id)?.texture }
+    #[cfg(test)]
+    fn design_message(&self, id: Id) -> Option<&str> {
+        let face = self.drawn_design(id)?;
+        face.error_area.map(|_| face.badge.text.as_str())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.scene.as_ref().is_none_or(|s| s.faces.is_empty())
     }
@@ -716,6 +792,10 @@ impl BoardCanvas {
 
     pub fn clear_media(&mut self, cx: &mut Cx) {
         self.image.draw_vars.empty_texture(0);
+        self.design_image.draw_vars.empty_texture(0);
+        self.designs.clear(cx);
+        for keep in &mut self.design_keep { keep.clear(); }
+        self.design_frame = NextFrame::default();
         self.media.clear(cx);
         self.media_keep.clear();
         self.media_town = None;
@@ -732,6 +812,9 @@ impl BoardCanvas {
         if self.media_town != Some(town) {
             self.clear_media(cx);
             self.media_town = Some(town);
+            if self.scene.as_ref().is_some_and(|s| s.faces.values().any(|f| f.design.is_some())) {
+                self.request(cx);
+            }
         }
         let Some(scene) = &mut self.scene else { return };
         let mut changed = false;
@@ -770,6 +853,7 @@ impl BoardCanvas {
                 if shown { self.request(cx) } else { self.repaint_pending = true }
             }
         } else {
+            self.designs.reconcile(cx, &scene.view);
             scene.lift(self.gesture.preview.as_ref());
             let lost_item = self.editing.as_ref().is_some_and(|e| scene.view.get(&e.item).is_none_or(|i| i.locked));
             self.fit_pending |= was_empty && !scene.faces.is_empty();
@@ -789,7 +873,7 @@ impl BoardCanvas {
     pub fn peer_snapshot(&mut self, cx: &mut Cx, state: &State, shown: bool) {
         if self.live_in.reconcile(state, self.board_id()) { self.request_overlay(cx); }
         let Some(scene) = &mut self.scene else { return };
-        let next = BoardView::build(state, scene.id);
+        let next = BoardView::rebuild(state, scene.id, Some(&scene.view));
         let ids = next.visible(total_bounds());
         let previous = scene.view.visible(total_bounds());
         let mut changed = std::collections::HashSet::new();
@@ -807,6 +891,7 @@ impl BoardCanvas {
                 changed.insert(*id);
             }
         }
+        self.designs.reconcile(cx, &next);
         scene.view = next;
         let path = scene.view.path(state);
         let path_changed = path != scene.path;
@@ -1002,6 +1087,7 @@ impl BoardCanvas {
             frame: self.frame_color,
             frame_line: self.frame_line,
             caption: self.caption_color,
+            error: self.error_color,
             shadow: self.shadow_color,
             shadow_strength: self.shadow_strength,
             shadow_softness: self.shadow_softness.clamp(0., 1.),
@@ -1205,6 +1291,44 @@ impl BoardCanvas {
             if let Some(town) = self.media_town {
                 for id in &ids[layer.clone()] {
                     let item = scene.view.get(id).unwrap();
+                    if let Some(design) = item.design.as_deref() {
+                        let face = scene.faces.get_mut(id).unwrap();
+                        if !face.detail.body || !geometry(item).intersects(bounds) { continue }
+                        let r = local_rect(&camera, geometry(item));
+                        let key = (town, *id);
+                        self.design_keep[lifted as usize].insert(key);
+                        let (state, texture) = self.designs.request(cx, key, item, design, camera.scale, self.design_upgrade);
+                        let slot = face.design.as_deref_mut().unwrap();
+                        #[cfg(test)]
+                        {
+                            slot.texture = texture.map(Texture::texture_id);
+                            slot.error_area = None;
+                        }
+                        if let Some(texture) = texture {
+                            self.design_image.border_radius = item_surface(item, Body::Frame, look.frame, r.size, &look).radius;
+                            self.design_image.draw_vars.set_texture(0, texture);
+                            self.design_image.draw_abs(cx, r);
+                            self.design_image.draw_vars.empty_texture(0);
+                        } else {
+                            match state {
+                                PictureState::Failed { message } => {
+                                    // The message reads at one screen size at any zoom, clipped to the card.
+                                    self.label.text_style.font_size = (DESIGN_ERROR_PT / camera.scale) as f32;
+                                    slot.badge.draw_error(cx, &mut self.label, r, &message, look.error, 8. / camera.scale);
+                                    #[cfg(test)]
+                                    {
+                                        slot.error_area = Some(self.label.area());
+                                        slot.error_pt = Some(self.label.text_style.font_size as f64 * camera.scale);
+                                    }
+                                }
+                                PictureState::Missing | PictureState::Rendering => {
+                                    slot.badge.draw(cx, &mut self.share_label, &mut self.card, &look, r, "Rendering…", false);
+                                }
+                                PictureState::Ready { .. } => {}
+                            }
+                        }
+                        continue;
+                    }
                     let Some(image) = item.image.as_deref() else { continue };
                     let face = scene.faces.get_mut(id).unwrap();
                     let media = face.media.as_mut().unwrap();
@@ -2382,14 +2506,21 @@ impl Widget for BoardCanvas {
         // An unrelated change can redraw the shell containing our hit area.
         // Reattach the board recording unless its geometry, data or glyphs changed.
         let recording = self.recording.get_or_insert_with(|| DrawList2d::new(cx));
-        let changed = cx.will_redraw(recording, walk) || self.repaint_pending;
+        let geometry_changed = cx.will_redraw(recording, walk);
         let view = cx.walk_turtle_with_area(&mut self.area, walk);
         let clip = self.area.clipped_rect(cx);
         if clip.size.x <= 0. || clip.size.y <= 0. {
+            self.designs.suspend(cx);
+            self.design_frame = NextFrame::default();
+            self.repaint_pending = true;
             return DrawStep::done();
         }
+        let theme_changed = self.designs.theme_changed(cx);
+        let picture_changed = self.designs.step(cx);
+        let changed = geometry_changed || self.repaint_pending || theme_changed || picture_changed;
         let board_redrew = !recording.begin_maybe(cx, changed).is_not_redrawing();
         if board_redrew {
+            self.design_keep[0].clear();
             self.repaint_pending = false;
             let previous = self.camera;
             self.camera.view = view;
@@ -2409,6 +2540,11 @@ impl Widget for BoardCanvas {
                 self.fit_pending = false;
             }
             let camera = self.camera;
+            if self.design_camera.is_some_and(|seen| seen != (camera.scale, camera.pan)) {
+                self.design_zooming = true;
+                if !cx.next_frame_is_pending(self.design_settle) { self.design_settle = cx.new_next_frame(); }
+            }
+            self.design_camera = Some((camera.scale, camera.pan));
             if previous.view != camera.view || previous.scale != camera.scale || previous.pan != camera.pan {
                 self.refresh_drag();
                 self.update_live(cx, false);
@@ -2443,8 +2579,10 @@ impl Widget for BoardCanvas {
             }
         }
         let overlay = self.overlay.get_or_insert_with(|| DrawList2d::new(cx));
-        if !overlay.begin_maybe(cx, changed || self.overlay_pending).is_not_redrawing() {
+        let overlay_redrew = !overlay.begin_maybe(cx, changed || self.overlay_pending).is_not_redrawing();
+        if overlay_redrew {
             self.overlay_pending = false;
+            self.design_keep[1].clear();
             if self.gesture.preview.is_some() {
                 let mut layer = self.preview_layer.take().unwrap_or_else(|| CanvasLayer::new(cx));
                 let scope = layer.begin(cx, &self.camera, clip);
@@ -2466,7 +2604,14 @@ impl Widget for BoardCanvas {
         if board_redrew {
             self.media.evict_to_budget(cx, &self.media_keep);
         }
+        self.designs.evict_to_budget(cx, &self.design_keep, board_redrew || overlay_redrew);
         self.draw_nav(cx, scope, clip);
+        if self.designs.busy() {
+            if !cx.next_frame_is_pending(self.design_frame) { self.design_frame = cx.new_next_frame(); }
+        } else {
+            self.design_frame = NextFrame::default();
+        }
+        if board_redrew { self.design_upgrade = false; }
         DrawStep::done()
     }
 
@@ -2474,6 +2619,20 @@ impl Widget for BoardCanvas {
         if matches!(event, Event::Signal) && self.media.poll(cx) {
             self.media.evict_to_budget(cx, &self.media_keep);
             self.request(cx);
+        }
+        if self.design_frame.is_event(event).is_some() {
+            self.design_frame = NextFrame::default();
+            self.area.redraw(cx);
+        }
+        if self.design_settle.is_event(event).is_some() {
+            if std::mem::take(&mut self.design_zooming) {
+                self.design_settle = cx.new_next_frame();
+            } else {
+                self.design_settle = NextFrame::default();
+                self.design_upgrade = true;
+                self.repaint_pending = true;
+                self.area.redraw(cx);
+            }
         }
         if self.next_frame.is_event(event).is_some() {
             self.glide_frame(cx, makepad_platform::monotonic_seconds());

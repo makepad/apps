@@ -101,7 +101,7 @@ fn block_rename_follows_indexed_paths_pads_origins_and_derived_nets() {
     set_text(&mut sources, CIRCUIT, circuit.clone());
     let board = text(&sources, BOARD)
         .replace("[\"lamps[0].r:2\", \"lamps[0].d:2\"])",
-            "[\"lamps[0].r:2\", arc([28mm, 24mm], \"lamps[0].d:2\")], {block: \"lamps[0]\"})")
+            "[\"lamps[0].r:2\", arc([28mm, 24mm], \"lamps[0].d:2\"[0])], {block: \"lamps[0]\"})")
         + "via(\"lamps[0].local\", [1mm, 1mm], {drill: 0.3mm pad: 0.6mm})\n"
         + "via(\"lamps[0].READY\", [2mm, 1mm], {drill: 0.3mm pad: 0.6mm})\n";
     let untouched = concat!(
@@ -124,6 +124,7 @@ fn block_rename_follows_indexed_paths_pads_origins_and_derived_nets() {
         assert_eq!(net.scope, None, "the document-given name {name} has no scope that follows a path rename");
     }
     let (edited, next, change) = renamed(&sources, &prev, Sel::Block(unit.id, block), "indicators");
+    assert!(text(&edited, BOARD).contains(r#""indicators[0].d:2"[0]"#), "renaming the block preserves the pad occurrence after the string");
     let board_doc = sources.find(BOARD).expect("the fixture has a board document");
     assert_eq!(change.edits.iter().filter(|e| e.doc == board_doc).count(), 43,
         "exactly 43 board tokens follow: sixteen placements, sixteen pads, eight track nets, one origin and two local nets");

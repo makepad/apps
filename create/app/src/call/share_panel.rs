@@ -110,6 +110,11 @@ fn picture_overlay(session: Option<SessionId>, share: &super::ShareShown) -> Opt
         && s.window_size.iter().all(|n| n.is_finite() && *n > 0.))
 }
 
+/// The overlay while this seat is in select mode on the picture: its presses pick widgets.
+fn picking_overlay(session: Option<SessionId>, share: &super::ShareShown) -> Option<&(Id, overlay::Selections)> {
+    picture_overlay(session, share).filter(|(_, s)| s.picking())
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct SharePanel {
     #[uid] uid: WidgetUid,
@@ -296,7 +301,7 @@ impl SharePanel {
     }
 
     fn watch_picture_input(&mut self, cx: &mut Cx, event: &Event, share: &super::ShareShown, pannable: bool) {
-        let overlay = picture_overlay(self.session, share);
+        let overlay = picking_overlay(self.session, share);
         if self.resize.is_some() && (overlay.is_none_or(|(_, s)| !s.build_mode || !s.can_edit)
             || matches!(event, Event::WindowLostFocus(_) | Event::DragEnd)) {
             self.resize.take().unwrap().cancel(cx, self.uid);
@@ -371,7 +376,7 @@ impl SharePanel {
                 }
             }
             Hit::FingerUp(e) if self.pan_drag.is_some_and(|(digit, _)| digit == e.digit_id) => self.pan_drag = None,
-            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) if pannable && share.overlay.is_none() => {
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) if pannable && overlay.is_none() => {
                 if self.picture_pointer(cx, share, e.abs, false).is_some() { cx.set_cursor(MouseCursor::Hand); }
             }
             _ => {}
@@ -607,13 +612,16 @@ impl Widget for SharePanel {
             }
         });
         let Some(share) = scope.data.get::<crate::lists::ViewData>().map(|d| &d.call.share) else { return };
+        // In select mode the picture's presses pick widgets, also while this seat holds control.
+        let picking = picking_overlay(self.session, share).is_some();
+        let driving = share.control.active.filter(|_| share.control_session == Some(session) && !picking);
         if let Event::Scroll(e) = event {
             let wheel = e.is_mouse || e.phase == ScrollPhase::None;
             let zoom = picture_overlay(self.session, share).filter(|(_, s)| s.focus.isolated_path.is_some())
                 .and_then(|(item, _)| AppZoom::wheel(*item, e.scroll, wheel, &e.modifiers));
             if let Some(zoom) = zoom {
                 // While a seat drives the app, its wheel scrolls the app, as before isolation.
-                if share.control.active.is_none() && self.picture_pointer(cx, share, e.abs, false).is_some()
+                if driving.is_none() && self.picture_pointer(cx, share, e.abs, false).is_some()
                     && matches!(event.hits(cx, self.draw_bg.area()), Hit::FingerScroll(_)) {
                     cx.widget_action(self.uid, zoom);
                     e.handled_x.set(true);
@@ -637,7 +645,7 @@ impl Widget for SharePanel {
                 let over = |bar: Area| bar.is_valid(cx) && bar.clipped_rect(cx).contains(wheel.abs);
                 let on_x = extent.x > 0. && over(bars[0]);
                 let on_y = extent.y > 0. && over(bars[1]);
-                if on_x || on_y || (pannable && share.control.active.is_none() && self.picture_pointer(cx, share, wheel.abs, false).is_some()) {
+                if on_x || on_y || (pannable && driving.is_none() && self.picture_pointer(cx, share, wheel.abs, false).is_some()) {
                     let d = wheel.scroll;
                     let delta = if on_x || (!on_y && wheel.modifiers.shift) { dvec2(d.x + d.y, 0.) }
                         else if on_y { dvec2(0., d.y) } else { d };
@@ -648,9 +656,9 @@ impl Widget for SharePanel {
                 }
             }
         }
-        let Some(grant) = share.control.active.filter(|_| share.control_session == Some(session)) else {
-            // The pop-out's presses move its window, except while the tweak overlay picks.
-            if !self.popout || share.overlay.is_some() { self.watch_picture_input(cx, event, share, pannable); }
+        let Some(grant) = driving else {
+            // The pop-out's presses move its window, except in select mode.
+            if !self.popout || picking { self.watch_picture_input(cx, event, share, pannable); }
             return;
         };
         if Some(grant) != self.panel_grant { return }

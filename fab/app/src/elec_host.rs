@@ -3368,14 +3368,15 @@ impl ElecHost {
             self.next = None;
         }
         let bar = cx.global::<ReviewNext>();
-        let next = self.next.as_ref().filter(|_| self.place_offer || accepted.is_some());
+        let placed = self.place_offer && self.next.as_ref().is_some_and(|step| matches!(step.stage, FlowStage::Route | FlowStage::Done));
+        let next = self.next.as_ref().filter(|_| placed || accepted.is_some());
         let label = accepted.map_or("", |(_, label)| label.as_str());
         if let (Some((caption, shown)), Some(step)) = (bar.0.as_deref(), next) {
-            let same_label = if self.place_offer { caption == "Placement completed" } else { caption.strip_prefix("Accepted: ") == Some(label) };
+            let same_label = if placed { caption == "Placement completed" } else { caption.strip_prefix("Accepted: ") == Some(label) };
             if same_label && shown == step { return; }
         } else if next.is_none() && bar.0.is_none() { return; }
         bar.0 = next.map(|step| {
-            let caption = if self.place_offer { "Placement completed".into() } else { format!("Accepted: {label}") };
+            let caption = if placed { "Placement completed".into() } else { format!("Accepted: {label}") };
             Arc::new((caption, step.clone()))
         });
         cx.redraw_all();
@@ -6400,6 +6401,29 @@ bench("press", {circuit: "ledavr"}, fn(b, c) {
             && rows[0].field("status").unwrap().value.ident() == Some("unknown")
             && rows[0].field("why").unwrap().value.string() == Some("nothing to check yet: the project has no circuit"),
             "the committed ERC requirement still reports unknown with the missing circuit as its reason");
+
+        let mut pair = plate.model.docs().as_ref().clone();
+        pair.insert("pair.ckt.splash".into(), Arc::from(r#"let e = mod.elec
+let a = e.net({name: "A"})
+let b = e.net({name: "B"})
+let r = e.r(1kohm, a, b, {package: "0402"})
+let s = e.r(2kohm, a, b, {package: "0402"})
+"#));
+        pair.insert("pair.pcb.splash".into(), Arc::from("board(\"pair\")\noutline([[[0mm, 0mm], [20mm, 0mm], [20mm, 10mm], [0mm, 10mm], [0mm, 0mm]]])\n"));
+        fresh.reload(&mut cx, 4, None, Arc::new(pair), Arc::default());
+        until(&mut fresh, &mut cx, "the new plate offers Place", &mut |h| h.offered(FlowStage::Place));
+        let unit = fresh.flow_unit().expect("Place must name the board");
+        fresh.place_all(&mut cx, unit);
+        until(&mut fresh, &mut cx, "placement commits on the new plate", &mut |h| h.offered(FlowStage::Route));
+        let placed = cx.global::<ReviewNext>().0.clone().expect("Place alone must offer the next stage");
+        assert!(placed.0 == "Placement completed" && placed.1.stage == FlowStage::Route,
+            "a committed placement must offer Route without a prior Accept");
+        fresh.undo(&mut cx);
+        until(&mut fresh, &mut cx, "Undo returns the board to Place", &mut |h| h.offered(FlowStage::Place));
+        assert!(cx.global::<ReviewNext>().0.is_none(), "Undo must hide the placement-only offer");
+        fresh.redo(&mut cx);
+        until(&mut fresh, &mut cx, "Redo restores the placed board", &mut |h| h.offered(FlowStage::Route));
+        assert_eq!(cx.global::<ReviewNext>().0.as_deref(), Some(placed.as_ref()), "Redo must restore the same placement offer");
     }
 
     /// Fable H1 (11-16): a circuit preview's sheet texels come from the preview circuit and its own

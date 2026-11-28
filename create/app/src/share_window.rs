@@ -160,8 +160,9 @@ impl App {
         let window = self.ui.window(cx, ids!(share_popout));
         if window.window_id() != Some(q.window_id) { return }
         let share = &self.view.call.share;
-        // Presses belong to the picture while the guest controls the app or the tweak overlay picks.
-        let controlled = (share.control_session == Some(session) && share.control.active.is_some()) || share.overlay.is_some();
+        // Presses belong to the picture while the guest controls the app or in select mode.
+        let controlled = (share.control_session == Some(session) && share.control.active.is_some())
+            || share.overlay.as_ref().is_some_and(|(_, s)| s.picking());
         let panel = window.widget(cx, ids!(popout_picture));
         let caption = !window.is_fullscreen(cx) && !cx.hosted_fullscreen(q.window_id)
             && panel.borrow::<makepad_create::call::SharePanel>().is_some_and(|p| p.caption_at(cx, q.abs, controlled));

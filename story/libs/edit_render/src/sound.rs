@@ -16,9 +16,7 @@
 //! a host with no picture, the motion desk), then started, followed and
 //! stopped with the host's playhead.
 //!
-//! A hidden or muted instance (`MAKEPAD_HIDE_WINDOWS`, `MAKEPAD_MUTE=1`:
-//! tests and agents) feeds silence: the clock runs as it would, nothing is
-//! heard.
+//! A muted process (`MAKEPAD_MUTE`) is fed the same mix: the platform opens no device for it and its taps hear the mix.
 
 use relax_attr::relax;
 use makepad_story_cut::mix::AudioMix;
@@ -202,12 +200,6 @@ impl CutSound {
     }
 }
 
-/// A hidden or muted instance (tests, agents): its sound is silence.
-pub fn muted() -> bool {
-    let set = |name: &str| std::env::var(name).is_ok_and(|value| !value.is_empty() && value != "0");
-    set("MAKEPAD_MUTE") || set("MAKEPAD_HIDE_WINDOWS")
-}
-
 impl Drop for PreviewSound {
     fn drop(&mut self) {
         // Silent from here; the worker ends when its channel goes.
@@ -227,7 +219,6 @@ enum Feeding {
 /// The feed's state: the mix, where the next block starts, the meter.
 struct Feeder {
     ring: &'static FeedRing,
-    muted: bool,
     mix: Option<Arc<AudioMix>>,
     next: Option<u64>,
     meter: Option<FeedMeter>,
@@ -235,11 +226,7 @@ struct Feeder {
 
 impl Feeder {
     fn new() -> Self {
-        let muted = muted();
-        if muted {
-            log!("edit sound: muted (a hidden or MAKEPAD_MUTE instance): silence is fed");
-        }
-        Self { ring: ring(), muted, mix: None, next: None, meter: FeedMeter::new() }
+        Self { ring: ring(), mix: None, next: None, meter: FeedMeter::new() }
     }
 
     fn command(&mut self, command: Feed) {
@@ -267,16 +254,11 @@ impl Feeder {
         while ring.queued() < AHEAD_FRAMES && ring.room() > BLOCK_FRAMES as u64 {
             // Timed only for the meter (wasm32 has no Instant).
             let t0 = self.meter.is_some().then(std::time::Instant::now);
-            let block = if self.muted {
-                vec![0.0; BLOCK_FRAMES * 2]
-            } else {
-                let gain = mix.gain as f32;
-                let mut block = mix.mix_f32(*at, BLOCK_FRAMES);
-                for v in &mut block {
-                    *v = (*v * gain).clamp(-1.0, 1.0);
-                }
-                block
-            };
+            let gain = mix.gain as f32;
+            let mut block = mix.mix_f32(*at, BLOCK_FRAMES);
+            for v in &mut block {
+                *v = (*v * gain).clamp(-1.0, 1.0);
+            }
             ring.push(&block);
             *at += BLOCK_FRAMES as u64;
             if let (Some(meter), Some(t0)) = (self.meter.as_mut(), t0) {

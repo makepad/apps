@@ -95,6 +95,16 @@ fab-loader-gltf       = { path = "fab/loaders/gltf" }
 fab-loose             = { path = "fab/loose" }
 fab-materials         = { path = "fab/materials" }
 fab-model             = { path = "fab/model" }
+# Fab's exact B-rep kernel (solidcore, Apache-2.0; fab/brep/SYNC.md) and its model layer, and the
+# UV unwrapper's corpus, which measures it on B-rep parts.
+makepad-csg-brep      = { path = "fab/brep/upstream/kernel" }
+makepad-csg-brep-model = { path = "fab/brep/model" }
+makepad-uv-unwrap-corpus = { path = "fab/tools/uv_unwrap_corpus" }
+# Stand-ins for thiserror, serde and spade, under those names, so the synced kernel compiles unchanged.
+makepad-solidsync-thiserror = { path = "fab/brep/sync/shims/thiserror" }
+makepad-solidsync-serde = { path = "fab/brep/sync/shims/serde" }
+makepad-solidsync-spade = { path = "fab/brep/sync/shims/spade" }
+makepad-solidsync = { path = "fab/brep/sync/tool" }
 fab-optimise          = { path = "fab/optimise" }
 makepad-fab-package   = { path = "fab/package" }
 fab-paint-field       = { path = "fab/paint_field" }

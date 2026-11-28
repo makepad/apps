@@ -12,8 +12,8 @@
 //!
 //! The picture shows what is heard: the deck's position as the engine last
 //! rendered it, moved on by its speed since (both on the engine's clock).
-//! Where no device runs (before the browser's first tap, a muted instance)
-//! the engine renders silently here, so the film moves the same way.
+//! Before the browser's first tap, the engine renders silently here to
+//! keep the film moving.
 
 use crate::job::Job;
 use makepad_stage_audio_media::pcm::TrackPcm;
@@ -95,17 +95,12 @@ impl Default for Transport {
 }
 
 impl Transport {
-    /// Open the device (once): the engine renders in its callback. A muted
-    /// instance (MAKEPAD_MUTE=1: hidden test runs) opens none.
+    /// Register the engine's output callback once.
     fn open(&mut self, cx: &mut Cx) {
         if self.device {
             return;
         }
         self.device = true;
-        if std::env::var("MAKEPAD_MUTE").is_ok_and(|v| v == "1") {
-            log!("player: muted (MAKEPAD_MUTE=1): no audio device");
-            return;
-        }
         let engine = self.engine.clone();
         let device_at = self.device_at.clone();
         cx.audio_output(0, move |info, buffer| {

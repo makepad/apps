@@ -26,12 +26,16 @@ pub struct Tweaks<L = LinkId, T = Ticket> {
     opening: Vec<Opening<L>>,
     design_pool: Option<makepad_widgets::makepad_platform::thread::TaskPool>,
     revisions: HashMap<SessionId, usize>,
+    control_revisions: HashMap<SessionId, u64>,
     selected: Option<DesignTarget>,
     painted_board: Option<(Id, Id, usize)>,
-    /// The panel shows only when the person opened it, by picking in the share's picture, or when
-    /// someone asks the sharer to edit and the sharer must answer. A share alone never opens it.
+    /// The person opens the panel with Tweak or a pick on a board's app.
     opened: bool,
+    /// The share bar's Select toggle. Opening the panel turns it on: an open panel is select mode.
+    selecting: bool,
     painted: Option<(SessionId, usize, bool)>,
+    // Capability, pending ask, and named rights can change without a board revision or notice.
+    painted_control: Option<(SessionId, bool, bool, Option<u64>)>,
     panel: panel::Panel,
     drag: DragController,
     drag_surface: Option<makepad_widgets::WidgetUid>,
@@ -41,8 +45,8 @@ pub struct Tweaks<L = LinkId, T = Ticket> {
 
 impl<L, T> Default for Tweaks<L, T> {
     fn default() -> Self {
-        Self { sessions: vec![], design_pool: None, opening: vec![], revisions: HashMap::new(),
-            selected: None, painted_board: None, opened: false, painted: None, panel: Default::default(), drag: Default::default(), drag_surface: None, peer_epochs: BTreeMap::new(),
+        Self { sessions: vec![], design_pool: None, opening: vec![], revisions: HashMap::new(), control_revisions: HashMap::new(),
+            selected: None, painted_board: None, opened: false, selecting: true, painted: None, painted_control: None, panel: Default::default(), drag: Default::default(), drag_surface: None, peer_epochs: BTreeMap::new(),
             tools: Default::default() }
     }
 }
@@ -51,6 +55,13 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
     pub fn set_themes_dir(&mut self, dir: std::path::PathBuf) { self.panel.set_themes_dir(dir); }
 
     pub fn session(&self, share: SessionId) -> Option<&Session<L, T>> { self.sessions.iter().find(|s| s.share == share) }
+
+    pub fn panel_share(&self) -> Option<SessionId> {
+        match self.selected {
+            Some(DesignTarget::LiveApp(share)) if self.opened => Some(share),
+            _ => None,
+        }
+    }
 
     pub fn sharer_started(&mut self, model: &Model, share: SessionId, title: String, link: L, window: WindowId,
         open_board: Option<Id>) -> Result<(), String> {
@@ -122,7 +133,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
         for s in &mut self.sessions { s.peer_unlinked(peer); }
     }
 
-    /// Revoke consent for departed or replaced links before polling all linked peers.
+    /// Apply control changes and handle replaced links before accepting peer requests.
     pub fn poll_call(&mut self, call: &mut CallController) {
         let epochs = call.peer_epochs().collect();
         for (peer, previous) in std::mem::replace(&mut self.peer_epochs, epochs) {
@@ -130,7 +141,23 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
                 self.peer_unlinked(peer);
             }
         }
+        self.sync_control_rights(call);
+        self.panel.asking = call.asking_for_control();
         self.relay(call);
+    }
+
+    fn sync_control_rights(&mut self, call: &CallController) {
+        for s in &mut self.sessions {
+            if s.me != s.sharer || s.is_ended() { continue }
+            let revision = call.control_rights_revision(s.share);
+            if self.control_revisions.get(&s.share).copied() == revision { continue }
+            s.set_control_rights(call.control_rights(s.share).unwrap_or_default());
+            if let Some(revision) = revision {
+                self.control_revisions.insert(s.share, revision);
+            } else {
+                self.control_revisions.remove(&s.share);
+            }
+        }
     }
 
     pub fn relay(&mut self, relay: &mut impl Relay) {
@@ -209,8 +236,12 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
         }
         self.selected = Some(DesignTarget::LiveApp(share));
         self.opened = true;
+        self.selecting = true;
         true
     }
+
+    /// Select flips the open panel's share picture between picking widgets and driving the app.
+    pub fn toggle_select(&mut self) { self.selecting = !self.selecting; }
 
     pub fn close_panel(&mut self) {
         self.opened = false;
@@ -256,12 +287,14 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
         let build = self.opened && self.selected == Some(DesignTarget::LiveApp(session.share)) && self.panel.is_build_mode(session.share, session.item);
         let edit = session.supports_design() && (session.me == session.sharer || session.view.allowed.contains(&session.me));
         let caret = self.drag.caret(session.share);
+        let select = (self.opened && self.selected == Some(DesignTarget::LiveApp(session.share))).then_some(self.selecting);
         if cache.as_ref().is_some_and(|(id, s)| *id == session.item && s.share == Some(session.share) && s.window == window
             && s.window_size == size && s.revision == Some(revision) && &s.focus == focus && s.build_mode == build
-            && s.can_edit == edit && s.caret.as_ref() == caret) { return false }
+            && s.can_edit == edit && s.caret.as_ref() == caret && s.select == select) { return false }
         let mut selections = overlay::Selections::new(window, size, &session.view, state).with_focus(focus.clone())
             .with_design(session.share, &session.view, &session.me, build, edit, caret);
         selections.revision = Some(revision);
+        selections.select = select;
         *cache = Some((session.item, selections));
         true
     }
@@ -311,6 +344,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
 
     pub fn tick_theme(&mut self, cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         let Event::NextFrame(frame) = event else { return };
+        if self.panel.board_index_frame(cx, self.selected) { self.painted_board = None; }
         if !self.needs_theme_tick() { return }
         let want_cache = self.panel.mixer_cache.ready.is_none()
             && (self.tools.needs_mixer_cache() || self.panel.wants_mixer_cache().is_some_and(|(share, item)| {
@@ -344,6 +378,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
             if !s.retired() { return true }
             self.drag.retire(cx, s.share);
             self.revisions.remove(&s.share);
+            self.control_revisions.remove(&s.share);
             self.panel.retire_share(s.share, s.item);
             false
         });
@@ -367,7 +402,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
         let root = ui.widget(cx, ids!(tweak_panel));
         let board = ui.widget(cx, ids!(canvas.surface));
         let mut received = false;
-        let mut asked = None;
         for s in &mut self.sessions {
             let active = selected == Some(DesignTarget::LiveApp(s.share));
             let state = model.tweak_board_state(s.town);
@@ -375,6 +409,12 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
             let changed = active && rev.is_some_and(|r| self.painted != Some((s.share, r, s.supports_design())));
             if !active || !self.opened { self.drag.cancel(cx, s, true); }
             let mut dirty = changed;
+            if active {
+                let control = (s.share, s.supports_control_tweak(), self.panel.asking == Some(s.share),
+                    self.control_revisions.get(&s.share).copied());
+                dirty |= self.painted_control != Some(control);
+                self.painted_control = Some(control);
+            }
             let mut design_status = false;
             while let Some((seat, req, agent, notice)) = s.view.updates.pop_front() {
                 received = true;
@@ -394,9 +434,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
                 if seat == s.me && agent.is_none() && self.drag.notice(cx, s, req, &notice) { continue }
                 dirty = true;
                 if matches!(notice, Notice::Running(_) | Notice::Stopped(_) | Notice::Looked) { continue }
-                if notice == Notice::Asked && seat != s.me && s.me == s.sharer && s.town == town && !s.is_ended() {
-                    asked = Some(s.share);
-                }
                 let dir = self.panel.themes_dir();
                 let context = crate::tools::ThemeToolContext { themes_dir: &dir, active_worn: self.panel.worn_for(s.share, s.item), mixer_cache: &mut self.panel.mixer_cache };
                 let effect = if let Some((result, changed, effect)) = self.tools.answer(s, seat, req, agent, &notice, waits, context) {
@@ -451,10 +488,6 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
             self.painted = None;
         } else {
             self.painted_board = None;
-        }
-        if let Some(share) = asked {
-            self.selected = Some(DesignTarget::LiveApp(share));
-            self.opened = true;
         }
         if self.selected.is_none() {
             self.painted = None;

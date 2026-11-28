@@ -14,6 +14,7 @@ use super::{ThemeOp, Notice, Request, RequestId, Seat, Session, SessionId, TreeQ
 use crate::model::Model;
 use makepad_town_core::{entity::{field, kind, Entity}, event::{Content, Id, Value}, fold::State};
 use makepad_widgets::*;
+use makepad_widgets::makepad_platform::thread::{Class, TaskHandle};
 use std::{collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 fn props_list(vm: &mut ScriptVm) -> ScriptValue {
@@ -96,7 +97,7 @@ script_mod! {
                 draw_icon +: {color: #xd0d0d0 svg: crate_resource("makepad_widgets:resources/icons/tab_hammer.svg")}}
             tweak_close := PanelButton{text: "Close" a11y: {label: "Close tweak panel"}}
         }
-        tweak_ask := PanelButton{text: "Ask to edit"}
+        tweak_ask := PanelButton{text: "Ask for control"}
         tweak_seats := TweakList{
             width: Fill height: 40
             tweak_seats_list := PortalList{width: Fill height: Fill
@@ -105,7 +106,7 @@ script_mod! {
                         draw_bg +: {color: palette.panel2 border_radius: 5}
                         tweak_seat_name := RailText{width: Fill flow: Right{wrap: true}}
                         tweak_status := Kicker{width: Fit}
-                        tweak_allow := PanelButton{text: "Allow"}
+                        tweak_allow := PanelButton{text: "Resume"}
                         tweak_revoke := PanelButton{text: "Revoke"}
                         tweak_stop := PanelButton{text: "Stop"}
                     }
@@ -245,13 +246,13 @@ impl HistoryRun {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ChipAction { Allow, Revoke, Stop(Id), Resume(Id) }
+enum ChipAction { Revoke, Stop(Id), Resume(Id) }
 
 #[derive(PartialEq)]
 enum Line {
     Property(PropLine),
     Tree(TreeLine),
-    Chip { seat: Seat, item: Id, name: String, ink: Vec4f, status: &'static str, action: Option<ChipAction> },
+    Chip { share: SessionId, seat: Seat, item: Id, name: String, ink: Vec4f, status: &'static str, action: Option<ChipAction> },
     Edit(HistoryRun),
 }
 
@@ -260,14 +261,20 @@ impl Line {
         match self {
             Self::Property(p) => p.draw_sidebar(cx, row, match previous { Some(Self::Property(old)) => Some(old), _ => None }, controls),
             Self::Tree(line) => line.draw_tree(cx, row, draggable),
-            Self::Chip { name, ink, status, action, .. } => {
+            Self::Chip { share, seat, name, ink, status, action, .. } => {
                 let label = row.label(cx, ids!(tweak_seat_name));
                 label.set_text(cx, name);
                 label.set_text_color(cx, *ink);
                 row.label(cx, ids!(tweak_status)).set_text(cx, status);
                 row.widget(cx, ids!(tweak_status)).set_visible(cx, !status.is_empty());
-                row.widget(cx, ids!(tweak_allow)).set_visible(cx, matches!(action, Some(ChipAction::Allow | ChipAction::Resume(_))));
-                row.widget(cx, ids!(tweak_revoke)).set_visible(cx, *action == Some(ChipAction::Revoke));
+                let revoke = row.button(cx, ids!(tweak_revoke));
+                revoke.set_visible(cx, *action == Some(ChipAction::Revoke));
+                if *action == Some(ChipAction::Revoke) {
+                    revoke.set_action_data(crate::call::CallAction::OnShare(*share, crate::call::Press::RevokeControl(*seat)));
+                } else {
+                    revoke.set_action_data(());
+                }
+                row.widget(cx, ids!(tweak_allow)).set_visible(cx, matches!(action, Some(ChipAction::Resume(_))));
                 row.widget(cx, ids!(tweak_stop)).set_visible(cx, matches!(action, Some(ChipAction::Stop(_))));
             }
             Self::Edit(run) => row.label(cx, ids!(tweak_entry)).set_text(cx, &run.text()),
@@ -285,7 +292,13 @@ struct TweakRow {
 }
 
 impl Widget for TweakRow {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) { self.view.handle_event(cx, event, scope); }
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(self.shown.as_deref(), Some(Line::Chip { .. })) {
+            crate::ui::live::button_events(&mut self.view, cx, event, scope);
+        } else {
+            self.view.handle_event(cx, event, scope);
+        }
+    }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep { self.view.draw_walk(cx, scope, walk) }
 }
 
@@ -520,15 +533,62 @@ impl Widget for TweakTabs {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PanelTab { #[default] Props, Shader, Tree, Theme, Build }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static BOARD_INDEX_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn board_widget_paths(src: &str) -> Result<Vec<String>, d1::D1Error> {
+    #[cfg(test)]
+    BOARD_INDEX_RUNS.with(|count| count.set(count.get() + 1));
+    Ok(d1::list_widgets(src)?.into_iter().map(|node| node.path).collect())
+}
+
 struct BoardDesign {
     item: Id,
+    // Only a successfully indexed revision authorizes board_actions.
     revision: Option<Id>,
+    failed_revision: Option<Id>,
+    pending: Option<(Id, TaskHandle<Result<Vec<String>, String>>)>,
     paths: Vec<String>,
     theme: Option<super::ThemeInstall>,
 }
 
+impl BoardDesign {
+    fn refresh_index(&mut self, cx: &mut Cx, model: &Model, first: bool) -> Option<Result<Vec<String>, String>> {
+        let writer = model.state.entities.get(&self.item).and_then(|e| e.fields.get(&field::SRC)).map(|r| r.writer);
+        if let Some((revision, handle)) = &mut self.pending {
+            let result = handle.try_take()?;
+            let current = Some(*revision) == writer;
+            self.pending = None;
+            if current {
+                let result = result.map_err(|err| err.to_string()).and_then(|paths| paths);
+                if result.is_ok() { self.revision = writer } else { self.failed_revision = writer }
+                return Some(result)
+            }
+            // Multiple writes during the parse need just one snapshot of the latest source.
+        } else if !first && writer == self.revision.or(self.failed_revision) { return None }
+        self.revision = None;
+        self.failed_revision = None;
+        let snapshot = match d1::read_design(&model.state, self.item) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Some(Err(err.to_string())),
+        };
+        match cx.task_pool().submit_named(Class::Visible, "design widget index", move || {
+            board_widget_paths(&snapshot.src).map_err(|err| err.to_string())
+        }) {
+            Ok(handle) => {
+                self.pending = Some((snapshot.revision, handle));
+                None
+            }
+            Err(err) => Some(Err(err.to_string())),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Panel {
+    pub(super) asking: Option<SessionId>,
     board: Option<BoardDesign>,
     bound: Option<(SessionId, Id)>,
     worn_by_share: BTreeMap<(SessionId, Id), super::theme::store::SavedTheme>,
@@ -686,7 +746,7 @@ impl Panel {
         let worn_by_share = std::mem::take(&mut self.worn_by_share);
         let tree = key.and_then(|key| self.other_trees.remove(&key)).unwrap_or_default();
         let other_trees = std::mem::take(&mut self.other_trees);
-        *self = Self { bound: key, mixer_cache, worn_by_share, tree, other_trees, ..Default::default() };
+        *self = Self { asking: self.asking, bound: key, mixer_cache, worn_by_share, tree, other_trees, ..Default::default() };
         self.theme.sync_mixer(cx, root);
         self.theme.sync_builder(cx, root);
         self.set_themes_dir(themes_dir);
@@ -719,7 +779,8 @@ impl Panel {
         let board = key.is_none();
         if board {
             self.tab = PanelTab::Build;
-            self.board = Some(BoardDesign { item, revision: None, paths: Vec::new(), theme: None });
+            self.board = Some(BoardDesign { item, revision: None, failed_revision: None, pending: None, paths: Vec::new(), theme: None });
+            root.drop_down(cx, ids!(board_widget)).set_labels(cx, Vec::new());
         }
         if let Some(mut tabs) = root.widget(cx, ids!(tweak_tabs)).borrow_mut::<TweakTabs>() {
             tabs.board = board;
@@ -761,13 +822,15 @@ impl Panel {
             self.board.as_mut().unwrap().theme = candidate.ok();
         }
         let board = self.board.as_mut().unwrap();
-        let writer = model.state.entities.get(&item).and_then(|e| e.fields.get(&field::SRC)).map(|r| r.writer);
-        if first || writer != board.revision {
-            let loaded = d1::read_design(&model.state, item).and_then(|s| Ok((s.revision, d1::list_widgets(&s.src)?)));
+        let had_index_error = board.failed_revision.is_some();
+        let loaded = board.refresh_index(cx, model, first);
+        if had_index_error && board.failed_revision.is_none() {
+            root.label(cx, ids!(tweak_result)).set_text(cx, "");
+        }
+        if let Some(loaded) = loaded {
             match loaded {
-                Ok((revision, nodes)) => {
-                    board.revision = Some(revision);
-                    board.paths = nodes.into_iter().map(|n| n.path).collect();
+                Ok(paths) => {
+                    board.paths = paths;
                     let index = board.paths.iter().position(|p| p == self.sidebar.path.as_ref()).unwrap_or(0);
                     self.sidebar.path = Rc::from(board.paths.get(index).map_or("", String::as_str));
                     let widgets = root.drop_down(cx, ids!(board_widget));
@@ -776,17 +839,30 @@ impl Panel {
                 }
                 Err(err) => {
                     board.paths.clear();
-                    board.revision = None;
                     self.sidebar.path = Rc::from("");
                     root.drop_down(cx, ids!(board_widget)).set_labels(cx, vec![]);
-                    root.label(cx, ids!(tweak_result)).set_text(cx, &err.to_string());
+                    root.label(cx, ids!(tweak_result)).set_text(cx, &err);
                 }
             }
+            root.redraw(cx);
         }
+        if board.pending.is_some() { cx.new_next_frame(); }
         let edit = model.state.active_member(&model.me()) && board.revision.is_some();
         design_view::enable_selection(cx, root, edit && !self.sidebar.path.is_empty());
         root.button(cx, ids!(theme_bake)).set_enabled(cx, edit && board.theme.is_some());
         root.label(cx, ids!(build_status)).set_text(cx, &format!("Insert: {}", self.build.ty()));
+    }
+
+    pub(super) fn board_index_frame(&mut self, cx: &mut Cx, selected: Option<DesignTarget>) -> bool {
+        let Some(board) = &mut self.board else { return false };
+        let Some((_, handle)) = &board.pending else { return false };
+        if selected != Some(DesignTarget::BoardDesign(board.item)) {
+            board.pending = None;
+            return false
+        }
+        if handle.is_finished() { return true }
+        cx.new_next_frame();
+        false
     }
 
     pub(super) fn board_actions(&mut self, cx: &mut Cx, root: &WidgetRef, model: &mut Model, item: Id, actions: &Actions) -> Option<Id> {
@@ -857,9 +933,17 @@ impl Panel {
         if self.tree.sync_seats(&session.view, state) && self.tab == PanelTab::Tree { self.draw_rows(cx, root, false); }
         self.sync_design(cx, root, session);
         let owner = session.me == session.sharer;
-        root.widget(cx, ids!(tweak_ask)).set_visible(cx, !session.is_ended() && !owner && !session.view.allowed.contains(&session.me));
+        let supported = session.supports_control_tweak();
+        // An older sharer's guest without the right is told why instead of being offered an ask.
+        let needs_right = !session.is_ended() && !owner && !session.view.allowed.contains(&session.me);
+        let ask = root.button(cx, ids!(tweak_ask));
+        ask.set_visible(cx, supported && needs_right);
+        ask.set_text(cx, if self.asking == Some(session.share) { "Asking for control…" } else { "Ask for control" });
+        let result = root.label(cx, ids!(tweak_result));
+        if !supported && needs_right { result.set_text(cx, super::OLDER_SHARER_CONTROL); }
+        else if result.text() == super::OLDER_SHARER_CONTROL { result.set_text(cx, ""); }
         let view = &session.view;
-        let mut actors: BTreeSet<_> = view.asked.union(&view.allowed).map(|&seat| (seat, None)).collect();
+        let mut actors: BTreeSet<_> = view.allowed.iter().map(|&seat| (seat, None)).collect();
         actors.extend(view.running.keys().copied());
         for &(seat, agent) in view.agents.keys() {
             actors.insert((seat, None));
@@ -882,12 +966,13 @@ impl Panel {
             let (status, action) = match agent {
                 Some(id) if view.agents.get(&(seat, id)) == Some(&true) => ("stopped", Some(ChipAction::Resume(id))),
                 Some(id) => ("", Some(ChipAction::Stop(id))),
-                None if view.allowed.contains(&seat) => ("Allowed", Some(ChipAction::Revoke)),
-                None if view.asked.contains(&seat) => ("Asked", Some(ChipAction::Allow)),
+                None if session.control_rights().is_some_and(|rights| rights.seats.contains(&seat)) && view.allowed.contains(&seat) =>
+                    ("Allowed", Some(ChipAction::Revoke)),
+                None if view.allowed.contains(&seat) => ("Allowed", None),
                 None => ("", None),
             };
-            let action = if owner && !session.is_ended() && (agent.is_some() || seat != session.sharer) { action } else { None };
-            Rc::new(Line::Chip { seat, item: session.item, name, ink: seat_colour(state, &seat), status, action })
+            let action = if owner && !session.is_ended() { action } else { None };
+            Rc::new(Line::Chip { share: session.share, seat, item: session.item, name, ink: seat_colour(state, &seat), status, action })
         }).collect();
         let list = root.widget(cx, ids!(tweak_seats));
         list.set_visible(cx, !chips.is_empty());
@@ -917,33 +1002,20 @@ impl Panel {
             let Some(shown) = row.borrow::<TweakRow>().and_then(|r| r.shown.clone()) else { continue };
             let Line::Chip { seat, item, action: Some(action), .. } = &*shown else { continue };
             if *item != session.item || session.me != session.sharer { continue }
-            let (button, current) = match *action {
-                ChipAction::Allow => (ids!(tweak_allow), session.view.asked.contains(seat)),
-                ChipAction::Revoke => (ids!(tweak_revoke), session.view.allowed.contains(seat)),
-                ChipAction::Stop(id) => (ids!(tweak_stop), session.view.agents.get(&(*seat, id)) == Some(&false)),
-                ChipAction::Resume(id) => (ids!(tweak_allow), session.view.agents.get(&(*seat, id)) == Some(&true)),
+            let (id, stop, button) = match *action {
+                ChipAction::Stop(id) => (id, true, ids!(tweak_stop)),
+                ChipAction::Resume(id) => (id, false, ids!(tweak_allow)),
+                ChipAction::Revoke => continue, // The button emits the call's scoped RevokeControl action.
             };
-            if !current || !row.button(cx, button).clicked(actions) { continue }
+            if session.view.agents.get(&(*seat, id)).copied() != Some(!stop) || !row.button(cx, button).clicked(actions) { continue }
             if !granted(cx) { return }
-            let result = match *action {
-                ChipAction::Allow => session.consent(*seat, true),
-                ChipAction::Revoke => session.consent(*seat, false),
-                ChipAction::Stop(id) => session.stop_agent(*seat, id, true),
-                ChipAction::Resume(id) => session.stop_agent(*seat, id, false),
-            };
-            if let Err(why) = result { root.label(cx, ids!(tweak_result)).set_text(cx, why); }
+            if let Err(why) = session.stop_agent(*seat, id, stop) { root.label(cx, ids!(tweak_result)).set_text(cx, why); }
             break
         }
     }
 
     pub fn actions<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, actions: &Actions, session: &mut Session<L, T>) {
         if !root.visible() || self.bound != Some((session.share, session.item)) { return }
-        if root.button(cx, ids!(tweak_ask)).clicked(actions) {
-            if let Err(why) = session.request(None, Request::AskEdit) {
-                root.label(cx, ids!(tweak_result)).set_text(cx, &why);
-            }
-            return
-        }
         let tab = if root.button(cx, ids!(tab_props)).clicked(actions) || root.button(cx, ids!(tab_props_i)).clicked(actions) { PanelTab::Props }
             else if root.button(cx, ids!(tab_shader)).clicked(actions) || root.button(cx, ids!(tab_shader_i)).clicked(actions) { PanelTab::Shader }
             else if root.button(cx, ids!(tab_tree)).clicked(actions) || root.button(cx, ids!(tab_tree_i)).clicked(actions) { PanelTab::Tree }
@@ -1734,7 +1806,6 @@ impl Panel {
         }
         let who = who(state, &seat, agent);
         let text = match notice {
-            Notice::Asked => format!("{who} asked to edit"),
             Notice::Allowed(true) => {
                 if seat == session.me {
                     self.ensure_theme(session);

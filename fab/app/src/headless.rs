@@ -553,6 +553,40 @@ let input = load({a: signal b: gnd})"#).unwrap();
     }
 
     #[test]
+    fn headless_req_passes_on_brief_ledctl_routed_board() {
+        use fab_elec_fixtures::brief_ledctl as fixture;
+
+        let dir = std::env::temp_dir().join(format!("fab-routed-brief-{}", std::process::id()));
+        let plate = dir.join("brief_ledctl.fab.splash");
+        let docs = project::elec_dir(&plate);
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(&plate, "use mod.fab.*\n").unwrap();
+        for &(name, text) in fixture::REQUIREMENTS.iter().chain(fixture::PARTS).chain(fixture::SCHEMATIC) {
+            fs::write(docs.join(name), text).unwrap();
+        }
+        fs::write(docs.join("brief_ledctl.pcb.splash"), fixture::ROUTED).unwrap();
+
+        let (code, stdout, stderr) = command(&plate, &["--check", "--req", "--json"]);
+        let saved = fs::read_to_string(docs.join("brief_ledctl.req.splash")).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(code, 0, "the routed plate must pass --check --req after reopening: {stdout} {stderr}");
+        let stages = json_lines(&stdout);
+        let check = stages.iter().find(|s| s.get("stage").and_then(Value::as_str) == Some("check")).expect("missing board check");
+        for key in ["errors", "unconnected"] {
+            assert_eq!(check.get(key).and_then(Value::as_u64), Some(0), "the saved board must reopen with zero {key}");
+        }
+
+        let rows = stages.iter().find_map(|s| s.get("requirements").and_then(Value::as_arr)).expect("missing graded requirements");
+        let verdicts: Vec<_> = rows.iter().map(|r| (r.get("id").and_then(Value::as_str), r.get("verdict").and_then(Value::as_str))).collect();
+        let names = ["fits the enclosure", "two copper layers", "every part placed", "fully routed", "ERC clean", "DRC clean"];
+        assert_eq!(verdicts, names.map(|name| (Some(name), Some("pass"))), "exactly the brief's six measurable targets must pass");
+        let (requirements, errors) = fab_elec_req::read(fab_elec_core::DocId(0), &saved);
+        assert!(errors.is_empty(), "the accepted requirements must still read: {errors:?}");
+        assert_eq!(requirements.wishes.iter().map(|wish| wish.words.as_str()).collect::<Vec<_>>(),
+            ["Keep silkscreen labels clean and readable."], "the silkscreen request must survive as an ungraded wish");
+    }
+
+    #[test]
     fn saved_plate_reports_its_committed_findings_without_writing() {
         struct Scratch(PathBuf);
         impl Drop for Scratch {

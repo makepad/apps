@@ -19,16 +19,30 @@ pub use crate::app_link::{AppLinkEvent, DesignOp, DesignVerb, LinkId, Ticket, Wi
 pub use crate::call::{NotLinked, topic::TWEAK};
 pub use relay::{PeerUndelivered, Relay};
 pub use session::{poll_relay, SeatView, Session, Selection, OLDER_SHARER_TREE, TREE_LEVEL, OLDER_SHARER_THEME, THEME_LEVEL,
-    DESIGN_LEVEL, OLDER_SHARER_DESIGN};
+    DESIGN_LEVEL, OLDER_SHARER_DESIGN, OLDER_SHARER_CONTROL};
 pub use wire::{At, Notice, Rect, Request, TreeQuery, ThemeInstall, ThemeOp, ThemeVal,
     BakeScope, DesignNotice, DesignPlace, DesignReplyKind, DesignRequest, StepDir};
 
 use makepad_town_core::{event::Id, key::PublicKey};
+use std::collections::BTreeSet;
 
 pub type Seat = PublicKey;
 pub type SessionId = [u8; 16];
 pub type RequestId = u128;
 
+/// A share's control right as the sharer's call holds it. A seat with control can tweak the app.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ControlRights {
+    pub all: bool,
+    pub seats: BTreeSet<Seat>,
+}
+
+impl ControlRights {
+    pub fn allows(&self, seat: &Seat) -> bool { self.all || self.seats.contains(seat) }
+}
+
+pub(crate) const NEEDS_CONTROL: &str = "Ask for control to edit this share.";
+pub(crate) const CONTROL_ENDED: &str = "Control ended. Ask for control to edit this share.";
 pub(crate) const OWN_LOOK: &str = "This share is your own app, so app_look has no picture for it. See your app with your local tools, such as `makepad-remote app <app> grab`.";
 
 // Exact widget refs use slashes (and can end in View.2). Older widget paths use dots.
@@ -62,7 +76,7 @@ impl Request {
             Self::Theme(ThemeOp::Set { name, value }) => format!("setting {name} {value}"),
             Self::Theme(ThemeOp::Install(spec)) => format!("installing {}", spec.label),
             Self::Look => format!("looking at {title}'s share"),
-            Self::Design(_) | Self::Select(_) | Self::AskEdit | Self::LookDone { .. } => return None,
+            Self::Design(_) | Self::Select(_) | Self::LookDone { .. } => return None,
         })
     }
 }

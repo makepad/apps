@@ -91,7 +91,7 @@ pub fn next_step(snap: &DesignSnapshot, req: Option<&Report>, last_accepted_slot
     if snap.checking(unit.id) { return None; }
     let unrouted = snap.of(&snap.conn, unit.id)?.value.unrouted.len();
     if unrouted != 0 {
-        return step(Route, "Route board", &format!("{unrouted} unrouted {}", if unrouted == 1 { "net" } else { "nets" }));
+        return step(Route, "Route board", &format!("Route {unrouted} unrouted {}", if unrouted == 1 { "net" } else { "nets" }));
     }
     if report.met() {
         step(Done, "Export", "Board routed · all requirements met")
@@ -225,6 +225,11 @@ place("load.s", [10mm, 5mm])
         assert!(next_step(&snap, Some(&report), None).is_none(), "pending whole-board checks cannot offer Route or Export");
         snap.checking.clear();
         check(&snap, Some(&report), None, Route, "Route board");
+        assert_eq!(next_step(&snap, Some(&report), None).unwrap().summary, "Route 2 unrouted nets",
+            "the Route offer must name the action and the settled net count");
+        Arc::make_mut(&mut snap.conn[0].value).unrouted.pop();
+        assert_eq!(next_step(&snap, Some(&report), None).unwrap().summary, "Route 1 unrouted net",
+            "the last unrouted net must use the singular");
         Arc::make_mut(&mut snap.conn[0].value).unrouted.clear();
         check(&snap, Some(&report), None, Done, "Export");
         assert_eq!(next_step(&snap, Some(&report), None).unwrap().summary, "Board routed · all requirements met",

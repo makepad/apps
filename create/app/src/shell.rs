@@ -697,6 +697,38 @@ mod tests {
         let page_view = app.call.share_subscription();
         assert_eq!((page_view.width, page_view.height), (restored.width, restored.height));
         docked_plays(&mut app, cx, "before the window opens");
+        // Select mode (the tweak panel open on the share, Select lit) picks widgets, also while
+        // this seat holds control; with Select off the press drives the app. A tweak session alone
+        // (no panel open) never picks. Returns (picked, handed to the app).
+        let mut picture_press = |app: &mut App, cx: &mut Cx, select: Option<bool>| {
+            use makepad_create::{app_link::AppInput, board::canvas::AppPick, call::control::PanelInput};
+            let mut rings = makepad_create::tweak::overlay::Selections::new(0, [1600., 1000.], &Default::default(), &Default::default());
+            rings.select = select;
+            app.view.call.share.overlay = Some(([9; 32], rings));
+            docked_plays(app, cx, "under the select press");
+            let (abs, button, window_id) = (center.area().clipped_rect(cx).center(), MouseButton::PRIMARY, WindowId(0, 1));
+            cx.fingers.first_mouse_button = Some((button, window_id));
+            let down = Event::MouseDown(MouseDownEvent { abs, button, window_id, modifiers: Default::default(),
+                handled: Default::default(), time: 1. });
+            let mut actions = cx.capture_actions(|cx| center.handle_event(cx, &down, &mut Scope::with_data(&mut app.view)));
+            cx.fingers.first_mouse_button = None;
+            let up = Event::MouseUp(MouseUpEvent { abs, button, window_id, modifiers: Default::default(), time: 1.1 });
+            actions.extend(cx.capture_actions(|cx| center.handle_event(cx, &up, &mut Scope::with_data(&mut app.view))));
+            cx.fingers = Default::default();
+            app.view.call.share.overlay = None;
+            let widget = || actions.iter().filter_map(|a| a.as_widget_action());
+            (widget().any(|w| w.action.downcast_ref::<AppPick>().is_some()),
+                widget().any(|w| matches!(w.action.downcast_ref::<PanelInput>().map(|i| &i.event), Some(AppInput::PointerDown { .. }))))
+        };
+        assert_eq!(picture_press(&mut app, cx, None), (false, false), "a tweak session alone does not pick");
+        assert_eq!(picture_press(&mut app, cx, Some(true)), (true, false), "select mode picks without control");
+        app.view.call.share.control_session = Some(session);
+        app.view.call.share.control.active = Some([2; 16]);
+        assert_eq!(picture_press(&mut app, cx, Some(true)), (true, false), "select mode picks while holding control");
+        assert_eq!(picture_press(&mut app, cx, Some(false)), (false, true), "Select off hands the press to the app");
+        assert_eq!(picture_press(&mut app, cx, None), (false, true), "with no panel open the press drives the app");
+        app.view.call.share.control.active = None;
+        docked_plays(&mut app, cx, "after the select presses");
         let native = makepad_call::driver::View { width: 1600, height: 1000, fps: 30 };
         let draw_popout = |app: &mut App, cx: &mut Cx, size: DVec2| cx.capture_actions(|cx| {
             let mut draw = CxDraw::new(cx, &event);
@@ -788,6 +820,20 @@ mod tests {
                     "the chip and button sit together at the visible picture's horizontal centre");
                 assert!((chip.pos.y - panel.pos.y).abs() <= 1., "the chip sits at the top of the visible picture");
                 assert!(matches!(drag(&mut app, cx, panel.center()), Caption), "the picture body moves the ungranted window");
+                // The tweak overlay takes the body's presses only in select mode. Asked of Town directly:
+                // the app's own event pass rebuilds the overlay from its (here empty) tweak sessions.
+                let town_drag = |app: &mut App, cx: &Cx, select: Option<bool>| {
+                    let mut rings = makepad_create::tweak::overlay::Selections::new(0, [1600., 1000.], &Default::default(), &Default::default());
+                    rings.select = select;
+                    app.view.call.share.overlay = Some(([9; 32], rings));
+                    let response = std::rc::Rc::new(std::cell::Cell::new(WindowDragQueryResponse::NoAnswer));
+                    app.share_window_drag_query(cx, &WindowDragQueryEvent { window_id, abs: panel.center(), response: response.clone() });
+                    app.view.call.share.overlay = None;
+                    response.get()
+                };
+                assert!(matches!(town_drag(&mut app, cx, None), Caption), "a tweak session alone leaves the body moving the window");
+                assert!(matches!(town_drag(&mut app, cx, Some(false)), Caption), "Select off leaves the body moving the window");
+                assert!(matches!(town_drag(&mut app, cx, Some(true)), Client), "in select mode the body picks");
                 assert!(matches!(drag(&mut app, cx, ask.center()), Client), "the control button keeps its press");
                 assert!(matches!(drag(&mut app, cx, close.center()), Client), "the close button keeps its press");
                 for (point, axis) in [(dvec2(panel.center().x, panel.pos.y + panel.size.y - 2.), "horizontal"),

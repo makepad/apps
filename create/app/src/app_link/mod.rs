@@ -6,6 +6,7 @@ mod endpoint;
 mod pictures;
 mod recording;
 pub mod report;
+mod sound;
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, unix))]
@@ -17,6 +18,7 @@ mod worker;
 pub use commands::{AppInput, DesignOp, DesignVerb, Mods};
 use makepad_call::driver::{codec::Codecs, Spawn};
 pub use pictures::{PicturePreview, PictureProbe, PictureStats, PictureStream, PictureWant};
+pub use sound::{AppSound, SoundStats};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -276,6 +278,7 @@ enum Command {
     Allow(u64, Instant),
     Input(u64, WindowId, AppInput),
     Picture(pictures::Subscription),
+    Sound(sound::SoundSubscription),
     Design(Ticket, Option<WindowId>, DesignOp),
     Start(Ticket, WindowId, PathBuf),
     Stop(Ticket),
@@ -524,6 +527,14 @@ impl AppLinks {
         let (stream, slot) = PictureStream::new(&env, want);
         link.commands.push(Command::Picture(slot));
         Some(stream)
+    }
+    /// Subscribes to program audio from the whole app.
+    pub fn open_sound(&mut self, id: LinkId) -> Option<AppSound> {
+        let env = self.env.as_ref()?.clone();
+        let link = self.live(id)?;
+        let (sound, slot) = AppSound::new(&env);
+        link.commands.push(Command::Sound(slot));
+        Some(sound)
     }
     /// The sharer's own view of a shared window; see `PicturePreview`.
     pub fn open_preview(&mut self, id: LinkId, want: PictureWant) -> Option<PicturePreview> {

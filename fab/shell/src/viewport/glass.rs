@@ -31,7 +31,7 @@ script_mod! {
         alpha_blend: true
         blend_op: @Over
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -489,7 +489,7 @@ pub fn draw_glass(
         let determinant = m[0] * (m[5] * m[10] - m[9] * m[6])
             - m[4] * (m[1] * m[10] - m[9] * m[2])
             + m[8] * (m[1] * m[6] - m[5] * m[2]);
-        vars.options.backface_culling = front && determinant > 0.0;
+        vars.options.cull_mode = if front && determinant > 0.0 { CullMode::Back } else { CullMode::None };
         vars.geometry_id = Some(group.geometry);
         // A fresh call prevents batching from moving a group across an earlier group.
         if cx.new_draw_call(vars).is_none() {

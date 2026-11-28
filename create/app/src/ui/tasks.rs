@@ -10,7 +10,13 @@ script_mod! {
     }
     mod.widgets.ProjectDot = RoundedView{width: 9 height: 9 draw_bg +: {color: palette.accent border_radius: 1.5}}
     mod.widgets.ProjectHeading = RailText{draw_text.text_style: theme.font_bold{font_size: 10.5}}
-    mod.widgets.SeatIcons = View{
+    mod.widgets.SeatIcons = mod.widgets.SeatIconsBase{
+        seat_0: palette.seat_0    seat_1: palette.seat_1
+        seat_2: palette.seat_2    seat_3: palette.seat_3
+        seat_4: palette.seat_4    seat_5: palette.seat_5
+        seat_6: palette.seat_6    seat_7: palette.seat_7
+        peer_default: palette.peer    peer_ai_default: palette.peerai
+        ink_dark: palette.seat_ink_dark    ink_light: palette.seat_ink_light
         width: Fit height: Fit spacing: 4
         you := SeatBadge{visible: false}
         your_ai := AiBadge{visible: false}
@@ -217,7 +223,7 @@ fn drop_actions(task: Id, source: usize, destination: usize, slot: usize, cards:
 fn fill_card(cx: &mut Cx, view: &WidgetRef, card: &Card) {
     view.label(cx, ids!(number)).set_text(cx, &card.number);
     view.label(cx, ids!(title)).set_text(cx, &card.title);
-    crate::lists::seat_icon(cx, &view.widget(cx, ids!(authors)), card.seat, &card.author_name);
+    crate::lists::seat_icon(cx, &view.widget(cx, ids!(authors)), card.seat, &card.author_name, card.tone);
     view.widget(cx, ids!(proposal)).set_visible(cx, card.proposed);
 }
 

@@ -1,5 +1,7 @@
 //! Shared app tweaking. A session belongs to one timeline share. Only its owner holds an app link.
 mod app;
+pub(crate) mod design;
+pub(crate) mod focus;
 mod hub;
 pub use hub::Tweaks;
 pub mod overlay;
@@ -8,7 +10,7 @@ mod props;
 mod relay;
 mod session;
 mod shader;
-pub(super) mod theme;
+pub mod theme;
 mod tree;
 pub mod wire;
 
@@ -16,8 +18,10 @@ pub use app::AppLink;
 pub use crate::app_link::{AppLinkEvent, DesignOp, DesignVerb, LinkId, Ticket, WindowId};
 pub use crate::call::{NotLinked, topic::TWEAK};
 pub use relay::{PeerUndelivered, Relay};
-pub use session::{poll_relay, SeatView, Session, Selection, OLDER_SHARER_TREE, TREE_LEVEL, OLDER_SHARER_THEME, THEME_LEVEL};
-pub use wire::{At, Notice, Rect, Request, TreeQuery, ThemeInstall, ThemeOp, ThemeVal};
+pub use session::{poll_relay, SeatView, Session, Selection, OLDER_SHARER_TREE, TREE_LEVEL, OLDER_SHARER_THEME, THEME_LEVEL,
+    DESIGN_LEVEL, OLDER_SHARER_DESIGN};
+pub use wire::{At, Notice, Rect, Request, TreeQuery, ThemeInstall, ThemeOp, ThemeVal,
+    BakeScope, DesignNotice, DesignPlace, DesignReplyKind, DesignRequest, StepDir};
 
 use makepad_town_core::{event::Id, key::PublicKey};
 
@@ -58,7 +62,7 @@ impl Request {
             Self::Theme(ThemeOp::Set { name, value }) => format!("setting {name} {value}"),
             Self::Theme(ThemeOp::Install(spec)) => format!("installing {}", spec.label),
             Self::Look => format!("looking at {title}'s share"),
-            Self::Select(_) | Self::AskEdit | Self::LookDone { .. } => return None,
+            Self::Design(_) | Self::Select(_) | Self::AskEdit | Self::LookDone { .. } => return None,
         })
     }
 }

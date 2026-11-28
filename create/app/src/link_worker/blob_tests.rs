@@ -456,7 +456,14 @@ fn dropped_files_are_told_apart_by_their_bytes_and_a_clip_may_have_no_project() 
     ben.sync_start(&ana.me());
     let town = join(&mut ana, &mut ben, false);
     let (signal, events) = mpsc::sync_channel(1);
-    ana.start_store(crate::store_worker::test_pool(), move || { let _ = signal.try_send(()); }).unwrap();
+    let decoded = Arc::new(Mutex::new(BTreeSet::new()));
+    let requested = decoded.clone();
+    ana.start_store_with_poster_decoder(crate::store_worker::test_pool(), move || { let _ = signal.try_send(()); },
+        Arc::new(move |path, _| {
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            requested.lock().unwrap().insert(name);
+            Err("synthetic test stub has no video frames".into())
+        })).unwrap();
     let own = homes.0.join("pictures");
     std::fs::create_dir_all(&own).unwrap();
     let files = [("shot.png", PNG_1X1.to_vec()), ("lying.png", mp4), ("screen.mov", mov), ("notes.mp4", b"not a movie at all".to_vec())];
@@ -468,6 +475,8 @@ fn dropped_files_are_told_apart_by_their_bytes_and_a_clip_may_have_no_project() 
         ana.drain_store();
         if ana.clips_pending() { events.recv().unwrap(); }
     }
+    assert_eq!(*decoded.lock().unwrap(), BTreeSet::from(["lying.png".to_owned(), "screen.mov".to_owned()]),
+        "only files sniffed as videos request poster decoding");
     let problems = ana.take_recording_problems();
     assert!(problems.iter().any(|s| s.starts_with("notes.mp4") && s.contains("Only pictures and videos post to the chat.")),
         "a file that is not media gets the one refusal line: {problems:?}");

@@ -77,6 +77,8 @@ pub struct RingExt {
     pub town: Option<[u8; 32]>,
     pub roster: Vec<PublicKey>,
     pub media_caps: Option<MediaCaps>,
+    /// The intended callee seat on a card call or call-back.
+    pub target_seat: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,7 +114,8 @@ pub enum Message {
     ShareOff { session: CallId, reason: ShareEndReason },
     View { session: CallId, width: u32, height: u32, fps: u32, ext: ShareWatchExt },
     CallJoin { call_id: CallId, town: [u8; 32], muted: bool, transcribing: bool },
-    CallJoinAck { call_id: CallId, muted: bool, transcribing: bool },
+    /// A card call carries the caller and callee seats, in that order.
+    CallJoinAck { call_id: CallId, muted: bool, transcribing: bool, seats: Option<[[u8; 32]; 2]> },
     MediaCapsNotice { caps: MediaCaps },
     RecordingState { call_id: CallId, recording: bool },
     RecordingConsent { call_id: CallId, allow: bool },
@@ -168,6 +171,7 @@ impl Message {
                 if let Some(town) = &ext.town { write_tlv(&mut body, 1, town); }
                 if !ext.roster.is_empty() { write_tlv(&mut body, 2, ext.roster.as_flattened()); }
                 if let Some(caps) = ext.media_caps { write_tlv(&mut body, 3, &caps.0.to_le_bytes()); }
+                if let Some(seat) = &ext.target_seat { write_tlv(&mut body, 4, seat); }
             }
             Self::Answer { secret, ext, .. } => {
                 body.extend(secret);
@@ -181,9 +185,10 @@ impl Message {
                 write_tlv(&mut body, 3, &[*muted as u8]);
                 write_tlv(&mut body, 4, &[*transcribing as u8]);
             }
-            Self::CallJoinAck { muted, transcribing, .. } => {
+            Self::CallJoinAck { muted, transcribing, seats, .. } => {
                 write_tlv(&mut body, 2, &[*muted as u8]);
                 write_tlv(&mut body, 3, &[*transcribing as u8]);
+                if let Some(pair) = seats { write_tlv(&mut body, 4, pair.as_flattened()); }
             }
             Self::MediaCapsNotice { caps } => write_tlv(&mut body, 1, &caps.0.to_le_bytes()),
             Self::RecordingState { recording, .. } => write_tlv(&mut body, 2, &[*recording as u8]),
@@ -252,10 +257,10 @@ fn decode_fields(tag: u8, tail: &[u8]) -> Result<Message, Refused> {
                 transcribing: matches!(transcribing, Some([1])) }
         }
         CALL_JOIN_ACK => {
-            let [Some(id), muted, transcribing] = fields(tail, [Bytes(16), Bool, Bool])?
+            let [Some(id), muted, transcribing, seats] = fields(tail, [Bytes(16), Bool, Bool, Bytes(64)])?
                 else { return Err(Refused::Length) };
             Message::CallJoinAck { call_id: array(id), muted: matches!(muted, Some([1])),
-                transcribing: matches!(transcribing, Some([1])) }
+                transcribing: matches!(transcribing, Some([1])), seats: seats.map(|pair| [array(&pair[..32]), array(&pair[32..])]) }
         }
         MEDIA_CAPS_NOTICE => {
             let [Some(value)] = fields(tail, [Bytes(4)])? else { return Err(Refused::Length) };
@@ -288,9 +293,9 @@ pub fn decode(body: &[u8]) -> Result<Option<Message>, Refused> {
     let call_id = array(&prefix[2..18]);
     Ok(Some(match tag {
         RING => {
-            let [town, roster, media_caps] = fields(tail, [Field::Bytes(32), Field::Roster, Field::Bytes(4)])?;
+            let [town, roster, media_caps, target_seat] = fields(tail, [Field::Bytes(32), Field::Roster, Field::Bytes(4), Field::Bytes(32)])?;
             let ext = RingExt { town: town.map(array), roster: roster.unwrap_or_default().as_chunks::<65>().0.to_vec(),
-                media_caps: media_caps.map(caps) };
+                media_caps: media_caps.map(caps), target_seat: target_seat.map(array) };
             Message::Ring { call_id, secret: array(&prefix[18..50]), video: flag(prefix[50])?, ext }
         }
         ANSWER => {
@@ -376,7 +381,7 @@ mod tests {
             (Message::Ring { call_id, secret, video: true, ext: RingExt::default() }, 51),
             (Message::Answer { call_id, secret, ext: AnswerExt::default() }, 50),
             (Message::Ring { call_id, secret, video: false,
-                ext: RingExt { town, roster: vec![[7; 65], [8; 65]], media_caps } }, 51 + 35 + 133 + 7),
+                ext: RingExt { town, roster: vec![[7; 65], [8; 65]], media_caps, target_seat: None } }, 51 + 35 + 133 + 7),
             (Message::Answer { call_id, secret, ext: AnswerExt { town, media_caps } }, 50 + 35 + 7),
         ] {
             let mut wire = message.encode();
@@ -390,6 +395,61 @@ mod tests {
         let mut ring = Message::Ring { call_id, secret, video: false, ext: RingExt::default() }.encode();
         write_tlv(&mut ring, 2, &[0; 64]);
         assert_eq!(decode(&ring), Err(Refused::Length));
+    }
+
+    #[test]
+    fn ring_target_seat_and_join_ack_seats_roundtrip_and_older_decoders_skip_tag_4() {
+        use Field::{Bool, Bytes, Roster};
+        let call_id = [10; 16];
+        let secret = [11; 32];
+        let town = [12; 32];
+        let peer = [7; 65];
+        let caps = MediaCaps(MediaCaps::MULTIPARTY_V1);
+        let cap_bytes = caps.0.to_le_bytes();
+        let ring = |target_seat| Message::Ring { call_id, secret, video: true, ext: RingExt {
+            town: Some(town), roster: vec![peer], media_caps: Some(caps), target_seat,
+        } };
+        let ack = |seats| Message::CallJoinAck { call_id, muted: true, transcribing: false, seats };
+
+        let mut town_ring = vec![VERSION, RING];
+        town_ring.extend(call_id);
+        town_ring.extend(secret);
+        town_ring.push(1);
+        write_tlv(&mut town_ring, 1, &town);
+        write_tlv(&mut town_ring, 2, &peer);
+        write_tlv(&mut town_ring, 3, &cap_bytes);
+        let mut town_ack = vec![VERSION, CALL_JOIN_ACK];
+        write_tlv(&mut town_ack, 1, &call_id);
+        write_tlv(&mut town_ack, 2, &[1]);
+        write_tlv(&mut town_ack, 3, &[0]);
+        assert_eq!(ring(None).encode(), town_ring, "town rings retain the original wire layout");
+        assert_eq!(ack(None).encode(), town_ack, "town acknowledgements retain the original wire layout");
+
+        let target = [9; 32];
+        let seats = [[13; 32], [14; 32]];
+        let card_ring = ring(Some(target)).encode();
+        let card_ack = ack(Some(seats)).encode();
+        let mut expected_ring = town_ring.clone();
+        write_tlv(&mut expected_ring, 4, &target);
+        let mut expected_ack = town_ack.clone();
+        write_tlv(&mut expected_ack, 4, seats.as_flattened());
+        assert_eq!(card_ring, expected_ring, "the sole addition to a card ring is its 35-byte callee field");
+        assert_eq!(card_ack, expected_ack, "the sole addition to a card ack is its 67-byte caller/callee field");
+        assert_eq!(decode(&card_ring), Ok(Some(ring(Some(target)))), "the recipient recovers the target");
+        assert_eq!(decode(&card_ack), Ok(Some(ack(Some(seats)))), "the joiner recovers both seats in order");
+        assert_eq!(fields(&card_ring[51..], [Bytes(32), Roster, Bytes(4)]),
+            Ok([Some(town.as_slice()), Some(peer.as_slice()), Some(cap_bytes.as_slice())]),
+            "an older ring reader skips the seat and retains the town, roster and capabilities");
+        assert_eq!(fields(&card_ack[2..], [Bytes(16), Bool, Bool]),
+            Ok([Some(call_id.as_slice()), Some(&[1][..]), Some(&[0][..])]),
+            "an older ack reader skips the seats and retains the call ID and both flags");
+        for (prefix, sizes) in [(&town_ring, &[31, 33][..]), (&town_ack, &[32, 63, 65][..])] {
+            for &size in sizes {
+                let mut malformed = prefix.clone();
+                write_tlv(&mut malformed, 4, &vec![0; size]);
+                assert_eq!(decode(&malformed), Err(Refused::Length), "scope field of width {size} must be refused");
+            }
+        }
     }
 
     #[test]
@@ -410,7 +470,7 @@ mod tests {
         let caps = MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::H264_444_DECODE);
         for (tag, message) in [
             (16, Message::CallJoin { call_id, town, muted: true, transcribing: false }),
-            (17, Message::CallJoinAck { call_id, muted: false, transcribing: true }),
+            (17, Message::CallJoinAck { call_id, muted: false, transcribing: true, seats: None }),
             (18, Message::MediaCapsNotice { caps }),
             (19, Message::RecordingState { call_id, recording: false }),
             (20, Message::RecordingConsent { call_id, allow: true }),

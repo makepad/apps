@@ -121,7 +121,7 @@ script_mod! {
         color_check: fab.color_warning
         color_readonly: fab.color_text_dim
         // the kind before a name ("cylinder"): quieter than the name and the row's icons
-        color_kind: fab.color_text_muted
+        color_kind: fab.color_text_dim
         // the dragged row's chip, as the app's tooltips look
         draw_tip: mod.draw.FabTipChip{}
         draw_tip_text: mod.draw.FabTipText{}
@@ -905,11 +905,16 @@ fn group_tip(f: &FeatureRow) -> Option<String> {
     })
 }
 
+const FEATURE_KIND_KEY_BIT: u64 = 1 << 32;
+
 /// Hit regions and source identity of a visible row.
 #[derive(Clone)]
 struct FeatureHit {
     rect: Rect,
     name: Rect,
+    verb: String,
+    /// The row's kind word as drawn (clipped to `name_rect`), for semantics.
+    kind: Option<Rect>,
     fold: Option<Rect>,
     /// Whether the row's children are folded away (as drawn), for a fold drag to set it.
     folded: bool,
@@ -1210,7 +1215,18 @@ impl Widget for FabFeatureTree {
                 node.states.set(a11y_tree::States::SELECTED, true);
             }
             makepad_platform::a11y::set_string(&mut node.name, &hit.label);
-            out.push((n as u64 + 1, None, node));
+            let row_key = n as u64 + 1;
+            out.push((row_key, None, node));
+            if let Some(kind) = hit.kind.filter(|_| !hit.verb.is_empty()) {
+                let mut kind_node = a11y_tree::Node {
+                    role: a11y_tree::Role::StaticText,
+                    bounds: makepad_platform::a11y::semantic_rect(kind),
+                    ..Default::default()
+                };
+                makepad_platform::a11y::set_string(&mut kind_node.name, &hit.verb);
+                makepad_platform::a11y::set_string(&mut kind_node.role_description, "feature kind");
+                out.push((FEATURE_KIND_KEY_BIT | row_key, Some(row_key), kind_node));
+            }
         }
     }
 
@@ -1220,6 +1236,7 @@ impl Widget for FabFeatureTree {
             return ActionResult::Unhandled;
         }
         let Some(key) = cx.a11y.action_part_key(request.node) else { return ActionResult::Unhandled };
+        if key == 0 || (key & FEATURE_KIND_KEY_BIT) != 0 { return ActionResult::Unsupported; }
         let Some(hit) = self.rows.get((key as usize).wrapping_sub(1)) else { return ActionResult::Unsupported };
         cx.set_key_focus(self.area);
         let id = hit.id.clone();
@@ -1548,6 +1565,7 @@ impl Widget for FabFeatureTree {
             let editable = f.editable || f.detail == TEST_PRINT;
             self.draw_name.color = if !editable { self.color_readonly } else if self.hover == Some(n) { self.color_hover } else { name_color };
             if f.off { self.draw_name.color.w *= 0.4; }
+            let mut kind_rect = None;
             if self.rename.as_ref() == Some(&f.id) {
                 rename_rect = Some(name_rect);
             } else {
@@ -1560,7 +1578,12 @@ impl Widget for FabFeatureTree {
                     if f.off { self.draw_op.color.w *= 0.4; }
                     self.draw_op.draw_abs(cx, dvec2(after, r.pos.y + 6.0), &f.verb);
                     self.draw_op.color = dim_color;
-                    after += self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                    let kind_w = self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(0.0, |run| run.width_in_lpxs as f64);
+                    let kx1 = (after + kind_w).min(text_end);
+                    if kx1 > after {
+                        kind_rect = Some(Rect { pos: dvec2(after, r.pos.y), size: dvec2(kx1 - after, r.size.y) });
+                    }
+                    after += kind_w + 6.0;
                 }
                 // How it takes part in its parent, in a disc after the kind: − cut away, + joined,
                 // ∩ intersected; the base has none.
@@ -1615,7 +1638,7 @@ impl Widget for FabFeatureTree {
                 self.draw_row.draw_abs(cx, Rect { pos: dvec2(x, if *after { r.pos.y + ROW - 2.0 } else { r.pos.y - 2.0 }), size: dvec2((r.pos.x + r.size.x - x).max(0.0), 2.0) });
             }
             if partial { cx.end_turtle(); }
-            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
+            self.rows.push(FeatureHit { rect: r, name: name_rect, verb: f.verb.clone(), kind: kind_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
         }
         cx.end_turtle();
         self.draw_name.color = name_color;
@@ -1646,4 +1669,53 @@ impl Widget for FabFeatureTree {
         }
         DrawStep::done()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn fab_feature_tree_exposes_kind_child_bounds() {
+    use a11y_tree::{ActionArg, ActionRequest, ActionResult, Actions, NodeId, Role};
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let mut tree = cx.with_vm(FabFeatureTree::script_new);
+    for (y, label, verb, width) in [(4.0, "base", "box", 20.0), (26.0, "hole", "cylinder", 33.0)] {
+        let rect = Rect { pos: dvec2(4.0, y), size: dvec2(160.0, 20.0) };
+        let name = Rect { pos: dvec2(34.0, y), size: dvec2(104.0, 20.0) };
+        let kind = Rect { pos: dvec2(70.0, y), size: dvec2(width, 20.0) };
+        tree.rows.push(FeatureHit {
+            rect, name, verb: verb.into(), kind: Some(kind), fold: None, folded: false,
+            eye: None, link: None, key: String::new(), label: label.into(), id: label.into(),
+            parent: None, editable: true, bypass: false, off: false, mark: None, role: "", can_role: false,
+        });
+    }
+    let mut parts = Vec::new();
+    tree.semantics_parts(&cx, &mut parts);
+    assert_eq!(parts.len(), 2 * tree.rows.len(), "each drawn kind has its own part");
+    for (n, hit) in tree.rows.iter().enumerate() {
+        let row_key = n as u64 + 1;
+        let (_, parent, row) = parts.iter().find(|(key, _, _)| *key == row_key).expect("the feature row");
+        assert_eq!((*parent, row.role), (None, Role::ListItem));
+        let (_, parent, kind) = parts.iter().find(|(key, _, _)| *key == (FEATURE_KIND_KEY_BIT | row_key)).expect("the feature kind");
+        assert_eq!((*parent, kind.role), (Some(row_key), Role::StaticText));
+        assert_eq!(kind.name, hit.verb);
+        assert_eq!(kind.role_description, "feature kind");
+        assert_eq!(kind.bounds, makepad_platform::a11y::semantic_rect(hit.kind.unwrap()));
+        assert!(kind.bounds.w > 0.0 && kind.bounds.x > row.bounds.x && kind.bounds.x + kind.bounds.w <= row.bounds.x + row.bounds.w);
+    }
+
+    let uid = tree.widget_uid().0;
+    cx.a11y.on = true;
+    cx.a11y.begin_frame();
+    let owner = cx.a11y.begin_node(uid, None);
+    cx.a11y.begin_window(WindowId(0, 1));
+    for (index, (key, parent, node)) in parts.into_iter().enumerate() {
+        cx.a11y.set_part(owner, key, parent, node, Area::Empty, || WidgetUid::new().0);
+        if key & FEATURE_KIND_KEY_BIT != 0 {
+            let id = NodeId::part(uid, (index + 1) as u16);
+            assert_eq!(cx.a11y.action_part_key(id), Some(key));
+            let press = ActionRequest { req: 1, node: id, action: Actions::PRESS, arg: ActionArg::None };
+            assert_eq!(tree.handle_action(&mut cx, &press, &mut Scope::empty()), ActionResult::Unsupported);
+        }
+    }
+    cx.a11y.end_window();
+    cx.a11y.end_node(owner, a11y_tree::Node::default(), Area::Empty);
 }

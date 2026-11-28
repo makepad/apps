@@ -41,7 +41,7 @@ script_mod! {
         blend_op: @Add
         alpha_blend: true
         depth_write: false
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)

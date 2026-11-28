@@ -117,7 +117,7 @@ fn typed_commands_preserve_fields_windows_and_unicode() {
         let windowed = op.clone().line(Some(w.id));
         match expected {
             "design pick" | "design tree" | "design props" | "design apply" | "design typed" | "design locate" | "design theme" |
-            "design states" | "design pose" => assert_eq!(values(&windowed.unwrap()), values(&format!("{expected} w=7"))),
+            "design states" | "design pose" | "design verify" | "design drop" => assert_eq!(values(&windowed.unwrap()), values(&format!("{expected} w=7"))),
             _ => {
                 let command = expected.split_whitespace().take_while(|word| !word.contains('=')).collect::<Vec<_>>().join(" ");
                 let reason = format!("{command} takes no window");
@@ -214,6 +214,10 @@ fn design_cases() -> Vec<(DesignOp, &'static str)> {
         (Theme, "design theme"),
         (States, "design states"),
         (Pose, "design pose"),
+        (Preview, "design preview"),
+        (PreviewChunk, "design preview_chunk"),
+        (Revert, "design revert"),
+        (Drop, "design drop"),
     ] {
         ops.push((DesignOp::Design { verb, args: vec![] }, line));
     }
@@ -256,6 +260,74 @@ fn windows_carrier_requires_numeric_local_address_and_registry_token() {
 mod unix;
 #[cfg(unix)]
 pub(crate) use unix::Rig as RecordingRig;
+
+#[test]
+fn scanning_stays_true_until_a_coalesced_rescan_finishes() {
+    use std::sync::{Condvar, Mutex};
+
+    #[derive(Default)]
+    struct Progress {
+        entered: usize,
+        released: usize,
+    }
+
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let signal: Arc<dyn Fn() + Send + Sync> = Arc::new(move || wake_tx.send(()).unwrap());
+    let mut app = AppLinks::default();
+    app.configure(AppLinkEnv {
+        signal: signal.clone(),
+        registry: None,
+        codecs: Arc::new(makepad_call::driver::codec::TestCodecs),
+        spawn: Arc::new(|_, _| panic!("the test already installed its scan worker")),
+    });
+    let (request, rx) = mpsc::sync_channel(1);
+    let (tx, result) = mpsc::sync_channel(1);
+    let requested = Arc::new(AtomicU64::new(0));
+    app.scan = Some(Scan { request, requested: requested.clone(), result });
+    let progress = Arc::new((Mutex::new(Progress::default()), Condvar::new()));
+    let worker_progress = progress.clone();
+    let worker = std::thread::spawn(move || run_scan_worker(rx, requested, tx, signal, || {
+        let (lock, wake) = &*worker_progress;
+        let mut p = lock.lock().unwrap();
+        p.entered += 1;
+        let invocation = p.entered;
+        wake.notify_all();
+        drop(wake.wait_while(p, |p| p.released < invocation).unwrap());
+        let apps = if invocation == 1 {
+            Vec::new()
+        } else {
+            let key = AppKey {
+                pid: 7, started_ms: 1, socket: "app.sock".into(), run_dir: None, restart_parent: None,
+            };
+            vec![LocalApp {
+                pid: key.pid, started_ms: key.started_ms, key, name: "Makepad".into(),
+                title: None, visible_windows: Vec::new(),
+            }]
+        };
+        (apps, Vec::new())
+    }));
+
+    let (lock, wake) = &*progress;
+    app.scan();
+    drop(wake.wait_while(lock.lock().unwrap(), |p| p.entered == 0).unwrap());
+    app.scan();
+    app.scan();
+    assert_eq!(app.scan_requested, 3, "coalesced requests still advance the requested generation");
+
+    lock.lock().unwrap().released = 1;
+    wake.notify_all();
+    wake_rx.recv().unwrap();
+    assert!(app.poll().iter().any(|e| matches!(e, AppLinkEvent::Apps)), "the first discovery result is published");
+    assert!(app.scanning() && app.apps().is_empty(), "the first reply leaves the newer scan pending");
+    lock.lock().unwrap().released = 2;
+    wake.notify_all();
+    wake_rx.recv().unwrap();
+    assert!(app.poll().iter().any(|e| matches!(e, AppLinkEvent::Apps)), "the coalesced discovery result is published");
+    assert!(!app.scanning(), "the rescan satisfies both queued refresh requests");
+    assert!(matches!(app.apps(), [found] if found.name == "Makepad"), "the picker receives the fresh registry contents");
+    drop(app);
+    worker.join().expect("closing discovery lets the scan worker exit");
+}
 
 #[test]
 fn restart_notice_requires_an_unambiguous_replacement() {
@@ -320,6 +392,98 @@ fn restart_notice_requires_an_unambiguous_replacement() {
     assert!(watch
         .replacement(&native, true, &[app(6, "app", None, None)])
         .is_some());
+}
+
+#[cfg(unix)]
+impl RecordingRig {
+    pub(crate) fn set_preview_codecs(&mut self, codecs: Arc<dyn Codecs>) {
+        self.app.env.as_mut().unwrap().codecs = codecs;
+    }
+}
+
+#[test]
+fn a_preview_delivers_a_picture_that_finishes_after_push_without_another_unit() {
+    use makepad_call::{driver::codec::{Decoder, Encoder, Picture, TestCodecs}, guard::Rung};
+    use std::sync::{Condvar, Mutex};
+
+    #[derive(Default)]
+    struct Progress { pushes: usize, polls: usize, release: bool }
+    struct DelayedCodecs(Arc<(Mutex<Progress>, Condvar)>);
+    struct DelayedDecoder {
+        progress: Arc<(Mutex<Progress>, Condvar)>,
+        inner: Box<dyn Decoder>,
+        staged: Vec<Picture>,
+    }
+    impl Codecs for DelayedCodecs {
+        fn encoder(&self, rung: Rung, kbps: u32) -> Result<Box<dyn Encoder>, String> { TestCodecs.encoder(rung, kbps) }
+        fn decoder(&self) -> Result<Box<dyn Decoder>, String> {
+            Ok(Box::new(DelayedDecoder { progress: self.0.clone(), inner: TestCodecs.decoder()?, staged: Vec::new() }))
+        }
+    }
+    impl Decoder for DelayedDecoder {
+        fn push_into(&mut self, au: &[u8], pts: i64, _: &mut Vec<Picture>) -> Result<(), String> {
+            self.inner.push_into(au, pts, &mut self.staged)?;
+            self.progress.0.lock().unwrap().pushes += 1;
+            self.progress.1.notify_one();
+            Ok(())
+        }
+        fn ready_into(&mut self, out: &mut Vec<Picture>) -> Result<(), String> {
+            let mut state = self.progress.0.lock().unwrap();
+            state.polls += 1;
+            if state.release { out.append(&mut self.staged); }
+            self.progress.1.notify_one();
+            Ok(())
+        }
+        fn recycle(&mut self, nv12: Vec<u8>) { self.inner.recycle(nv12); }
+        fn allocated(&self) -> u64 { self.inner.allocated() }
+        fn name(&self) -> String { self.inner.name() }
+    }
+
+    let progress = Arc::new((Mutex::new(Progress::default()), Condvar::new()));
+    let workers = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let tracked = workers.clone();
+    let (tx, rx) = mpsc::channel();
+    let env = AppLinkEnv {
+        spawn: Arc::new(move |_, work| {
+            let tracked = tracked.clone();
+            *tracked.0.lock().unwrap() += 1;
+            std::thread::spawn(move || {
+                work();
+                *tracked.0.lock().unwrap() -= 1;
+                tracked.1.notify_one();
+            });
+        }),
+        signal: Arc::new(move || { let _ = tx.send(()); }),
+        codecs: Arc::new(DelayedCodecs(progress.clone())),
+        registry: None,
+    };
+    let want = PictureWant { window: WindowId(0), max_w: 100, max_h: 100, fps: 15, kbps: 0 };
+    let (preview, slot) = PicturePreview::new(&env, want);
+    let rung = Rung { width: 320, height: 160, fps: 15, min_ask_bps: 0, full_bps: 1_000 };
+    let mut encoder = env.codecs.encoder(rung, 1).unwrap();
+    let pixels = vec![128; 320 * 160 * 3 / 2];
+    let mut relay = |pts| {
+        let packet = encoder.push(&pixels, pts).unwrap().pop().unwrap();
+        let key = packet.key;
+        slot.relay(Arc::new(packet), (320, 160), key);
+    };
+    relay(0);
+    let mut state = progress.1.wait_while(progress.0.lock().unwrap(), |s| s.pushes != 1 || s.polls == 0).unwrap();
+    assert!(preview.take().is_none(), "an empty poll cannot publish a preview");
+    state.release = true;
+    drop(state);
+    rx.recv().expect("the first picture wakes the page without a second access unit");
+    let picture = preview.take().expect("the late picture reaches the preview");
+    assert_eq!((picture.pts_100ns, picture.width, picture.height, picture.nv12.len()), (0, 100, 50, 7500),
+        "the preview fits the original picture to the page");
+
+    progress.0.lock().unwrap().release = false;
+    relay(666_667);
+    drop(progress.1.wait_while(progress.0.lock().unwrap(), |s| s.pushes != 2).unwrap());
+    assert_eq!(*workers.0.lock().unwrap(), 1, "the worker still owes the second picture");
+    drop(preview);
+    drop(workers.1.wait_while(workers.0.lock().unwrap(), |n| *n != 0).unwrap());
+    assert!(slot.demand().is_none(), "closing the page ends the worker and its demand while a picture is pending");
 }
 
 #[test]

@@ -223,18 +223,18 @@ fn a_future_constructor_has_a_readable_card_with_default_geometry() {
     let mut h = History::new();
     let board = h.board();
     let mut scene = Scene::new(&h.state, board);
-    let (id, touched) = h.push(Content::Entity { kind: Key::Name("FutureCard".into()), derive: None,
+    let (id, touched) = h.push(Content::Entity { copied_from: vec![], kind: Key::Name("FutureCard".into()), derive: None,
         project: None, fields: vec![(field::PARENT, Value::Id(board))] });
     assert!(scene.apply(&h.state, &touched, &mut Gesture::default()));
     let card = scene.view.get(&id).unwrap();
     assert!(supported(&card.kind) && rect(card.rect).size.x > 0. && rect(card.rect).size.y > 0.);
     assert_eq!(scene.faces[&id].text, "unknown kind FutureCard");
 
-    let (text, touched) = h.push(Content::Entity { kind: Key::Number(kind::TEXT_BLOCK), derive: None, project: None,
+    let (text, touched) = h.push(Content::Entity { copied_from: vec![], kind: Key::Number(kind::TEXT_BLOCK), derive: None, project: None,
         fields: vec![(field::PARENT, Value::Id(board)), (field::W, Value::Int(100 * 64)),
             (field::H, Value::Int(32 * 64)), (field::TEXT, Value::Text("Text".into()))] });
     assert!(scene.apply(&h.state, &touched, &mut Gesture::default()));
-    let (sticky, touched) = h.push(Content::Entity { kind: Key::Number(kind::STICKY), derive: None, project: None,
+    let (sticky, touched) = h.push(Content::Entity { copied_from: vec![], kind: Key::Number(kind::STICKY), derive: None, project: None,
         fields: vec![(field::PARENT, Value::Id(board)), (field::W, Value::Int(96 * 64)),
             (field::H, Value::Int(40 * 64)), (field::TEXT, Value::Text("Plan the demo".into()))] });
     assert!(scene.apply(&h.state, &touched, &mut Gesture::default()));
@@ -254,7 +254,7 @@ fn a_future_constructor_has_a_readable_card_with_default_geometry() {
     assert!(canvas.scene.as_ref().unwrap().faces[&sticky].detail.text,
         "a sticky keeps its saved text at reading size after the editor closes");
 
-    let (design, touched) = h.push(Content::Entity { kind: Key::Number(kind::DESIGN), derive: None, project: None,
+    let (design, touched) = h.push(Content::Entity { copied_from: vec![], kind: Key::Number(kind::DESIGN), derive: None, project: None,
         fields: vec![(field::PARENT, Value::Id(board)), (field::Z, Value::Key(vec![2])), (field::W, Value::Int(390 * 64)),
             (field::H, Value::Int(844 * 64)), (field::TITLE, Value::Text("Welcome".into())),
             (field::SRC, Value::Text("arbitrary unfinished Splash{".into()))] });
@@ -572,7 +572,12 @@ fn a_stickys_editor_owns_typing_and_its_one_undo_on_both_devices() {
     exchange(&mut a, &mut b);
     assert_eq!(b.state.entities[&id].text(field::TEXT), "Plan the demo");
 
+    // The editor takes the item's text alignment from a script eval; a script error there
+    // only logs, and the alignment silently falls back.
+    cx.with_vm(|vm| vm.capture_errors_nested());
     canvas.open_text(&mut cx, id, false);
+    let errors = cx.with_vm(|vm| { let errors = vm.take_errors(); vm.capture_errors_restore(); errors });
+    assert!(errors.is_empty(), "opening the text editor raises no script errors:\n{}", errors.join("\n"));
     settle_focus(&mut cx);
     assert!(send(&mut canvas, &mut cx, vec![key(KeyCode::Escape)]).is_empty(), "unchanged text writes nothing");
     history.step(false, |undo| Some(a.act(undo, Origin::Ui).unwrap()));
@@ -608,6 +613,270 @@ fn a_stickys_editor_owns_typing_and_its_one_undo_on_both_devices() {
     canvas.edit_context(&mut cx, true, false);
     assert!(!canvas.editor.visible(), "losing write access closes the draft");
     assert_eq!(a.state.entities[&id].text(field::TEXT), "Text");
+}
+
+#[test]
+fn board_canvas_draws_image_placeholder_and_emits_open_media_on_double_click() {
+    use crate::board::tests::{item, History};
+    use makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp};
+    use makepad_town_core::{blob, event::Content};
+    let mut history = History::new();
+    let board = history.board();
+    let mut content = item(kind::IMAGE, board, [20, 40, 200, 100], None);
+    let Content::Entity { fields, .. } = &mut content else { unreachable!() };
+    let large = 1024 * 1024 + 1;
+    fields.extend([(field::BLOB, Value::Blob { size: 50, root: [1; 32] }),
+        (field::POSTER, Value::Blob { size: large, root: [2; 32] }), (field::MEDIA, Value::Text("video/mp4".into())),
+        (field::DURATION, Value::Int(65432))]);
+    let id = history.push(content).0;
+    let mut surface = WidgetRef::empty();
+    let target = surface.clone();
+    let heard = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let actions = heard.clone();
+    let mut cx = Cx::new(Box::new(move |cx, event| {
+        if let Event::Actions(batch) = event {
+            actions.borrow_mut().extend(batch.iter().filter_map(|a| a.as_widget_action()?.action.downcast_ref::<BoardCanvasAction>().cloned()));
+        }
+        target.handle_event(cx, event, &mut Scope::empty());
+    }));
+    cx.init_cx_os();
+    cx.with_vm(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::script_mod(vm);
+        let template = script_eval!(vm, {mod.widgets.BoardCanvas{}});
+        surface.script_apply(vm, &Apply::New, &mut Scope::empty(), template);
+    });
+    let size = dvec2(420., 240.);
+    let mut paint = draw_pass(&mut cx, size, 1.);
+    let status = |canvas: &mut BoardCanvas, cx: &mut Cx, wanted| {
+        canvas.sync_media(cx, [8; 32], Path::new("blobs"), |_| (false, wanted, None));
+    };
+    let get_point = {
+        let mut canvas = surface.borrow_mut::<BoardCanvas>().unwrap();
+        canvas.select_board(&mut cx, &history.state, Some(board), true);
+        canvas.edit_context(&mut cx, true, true);
+        canvas.camera = Camera::new(Rect { pos: DVec2::default(), size }, CameraState { zoom: 1., pan_x: 0., pan_y: 0. });
+        canvas.fit_pending = false;
+        status(&mut canvas, &mut cx, false);
+        paint(&mut cx, &mut canvas);
+        let face = canvas.scene.as_ref().unwrap().faces[&id].media.as_ref().unwrap();
+        assert_eq!(face.placeholder.text, "Get", "a large absent poster offers a fetch");
+        assert_eq!(face.duration.text, "1:05", "the clip length is drawn on the card");
+        canvas.camera.local_to_screen(face.get_rect.unwrap().center())
+    };
+    let click = |cx: &mut Cx, point: DVec2, time| {
+        let win = WindowId(1, 1);
+        let button_raw_bits = MouseButton::PRIMARY.bits();
+        cx.dispatch_studio_msg(StudioToApp::MouseDown(RemoteMouseDown { x: point.x, y: point.y, time,
+            button_raw_bits, modifiers: Default::default() }), win, DVec2::default());
+        cx.dispatch_studio_msg(StudioToApp::MouseUp(RemoteMouseUp { x: point.x, y: point.y, time: time + 0.02,
+            button_raw_bits, modifiers: Default::default() }), win, DVec2::default());
+    };
+    click(&mut cx, get_point, 1.);
+    assert!(heard.borrow().iter().any(|a| matches!(a, BoardCanvasAction::FetchBlob { blob: b } if *b == blob::id(large, &[2; 32]))));
+    {
+        let mut canvas = surface.borrow_mut::<BoardCanvas>().unwrap();
+        status(&mut canvas, &mut cx, true);
+        paint(&mut cx, &mut canvas);
+        let face = canvas.scene.as_ref().unwrap().faces[&id].media.as_ref().unwrap();
+        assert_eq!(face.placeholder.text, "Loading…");
+        assert!(face.get_rect.is_none(), "a wanted poster cannot be requested again");
+    }
+    click(&mut cx, get_point, 2.);
+    click(&mut cx, get_point, 2.1);
+    assert!(heard.borrow().iter().any(|a| matches!(a, BoardCanvasAction::OpenMedia { item, blob: b, media }
+        if *item == id && *b == blob::id(50, &[1; 32]) && media == "video/mp4")), "double-click opens the primary blob");
+}
+
+fn write_board_png(dir: &Path, town: TownId, n: u8) -> (Id, Value, PathBuf) {
+    use makepad_ai_services::pictures::{encode_png, RgbaPicture};
+    use makepad_town_core::{blob, hex};
+    let png = encode_png(&RgbaPicture { width: 4, height: 4, rgba: [n, 0, 0, 255].repeat(16) }).unwrap();
+    let size = png.len() as u64;
+    let root = [n; 32];
+    let id = blob::id(size, &root);
+    let town_dir = dir.join(hex(&town));
+    std::fs::create_dir_all(&town_dir).unwrap();
+    let path = blob::data_path(&town_dir, &id);
+    std::fs::write(&path, png).unwrap();
+    (id, Value::Blob { size, root }, path)
+}
+
+fn board_picture(history: &mut crate::board::tests::History, board: Id, rect: [i64; 4], blob: Value) -> Id {
+    let mut picture = crate::board::tests::item(kind::IMAGE, board, rect, None);
+    let makepad_town_core::event::Content::Entity { fields, .. } = &mut picture else { unreachable!() };
+    fields.extend([(field::BLOB, blob), (field::MEDIA, Value::Text("image/png".into()))]);
+    history.push(picture).0
+}
+
+fn media_canvas(cx: &mut Cx, state: &State, board: Id, size: DVec2, town: TownId, dir: &Path) -> BoardCanvas {
+    let mut canvas = cx.with_vm(|vm| BoardCanvas::script_new_with_default(vm));
+    canvas.select_board(cx, state, Some(board), true);
+    canvas.edit_context(cx, true, true);
+    canvas.camera = Camera::new(Rect { pos: DVec2::default(), size }, CameraState { zoom: 1., pan_x: 0., pan_y: 0. });
+    canvas.fit_pending = false;
+    canvas.sync_media(cx, town, dir, |_| (true, false, None));
+    canvas
+}
+
+fn wait_for_board_pngs(cx: &mut Cx, canvas: &mut BoardCanvas, town: TownId, blobs: &[Id]) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ready = MediaSlotState::Ready { w: 4, h: 4 };
+    while !blobs.iter().all(|&id| canvas.media.state(town, id) == ready) {
+        canvas.media.poll(cx);
+        assert!(Instant::now() < deadline, "board picture workers did not finish");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn board_canvas_media_evict_and_clear_release_bound_textures() {
+    let dir = std::env::temp_dir().join(format!("town-board-media-release-{}", std::process::id()));
+    let town = [7; 32];
+    let (blob_a, value_a, _) = write_board_png(&dir, town, 1);
+    let (blob_b, value_b, _) = write_board_png(&dir, town, 2);
+    let mut history = crate::board::tests::History::new();
+    let board = history.board();
+    let item_a = board_picture(&mut history, board, [20, 40, 120, 80], value_a);
+    board_picture(&mut history, board, [200, 40, 120, 80], value_b);
+    let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+    let size = dvec2(420., 240.);
+    let mut canvas = media_canvas(&mut cx, &history.state, board, size, town, &dir);
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    wait_for_board_pngs(&mut cx, &mut canvas, town, &[blob_a, blob_b]);
+    canvas.request(&mut cx);
+    draw(&mut cx, &mut canvas);
+
+    let center = rect(canvas.scene.as_ref().unwrap().view.get(&item_a).unwrap().rect).center();
+    let start = canvas.camera.local_to_screen(canvas.camera.world_to_local(center));
+    let end = start + dvec2(20., 0.);
+    let win = WindowId(1, 1);
+    cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, win));
+    canvas.input(&mut cx, &Event::MouseDown(MouseDownEvent { abs: start, button: MouseButton::PRIMARY,
+        window_id: win, modifiers: Default::default(), handled: Default::default(), time: 1. }));
+    canvas.input(&mut cx, &Event::MouseMove(MouseMoveEvent { abs: end, lock_delta: Default::default(),
+        window_id: win, modifiers: Default::default(), handled: Default::default(), time: 1.1 }));
+    draw(&mut cx, &mut canvas);
+    cx.fingers.first_mouse_button = None;
+    canvas.input(&mut cx, &Event::MouseUp(MouseUpEvent { abs: end, button: MouseButton::PRIMARY,
+        window_id: win, modifiers: Default::default(), time: 1.2 }));
+    draw(&mut cx, &mut canvas);
+
+    let a = canvas.media.request(&mut cx, town, blob_a, None).unwrap();
+    let (id_a, readers_a) = (a.texture_id(), a.readers());
+    let b = canvas.media.request(&mut cx, town, blob_b, None).unwrap();
+    let (id_b, readers_b) = (b.texture_id(), b.readers());
+    assert!(readers_a >= 3, "both the board and the stale drag preview retain the first texture");
+    assert!(readers_b >= 2, "the board retains the second texture");
+    let live_before = cx.texture_pool_live_count();
+    let cpu_before = cx.gpu_inventory().texture_cpu_bytes();
+    let free_cpu_before = cx.gpu_inventory().free_slot_cpu_bytes();
+
+    canvas.media.evict(&mut cx, &HashSet::from([(town, blob_b)]), 0);
+    assert_eq!(canvas.media.state(town, blob_a), MediaSlotState::Missing);
+    assert_eq!(canvas.media.state(town, blob_b), MediaSlotState::Ready { w: 4, h: 4 });
+    assert_eq!(cx.draw_lists.release_bindings(&[id_a], &[]), 0, "eviction cleared both layers without a redraw");
+    assert_eq!(cx.texture_pool_live_count(), live_before - 1);
+    let cpu_mid = cx.gpu_inventory().texture_cpu_bytes();
+    assert!(cpu_mid < cpu_before, "eviction freed the first picture's pixels");
+    assert_eq!(cx.gpu_inventory().free_slot_cpu_bytes(), free_cpu_before);
+
+    canvas.clear_media(&mut cx);
+    assert_eq!(canvas.media.state(town, blob_b), MediaSlotState::Missing);
+    assert_eq!(cx.draw_lists.release_bindings(&[id_b], &[]), 0, "clear released the board's last binding");
+    assert_eq!(cx.texture_pool_live_count(), live_before - 2);
+    assert!(cx.gpu_inventory().texture_cpu_bytes() < cpu_mid, "clear freed the remaining pixels");
+    assert_eq!(cx.gpu_inventory().free_slot_cpu_bytes(), free_cpu_before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn file_drop_ghost_snaps_in_the_overlay_and_free_spots_clear_offscreen_neighbours() {
+    use crate::board::tests::{item, History};
+    let mut history = History::new();
+    let board = history.board();
+    assert_eq!(BoardView::build(&history.state, board).next_free_spot(None, (120., 80.)), (0, 0));
+    for bounds in [[60, 40, 20, 20], [190, 100, 100, 60], [430, 100, 70, 50]] {
+        history.push(item(kind::SHAPE, board, bounds, None));
+    }
+    let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+    let mut canvas = cx.with_vm(|vm| BoardCanvas::script_new_with_default(vm));
+    canvas.select_board(&mut cx, &history.state, Some(board), true);
+    let size = dvec2(420., 240.);
+    canvas.camera = Camera::new(Rect { pos: DVec2::default(), size }, CameraState { zoom: 1., pan_x: 0., pan_y: 0. });
+    canvas.fit_pending = false;
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+
+    let view = &canvas.scene.as_ref().unwrap().view;
+    assert_eq!(view.next_free_spot(None, (120., 80.)), (532 * 64, 100 * 64));
+    assert_eq!(view.next_free_spot(Some(Bounds::new(0., 0., 40., 40.)), (12., 8.)), (20 * 64, 20 * 64));
+    assert_eq!(canvas.next_free_spot(board, (120., 80.)), Some((532 * 64, 100 * 64)),
+        "after the visible obstruction, skip the card just outside the viewport too");
+    assert_eq!(canvas.next_free_spot([0; 32], (120., 80.)), None);
+
+    let base = canvas.recording.as_ref().unwrap().id();
+    let base_gen = cx.draw_lists[base].recording_gen;
+    let point = canvas.camera.local_to_screen(canvas.camera.world_to_local(dvec2(62., 42.)));
+    canvas.file_hover(&mut cx, point, false, 1, Some("layers.png"));
+    draw(&mut cx, &mut canvas);
+    let ghost = canvas.drop_ghost.as_ref().unwrap();
+    assert_eq!(ghost.rect, Bounds::new(60., 40., 380., 280.));
+    assert!(ghost.guides.iter().all(Option::is_some));
+    assert_eq!(ghost.badge.text, "Drop on board: layers.png");
+    let layout = ghost.badge.layout.as_ref().unwrap().1.clone();
+    canvas.file_hover(&mut cx, point, true, 1, Some("layers.png"));
+    draw(&mut cx, &mut canvas);
+    let ghost = canvas.drop_ghost.as_ref().unwrap();
+    assert_eq!(ghost.rect, Bounds::new(62., 42., 382., 282.));
+    assert!(ghost.guides.iter().all(Option::is_none), "Alt frees the ghost from its guides");
+    assert!(Rc::ptr_eq(&layout, &ghost.badge.layout.as_ref().unwrap().1), "moving reuses the laid-out label");
+    canvas.file_hover(&mut cx, point, false, 6, None);
+    draw(&mut cx, &mut canvas);
+    let ghost = canvas.drop_ghost.as_ref().unwrap();
+    assert_eq!(ghost.count, 6);
+    assert_eq!(ghost.badge.text, "Drop 6 files on board");
+    assert_eq!(canvas.take_file_drop(&mut cx), Some((60 * 64, 40 * 64)));
+    draw(&mut cx, &mut canvas);
+    assert!(canvas.drop_ghost.is_none());
+    assert_eq!(cx.draw_lists[base].recording_gen, base_gen, "file hover and drop reuse the base recording");
+    canvas.file_hover(&mut cx, point, true, 1, None);
+    assert_eq!(canvas.drop_ghost.as_ref().unwrap().label, "Drop on board");
+    canvas.select_board(&mut cx, &history.state, None, false);
+    assert!(canvas.drop_ghost.is_none(), "leaving the board clears the hover");
+    assert!(canvas.show_invitation(), "an empty board invites");
+    canvas.file_hover(&mut cx, point, false, 1, Some("layers.png"));
+    assert!(!canvas.show_invitation(), "the invitation steps aside while a file's ghost shows the drop");
+    assert!(canvas.clear_file_hover(&mut cx));
+    assert!(canvas.show_invitation(), "the invitation returns when the file leaves");
+}
+
+#[test]
+fn board_canvas_zero_size_ready_image_skips_draw_without_error_placeholder() {
+    let dir = std::env::temp_dir().join(format!("town-board-zero-size-{}", std::process::id()));
+    let town = [7; 32];
+    let (blob, value, path) = write_board_png(&dir, town, 3);
+    let mut history = crate::board::tests::History::new();
+    let board = history.board();
+    let flat = board_picture(&mut history, board, [20, 40, 200, 0], value.clone());
+    let thin = board_picture(&mut history, board, [20, 80, 0, 100], value);
+    let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+    let size = dvec2(320., 240.);
+    let mut canvas = media_canvas(&mut cx, &history.state, board, size, town, &dir);
+    canvas.media.request(&mut cx, town, blob, Some(path));
+    wait_for_board_pngs(&mut cx, &mut canvas, town, &[blob]);
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    assert_eq!(canvas.media.request(&mut cx, town, blob, None).unwrap().readers(), 1,
+        "a zero-size card never binds the ready texture");
+    for id in [flat, thin] {
+        let face = canvas.scene.as_ref().unwrap().faces[&id].media.as_ref().unwrap();
+        assert!(face.placeholder.text.is_empty(), "a ready image has no error placeholder");
+        assert!(face.get_rect.is_none(), "a ready image has no fetch target");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

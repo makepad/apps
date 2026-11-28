@@ -24,7 +24,7 @@ impl Model {
     }
 
     pub(crate) fn file_issue(&mut self, project: IssueProject, pictures: [StoredFile; 2], [w, h]: [u32; 2],
-        label: &str, note: &str, session: Option<SessionId>, video: Option<(StoredFile, i64)>) -> Result<Id, String> {
+        label: &str, note: &str, session: Option<SessionId>, video: Option<(StoredFile, i64)>, source_peer: Option<PublicKey>) -> Result<Id, String> {
         if !self.complete_blobs(&project.town).is_some_and(|held| pictures.iter().chain(video.as_ref().map(|(f, _)| f)).all(|f| held.contains(&f.id))) {
             return Err("Issue media is missing from storage.".into());
         }
@@ -42,7 +42,13 @@ impl Model {
                     (field::DURATION, FieldValue::Int(duration)), (field::MEDIA, FieldValue::Text("video/mp4".into()))]);
             }
             if let Some(session) = session { fields.push((field::SESSION, FieldValue::Key(session.to_vec()))); }
-            r.append(key, Content::Entity { kind: Key::Number(kind::ISSUE), project: Some(project.project),
+            let open = session.and_then(|s| r.state.session(&s)?.open.as_ref());
+            let peer = source_peer.or_else(|| open.map(|o| o.opener).filter(|p| *p != key.public()));
+            let mut sources = Vec::new();
+            if let Some(peer) = peer { sources.push(CopySource::SharePeer { peer }); }
+            if let Some(open) = open { sources.push(CopySource::Record(open.anchor)); }
+            let copied_from = entity_copy_refs(&fields, &[field::LABEL, field::BLOB, field::POSTER, field::VIDEO], &sources);
+            r.append(key, Content::Entity { copied_from, kind: Key::Number(kind::ISSUE), project: Some(project.project),
                 derive: None, fields }, Origin::Ui)
         })
     }
@@ -61,7 +67,7 @@ impl Model {
                 return Err("Only the reporter can change this issue's note or delete it.".into());
             }
             if e.value(field.clone()) != Some(&value) {
-                r.append(key, Content::Set { changes: vec![Change { entity: issue, field, value }], label: None }, Origin::Ui)?;
+                r.append(key, Content::Set { copied_from: vec![], changes: vec![Change { entity: issue, field, value }], label: None }, Origin::Ui)?;
             }
             Ok(())
         })
@@ -120,7 +126,7 @@ mod tests {
         assert_eq!(pictures.map(|f| f.id), expected, "the store receipt identifies the original PNG and its poster");
         let before = ana.open_event_count();
         assert!(ana.project_issues(project.project).is_empty(), "storing pictures alone publishes no issue");
-        let issue = ana.file_issue(project, pictures, size, label, "Clipped title", None, None).unwrap();
+        let issue = ana.file_issue(project, pictures, size, label, "Clipped title", None, None, None).unwrap();
         assert_eq!(ana.open_event_count(), before + 1, "filing publishes both pictures and the note in one record");
         exchange(&mut ana, &mut ben);
         let seen = ben.project_issues(project.project);
@@ -142,7 +148,7 @@ mod tests {
         exchange(&mut ana, &mut ben);
         assert_eq!(ben.state.entities[&issue].text(field::TEXT), "Clipped on resize", "Ana's note edit reaches Ben");
         // Deliver a signed SET directly so this exercises the fold on both computers.
-        ben.append(Content::Set { label: None, changes: vec![
+        ben.append(Content::Set { copied_from: vec![], label: None, changes: vec![
             Change { entity: issue, field: field::TEXT, value: FieldValue::Text("Other".into()) },
             Change { entity: issue, field: field::DELETED, value: FieldValue::Bool(true) },
         ] }, Origin::Ui).unwrap();

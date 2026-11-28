@@ -11,7 +11,7 @@ use crate::{ProposalChecks, ProposalDoc, ProposalView};
 use fab_elec_core::Diag;
 use fab_elec_lang::SpanEdit;
 use fab_elec_req::{Family, Measure, Status};
-use fab_elec_view::snapshot::{ProposalBoard, ReqSummary};
+use fab_elec_view::snapshot::{ProposalBoard, ProposalFinding, ReqSummary};
 
 type Plan = (Sources, SpanEdit);
 
@@ -190,7 +190,7 @@ impl Held {
         view.state = ProposalState::Checking;
     }
 
-    /// Checks and requirements are one decision revision, including a change only to a reason.
+    /// The decision revision binds every finding, pending label and requirement, even at equal counts.
     fn show_summaries(&mut self, checks: Arc<ProposalChecks>, requirements: Option<Arc<ReqSummary>>) -> bool {
         let requirements_changed = self.view.requirements != requirements;
         if !requirements_changed && self.view.checks.as_ref() == Some(&checks) { return false; }
@@ -203,6 +203,8 @@ impl Held {
                 if before != after { differences.push(format!("{:?} {:?} {before} to {after}", key.0, key.1)); }
             }
             if old.pending != checks.pending { differences.push(format!("pending {} to {}", old.pending, checks.pending)); }
+            if old.pending_labels != checks.pending_labels { differences.push("pending checks changed".into()); }
+            if differences.is_empty() && old.findings != checks.findings { differences.push("finding details changed".into()); }
             if requirements_changed { differences.push("requirement results changed".into()); }
             differences.join(", ")
         } else {
@@ -339,12 +341,30 @@ impl Engine {
     fn candidate_summaries(&self, candidate: &Candidate) -> (Arc<ProposalChecks>, Option<Arc<ReqSummary>>) {
         let (findings, awaiting) = self.shown_findings(&candidate.design, Some(&candidate.carry.sources), &candidate.results, &[], candidate.profiles.as_ref(), true);
         let requirements = candidate.requirements(&findings, &awaiting);
-        let pending = candidate.results.boards.iter().any(|b| b.pending.whole || !b.pending.zones.is_empty());
-        let mut counts = BTreeMap::new();
-        for v in findings.into_iter().filter(|v| awaiting.binary_search(&v.id).is_err()) {
-            *counts.entry((v.kind, v.severity)).or_default() += 1;
+        let mut checks = ProposalChecks::default();
+        for unit in &candidate.design.units {
+            if unit.board.is_none() { checks.pending_labels.push(format!("DRC ({}) — no board yet", unit.name)); }
         }
-        (Arc::new(ProposalChecks { counts, pending }), requirements)
+        for b in &candidate.results.boards {
+            if b.pending.whole || !b.pending.zones.is_empty() {
+                let name = &candidate.design.unit(b.unit).expect("board results belong to the candidate").name;
+                checks.pending_labels.push(format!("DRC ({name})"));
+            }
+        }
+        checks.pending = !checks.pending_labels.is_empty();
+        for v in findings.into_iter().filter(|v| awaiting.binary_search(&v.id).is_err()) {
+            use crate::edit_actions::{check_family, check_name, sel_text};
+            *checks.counts.entry((v.kind.clone(), v.severity)).or_default() += 1;
+            let unit = v.unit.or_else(|| v.items.iter().find_map(Sel::unit)).and_then(|id| candidate.design.unit(id));
+            checks.findings.push(ProposalFinding {
+                unit: unit.map_or("", |u| &u.name).to_owned(), family: check_family(&v.kind), title: check_name(&v.kind),
+                kind: v.kind, severity: v.severity, items: v.items.iter().map(|s| sel_text(&candidate.design, s)).collect::<Vec<_>>().join(", "),
+                message: v.message, fix: (!v.fix_hint.is_empty()).then_some(v.fix_hint),
+            });
+        }
+        checks.findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(||
+            (&a.unit, &a.kind, &a.items, &a.message).cmp(&(&b.unit, &b.kind, &b.items, &b.message))));
+        (Arc::new(checks), requirements)
     }
 
     /// A fill or whole-board check that merged on a shared board also settles that board

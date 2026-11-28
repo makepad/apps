@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {"mpn": "REF-USB-C", "currency": "USD", "breaks": [{"min": 1, "micros": 430000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-3V3-600", "currency": "USD", "breaks": [{"min": 1, "micros": 239000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-MCU-20", "currency": "USD", "breaks": [{"min": 1, "micros": 980000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-TACT", "currency": "USD", "breaks": [{"min": 1, "micros": 130000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-SWD-5", "currency": "USD", "breaks": [{"min": 1, "micros": 177000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-5K1", "currency": "USD", "breaks": [{"min": 1, "micros": 5000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-10K", "currency": "USD", "breaks": [{"min": 1, "micros": 5000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-220R", "currency": "USD", "breaks": [{"min": 1, "micros": 5000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-100nF", "currency": "USD", "breaks": [{"min": 1, "micros": 10000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-1uF", "currency": "USD", "breaks": [{"min": 1, "micros": 10000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-4u7", "currency": "USD", "breaks": [{"min": 1, "micros": 10000}], "source": "Fixture price book", "date": "2026-11-20"},
+    {"mpn": "REF-LED-0603-G", "currency": "USD", "breaks": [{"min": 1, "micros": 54000}], "source": "Fixture price book", "date": "2026-11-20"}
+  ]
+}

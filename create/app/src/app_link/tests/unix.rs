@@ -97,7 +97,7 @@ fn unit_bytes(window: usize, w: u32, h: u32, key: bool, pts: i64) -> Vec<u8> {
 }
 
 impl Feed {
-    fn send(&mut self, time: u64, key: bool, advertise: bool) {
+    fn send(&mut self, time: u64, key: bool, advertise: bool) -> bool {
         let msg = if self.video {
             let (w, h) = dimensions(self.window);
             let even = |n| ((f64::from(n) * self.scale).round() as u32).max(2) & !1;
@@ -111,8 +111,14 @@ impl Feed {
         } else {
             record(self.window, self.scale, time)
         };
-        self.channel.try_send(msg).unwrap();
-        self.last = Some(time);
+        match self.channel.try_send(msg) {
+            Ok(()) => {
+                self.last = Some(time);
+                true
+            }
+            Err(makepad_remote::conn::SendError::Closed) => false,
+            Err(makepad_remote::conn::SendError::Full(_)) => panic!("fake app frame channel full"),
+        }
     }
 }
 impl Fake {
@@ -124,16 +130,22 @@ impl Fake {
         d.clock += advance_ns;
         let now = d.clock;
         let mut sent = 0;
-        for feed in &mut d.frames {
+        let mut closed = false;
+        d.frames.retain_mut(|feed| {
             if feed.window == window
                 && feed
                     .last
                     .is_none_or(|last| now - last >= 1_000_000_000 / u64::from(feed.fps))
             {
-                feed.send(now, false, false);
+                if !feed.send(now, false, false) {
+                    closed = true;
+                    return false;
+                }
                 sent += 1;
             }
-        }
+            true
+        });
+        if closed { self.release.notify_all(); }
         sent
     }
     fn answer(&self, line: &str, answers: &mut Vec<String>) {
@@ -274,7 +286,7 @@ impl Rig {
                         if std::mem::take(&mut d.refuse_video) {
                             return Err((makepad_remote::conn::CLOSE_REFUSED, "unknown codec".into()));
                         }
-                        feed.send(d.clock, true, !std::mem::take(&mut d.omit_codecs));
+                        if !feed.send(d.clock, true, !std::mem::take(&mut d.omit_codecs)) { return Ok(()); }
                     }
                     let id = open.channel.id();
                     d.frames.push(feed);
@@ -284,8 +296,8 @@ impl Rig {
                             let text = String::from_utf8(msg).unwrap();
                             let mut d = fake.data.lock().unwrap();
                             let now = d.clock;
-                            let feed = d.frames.iter_mut().find(|f| f.channel.id() == id && f.window == w).unwrap();
-                            if text == "key" { feed.send(now, true, false); }
+                            let Some(feed) = d.frames.iter_mut().find(|f| f.channel.id() == id && f.window == w) else { break };
+                            if text == "key" { if !feed.send(now, true, false) { break; } }
                             else if let Some(rate) = text.strip_prefix("fps=") { feed.fps = rate.parse().unwrap(); }
                             else { assert!(text.starts_with("kbps=")); }
                             d.controls.push((w, text));
@@ -449,7 +461,7 @@ impl Rig {
         self.wait(|r| {
             r.events[mark..]
                 .iter()
-                .any(|e| matches!(e, AppLinkEvent::Apps))
+                .any(|e| matches!(e, AppLinkEvent::Apps)) && !r.app.scanning()
         });
     }
     pub(crate) fn wait(&mut self, mut until: impl FnMut(&mut Self) -> bool) {
@@ -583,7 +595,7 @@ fn picker_lists_visible_windows_and_explains_a_refused_or_vanished_choice() {
         // Opening the picker requests a scan. Apply its reply just as the UI does.
         let mark = rig.events.len();
         picker.poll(&mut rig.app, &[], rows);
-        rig.wait(|r| r.events[mark..].iter().any(|e| matches!(e, AppLinkEvent::Apps)));
+        rig.wait(|r| r.events[mark..].iter().any(|e| matches!(e, AppLinkEvent::Apps)) && !r.app.scanning());
         picker.poll(&mut rig.app, &rig.events[mark..], rows);
     };
     let mut picker = WindowPicker::default();
@@ -705,6 +717,31 @@ fn quit_waits_for_the_button_release_reply_and_a_second_close_can_force_exit() {
             assert_eq!(rig.app.state(id).unwrap().phase, LinkPhase::Live, "the recorder can still use the link");
         }
     }
+}
+
+#[test]
+fn fake_present_retires_a_closed_feed_without_panicking() {
+    let mut rig = Rig::new();
+    rig.rescan();
+    let link = rig.app.link(&rig.app.apps()[0].key.clone());
+    rig.live(link);
+    let want = PictureWant { window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100 };
+    let first = rig.app.open_picture(link, want).unwrap();
+    assert!(rig.packet(&first).key, "the first stream starts with a keyframe");
+    let stale_tx = rig.fake.data.lock().unwrap().frames[0].channel.clone();
+    drop(first);
+    let data = rig.fake.data.lock().unwrap();
+    drop(rig.fake.release.wait_while(data, |d| !d.frames.is_empty()).unwrap());
+
+    let live = rig.app.open_picture(link, want).unwrap();
+    assert!(rig.packet(&live).key, "the replacement stream starts with its own keyframe");
+    rig.fake.data.lock().unwrap().frames.insert(0, Feed { window: 3, scale: 1., fps: 30,
+        last: None, channel: stale_tx, video: true, last_pts: None });
+    assert_eq!(rig.fake.present_after(3, 1_000_000_000), 1, "only the live feed counts as a send");
+    assert_eq!(rig.fake.data.lock().unwrap().frames.len(), 1, "presentation retires the closed feed");
+    let delta = rig.packet(&live);
+    assert!(!delta.key && delta.data == unit_bytes(3, 24, 16, false, delta.pts_100ns),
+        "the live feed delivers the window's delta frame");
 }
 
 #[test]

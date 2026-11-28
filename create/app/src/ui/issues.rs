@@ -9,7 +9,7 @@ use crate::{
     store_worker::{IssueMedia, IssueReceipt, StoredFile},
     view::LocalClock,
 };
-use makepad_town_core::{blob, entity::{field, kind, Entity}, event::{Id, Key, SessionId, Value}};
+use makepad_town_core::{blob, entity::{field, kind, Entity}, event::{Id, Key, SessionId, Value}, key::PublicKey};
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::thread::{Class, TaskHandle, TaskPool};
 use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::{Arc, mpsc::{Receiver, TryRecvError}}};
@@ -63,6 +63,7 @@ pub(super) fn page_template(vm: &mut ScriptVm) -> ScriptValue {
                 }
                 problem := BodyNote{visible: false width: Fill}
                 controls := View{width: Fill height: Fit flow: Right{wrap: true} spacing: 6
+                    issue_pin := PanelButton{text: "Pin to board"}
                     issue_status := PanelButton{text: "Resolve"}
                     issue_delete := PanelButton{text: "Delete"}
                 }
@@ -101,6 +102,7 @@ enum RecordingState {
 struct Draft {
     project: IssueProject,
     session: Option<SessionId>,
+    source_peer: Option<PublicKey>,
     note: String,
     label: String,
     size: [u32; 2],
@@ -176,6 +178,7 @@ pub struct Issues {
     focus: bool,
     picture: Option<PathBuf>,
     error: Option<String>,
+    pending_pin: Option<(Id, Id)>,
     play_requested: Option<Id>,
     playing: Option<MovieSource>,
     preparing: Option<TaskHandle<Result<MovieSource, String>>>,
@@ -242,11 +245,12 @@ fn image_path(cx: &mut Cx, image: ImageRef, shown: &mut Option<PathBuf>, path: O
 }
 
 impl Issues {
-    fn start_draft(&mut self, project: IssueProject, label: String, session: Option<SessionId>, capture: Capture, done: Option<Receiver<Option<Recording>>>) {
+    fn start_draft(&mut self, project: IssueProject, label: String, session: Option<SessionId>, source_peer: Option<PublicKey>,
+        capture: Capture, done: Option<Receiver<Option<Recording>>>) {
         self.next += 1;
         self.project = Some(project);
         self.source_share = session;
-        self.drafts.insert(self.next, Draft { project, session, label, note: String::new(), size: [0, 0], capture, pictures: None,
+        self.drafts.insert(self.next, Draft { project, session, source_peer, label, note: String::new(), size: [0, 0], capture, pictures: None,
             recording: done.map(RecordingState::Waiting).unwrap_or(RecordingState::Ready(None)) });
         self.list_revision = None;
         self.choices = None;
@@ -394,6 +398,7 @@ impl Issues {
             page.label(cx, ids!(window_label)).set_text(cx, draft.map(|d| d.label.as_str())
                 .or_else(|| entity.map(|e| e.text(field::LABEL))).unwrap_or(""));
             page.widget(cx, ids!(controls)).set_visible(cx, entity.is_some() && writable);
+            page.button(cx, ids!(issue_pin)).set_visible(cx, entity.and_then(|e| blob_id(e, field::BLOB)).is_some());
             let resolved = entity.is_some_and(|e| e.text(field::STATUS) == "resolved");
             page.button(cx, ids!(issue_status)).set_text(cx, if resolved { "Reopen" } else { "Resolve" });
             page.widget(cx, ids!(issue_delete)).set_visible(cx, own);
@@ -417,7 +422,7 @@ impl Issues {
             if !self.picker.choose(*key) { continue }
             self.picker_changed = true;
             let picker = std::mem::take(&mut self.picker);
-            self.start_draft(project, String::new(), None, Capture::Linking(picker), None);
+            self.start_draft(project, String::new(), None, None, Capture::Linking(picker), None);
             return true
         }
         false
@@ -460,7 +465,7 @@ impl Issues {
         if matches!(d.capture, Capture::Failed(_)) { return }
         let (Some(files), RecordingState::Ready(video)) = (d.pictures, &d.recording) else { return };
         self.list_revision = None;
-        match model.file_issue(d.project, files, d.size, &d.label, &d.note, d.session, *video) {
+        match model.file_issue(d.project, files, d.size, &d.label, &d.note, d.session, *video, d.source_peer) {
             Ok(id) => {
                 self.drafts.remove(&draft);
                 if self.open == Some(Open::Draft(draft)) { self.open = Some(Open::Filed(id)); }
@@ -468,6 +473,10 @@ impl Issues {
             Err(why) => d.capture = Capture::Failed(why.replace(['\r', '\n'], " ")),
         }
     }
+
+    pub fn take_pin(&mut self) -> Option<(Id, Id)> { self.pending_pin.take() }
+
+    pub fn set_error(&mut self, why: String) { self.error = Some(why); }
 
     pub fn actions(&mut self, cx: &mut Cx, page: &WidgetRef, actions: &Actions, model: &mut Model) -> bool {
         let Some(project) = self.project else { return false };
@@ -487,6 +496,13 @@ impl Issues {
         if input.key_focus_lost(actions) { self.flush(cx, model); changed = true; }
         if page.button(cx, ids!(issue_back)).clicked(actions) { self.select(cx, model, None); return true }
         if let Some(Open::Filed(id)) = self.open {
+            if page.button(cx, ids!(issue_pin)).clicked(actions) && project.town == model.open_id()
+                && model.state.active_member(&model.me()) && model.state.entities.get(&id).is_some_and(|e|
+                    e.project == Some(project.project) && !e.flag(field::DELETED) && blob_id(e, field::BLOB).is_some()) {
+                self.error = None;
+                self.pending_pin = Some((project.project, id));
+                changed = true;
+            }
             if page.button(cx, ids!(issue_play)).clicked(actions) {
                 if self.play_requested.take().is_none() {
                     if let Some(blob) = model.state.entities.get(&id).and_then(|e| blob_id(e, field::VIDEO)) {
@@ -546,8 +562,8 @@ impl ViewData {
     }
 
     fn open_issue_draft(&mut self, model: &mut Model, project: IssueProject, label: String, session: Option<SessionId>,
-        capture: Capture, done: Option<Receiver<Option<Recording>>>) {
-        self.issues.start_draft(project, label, session, capture, done);
+        source_peer: Option<PublicKey>, capture: Capture, done: Option<Receiver<Option<Recording>>>) {
+        self.issues.start_draft(project, label, session, source_peer, capture, done);
         if project.town == model.open_id() {
             self.select_project(model, project.project);
             self.page = Page::Issues;
@@ -560,7 +576,7 @@ impl ViewData {
         self.issues.flush(cx, model);
         let capture = cx.task_pool().submit_named(Class::Background, "Town reported picture", move || IssueStill::from_report(still, size))
             .map(Capture::Converting).unwrap_or_else(|e| Capture::Failed(e.to_string()));
-        self.open_issue_draft(model, project, label, None, capture, Some(done));
+        self.open_issue_draft(model, project, label, None, None, capture, Some(done));
     }
 
     /// Called on the original input with the share page's actions.
@@ -571,17 +587,19 @@ impl ViewData {
         let share = &self.call.share;
         let Some(offer) = share.offer(session) else { return false };
         let mut label = offer.title.replace(['\r', '\n'], " ");
-        let capture = match offer.role {
-            ShareRole::Sharer { link, window } => grab_window(links, link, window, &mut label),
-            ShareRole::Viewer => {
+        let (source_peer, capture) = match offer.role {
+            ShareRole::Sharer { link, window } => (None, grab_window(links, link, window, &mut label)),
+            ShareRole::Viewer { sharer } => {
                 let Some(picture) = share.picture_for(session).cloned() else { return false };
                 let (w, h) = offer.window_size;
                 label = format!("{label} · {w} × {h} pt · as received");
-                cx.task_pool().submit_named(Class::Background, "Town visual issue", move || IssueStill::from_picture(&picture))
-                    .map(Capture::Converting).map_err(|e| e.to_string())
+                let peer = model.state.session(&session).and_then(|s| s.open.as_ref()).map(|o| o.opener).or(Some(sharer));
+                let capture = cx.task_pool().submit_named(Class::Background, "Town visual issue", move || IssueStill::from_picture(&picture))
+                    .map(Capture::Converting).map_err(|e| e.to_string());
+                (peer, capture)
             }
         };
-        self.open_issue_draft(model, project, label, Some(session), capture.unwrap_or_else(Capture::Failed), None);
+        self.open_issue_draft(model, project, label, Some(session), source_peer, capture.unwrap_or_else(Capture::Failed), None);
         true
     }
 }

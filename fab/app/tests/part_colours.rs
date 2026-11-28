@@ -8,6 +8,8 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/part_editor.rs"]
+mod part_editor;
 use idle_wait::wait_poll;
 use makepad_strict_json::Value;
 use makepad_test::{makepad_test, Role, Selector, TestApp};
@@ -104,6 +106,7 @@ place("toy", name: "Toy", color: "Base")"#;
     call(&app, "place", &format!(r#"{{"request_id":"colours-place","expected":{h:?},"edits":{}}}"#, Value::Str(edits.to_string()).to_json())).expect("place");
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name("Toy")).wait_visible().click();
+    part_editor::open(&app);
 
     // One colour: the base, marked so.
     wait_until(&app, "the base row", || names(&app) == ["Base"]);

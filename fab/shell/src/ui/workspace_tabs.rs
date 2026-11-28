@@ -38,7 +38,7 @@ script_mod! {
             }
         }
         draw_text +: {text_style: theme.font_regular{font_size: fab.font_size_ui}}
-        draw_key +: {color: fab.color_text_muted text_style: theme.font_regular{font_size: 6.75}}
+        draw_key +: {color: fab.color_text_dim text_style: theme.font_regular{font_size: 6.75}}
         draw_cue +: {
             text_style: theme.font_regular{font_size: fab.font_size_ui}
             max_lines: 1

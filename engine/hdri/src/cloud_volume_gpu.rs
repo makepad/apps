@@ -371,18 +371,31 @@ impl GpuRecord {
     /// two targets (`width` x `rows` texels of four little-endian halves) one after the other in `reads`. False where a
     /// read's size is not the tile's.
     pub fn put_tile(&mut self, y0: usize, rows: usize, seg0: usize, reads: &[&[u8]]) -> bool {
-        let texels = self.width * rows;
-        if y0 + rows > self.rows || seg0 + reads.len() / 2 > self.segments || reads.iter().any(|r| r.len() != texels * 8) {
+        self.put_rect(0, self.width, y0, rows, seg0, reads)
+    }
+
+    /// Copies tightly packed target pairs into a rectangle of the record. Checks every read before writing.
+    pub fn put_rect(&mut self, x0: usize, cols: usize, y0: usize, rows: usize, seg0: usize, reads: &[&[u8]]) -> bool {
+        let bytes = cols.checked_mul(rows).and_then(|n| n.checked_mul(8));
+        if reads.len() % 2 != 0
+            || x0.checked_add(cols).is_none_or(|end| end > self.width)
+            || y0.checked_add(rows).is_none_or(|end| end > self.rows)
+            || seg0.checked_add(reads.len() / 2).is_none_or(|end| end > self.segments)
+            || reads.iter().any(|r| Some(r.len()) != bytes)
+        {
             return false;
         }
         let half = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
         for (k, pair) in reads.chunks_exact(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
-            for t in 0..texels {
-                let entry = &mut self.halves[(y0 * self.width + t) * self.segments + seg0 + k];
-                for c in 0..4 {
-                    entry[c] = half(a, 4 * t + c);
-                    entry[4 + c] = half(b, 4 * t + c);
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    let t = dy * cols + dx;
+                    let entry = &mut self.halves[((y0 + dy) * self.width + x0 + dx) * self.segments + seg0 + k];
+                    for c in 0..4 {
+                        entry[c] = half(a, 4 * t + c);
+                        entry[4 + c] = half(b, 4 * t + c);
+                    }
                 }
             }
         }
@@ -509,6 +522,43 @@ pub fn cpu_entries_at(volume: &crate::cloud_volume_cumulus::CloudVolume, width: 
 mod tests {
     use super::*;
     use crate::{Env, ImageSet};
+
+    #[test]
+    fn put_rect_writes_sub_row_slices_identically_to_put_tile() {
+        const WIDTH: usize = 32;
+        let targets = |x0: usize, cols: usize, y0: usize, rows: usize| {
+            let mut reads = [const { Vec::new() }; 4];
+            for (target, bytes) in reads.iter_mut().enumerate() {
+                for y in y0..y0 + rows {
+                    for x in x0..x0 + cols {
+                        for channel in 0..4 {
+                            let value = ((target * 256 + y * WIDTH + x) * 4 + channel) as u16;
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            reads
+        };
+        let mut full = GpuRecord::new(1, WIDTH, 3);
+        let mut tiled = GpuRecord::new(1, WIDTH, 3);
+        let reads = targets(0, WIDTH, 1, 2);
+        assert!(full.put_tile(1, 2, 1, &reads.each_ref().map(Vec::as_slice)));
+        for (x, y, rows) in [(16, 1, 2), (0, 2, 1), (0, 1, 1)] {
+            let reads = targets(x, 16, y, rows);
+            assert!(tiled.put_rect(x, 16, y, rows, 1, &reads.each_ref().map(Vec::as_slice)));
+        }
+        assert_eq!(tiled.halves, full.halves, "sub-row copies preserve both segments and their neighbours");
+
+        let bytes = [0xff; 8];
+        let pair = [&bytes[..], &bytes[..]];
+        for (x, y, seg) in [(WIDTH, 0, 0), (0, tiled.rows(), 0), (0, 0, 3), (usize::MAX, 0, 0), (0, usize::MAX, 0), (0, 0, usize::MAX)] {
+            assert!(!tiled.put_rect(x, 1, y, 1, seg, &pair));
+        }
+        assert!(!tiled.put_rect(0, 1, 0, 1, 0, &[&bytes, &bytes, &bytes]));
+        assert!(!tiled.put_rect(0, 1, 0, 1, 0, &[&bytes, &bytes, &bytes, &bytes[..7]]));
+        assert_eq!(tiled.halves, full.halves, "an invalid rectangle or target leaves the entire record untouched");
+    }
 
     /// Task-13 study §5 step 2: a record filled from the CPU's own marches and put through the halves the GPU's targets
     /// hold bakes a 1024 map within the halves' rounding of the marched bake: each texel's opacity within 1e-3 and its

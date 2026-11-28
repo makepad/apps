@@ -18,7 +18,7 @@ use makepad_flow::{Graph, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use makepad_flow::PortValue;
 
 #[derive(Clone)]
@@ -319,21 +319,15 @@ pub fn receive_until(
     receiver: &mpsc::Receiver<RunEvent>,
     predicate: impl Fn(&RunEvent) -> bool,
 ) -> Vec<RunEvent> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // No wall-clock cap: devhub's hang watch catches a run that never ends.
     let mut events = Vec::new();
     loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => {
-                let found = predicate(&event);
-                events.push(event);
-                if found {
-                    return events;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(error) => panic!("event channel failed: {error}"),
+        let event = receiver.recv().unwrap_or_else(|error| panic!("event channel failed: {error}"));
+        let found = predicate(&event);
+        events.push(event);
+        if found {
+            return events;
         }
-        assert!(Instant::now() < deadline, "event deadline elapsed");
     }
 }
 

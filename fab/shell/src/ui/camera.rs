@@ -116,7 +116,7 @@ script_mod! {
         }
         draw_bed: mod.draw.DrawQuad{
             depth_write: true
-            backface_culling: false
+            cull_mode: @None
             alpha_blend: false
             vertex: fn() {
                 let mm = self.rect_pos + self.geom.pos * self.rect_size
@@ -168,7 +168,26 @@ script_mod! {
                 cursor: MouseCursor.Move
                 Filler{}
                 mod.widgets.FabTip{ text: "Hide the camera"
-                    close := mod.widgets.FabIconButton{ a11y: {label: "Hide camera"} draw_bg +: { color: #x000000a0 } draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") color: #xffffffd0 } }
+                    close := mod.widgets.FabIconButton{
+                        a11y: {label: "Hide camera"}
+                        draw_bg +: {
+                            color: #x000000a0 color_hover: fab.color_cam_close_hover
+                            color_down: fab.color_cam_close_down color_focus: fab.color_cam_close_focus
+                            color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+                            vertex: fn() { self.vertex_pos = self.clip_and_transform_vertex(self.rect_pos, self.rect_size) }
+                            pixel: fn() {
+                                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.border_radius)
+                                sdf.fill(self.face_fill())
+                                return sdf.result
+                            }
+                        }
+                        draw_icon +: {
+                            svg: crate_resource("self://resources/icons/close.svg")
+                            color: #xffffffd0 color_focus: #xffffffd0
+                            color_hover: fab.color_cam_close_ink_hot color_down: fab.color_cam_close_ink_hot
+                        }
+                    }
                 }
             }
         }

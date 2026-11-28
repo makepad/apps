@@ -114,6 +114,20 @@ impl Traces {
     pub fn rows(&self, line: &Id) -> &[Trace] { self.rows.get(line).map_or(&[], Vec::as_slice) }
     pub fn working(&self, binding: Credential) -> bool { self.working.contains(&binding) }
 
+    /// Refresh the town's receipts, keeping the last known name when an agent has left.
+    pub fn sync_names(&mut self, town: Id, mut name_of: impl FnMut(Id) -> Option<String>) {
+        if self.rows.is_empty() { return }
+        let mut names = HashMap::new();
+        for row in self.rows.values_mut().flatten().filter(|row| row.binding.town == town) {
+            let name = names.entry(row.agent).or_insert_with(|| name_of(row.agent).map(|name| {
+                if name == row.name.as_ref() { row.name.clone() } else { Arc::<str>::from(name) }
+            }));
+            if let Some(name) = name {
+                if row.name != *name { row.name = name.clone(); }
+            }
+        }
+    }
+
     pub(crate) fn offer(&mut self, binding: Credential, agent: Id, name: &str, line: Id, sent: u64, now: u64) {
         let rows = self.rows.entry(line).or_default();
         if rows.iter().any(|r| r.binding == binding) { return }

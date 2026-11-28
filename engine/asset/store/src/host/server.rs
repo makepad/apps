@@ -24,7 +24,7 @@ use crate::{
 use std::fs::File;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -57,6 +57,17 @@ pub struct AssetServer {
 
 impl AssetServer {
     pub fn start(cfg: ServerConfig) -> ServerResult<AssetServer> {
+        Self::start_inner(
+            cfg,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_inner(
+        cfg: ServerConfig,
+        #[cfg(test)] mut control_probe: Option<tests::ShutdownProbe>,
+    ) -> ServerResult<AssetServer> {
         cfg.validate()?;
         std::fs::create_dir_all(&cfg.root)
             .map_err(|e| ServerError::Io { op: "create server root", kind: e.kind() })?;
@@ -132,6 +143,8 @@ impl AssetServer {
             rc.requests = requests[n].clone();
             let stop = stop.clone();
             let counter = accepted[n].clone();
+            #[cfg(test)]
+            let probe = if plane == Plane::Control { control_probe.take() } else { None };
             let name = format!(
                 "asset-server-{}-accept",
                 if plane == Plane::Control { "control" } else { "data" }
@@ -139,7 +152,13 @@ impl AssetServer {
             workers.push(
                 std::thread::Builder::new()
                     .name(name)
-                    .spawn(move || accept_loop(listener, rc, plane, max_conns, &stop, counter))
+                    .spawn(move || {
+                        accept_loop(
+                            listener, rc, plane, max_conns, &stop, counter,
+                            #[cfg(test)]
+                            probe,
+                        )
+                    })
                     .map_err(|e| ServerError::Io { op: "spawn plane acceptor", kind: e.kind() })?,
             );
         }
@@ -331,6 +350,11 @@ fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+struct ConnectionWorker {
+    join: JoinHandle<()>,
+    wake: Weak<TcpStream>,
+}
+
 fn accept_loop(
     listener: TcpListener,
     rc: RouteCtx,
@@ -338,9 +362,10 @@ fn accept_loop(
     max_conns: usize,
     stop: &Arc<AtomicBool>,
     accepted: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)] mut probe: Option<tests::ShutdownProbe>,
 ) {
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut joins: Vec<JoinHandle<()>> = Vec::new();
+    let mut workers: Vec<ConnectionWorker> = Vec::new();
     // The listener is non-blocking so shutdown never has to interrupt a
     // parked accept. That makes the idle wait a LATENCY budget: a flat 10 ms
     // nap meant every new connection could wait 10 ms to be accepted, which
@@ -351,9 +376,12 @@ fn accept_loop(
     while !stop.load(Ordering::Relaxed) {
         // Reap finished connection threads so the handle list stays bounded
         // by the live-connection cap.
-        joins.retain(|j| !j.is_finished());
+        workers.retain(|worker| !worker.join.is_finished());
         match listener.accept() {
             Ok((stream, _peer)) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 idle = 0;
                 if active.load(Ordering::Relaxed) >= max_conns {
                     refuse_over_capacity(stream);
@@ -364,14 +392,30 @@ fn accept_loop(
                 let rc = rc.clone();
                 let stop = stop.clone();
                 let conn_active = active.clone();
+                let wake_stream = match stream.try_clone() {
+                    Ok(socket) => Some(Arc::new(socket)),
+                    Err(error) => {
+                        log(rc.cfg.log, &format!("connection wake socket clone failed: {error}"));
+                        None
+                    }
+                };
+                // Only the worker owns the duplicate, so an unreaped handle cannot delay EOF.
+                let wake = wake_stream.as_ref().map(Arc::downgrade).unwrap_or_default();
+                #[cfg(test)]
+                let connection_probe = probe.as_mut().and_then(tests::ShutdownProbe::next_connection);
                 let spawned = std::thread::Builder::new()
                     .name("asset-server-conn".into())
                     .spawn(move || {
-                        serve_conn(stream, &rc, plane, &stop);
+                        serve_conn(
+                            stream, &rc, plane, &stop,
+                            #[cfg(test)]
+                            connection_probe,
+                        );
+                        drop(wake_stream);
                         conn_active.fetch_sub(1, Ordering::Relaxed);
                     });
                 match spawned {
-                    Ok(j) => joins.push(j),
+                    Ok(join) => workers.push(ConnectionWorker { join, wake }),
                     Err(_) => {
                         active.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -393,9 +437,20 @@ fn accept_loop(
             }
         }
     }
-    // Stopping: connection threads notice the flag between requests and
-    // within an idle-wait slice; join them all before the acceptor exits.
-    for j in joins {
+    for worker in &workers {
+        if let Some(stream) = worker.wake.upgrade() {
+            match makepad_bounded_http::wake_idle_read(&stream) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                Err(error) => log(rc.cfg.log, &format!("connection read wake failed: {error}")),
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        probe.wake_pass_finished();
+    }
+    for ConnectionWorker { join: j, .. } in workers {
         let _ = j.join();
     }
 }
@@ -403,21 +458,31 @@ fn accept_loop(
 /// The over-capacity refusal: explicit and immediate, never a silent queue.
 fn refuse_over_capacity(stream: TcpStream) {
     let _ = stream.set_nonblocking(false);
-    let mut conn = match Conn::new(stream, 1000, 1000) {
+    let mut conn = match makepad_bounded_http::Conn::new(stream, 1000, 1000) {
         Ok(c) => c,
         Err(_) => return,
     };
     let _ = conn.write_resp(false, &Resp::error(503, "connection capacity").closing());
 }
 
-fn serve_conn(stream: TcpStream, rc: &RouteCtx, plane: Plane, stop: &AtomicBool) {
+fn serve_conn(
+    stream: TcpStream,
+    rc: &RouteCtx,
+    plane: Plane,
+    stop: &AtomicBool,
+    #[cfg(test)] probe: Option<tests::ConnectionProbe>,
+) {
     // The accepted socket may inherit the listener's nonblocking mode on some
     // platforms; timeouts require blocking mode.
     if stream.set_nonblocking(false).is_err() {
         return;
     }
     let cfg = &rc.cfg;
-    let mut conn = match Conn::new(stream, cfg.read_timeout_ms, cfg.write_timeout_ms) {
+    #[cfg(not(test))]
+    let connection = Conn::new(stream, cfg.read_timeout_ms, cfg.write_timeout_ms);
+    #[cfg(test)]
+    let connection = tests::ProbeTransport::connection(stream, cfg, probe);
+    let mut conn = match connection {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -574,4 +639,212 @@ fn write_secret_file(path: &std::path::Path, secret: &str) -> ServerResult<()> {
         .map_err(|e| ServerError::Io { op: "write admin-token", kind: e.kind() })?;
     f.sync_all()
         .map_err(|e| ServerError::Io { op: "sync admin-token", kind: e.kind() })
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use makepad_bounded_http::Transport;
+    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::sync::mpsc::Sender;
+
+    const EMPTY_ASSETS: &[u8] = br#"{"assets":[],"cursor":null}"#;
+
+    #[derive(Debug)]
+    enum Event {
+        IdlePending(Sender<()>),
+        IdleResult(Result<usize, io::ErrorKind>),
+        TailPending(Sender<()>),
+        WakePassFinished,
+    }
+
+    enum Watch {
+        Idle { response_written: bool },
+        Tail,
+        TailByte,
+    }
+
+    pub(super) struct ConnectionProbe {
+        watch: Watch,
+        events: Sender<Event>,
+    }
+
+    pub(super) struct ShutdownProbe {
+        connections: std::vec::IntoIter<Option<ConnectionProbe>>,
+        events: Sender<Event>,
+    }
+
+    impl ShutdownProbe {
+        pub(super) fn next_connection(&mut self) -> Option<ConnectionProbe> {
+            self.connections.next().flatten()
+        }
+
+        pub(super) fn wake_pass_finished(self) {
+            self.events.send(Event::WakePassFinished).unwrap();
+        }
+    }
+
+    pub struct ProbeTransport {
+        stream: TcpStream,
+        probe: Option<ConnectionProbe>,
+    }
+
+    impl ProbeTransport {
+        pub(super) fn connection(
+            stream: TcpStream,
+            cfg: &ServerConfig,
+            probe: Option<ConnectionProbe>,
+        ) -> io::Result<Conn> {
+            stream.set_nodelay(true)?;
+            stream.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms.max(1))))?;
+            Ok(Conn::over(Self { stream, probe }, cfg.read_timeout_ms))
+        }
+    }
+
+    impl Read for ProbeTransport {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(ConnectionProbe { watch: Watch::Idle { response_written: true }, events }) = &self.probe {
+                self.stream.set_nonblocking(true)?;
+                assert_eq!(self.stream.read(buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                let (resume, gate) = mpsc::channel();
+                events.send(Event::IdlePending(resume)).unwrap();
+                gate.recv().unwrap();
+                let result = self.stream.read(buf);
+                events.send(Event::IdleResult(result.as_ref().copied().map_err(io::Error::kind))).unwrap();
+                self.stream.set_nonblocking(false)?;
+                return result;
+            }
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for ProbeTransport {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(probe) = &mut self.probe {
+                match &mut probe.watch {
+                    Watch::Idle { response_written } => {
+                        let written = self.stream.write(buf)?;
+                        *response_written = written == buf.len();
+                        return Ok(written);
+                    }
+                    Watch::Tail => {
+                        assert!(
+                            buf.strip_suffix(EMPTY_ASSETS).is_some_and(|head| {
+                                head.starts_with(b"HTTP/1.1 ") && head.ends_with(b"\r\n\r\n")
+                            }),
+                            "tail hold needs head and body in one write"
+                        );
+                        let prefix = &buf[..buf.len() - 1];
+                        self.stream.write_all(prefix)?;
+                        probe.watch = Watch::TailByte;
+                        return Ok(prefix.len());
+                    }
+                    Watch::TailByte => {
+                        let (resume, gate) = mpsc::channel();
+                        probe.events.send(Event::TailPending(resume)).unwrap();
+                        gate.recv().unwrap();
+                    }
+                }
+            }
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    impl Transport for ProbeTransport {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.stream.set_read_timeout(timeout)
+        }
+
+        fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.stream.set_nonblocking(nonblocking)
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.stream.peer_addr()
+        }
+    }
+
+    fn request_assets(control: SocketAddr, token: &str) -> BufReader<TcpStream> {
+        let mut client = TcpStream::connect(control).unwrap();
+        write!(
+            client,
+            "GET /v1/assets HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+        ).unwrap();
+        let mut reader = BufReader::new(client);
+        let headers: Vec<_> = (&mut reader).lines().map(Result::unwrap)
+            .take_while(|line| !line.is_empty()).collect();
+        assert_eq!(headers[0].split_whitespace().nth(1), Some("200"));
+        let length = format!("Content-Length: {}", EMPTY_ASSETS.len());
+        assert!(headers.iter().any(|line| line.eq_ignore_ascii_case(&length)), "{headers:?}");
+        reader
+    }
+
+    #[test]
+    fn shutdown_wakes_idle_read_and_finishes_partial_response() {
+        let root = std::env::temp_dir().join(format!("asset-shutdown-{}", to_hex(&rand32().unwrap())));
+        let mut cfg = ServerConfig::new(root.clone());
+        cfg.control_addr.set_port(0);
+        cfg.data_addr.set_port(0);
+        cfg.bootstrap_admin = true;
+
+        // On a setup assertion, drop the gate channels before the server joins its workers.
+        let mut server;
+        let (idle_tx, idle_events) = mpsc::channel();
+        let (tail_tx, tail_events) = mpsc::channel();
+        let (wake_tx, wake_events) = mpsc::channel();
+        // Windows and other non-Unix platforms check only the partial response.
+        // Windows still relies on the idle slice until the stop-event wake is implemented.
+        let probe = ShutdownProbe {
+            connections: vec![
+                cfg!(unix).then_some(ConnectionProbe {
+                    watch: Watch::Idle { response_written: false },
+                    events: idle_tx,
+                }),
+                Some(ConnectionProbe { watch: Watch::Tail, events: tail_tx }),
+            ].into_iter(),
+            events: wake_tx,
+        };
+        server = AssetServer::start_inner(cfg, Some(probe)).unwrap();
+        let control = server.control_addr();
+        let token = std::fs::read_to_string(root.join("admin-token")).unwrap();
+        let mut idle = request_assets(control, token.trim());
+        let mut idle_body = [0; EMPTY_ASSETS.len()];
+        idle.read_exact(&mut idle_body).unwrap();
+        assert_eq!(&idle_body, EMPTY_ASSETS);
+        let idle_gate = cfg!(unix).then(|| match idle_events.recv().unwrap() {
+            Event::IdlePending(resume) => resume,
+            event => panic!("expected a pending idle read, got {event:?}"),
+        });
+
+        let mut client = request_assets(control, token.trim());
+        let prefix = &EMPTY_ASSETS[..EMPTY_ASSETS.len() - 1];
+        let mut body = vec![0; prefix.len()];
+        client.read_exact(&mut body).unwrap();
+        assert_eq!(body, prefix);
+        let Event::TailPending(tail_gate) = tail_events.recv().unwrap() else {
+            panic!("expected a pending response tail");
+        };
+        let shutdown = std::thread::spawn(move || server.shutdown());
+        assert!(matches!(wake_events.recv().unwrap(), Event::WakePassFinished));
+        if let Some(resume) = idle_gate {
+            resume.send(()).unwrap();
+        }
+        tail_gate.send(()).unwrap();
+        shutdown.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        client.read_to_end(&mut body).unwrap();
+        assert_eq!(body, EMPTY_ASSETS, "shutdown interrupted the response");
+        if cfg!(unix) {
+            let event = idle_events.try_recv().expect("idle read exited without a result");
+            assert!(
+                matches!(event, Event::IdleResult(Ok(0) | Err(io::ErrorKind::NotConnected))),
+                "expected shutdown to end the idle read, got {event:?}"
+            );
+        }
+    }
 }

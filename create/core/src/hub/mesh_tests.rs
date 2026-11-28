@@ -565,7 +565,7 @@ fn words_replace_one_carrier_while_its_older_stream_finishes() {
     });
     m.held_id = Some(id);
     for i in [0, 1] {
-        m.hubs[i].words(invites[i].0, invites[i].1.clone(), invites[1 - i].1.clone(), "peer".into(), now.ms);
+        m.hubs[i].words(invites[i].0, invites[i].1.clone(), invites[1 - i].1.clone(), "peer".into(), now.ms).unwrap();
     }
     m.until("both words promotions", |m| m.linked[0][1] == 2 && m.linked[1][0] == 2);
     let replacement = m.hubs[0].attempt(m.key(1)).unwrap();

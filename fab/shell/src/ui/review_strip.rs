@@ -1,7 +1,7 @@
 //! Review the exact proposal revision shown on each row. Text work belongs on the pool.
 use super::journal_panel::{bind_diff_editor, JournalDiff, TextDiffError};
 use super::widgets::section_rows;
-use fab_elec_view::snapshot::ElecLive;
+use fab_elec_view::snapshot::{ElecLive, ProposalChecks};
 use makepad_code_editor::{CodeDocument, CodeSession};
 use makepad_widgets_core::makepad_platform::thread::{checkpoint, Class, TaskHandle};
 use makepad_widgets_core::{button::ButtonAction, tip::TipWidgetRefExt};
@@ -15,6 +15,17 @@ use makepad_git::diff::{diff_lines_bounded, DiffOp};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reason { Refused, Stale }
 
+use fab_elec_view::flow::{FlowStage, NextStep};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewAction { NextStage(FlowStage), DismissNext }
+
+/// Published by the app from a committed snapshot and the person's last accepted stage.
+#[derive(Default)]
+pub struct ReviewNext(pub Option<Arc<(String, NextStep)>>);
+
+const FIRST_FINDINGS: usize = 25;
+
 struct Row {
     id: ProposalId,
     shown: u64,
@@ -23,7 +34,9 @@ struct Row {
     state: String,
     reason: Option<Reason>,
     seconds: Option<u64>,
-    checks: Option<(usize, usize, bool)>,
+    checks: Option<Arc<ProposalChecks>>,
+    erc_summary: String,
+    other_problems: (usize, usize),
     requirements: Option<Arc<ReqSummary>>,
     no_problems: bool,
     check_enabled: Option<bool>,
@@ -50,10 +63,16 @@ impl Row {
             ProposalAuthor::Local(By::Disk) => "Disk".into(),
             ProposalAuthor::Peer { label } => format!("{label} (peer)"),
         };
-        let checks = view.checks.as_ref().map(|c| {
-            let count = |level| c.counts.iter().filter(|((_, s), _)| *s == level).map(|(_, n)| n).sum();
-            (count(Severity::Error), count(Severity::Warning), c.pending)
-        });
+        let checks = view.checks.clone();
+        let mut erc = (0, 0);
+        let mut other_problems = (0, 0);
+        // Keep every family label (erc, drc, factory, case, system, route, custom) as published.
+        for f in checks.iter().flat_map(|c| &c.findings) {
+            let totals = if f.family == "erc" { &mut erc } else { &mut other_problems };
+            match f.severity { Severity::Error => totals.0 += 1, Severity::Warning => totals.1 += 1, Severity::Info => {} }
+        }
+        let erc_summary = format!("ERC: {} error{}, {} warning{}", erc.0, if erc.0 == 1 { "" } else { "s" },
+            erc.1, if erc.1 == 1 { "" } else { "s" });
         let seconds = if view.state == ProposalState::Checking { elapsed(&view.run) } else { None };
         let (state, accept_tip, reason) = match &view.state {
             ProposalState::Unchecked => ("Text only, not checked".into(), Some("Check it first"), None),
@@ -63,12 +82,38 @@ impl Row {
             ProposalState::Refused(why) => (format!("Not usable: {why}"), Some("Not usable"), Some(Reason::Refused)),
             ProposalState::Stale(why) => (format!("Out of date: {why}"), Some("Out of date"), Some(Reason::Stale)),
         };
-        let no_problems = view.state == ProposalState::Ready && checks == Some((0, 0, false))
+        let no_problems = view.state == ProposalState::Ready && checks.as_ref().is_some_and(|c| !c.pending)
+            && erc == (0, 0) && other_problems == (0, 0)
             && view.requirements.as_ref().is_none_or(|r| r.fail == 0 && r.unknown == 0);
         Self { id: view.id, shown: view.shown, author, label: view.label.clone(), checks, state, seconds,
-            requirements: view.requirements.clone(), no_problems,
+            requirements: view.requirements.clone(), no_problems, erc_summary, other_problems,
             reason, accept_tip,
             check_enabled: matches!(view.by, ProposalAuthor::Peer { .. }).then_some(view.state == ProposalState::Unchecked) }
+    }
+
+    fn pending_text(&self) -> Option<String> {
+        let c = self.checks.as_ref().filter(|c| c.pending)?;
+        Some(if c.pending_labels.is_empty() { "Checks pending".into() } else { format!("Pending: {}", c.pending_labels.join(", ")) })
+    }
+
+    /// Format only the visible prefix, already in severity order, into the three coloured labels.
+    fn finding_lines(&self, all: bool) -> [String; 3] {
+        use std::fmt::Write;
+        let mut lines: [String; 3] = Default::default();
+        if let Some(c) = &self.checks {
+            let count = if all { c.findings.len() } else { FIRST_FINDINGS };
+            for f in c.findings.iter().take(count) {
+                let (i, glyph) = match f.severity { Severity::Error => (0, "✕"), Severity::Warning => (1, "⚠"), Severity::Info => (2, "ⓘ") };
+                let line = &mut lines[i];
+                if !line.is_empty() { line.push('\n'); }
+                write!(line, "{glyph} {} · {}", f.family, f.title).unwrap();
+                if !f.unit.is_empty() { write!(line, " · {}", f.unit).unwrap(); }
+                if !f.items.is_empty() { write!(line, " · {}", f.items).unwrap(); }
+                write!(line, "\n{}", f.message).unwrap();
+                if let Some(fix) = &f.fix { write!(line, "\nFix: {fix}").unwrap(); }
+            }
+        }
+        lines
     }
 
     fn check(&self) -> Option<ViewAction> {
@@ -168,6 +213,7 @@ script_mod! {
                     }
                     errors := FabLabel{draw_text +: {color: fab.color_error}}
                     warnings := FabLabel{draw_text +: {color: fab.color_warning}}
+                    erc := FabLabel{}
                     review_req_fail := FabLabel{visible: false draw_text +: {color: fab.color_error}}
                     review_req_unknown := FabLabelDim{visible: false}
                     ok := FabLabel{text: "No problems" draw_text +: {color: fab.color_ok}}
@@ -192,6 +238,14 @@ script_mod! {
                 draw_text +: {color: fab.color_error}
             }
             review_req_unknown_detail := FabLabelDim{visible: false width: Fill height: Fit padding: Inset{left: 12 right: 8 top: 4}}
+            review_checks := View{visible: false width: Fill height: Fit flow: Down spacing: 3 padding: Inset{left: 12 right: 8 top: 4}
+                heading := FabLabel{text: "Checks"}
+                errors := FabLabel{visible: false width: Fill height: Fit draw_text +: {color: fab.color_error}}
+                warnings := FabLabel{visible: false width: Fill height: Fit draw_text +: {color: fab.color_warning}}
+                info := FabLabelDim{visible: false width: Fill height: Fit}
+                pending_checks := FabLabelDim{visible: false width: Fill height: Fit}
+                show_all := FabButton{visible: false width: Fit}
+            }
             content := View{width: Fill height: Fit flow: Down}
             SolidView{width: Fill height: 1 draw_bg +: {color: fab.color_border}}
         }
@@ -204,6 +258,12 @@ script_mod! {
         notice := Band{
             visible: false
             note := FabLabel{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+            dismiss := FabButton{text: "Dismiss"}
+        }
+        next_banner := Band{
+            visible: false
+            summary := FabLabel{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+            next_tip := FabTip{next := FabButton{}}
             dismiss := FabButton{text: "Dismiss"}
         }
         list := View{width: Fill height: Fit flow: Down
@@ -303,6 +363,7 @@ struct ShownRow {
     summary: String,
     count: Job<Option<String>>,
     expanded: bool,
+    all_findings: bool,
     editors: HashMap<String, Document>,
     // A check summary may change between pointer-down and click. Keep the press's drawn revision.
     pressed: HashMap<WidgetUid, ViewAction>,
@@ -314,7 +375,7 @@ impl ShownRow {
     fn new(cx: &mut Cx, template: &ScriptObjectRef, proposal: &Arc<ProposalView>, compact: bool) -> Self {
         let mut row = Self { bound: Arc::downgrade(proposal), model: Row::of(proposal), widget: instance(cx, template),
             docs: proposal.docs.clone(), summary: String::new(), count: Job(None),
-            expanded: false, editors: HashMap::new(), pressed: HashMap::new(), preview_press: None, preview_bound: Weak::new() };
+            expanded: false, all_findings: false, editors: HashMap::new(), pressed: HashMap::new(), preview_press: None, preview_bound: Weak::new() };
         if compact { row.set_compact(cx, true); }
         row.count_lines(cx);
         row.header(cx);
@@ -339,14 +400,16 @@ impl ShownRow {
         words.widget(cx, ids!(refusal)).set_visible(cx, refused);
         words.widget(cx, ids!(spinner)).set_visible(cx, self.model.seconds.is_some());
         actions.button(cx, ids!(decline)).set_text(cx, if refused { "Dismiss" } else { "Decline" });
-        let (errors, warnings, pending) = self.model.checks.unwrap_or_default();
-        let has_problems = errors > 0 || warnings > 0;
+        let erc = words.label(cx, ids!(erc));
+        erc.set_text(cx, &self.model.erc_summary);
+        erc.set_visible(cx, self.model.checks.is_some());
+        let (errors, warnings) = self.model.other_problems;
         for (id, count, word) in [(ids!(errors), errors, "error"), (ids!(warnings), warnings, "warning")] {
             let field = words.label(cx, id);
-            if has_problems {
-                field.set_text(cx, &format!("{count} {word}{}", if count == 1 { "" } else { "s" }));
+            if count > 0 {
+                field.set_text(cx, &format!("{count} other {word}{}", if count == 1 { "" } else { "s" }));
             }
-            field.set_visible(cx, has_problems);
+            field.set_visible(cx, count > 0);
         }
         let (fail, unknown) = self.model.requirements.as_ref().map_or((0, 0), |r| (r.fail, r.unknown));
         let failures = words.label(cx, ids!(review_req_fail));
@@ -358,7 +421,10 @@ impl ShownRow {
         if unknown > 0 { unjudged.set_text(cx, &format!("{unknown} not judged")); }
         unjudged.set_visible(cx, unknown > 0);
         words.widget(cx, ids!(ok)).set_visible(cx, self.model.no_problems);
-        words.widget(cx, ids!(pending)).set_visible(cx, pending);
+        let pending = words.label(cx, ids!(pending));
+        let pending_text = self.model.pending_text();
+        pending.set_visible(cx, pending_text.is_some());
+        if let Some(text) = pending_text { pending.set_text(cx, &text); }
         words.label(cx, ids!(summary)).set_text(cx, &self.summary);
         let check = actions.button(cx, ids!(check));
         check.set_visible(cx, self.model.check_enabled.is_some());
@@ -373,6 +439,25 @@ impl ShownRow {
     }
 
     fn show_details(&self, cx: &mut Cx) {
+        let section = self.widget.widget(cx, ids!(review_checks));
+        let checks = self.model.checks.as_ref().filter(|c| self.expanded && (!c.findings.is_empty() || c.pending));
+        section.set_visible(cx, checks.is_some());
+        if let Some(c) = checks {
+            for (path, text) in [ids!(errors).as_slice(), ids!(warnings), ids!(info)].into_iter().zip(self.model.finding_lines(self.all_findings)) {
+                let label = section.label(cx, path);
+                label.set_visible(cx, !text.is_empty());
+                if !text.is_empty() { label.set_text(cx, &text); }
+            }
+            let pending = section.label(cx, ids!(pending_checks));
+            pending.set_visible(cx, c.pending);
+            if let Some(text) = self.model.pending_text() { pending.set_text(cx, &text); }
+            let toggle = section.button(cx, ids!(show_all));
+            toggle.set_visible(cx, c.findings.len() > FIRST_FINDINGS);
+            if c.findings.len() > FIRST_FINDINGS {
+                let text = if self.all_findings { format!("Show first {FIRST_FINDINGS} findings") } else { format!("Show all {} findings", c.findings.len()) };
+                toggle.set_text(cx, &text);
+            }
+        }
         for (path, reason) in [(ids!(refusal_detail), Reason::Refused), (ids!(stale_detail), Reason::Stale)] {
             let label = self.widget.label(cx, path);
             let show = self.expanded && self.model.reason == Some(reason);
@@ -438,6 +523,7 @@ impl ShownRow {
         self.docs = view.docs.clone();
         if changed { self.count_lines(cx); }
         if self.expanded && changed { self.documents(cx, doc_template); }
+        if self.model.id != view.id { self.all_findings = false; }
         self.model = Row::of(view);
         self.header(cx);
         self.bound = Arc::downgrade(view);
@@ -467,6 +553,8 @@ pub struct ReviewStrip {
     #[rust] running: Vec<(Arc<str>, Arc<RunClock>)>,
     #[rust] frame: NextFrame,
     #[rust] notice: Option<Arc<str>>,
+    #[rust] next_stage: Option<FlowStage>,
+    #[rust] next_reason: Option<&'static str>,
     #[rust] busy: bool,
     #[rust] compact: bool,
     #[rust] previewing: Option<ProposalId>,
@@ -475,6 +563,33 @@ pub struct ReviewStrip {
 }
 
 impl ReviewStrip {
+    pub(super) fn sync_next(&mut self, cx: &mut Cx, next: Option<&(String, NextStep)>) {
+        let bar = self.view.view(cx, ids!(next_banner));
+        bar.set_visible(cx, next.is_some());
+        self.next_stage = next.map(|(_, step)| step.stage);
+        if let Some((label, step)) = next {
+            let summary = bar.label(cx, ids!(summary));
+            if step.stage == FlowStage::Done { summary.set_text(cx, &step.summary); }
+            else { summary.set_text(cx, &format!("{label} · Next: {}", step.summary)); }
+            bar.button(cx, ids!(next_tip.next)).set_text(cx, step.button);
+        }
+    }
+
+    fn next_admission(&mut self, cx: &mut Cx) {
+        let Some(stage) = self.next_stage else { return };
+        let reason = if matches!(stage, FlowStage::Requirements | FlowStage::Architecture | FlowStage::Parts | FlowStage::Schematic | FlowStage::FixErc) {
+            cx.get_global_ref::<fab_elec_view::req_list::ReqDraft>().and_then(|draft| {
+                if draft.view.as_ref().is_some_and(|v| !v.done) { Some("A stage is being drafted") } else { draft.admit.err() }
+            })
+        } else { None };
+        if self.next_reason != reason {
+            self.next_reason = reason;
+            let bar = self.view.view(cx, ids!(next_banner));
+            bar.button(cx, ids!(next_tip.next)).set_enabled(cx, reason.is_none());
+            bar.tip(cx, ids!(next_tip)).set_text(reason.unwrap_or(""));
+        }
+    }
+
     pub(super) fn reveal(&mut self, cx: &mut Cx, id: ProposalId) -> Option<f64> {
         let row = self.rows.values_mut().find(|row| row.model.id == id)?;
         if !row.expanded {
@@ -561,6 +676,7 @@ impl Widget for ReviewStrip {
             ElecLive::select_preview(cx, None);
             return;
         }
+        self.next_admission(cx);
         self.view.handle_event(cx, event, scope);
         if !self.waiting.is_empty() && matches!(event, Event::Signal) {
             self.started(cx);
@@ -579,6 +695,11 @@ impl Widget for ReviewStrip {
             for row in self.rows.values_mut() { self.busy |= row.poll(cx); }
         }
         let Event::Actions(actions) = event else { return };
+        if let Some(stage) = self.next_stage {
+            let bar = self.view.view(cx, ids!(next_banner));
+            if bar.button(cx, ids!(next_tip.next)).clicked(actions) { cx.action(ReviewAction::NextStage(stage)); }
+            if bar.button(cx, ids!(dismiss)).clicked(actions) { cx.action(ReviewAction::DismissNext); }
+        }
         if self.view.button(cx, ids!(notice.dismiss)).clicked(actions) {
             if let Some(live) = cx.get_global_ref::<ElecLive>() {
                 if same_arc(self.notice.as_ref(), live.ended_proposals.as_ref()) {
@@ -609,9 +730,15 @@ impl Widget for ReviewStrip {
             }
             if controls.button(cx, ids!(review)).clicked(actions) {
                 row.expanded = !row.expanded;
+                row.all_findings = false;
                 row.documents(cx, &self.doc_template);
                 row.show_details(cx);
                 self.busy |= row.expanded;
+            }
+            if row.expanded && row.widget.button(cx, ids!(review_checks.show_all)).clicked(actions) {
+                row.all_findings = !row.all_findings;
+                row.show_details(cx);
+                self.view.redraw(cx);
             }
             for path in [ids!(accept_tip.accept).as_slice(), ids!(decline), ids!(check)] {
                 let button = controls.widget(cx, path).widget_uid();
@@ -654,6 +781,41 @@ mod tests {
     use makepad_widgets_core::widget::WidgetActionData;
 
     #[test]
+    fn review_row_lists_candidate_erc_findings_and_keeps_accept_enabled() {
+        use fab_elec_view::snapshot::{CheckKind, ProposalFinding};
+        let finding = |kind, severity, title: &str, message: &str, items: &str| ProposalFinding {
+            kind, severity, title: title.into(), message: message.into(), items: items.into(), family: "erc",
+            unit: "sensor".into(), fix: Some("Connect the rail".into()),
+        };
+        let checks = ProposalChecks { pending: true, pending_labels: vec!["DRC (sensor)".into()], findings: vec![
+            finding(CheckKind::PowerNotDriven, Severity::Error, "PowerNotDriven", "VDD: no driver", "U1.VDD"),
+            finding(CheckKind::SinglePinNet, Severity::Warning, "SinglePinNet", "IRQ has one pin", "IRQ"),
+        ], ..Default::default() };
+        let mut view = ProposalView { id: ProposalId(1), shown: 2, slot: "schematic".into(), label: "Schematic".into(),
+            by: ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), state: ProposalState::Ready, run: Arc::default(),
+            docs: Arc::default(), design: None, boards: Arc::default(), sheets: Arc::default(), created: Arc::default(),
+            checks: Some(Arc::new(checks)), requirements: None };
+        let row = Row::of(&view);
+        assert_eq!(row.erc_summary, "ERC: 1 error, 1 warning", "the badge must report the candidate ERC verdict");
+        assert_eq!(row.pending_text().as_deref(), Some("Pending: DRC (sensor)"), "Review must name the pending check and its unit");
+        let [error, warning, _] = row.finding_lines(false);
+        assert!(error.contains("U1.VDD") && error.contains("VDD: no driver") && error.contains("Fix: Connect the rail")
+            && warning.contains("SinglePinNet") && warning.contains("IRQ has one pin"), "the detail must show both severities, items, messages and fix");
+        assert_eq!(row.decide(true), Some(ViewAction::ProposalDecision { id: view.id, shown: view.shown, accept: true }),
+            "Ready must allow accepting the exact revision despite ERC and pending checks");
+        let checks = Arc::make_mut(view.checks.as_mut().unwrap());
+        for i in 2..=FIRST_FINDINGS {
+            let mut f = finding(CheckKind::SharpCorner, Severity::Warning, "SharpCorner", &format!("corner {i}"), "track");
+            f.family = "route";
+            checks.findings.push(f);
+        }
+        let row = Row::of(&view);
+        assert_eq!(row.erc_summary, "ERC: 1 error, 1 warning", "other check families must stay outside the ERC count");
+        assert!(!row.finding_lines(false)[1].contains("corner 25") && row.finding_lines(true)[1].contains("corner 25")
+            && row.finding_lines(true)[1].contains("route · SharpCorner"), "Show all must expose the last finding with its published family");
+    }
+
+    #[test]
     fn review_rows_bind_the_shown_revision_and_report_the_proposed_edits() {
         let doc = |name: &str, before: Option<&str>, after: Option<&str>| ProposalDoc {
             name: name.into(), before: before.map(Arc::from), after: after.map(Arc::from),
@@ -677,8 +839,8 @@ mod tests {
         let first = Row::of(&view);
         assert!(first.check_enabled == Some(false) && first.check().is_none(), "the peer check stays present and disabled during checking");
         assert!(first.decide(true).is_none() && first.accept_tip == Some("Waiting…"), "waiting for first verification disables Accept");
-        view.checks = Some(Arc::new(ProposalChecks { counts: Default::default(), pending: true }));
-        assert!(Row::of(&view).checks == Some((0, 0, true)) && Row::of(&view).decide(true).is_some(),
+        view.checks = Some(Arc::new(ProposalChecks { pending: true, ..Default::default() }));
+        assert!(Row::of(&view).checks.unwrap().pending && Row::of(&view).decide(true).is_some(),
             "a recheck with shown checks permits a parked accept and reports pending work");
         view.by = ProposalAuthor::Local(By::Ai { turn: 1, call: 1 });
         view.state = ProposalState::Ready;
@@ -722,6 +884,22 @@ mod tests {
             super::script_mod(vm);
             ReviewStrip::script_new_with_default(vm)
         });
+        let offer = ("Placement completed".into(), NextStep { stage: FlowStage::Route, button: "Route board",
+            summary: "2 unrouted nets".into(), unit: Some("controller".into()) });
+        strip.sync_next(&mut cx, Some(&offer));
+        let banner = strip.view.view(&cx, ids!(next_banner));
+        assert!(banner.visible() && banner.label(&cx, ids!(summary)).text() == "Placement completed · Next: 2 unrouted nets",
+            "the bar must identify the finished work and the committed board's next step");
+        for (path, expected) in [(ids!(next_tip.next).as_slice(), ReviewAction::NextStage(FlowStage::Route)),
+            (ids!(dismiss), ReviewAction::DismissNext)] {
+            let uid = banner.button(&cx, path).widget_uid();
+            let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+            let emitted = cx.capture_actions(|cx| strip.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+            assert!(emitted.iter().filter_map(|a| a.downcast_ref::<ReviewAction>()).eq([&expected]),
+                "only the pressed offer action may be emitted");
+        }
+        strip.sync_next(&mut cx, None);
+        assert!(!banner.visible(), "an absent offer removes the whole bar");
         strip.sync(&mut cx, std::slice::from_ref(&proposal), None);
         let slot = proposal.slot.clone();
         let band = strip.rows[&slot].widget.view(&cx, ids!(band));
@@ -872,7 +1050,7 @@ mod tests {
         let unknown_detail = widget.label(&cx, ids!(review_req_unknown_detail));
         let ready = Arc::make_mut(&mut proposal);
         ready.state = ProposalState::Ready;
-        ready.checks = Some(Arc::new(ProposalChecks { counts: Default::default(), pending: false }));
+        ready.checks = Some(Arc::default());
         ready.requirements = Some(Arc::new(ReqSummary { fail: 1,
             failures: vec![("fits opening".into(), "12 mm, required max 10 mm".into())], ..Default::default() }));
         strip.sync(&mut cx, std::slice::from_ref(&proposal), None);

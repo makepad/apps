@@ -3118,6 +3118,17 @@ impl Evaluator {
             content.update(&[by_object as u8]);
             content.update(&gap.to_bits().to_le_bytes());
         }
+        // Calibrated joints and weaves can change the printable solids under the same script.
+        content.update(b"part_nodes");
+        for &(ii, s) in &part_src {
+            content.update(&built[ii].graph.node(built[ii].nodes[s]).key);
+        }
+        for (ex, &(ii, s)) in plate.excluded.iter().zip(&excluded_src) {
+            if ex.insert.is_some() {
+                content.update(b"insert_node");
+                content.update(&built[ii].graph.node(built[ii].nodes[s]).key);
+            }
+        }
         let built_count = self.graph.built;
         halt()?;
         if let Some(step) = &plate_step {

@@ -1,11 +1,15 @@
 //! Property inspector for one App item. The share view owns its picture.
 use super::props::layout::view::{set_face, LayoutControls};
+use super::design::{d1, DesignTarget};
+use super::design::view::{self as design_view, BuildTab, PaletteList};
+use super::{DesignRequest, DesignReplyKind, DesignNotice};
 use super::shader::{ShaderTab, view::ShaderPills};
 use super::props::live::LiveSets;
+use super::focus::{zoom_label, FocusState, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
 use super::overlay::{seat_colour, who};
-use super::props::{AppliedEdit, Props, view::{PropLine, Sidebar, SidebarAction}};
-use super::tree::{TreeAction, TreeLine, TreeState};
-use super::theme::{ThemePalette, ThemeSnapshot};
+use super::props::{AppliedEdit, Props, view::{HeaderId, PropLine, Sidebar, SidebarAction}};
+use super::tree::{drop_zone, DropIndicator, TreeAction, TreeLine, TreeState};
+use super::theme::{BuildAction, InstallSource, MixAction, PendingInstall, ThemeAction, ThemeMixerCache, ThemeSnapshot, ThemeTab};
 use super::{ThemeOp, Notice, Request, RequestId, Seat, Session, SessionId, TreeQuery};
 use crate::model::Model;
 use makepad_town_core::{entity::{field, kind, Entity}, event::{Content, Id, Value}, fold::State};
@@ -22,6 +26,11 @@ fn tree_list(vm: &mut ScriptVm) -> ScriptValue {
     super::tree::view::tree_list_value(vm, row)
 }
 
+fn theme_wrap(vm: &mut ScriptVm) -> ScriptValue {
+    let rows = super::theme::view::EqRows::register_widget(vm);
+    super::theme::view::wrap_value(vm, rows)
+}
+
 script_mod! {
     use mod.prelude.workspace.*
     use mod.widgets.*
@@ -30,6 +39,9 @@ script_mod! {
     let TweakRow = #(TweakRow::register_widget(vm))
     let PropsList = #(props_list(vm))
     let TreeList = #(tree_list(vm))
+    let BuildWrap = #(design_view::wrap_value(vm))
+    let DesignStrip = #(design_view::strip_value(vm))
+    let ThemeWrap = #(theme_wrap(vm))
     let TweakTabs = #(TweakTabs::register_widget(vm))
     let ShaderPills = #(ShaderPills::register_widget(vm))
     let PanelTabButton = PanelButton {
@@ -66,7 +78,7 @@ script_mod! {
         width: Fill height: Fill flow: Down spacing: 4
         padding: Inset{left: 4 right: 4 top: 6 bottom: 4}
         show_bg: true draw_bg +: {color: #x303030}
-        TweakTabs{width: Fill height: Fit flow: Right{wrap: true} spacing: 3 align: Align{y: 0.5}
+        tweak_tabs := TweakTabs{width: Fill height: Fit flow: Right{wrap: true} spacing: 3 align: Align{y: 0.5}
             tab_props := PanelTabButton{text: "Props"}
             tab_props_i := PanelTabButton{visible: false text: "" a11y: {label: "Props"} icon_walk: Walk{width: 13 height: Fit}
                 draw_icon +: {color: #xd0d0d0 svg: crate_resource("makepad_widgets:resources/icons/tab_list.svg")}}
@@ -76,6 +88,12 @@ script_mod! {
             tab_tree := PanelTabButton{text: "Tree"}
             tab_tree_i := PanelTabButton{visible: false text: "" a11y: {label: "Tree"} icon_walk: Walk{width: 13 height: Fit}
                 draw_icon +: {color: #xd0d0d0 svg: crate_resource("makepad_widgets:resources/icons/tab_tree.svg")}}
+            tab_theme := PanelTabButton{text: "Theme"}
+            tab_theme_i := PanelTabButton{visible: false text: "" a11y: {label: "Theme"} icon_walk: Walk{width: 13 height: Fit}
+                draw_icon +: {color: #xd0d0d0 svg: crate_resource("makepad_widgets:resources/icons/tab_palette.svg")}}
+            tab_build := PanelTabButton{text: "Build"}
+            tab_build_i := PanelTabButton{visible: false text: "" a11y: {label: "Build"} icon_walk: Walk{width: 13 height: Fit}
+                draw_icon +: {color: #xd0d0d0 svg: crate_resource("makepad_widgets:resources/icons/tab_hammer.svg")}}
             tweak_close := PanelButton{text: "Close" a11y: {label: "Close tweak panel"}}
         }
         tweak_ask := PanelButton{text: "Ask to edit"}
@@ -134,18 +152,33 @@ script_mod! {
         }
         tweak_tree_wrap := View{visible: false width: Fill height: Fill{weight: 75.0} flow: Down spacing: 3
             tweak_tree_head := View{width: Fill height: Fit flow: Down spacing: 3
-                View{width: Fill height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                View{width: Fill height: Fit flow: Right spacing: 3 align: Align{y: 0.5}
                     tree_filter := FabSearch{input +: {empty_text: "Filter tree"}}
                     tree_refresh := PanelTabButton{text: "↻" a11y: {label: "Refresh tree"}}
                 }
+                View{width: Fill height: Fit flow: Right{wrap: true} spacing: 3 align: Align{y: 0.5}
+                    tree_isolate := PanelTabButton{text: "Isolate"}
+                    tree_center := PanelTabButton{text: "Center"}
+                    tree_zoom_out := PanelTabButton{text: "−" a11y: {label: "Zoom out"}}
+                    tree_zoom := BodyNote{width: Fit text: "1.0×"}
+                    tree_zoom_in := PanelTabButton{text: "+" a11y: {label: "Zoom in"}}
+                }
+                tree_strip := DesignStrip{}
+                isolate_hint := BodyNote{visible: false width: Fill flow: Right{wrap: true}}
                 tree_status := BodyNote{visible: false width: Fill flow: Right{wrap: true}}
             }
-            tweak_tree := TweakList{width: Fill height: Fill
+            tweak_tree := TweakList{width: Fill height: Fill drag_chip: DragChip{}
                 tweak_tree_list := TreeList{}
             }
         }
+        tweak_build_wrap := BuildWrap{}
+        tweak_theme_wrap := ThemeWrap{
+            tweak_theme := TweakList{width: Fill height: Fill
+                tweak_theme_list := PropsList{}
+            }
+        }
         tweak_result := BodyNote{}
-        Kicker{text: "EDIT HISTORY"}
+        history_title := Kicker{text: "EDIT HISTORY"}
         tweak_history := TweakList{
             width: Fill height: Fill{weight: 25.0}
             tweak_history_list := PortalList{width: Fill height: Fill
@@ -223,10 +256,10 @@ enum Line {
 }
 
 impl Line {
-    fn bind(&self, cx: &mut Cx, row: &View, previous: Option<&Line>, controls: &mut LayoutControls) {
+    fn bind(&self, cx: &mut Cx, row: &View, previous: Option<&Line>, controls: &mut LayoutControls, draggable: bool) {
         match self {
             Self::Property(p) => p.draw_sidebar(cx, row, match previous { Some(Self::Property(old)) => Some(old), _ => None }, controls),
-            Self::Tree(line) => line.draw_tree(cx, row),
+            Self::Tree(line) => line.draw_tree(cx, row, draggable),
             Self::Chip { name, ink, status, action, .. } => {
                 let label = row.label(cx, ids!(tweak_seat_name));
                 label.set_text(cx, name);
@@ -248,6 +281,7 @@ struct TweakRow {
     #[deref] view: View,
     #[rust] shown: Option<Rc<Line>>,
     #[rust] controls: LayoutControls,
+    #[rust] draggable: bool,
 }
 
 impl Widget for TweakRow {
@@ -259,15 +293,121 @@ impl Widget for TweakRow {
 const SEAT_ROW: f64 = 40.0;
 
 #[derive(Script, ScriptHook, Widget)]
-struct TweakList {
+pub struct TweakList {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
+    #[live] drag_chip: ScriptObjectRef,
+    #[rust] can_edit_tree: bool,
+    #[rust] drag_enabled: bool,
+    #[rust] press: Option<(DVec2, Rc<str>, String)>,
+    #[rust] dragged: bool,
+    #[rust] indicator: Option<(usize, Rc<str>, DropIndicator)>,
     #[rust] rows: Vec<Rc<Line>>,
     #[rust] history: Vec<Rc<HistoryEntry>>,
 }
 
+impl TweakList {
+    pub(super) fn configure_tree_drag(&mut self, cx: &mut Cx, can_edit: bool, tree: &TreeState) {
+        self.can_edit_tree = can_edit;
+        let enabled = can_edit && tree.filter.is_empty();
+        if self.drag_enabled == enabled { return }
+        self.drag_enabled = enabled;
+        if !enabled {
+            self.press = None;
+            self.indicate(cx, None);
+        }
+        self.view.redraw(cx);
+    }
+
+    fn indicate(&mut self, cx: &mut Cx, next: Option<(usize, Rc<str>, DropIndicator)>) {
+        if self.indicator == next { return }
+        let old = std::mem::replace(&mut self.indicator, next);
+        for (entry, value) in [(old.as_ref(), None), (self.indicator.as_ref(), self.indicator.as_ref().map(|t| t.2))] {
+            let Some((i, target, _)) = entry else { continue };
+            let Some(row) = self.rows.get_mut(*i) else { continue };
+            let Line::Tree(line @ TreeLine::Node { path, .. }) = row.as_ref() else { continue };
+            if path != target { continue }
+            let mut line = line.clone();
+            if let TreeLine::Node { drop, .. } = &mut line { *drop = value; }
+            *row = Rc::new(Line::Tree(line));
+        }
+        self.view.redraw(cx);
+    }
+
+    fn tree_pointer(&mut self, cx: &mut Cx, event: &Event) {
+        match event {
+            Event::MouseDown(e) if e.button.is_primary() => {
+                let portal = self.view.portal_list(cx, ids!(tweak_tree_list));
+                self.press = portal.item_at(cx, e.abs).and_then(|i| {
+                    let Line::Tree(TreeLine::Node { path, label, .. }) = self.rows.get(i)?.as_ref() else { return None };
+                    let (_, row) = portal.get_item(i)?;
+                    let twisty = row.button(cx, ids!(twisty));
+                    if twisty.visible() && twisty.area().clipped_rect(cx).contains(e.abs) { return None }
+                    Some((e.abs, path.clone(), label.clone()))
+                });
+                self.dragged = false;
+            }
+            Event::MouseMove(e) if self.press.as_ref().is_some_and(|(at, ..)| (e.abs - *at).length() > 4.) => {
+                let (_, path, label) = self.press.take().unwrap();
+                if cx.has_internal_drag() { return }
+                let chip = cx.with_vm(|vm| WidgetRef::script_from_value(vm, self.drag_chip.as_object().into()));
+                chip.label(cx, ids!(label)).set_text(cx, &label);
+                self.dragged = true;
+                let item = DragItem::String { value: path.to_string(), internal_id: Some(live_id!(town_design_node)) };
+                cx.start_dragging_with(vec![item], chip, dvec2(14., 10.));
+            }
+            Event::MouseUp(_) => self.press = None,
+            Event::DragEnd | Event::WindowLostFocus(_) => {
+                self.press = None;
+                if matches!(event, Event::WindowLostFocus(_)) { self.dragged = false; }
+                self.indicate(cx, None);
+            }
+            Event::Drag(_) | Event::Drop(_) => {
+                let items = match event { Event::Drag(e) => &e.items, Event::Drop(e) => &e.items, _ => unreachable!() };
+                let Some(source) = items.iter().find_map(|item| match item {
+                    DragItem::String { value, internal_id: Some(id) } if *id == live_id!(town_design_node) => Some(value),
+                    _ => None,
+                }) else { return };
+                let portal = self.view.portal_list(cx, ids!(tweak_tree_list));
+                let (abs, response) = match event.drag_hits(cx, portal.area()) {
+                    DragHit::Drag(d) if d.state != DragState::Out => (d.abs, Some(d.response)),
+                    DragHit::Drop(d) => (d.abs, None),
+                    _ => { self.indicate(cx, None); return }
+                };
+                let target = portal.item_at(cx, abs).and_then(|i| {
+                    let Line::Tree(TreeLine::Node { path, ty, .. }) = self.rows.get(i)?.as_ref() else { return None };
+                    let rect = portal.get_item(i)?.1.area().rect(cx);
+                    Some((i, path.clone(), drop_zone(source, path, ty, abs.y - rect.pos.y, rect.size.y)?))
+                });
+                if let Some(response) = response {
+                    if target.is_some() {
+                        *response.lock().unwrap_or_else(|e| e.into_inner()) = DragResponse::Move;
+                        cx.set_cursor(MouseCursor::Hand);
+                    } else { cx.set_cursor(MouseCursor::NotAllowed); }
+                    self.indicate(cx, target);
+                } else {
+                    if let Some((_, target, zone)) = target {
+                        cx.widget_action(self.widget_uid(), TreeAction::Move { source: source.clone(), target: target.to_string(), place: zone.place() });
+                    }
+                    self.indicate(cx, None);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Widget for TweakList {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) { self.view.handle_event(cx, event, scope); }
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.drag_enabled { self.tree_pointer(cx, event); }
+        else if matches!(event, Event::MouseDown(_) | Event::WindowLostFocus(_)) { self.dragged = false; }
+        if self.dragged && matches!(event, Event::MouseUp(_)) {
+            let mut actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
+            actions.retain(|a| !a.as_widget_action().is_some_and(|w| matches!(w.action.downcast_ref::<ButtonAction>(), Some(ButtonAction::Clicked(_)))));
+            cx.extend_actions(actions);
+            self.dragged = false;
+        } else { self.view.handle_event(cx, event, scope); }
+    }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             let Some(mut list) = step.borrow_mut::<PortalList>() else { continue };
@@ -277,9 +417,10 @@ impl Widget for TweakList {
                 let template = match line.as_ref() { Line::Property(p) => p.template(), Line::Tree(t) => t.template(), _ => id!(Row) };
                 let (item, existed) = list.item_with_existed(cx, i, template);
                 if let Some(mut row) = item.borrow_mut::<TweakRow>() {
-                    if !existed || !row.shown.as_ref().is_some_and(|old| Rc::ptr_eq(old, line)) {
+                    if !existed || row.draggable != self.drag_enabled || !row.shown.as_ref().is_some_and(|old| Rc::ptr_eq(old, line)) {
                         let mut controls = LayoutControls::default();
-                        line.bind(cx, &row.view, row.shown.as_deref(), &mut controls);
+                        line.bind(cx, &row.view, row.shown.as_deref(), &mut controls, self.drag_enabled);
+                        row.draggable = self.drag_enabled;
                         row.controls = controls;
                         row.shown = Some(line.clone());
                     }
@@ -346,6 +487,7 @@ struct TweakTabs {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
     #[rust] room: Option<f64>,
+    #[rust] board: bool,
 }
 
 impl Widget for TweakTabs {
@@ -357,14 +499,16 @@ impl Widget for TweakTabs {
         let room = cx.turtle().max_width(walk);
         if let Some(width) = room.filter(|_| self.room != room) {
             let visible = width_override::WidthOverride { visible: Some(true), ..Default::default() };
-            let words = [ids!(tab_props), ids!(tab_shader), ids!(tab_tree), ids!(tweak_close)];
-            let widths: Option<f64> = words.into_iter().map(|id| self.view.widget(cx, id).measure_width(cx, Some(&visible))).sum();
+            let tabs = [(ids!(tab_props), ids!(tab_props_i)), (ids!(tab_shader), ids!(tab_shader_i)),
+                (ids!(tab_tree), ids!(tab_tree_i)), (ids!(tab_theme), ids!(tab_theme_i)), (ids!(tab_build), ids!(tab_build_i))];
+            let start = if self.board { 3 } else { 0 };
+            let words = tabs[start..].iter().map(|&(word, _)| word).chain([ids!(tweak_close)]);
+            let widths: Option<f64> = words.map(|id| self.view.widget(cx, id).measure_width(cx, Some(&visible))).sum();
             if let Some(widths) = widths {
-                let narrow = widths + (words.len() - 1) as f64 * self.view.layout.spacing > width;
-                for (word, icon) in [(ids!(tab_props), ids!(tab_props_i)), (ids!(tab_shader), ids!(tab_shader_i)),
-                    (ids!(tab_tree), ids!(tab_tree_i))] {
-                    self.view.widget(cx, word).set_visible(cx, !narrow);
-                    self.view.widget(cx, icon).set_visible(cx, narrow);
+                let narrow = widths + (tabs.len() - start) as f64 * self.view.layout.spacing > width;
+                for (index, (word, icon)) in tabs.into_iter().enumerate() {
+                    self.view.widget(cx, word).set_visible(cx, index >= start && !narrow);
+                    self.view.widget(cx, icon).set_visible(cx, index >= start && narrow);
                 }
                 self.room = room;
             }
@@ -374,24 +518,35 @@ impl Widget for TweakTabs {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PanelTab { #[default] Props, Shader, Tree }
+enum PanelTab { #[default] Props, Shader, Tree, Theme, Build }
+
+struct BoardDesign {
+    item: Id,
+    revision: Option<Id>,
+    paths: Vec<String>,
+    theme: Option<super::ThemeInstall>,
+}
 
 #[derive(Default)]
 pub struct Panel {
+    board: Option<BoardDesign>,
     bound: Option<(SessionId, Id)>,
+    worn_by_share: BTreeMap<(SessionId, Id), super::theme::store::SavedTheme>,
     last_selection: Option<RequestId>,
     props: Option<(RequestId, String)>,
     sidebar: Sidebar,
-    theme_snap: Option<ThemeSnapshot>,
-    palette: ThemePalette,
-    theme_requested: bool,
-    theme_req: Option<RequestId>,
+    theme: ThemeTab,
+    pub(super) mixer_cache: ThemeMixerCache,
     tab: PanelTab,
+    build: BuildTab,
     shader: ShaderTab,
     tree: TreeState,
+    // Retain an isolated share's pages and outstanding reads while another share owns the panel.
+    other_trees: BTreeMap<(SessionId, Id), TreeState>,
     proposals: BTreeMap<RequestId, (Rc<str>, String)>,
     edits: BTreeMap<RequestId, (Rc<str>, String)>,
     live: LiveSets,
+    pending_resize_bake: Option<Rc<str>>,
     // Notices can beat signed-log replication. Keep those rows until their creates arrive.
     pending: BTreeMap<u64, Rc<HistoryEntry>>,
 }
@@ -399,11 +554,14 @@ pub struct Panel {
 /// Keep optimistic composite fields ahead of the last Rows snapshot only
 /// for the selected path. A queued Set can be released after selection moves.
 fn send_set<L: Copy + Eq, T: Copy + Eq>(session: &mut Session<L, T>, sidebar: &mut Sidebar,
-    edits: &mut BTreeMap<RequestId, (Rc<str>, String)>, path: &Rc<str>, prop: &str, value: &str) -> Option<RequestId> {
-    let selected = *path == sidebar.path;
-    let request = Request::Set { path: path.to_string(), prop: prop.into(), value: value.into() };
+    theme: &mut ThemeTab, edits: &mut BTreeMap<RequestId, (Rc<str>, String)>, path: &Rc<str>, prop: &str, value: &str) -> Option<RequestId> {
+    let token = path.as_ref() == "theme";
+    let selected = !token && *path == sidebar.path;
+    let request = if token { Request::Theme(ThemeOp::Set { name: prop.into(), value: value.into() }) }
+        else { Request::Set { path: path.to_string(), prop: prop.into(), value: value.into() } };
     match session.request(None, request) {
         Ok(req) => {
+            if token { theme.refusals.remove(prop); }
             if selected {
                 sidebar.refusals.remove(prop);
                 if super::props::layout_composited(prop) {
@@ -418,37 +576,286 @@ fn send_set<L: Copy + Eq, T: Copy + Eq>(session: &mut Session<L, T>, sidebar: &m
             Some(req)
         }
         Err(why) => {
-            if selected { sidebar.refusals.insert(prop.into(), why); }
+            if token { theme.refusals.insert(prop.into(), why); }
+            else if selected { sidebar.refusals.insert(prop.into(), why); }
             None
         }
     }
 }
 
 impl Panel {
+    pub(super) fn is_build_mode(&self, share: SessionId, item: Id) -> bool {
+        self.bound == Some((share, item)) && self.tab == PanelTab::Build
+    }
+
+    pub fn set_themes_dir(&mut self, dir: std::path::PathBuf) { self.theme.themes_dir = dir; }
+
+    #[cfg(test)]
+    pub(super) fn theme_state(&self) -> &ThemeTab { &self.theme }
+
+    #[cfg(test)]
+    pub(super) fn sidebar_rect(&self) -> Option<super::Rect> { self.sidebar.rect }
+
+    pub(super) fn themes_dir(&self) -> std::path::PathBuf { self.theme.themes_dir() }
+
+    pub(super) fn worn_for(&self, share: SessionId, item: Id) -> Option<(SessionId, Id, String)> {
+        let worn = if self.bound == Some((share, item)) {
+            self.theme.worn.as_ref()
+        } else {
+            self.worn_by_share.get(&(share, item))
+        };
+        Some((share, item, worn?.name.clone()))
+    }
+
+    pub(super) fn clear_worn(&mut self, cx: &mut Cx, root: &WidgetRef, share: SessionId, item: Id) {
+        let key = (share, item);
+        self.worn_by_share.remove(&key);
+        if self.bound == Some(key) && self.theme.worn.take().is_some() {
+            if self.theme.confirm.take().is_some() { self.theme.msg.clear(); }
+            if self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+        }
+    }
+
+    pub(super) fn retire_share(&mut self, share: SessionId, item: Id) {
+        let key = (share, item);
+        self.worn_by_share.remove(&key);
+        self.other_trees.remove(&key);
+        if self.bound == Some(key) {
+            self.theme.worn = None;
+            self.tree = TreeState::default();
+        }
+    }
+
+    pub(super) fn apply_theme_tool_effect(&mut self, cx: &mut Cx, root: &WidgetRef, effect: crate::tools::ThemeToolEffect) {
+        use crate::tools::ThemeToolEffect::*;
+        match effect {
+            Saved { share, item, saved } => {
+                let key = (share, item);
+                if self.bound == Some(key) {
+                    self.theme.sync_ai_saved(saved, true);
+                    match &self.theme.worn {
+                        Some(worn) => { self.worn_by_share.insert(key, worn.clone()); }
+                        None => { self.worn_by_share.remove(&key); }
+                    }
+                } else {
+                    self.worn_by_share.insert(key, saved.clone());
+                    self.theme.sync_ai_saved(saved, false);
+                }
+            }
+            Deleted(name) => {
+                self.worn_by_share.retain(|_, s| s.name != name);
+                self.theme.sync_ai_deleted(&name);
+            }
+            InstalledSaved { share, item, saved } => {
+                let key = (share, item);
+                self.worn_by_share.insert(key, saved.clone());
+                if self.bound == Some(key) {
+                    self.theme.sync_ai_installed_saved(saved);
+                } else {
+                    return
+                }
+            }
+        }
+        if self.board.is_none() && self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+    }
+
     fn bind<L, T>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &Session<L, T>) {
-        let key = (session.share, session.item);
-        if self.bound == Some(key) { return }
-        *self = Self { bound: Some(key), ..Default::default() };
-        for list in [ids!(tweak_seats), ids!(tweak_properties), ids!(tweak_shader_rows), ids!(tweak_tree), ids!(tweak_history)] {
+        self.bind_target(cx, root, DesignTarget::LiveApp(session.share), session.item);
+    }
+
+    fn bind_target(&mut self, cx: &mut Cx, root: &WidgetRef, target: DesignTarget, item: Id) {
+        let key = match target {
+            DesignTarget::LiveApp(share) => Some((share, item)),
+            DesignTarget::BoardDesign(_) => None,
+        };
+        if self.bound == key && (key.is_some() || self.board.as_ref().is_some_and(|b| b.item == item)) { return }
+        // A resize bake belongs to the share it was dragged on; it never follows the panel to another one.
+        self.pending_resize_bake = None;
+        if let Some(old) = self.bound {
+            if self.tree.focus != FocusState::default() {
+                self.other_trees.insert(old, std::mem::take(&mut self.tree));
+            }
+            match self.theme.worn.take() {
+                Some(saved) => { self.worn_by_share.insert(old, saved); }
+                None => { self.worn_by_share.remove(&old); }
+            }
+        }
+        let themes_dir = std::mem::take(&mut self.theme.themes_dir);
+        self.theme.close_build_popovers(cx, root);
+        let mixer_cache = std::mem::take(&mut self.mixer_cache);
+        let worn_by_share = std::mem::take(&mut self.worn_by_share);
+        let tree = key.and_then(|key| self.other_trees.remove(&key)).unwrap_or_default();
+        let other_trees = std::mem::take(&mut self.other_trees);
+        *self = Self { bound: key, mixer_cache, worn_by_share, tree, other_trees, ..Default::default() };
+        self.theme.sync_mixer(cx, root);
+        self.theme.sync_builder(cx, root);
+        self.set_themes_dir(themes_dir);
+        if let Some((key, saved)) = key.and_then(|key| self.worn_by_share.get(&key).cloned().map(|saved| (key, saved))) {
+            self.theme.refresh_saved();
+            if self.theme.saved_names.iter().any(|n| n == &saved.name) {
+                self.theme.sync_ai_installed_saved(saved);
+            } else {
+                self.worn_by_share.remove(&key);
+            }
+        }
+        for list in [ids!(tweak_seats), ids!(tweak_properties), ids!(tweak_shader_rows), ids!(tweak_tree), ids!(tweak_theme), ids!(tweak_history)] {
             replace(cx, root.widget(cx, list), Vec::new(), true);
         }
-        root.text_input(cx, ids!(tree_filter.input)).set_text(cx, "");
+        if let Some(mut tree) = root.widget(cx, ids!(tweak_tree)).borrow_mut::<TweakList>() {
+            tree.configure_tree_drag(cx, false, &self.tree);
+        }
+        root.text_input(cx, ids!(tree_filter.input)).set_text(cx, &self.tree.filter);
+        root.text_input(cx, ids!(theme_filter.input)).set_text(cx, "");
+        root.text_input(cx, ids!(theme_name)).set_text(cx, &self.theme.name_text);
         root.label(cx, ids!(tree_status)).set_text(cx, "");
         root.widget(cx, ids!(tree_status)).set_visible(cx, false);
+        if let Some(mut list) = root.widget(cx, ids!(build_palette)).borrow_mut::<PaletteList>() {
+            list.set_drag_enabled(false);
+            list.palette = Default::default();
+            list.redraw(cx);
+        }
+        root.text_input(cx, ids!(palette_filter.input)).set_text(cx, "");
+        root.widget(cx, ids!(build_preview)).set_visible(cx, false);
+        let board = key.is_none();
+        if board {
+            self.tab = PanelTab::Build;
+            self.board = Some(BoardDesign { item, revision: None, paths: Vec::new(), theme: None });
+        }
+        if let Some(mut tabs) = root.widget(cx, ids!(tweak_tabs)).borrow_mut::<TweakTabs>() {
+            tabs.board = board;
+            tabs.room = None;
+            tabs.redraw(cx);
+        }
+        for id in [ids!(design_session_actions), ids!(history_title), ids!(tweak_history), ids!(theme_save_row),
+            ids!(theme_filter), ids!(tweak_theme)] { root.widget(cx, id).set_visible(cx, !board); }
+        root.widget(cx, ids!(board_widget)).set_visible(cx, board);
         self.show_tab(cx, root);
-        root.widget(cx, ids!(tweak_hint)).set_visible(cx, true);
+        root.widget(cx, ids!(tweak_hint)).set_visible(cx, !board);
         root.label(cx, ids!(tweak_result)).set_text(cx, "");
+    }
+
+    pub(super) fn refresh_board(&mut self, cx: &mut Cx, root: &WidgetRef, model: &Model, item: Id) {
+        let first = self.board.as_ref().is_none_or(|b| b.item != item);
+        self.bind_target(cx, root, DesignTarget::BoardDesign(item), item);
+        if first {
+            for id in [ids!(tweak_ask), ids!(tweak_seats), ids!(design_commit), ids!(eq_fold), ids!(tb_fold)] {
+                root.widget(cx, id).set_visible(cx, false);
+            }
+            if let Some(read) = cx.tweak_callback {
+                if let Ok(palette) = read(cx, "design_palette", &[]) {
+                    if let (Ok(value), Some(mut list)) = (super::parse_json(&palette), root.widget(cx, ids!(build_palette)).borrow_mut::<PaletteList>()) {
+                        if let Err(why) = list.palette.page(&value, true) { root.label(cx, ids!(tweak_result)).set_text(cx, &why); }
+                        list.redraw(cx);
+                    }
+                }
+                self.theme.snapshot = read(cx, "design_theme", &[("get".into(), "1".into())]).ok()
+                    .and_then(|json| ThemeSnapshot::parse(&json));
+            }
+            self.theme.refresh_saved();
+            self.theme.entries = self.theme.choice_list();
+            let choices = root.drop_down(cx, ids!(theme_pick));
+            choices.set_labels(cx, self.theme.entries.iter().map(|e| e.label().into()).collect());
+            let index = self.theme.selected_choice_index();
+            choices.set_selected_item(cx, index);
+            let candidate = self.theme.board_theme(index);
+            self.board.as_mut().unwrap().theme = candidate.ok();
+        }
+        let board = self.board.as_mut().unwrap();
+        let writer = model.state.entities.get(&item).and_then(|e| e.fields.get(&field::SRC)).map(|r| r.writer);
+        if first || writer != board.revision {
+            let loaded = d1::read_design(&model.state, item).and_then(|s| Ok((s.revision, d1::list_widgets(&s.src)?)));
+            match loaded {
+                Ok((revision, nodes)) => {
+                    board.revision = Some(revision);
+                    board.paths = nodes.into_iter().map(|n| n.path).collect();
+                    let index = board.paths.iter().position(|p| p == self.sidebar.path.as_ref()).unwrap_or(0);
+                    self.sidebar.path = Rc::from(board.paths.get(index).map_or("", String::as_str));
+                    let widgets = root.drop_down(cx, ids!(board_widget));
+                    widgets.set_labels(cx, board.paths.clone());
+                    widgets.set_selected_item(cx, index);
+                }
+                Err(err) => {
+                    board.paths.clear();
+                    board.revision = None;
+                    self.sidebar.path = Rc::from("");
+                    root.drop_down(cx, ids!(board_widget)).set_labels(cx, vec![]);
+                    root.label(cx, ids!(tweak_result)).set_text(cx, &err.to_string());
+                }
+            }
+        }
+        let edit = model.state.active_member(&model.me()) && board.revision.is_some();
+        design_view::enable_selection(cx, root, edit && !self.sidebar.path.is_empty());
+        root.button(cx, ids!(theme_bake)).set_enabled(cx, edit && board.theme.is_some());
+        root.label(cx, ids!(build_status)).set_text(cx, &format!("Insert: {}", self.build.ty()));
+    }
+
+    pub(super) fn board_actions(&mut self, cx: &mut Cx, root: &WidgetRef, model: &mut Model, item: Id, actions: &Actions) -> Option<Id> {
+        if !root.visible() || self.board.as_ref()?.item != item { return None }
+        for (tab, word, icon) in [(PanelTab::Theme, ids!(tab_theme), ids!(tab_theme_i)), (PanelTab::Build, ids!(tab_build), ids!(tab_build_i))] {
+            if root.button(cx, word).clicked(actions) || root.button(cx, icon).clicked(actions) {
+                self.tab = tab;
+                self.show_tab(cx, root);
+                return None
+            }
+        }
+        let board = self.board.as_mut()?;
+        let revision = board.revision?;
+        let outcome = match self.tab {
+            PanelTab::Build => {
+                if let Some(path) = root.drop_down(cx, ids!(board_widget)).selected(actions).and_then(|i| board.paths.get(i)) {
+                    self.sidebar.path = Rc::from(path.as_str());
+                    return None
+                }
+                if self.build.palette_action(cx, root, actions) {
+                    root.label(cx, ids!(build_status)).set_text(cx, &format!("Insert: {}", self.build.ty()));
+                    return None
+                }
+                let request = self.build.request(cx, root, &root.widget(cx, ids!(build_strip)), actions, &self.sidebar.path, true)?;
+                if !model.state.active_member(&model.me()) { return None }
+                d1::D1Op::from_request(&request).and_then(|op| d1::apply_op(model, item, revision, &op, crate::model::Origin::Ui))
+            }
+            PanelTab::Theme => match self.theme.header_action(cx, root, actions)? {
+                ThemeAction::PickChoice(index) => {
+                    match self.theme.board_theme(index) {
+                        Ok(install) => board.theme = Some(install),
+                        Err(why) => {
+                            board.theme = None;
+                            root.label(cx, ids!(tweak_result)).set_text(cx, &why);
+                        }
+                    }
+                    root.button(cx, ids!(theme_bake)).set_enabled(cx, board.theme.is_some() && model.state.active_member(&model.me()));
+                    return None
+                }
+                ThemeAction::Bake if model.state.active_member(&model.me()) => {
+                    let theme = board.theme.as_ref()?;
+                    let tokens = theme.globals.iter().chain(&theme.overrides).map(|(name, value)|
+                        Ok((name.clone(), d1::theme_val_literal(*value)?))).collect::<Result<BTreeMap<_,_>, d1::D1Error>>();
+                    tokens.and_then(|tokens| d1::apply_theme_tokens(model, item, revision, Some(&theme.base),
+                        theme.sheet.as_deref(), &tokens.into_iter().collect::<Vec<_>>(), crate::model::Origin::Ui))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        match outcome {
+            Ok(outcome) => {
+                if let Some(path) = outcome.edit.focus_path { self.sidebar.path = Rc::from(path); }
+                root.label(cx, ids!(tweak_result)).set_text(cx, "");
+                self.refresh_board(cx, root, model, item);
+                outcome.changed.then_some(outcome.revision)
+            }
+            Err(err) => {
+                self.refresh_board(cx, root, model, item);
+                root.label(cx, ids!(tweak_result)).set_text(cx, &err.to_string());
+                None
+            }
+        }
     }
 
     pub fn refresh<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &Session<L, T>, state: &State, clock: &crate::view::LocalClock) {
         self.bind(cx, root, session);
-        if self.theme_snap.is_some() && !session.supports_theme() {
-            self.theme_snap = None;
-            self.palette = ThemePalette::default();
-            self.theme_requested = false;
-            if self.tab != PanelTab::Tree { self.draw_rows(cx, root, false); }
-        }
         if self.tree.sync_seats(&session.view, state) && self.tab == PanelTab::Tree { self.draw_rows(cx, root, false); }
+        self.sync_design(cx, root, session);
         let owner = session.me == session.sharer;
         root.widget(cx, ids!(tweak_ask)).set_visible(cx, !session.is_ended() && !owner && !session.view.allowed.contains(&session.me));
         let view = &session.view;
@@ -497,6 +904,14 @@ impl Panel {
         actions: &Actions, session: &mut Session<L, T>, granted: impl FnOnce(&Cx) -> bool) {
         if !root.visible() || !matches!(event,
             Event::MouseUp(_) | Event::TouchUpdate(_) | Event::KeyUp(_) | Event::A11yAction(_)) { return }
+        if self.bound == Some((session.share, session.item)) && self.tab == PanelTab::Build
+            && session.me == session.sharer && !session.is_ended() && session.view.design.dirty_files > 0
+            && root.button(cx, ids!(design_commit)).clicked(actions) {
+            if granted(cx) {
+                if let Err(why) = session.commit_design_to_disk() { root.label(cx, ids!(tweak_result)).set_text(cx, &why); }
+            }
+            return
+        }
         for (_, row) in root.portal_list(cx, ids!(tweak_seats_list)).items_with_actions(actions) {
             // Use the binding actually painted under the press, even if the roster has since changed.
             let Some(shown) = row.borrow::<TweakRow>().and_then(|r| r.shown.clone()) else { continue };
@@ -532,22 +947,52 @@ impl Panel {
         let tab = if root.button(cx, ids!(tab_props)).clicked(actions) || root.button(cx, ids!(tab_props_i)).clicked(actions) { PanelTab::Props }
             else if root.button(cx, ids!(tab_shader)).clicked(actions) || root.button(cx, ids!(tab_shader_i)).clicked(actions) { PanelTab::Shader }
             else if root.button(cx, ids!(tab_tree)).clicked(actions) || root.button(cx, ids!(tab_tree_i)).clicked(actions) { PanelTab::Tree }
+            else if root.button(cx, ids!(tab_theme)).clicked(actions) || root.button(cx, ids!(tab_theme_i)).clicked(actions) { PanelTab::Theme }
+            else if root.button(cx, ids!(tab_build)).clicked(actions) || root.button(cx, ids!(tab_build_i)).clicked(actions) { PanelTab::Build }
             else { self.tab };
         if tab != self.tab {
             self.tree.cancel_reveal();
+            if self.tab == PanelTab::Theme && self.theme.confirm.take().is_some() { self.theme.msg.clear(); }
             self.tab = tab;
+            if tab == PanelTab::Theme {
+                self.theme.refresh_saved();
+                if self.theme.snapshot.is_none() && self.theme.inflight_get.is_none() { self.request_theme(session); }
+                self.theme.sync_header(cx, root);
+            }
             if tab == PanelTab::Tree {
                 let ready = self.tree.loaded || self.tree.inflight_root.is_some() || self.send_tree(session, TreeState::root());
                 if ready && !self.sidebar.path.is_empty() {
                     self.follow_selection(cx, root, session, &self.sidebar.path.clone(), true);
                 }
             }
+            if tab == PanelTab::Build { self.load_palette(cx, root, session); }
+            self.sync_design(cx, root, session);
             self.show_tab(cx, root);
             self.draw_rows(cx, root, false);
             return;
         }
+        if matches!(self.tab, PanelTab::Tree | PanelTab::Build) {
+            let build = self.tab == PanelTab::Build;
+            let strip = root.widget(cx, if build { ids!(build_strip) } else { ids!(tree_strip) });
+            if let Some(req) = self.build.request(cx, root, &strip, actions, &self.sidebar.path, build) {
+                self.request_design(cx, root, session, req);
+                return
+            }
+        }
         let (properties, list) = match self.tab {
+            PanelTab::Build => {
+                if self.build.palette_action(cx, root, actions) { self.sync_design(cx, root, session); }
+                return
+            }
+            PanelTab::Theme => {
+                if let Some(action) = self.theme.header_action(cx, root, actions) {
+                    self.handle_theme_action(cx, root, session, action);
+                    return
+                }
+                (ids!(tweak_theme), ids!(tweak_theme_list))
+            }
             PanelTab::Tree => {
+                if self.focus_action(cx, root, actions, session) { return }
                 if let Some(action) = self.tree_action(cx, root, actions) {
                     self.handle_tree_action(cx, root, action, session);
                 }
@@ -565,24 +1010,231 @@ impl Panel {
         self.handle_prop_list_actions(cx, root, actions, session, root.widget(cx, properties), root.portal_list(cx, list));
     }
 
+    fn locate_selection<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &mut Session<L,T>) {
+        if self.sidebar.location_checked || self.sidebar.path.is_empty() || !session.supports_design()
+            || !session.view.design.active || session.is_ended() || (session.me != session.sharer && !session.view.allowed.contains(&session.me)) { return }
+        self.sidebar.location_checked = true;
+        self.request_design(cx, root, session, DesignRequest::State { path: Some(self.sidebar.path.to_string()) });
+    }
+
+    fn request_design<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
+        session: &mut Session<L,T>, req: DesignRequest) -> bool {
+        if !session.supports_design() || session.is_ended() { return false }
+        let request = Request::Design(req.clone());
+        if session.may_act(&session.me, None, &request).is_err() { return false }
+        match session.request(None, request) {
+            Ok(id) => { self.build.pending.insert(id, req); true }
+            Err(why) => {
+                root.label(cx, ids!(tweak_result)).set_text(cx, &why);
+                false
+            }
+        }
+    }
+
+    fn load_palette<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &mut Session<L,T>) {
+        if !self.build.loaded && !self.build.pending.values().any(|r| matches!(r, DesignRequest::Palette { .. })) {
+            self.request_design(cx, root, session, DesignRequest::Palette { query: None, offset: 0, limit: super::wire::MAX_PALETTE_LIMIT });
+        }
+    }
+
+    fn sync_design<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &Session<L,T>) {
+        let supported = session.supports_design();
+        let read = supported && !session.is_ended();
+        let owner = session.me == session.sharer;
+        let edit = read && (owner || session.view.allowed.contains(&session.me));
+        if let Some(mut tree) = root.widget(cx, ids!(tweak_tree)).borrow_mut::<TweakList>() {
+            tree.configure_tree_drag(cx, edit, &self.tree);
+        }
+        if let Some(mut list) = root.widget(cx, ids!(build_palette)).borrow_mut::<PaletteList>() { list.set_drag_enabled(edit); }
+        root.button(cx, ids!(theme_bake)).set_enabled(cx, edit);
+        let rename = edit && self.sidebar.located;
+        if self.sidebar.rename.editable != rename {
+            self.sidebar.rename.editable = rename;
+            if !rename { self.sidebar.rename = Default::default(); }
+            if self.tab == PanelTab::Props { self.draw_rows(cx, root, false); }
+        }
+        let status = &session.view.design;
+        design_view::enable_selection(cx, root, edit && !self.sidebar.path.is_empty());
+        for (id, enabled) in [(ids!(design_undo), edit && status.undo > 0), (ids!(design_redo), edit && status.redo > 0),
+            (ids!(design_reset), edit && status.dirty_files > 0), (ids!(design_bake), edit), (ids!(design_patch), edit),
+            (ids!(design_diff), read), (ids!(design_verify), read)] {
+            root.button(cx, id).set_enabled(cx, enabled);
+        }
+        root.widget(cx, ids!(design_commit)).set_visible(cx, read && owner && status.dirty_files > 0);
+        if self.tab == PanelTab::Build {
+            let label = if !supported { super::OLDER_SHARER_DESIGN.into() } else {
+                let target = if self.sidebar.path.is_empty() {
+                    "Select a widget".into()
+                } else if self.sidebar.ty.is_empty() {
+                    self.sidebar.path.to_string()
+                } else {
+                    format!("{} ({})", self.sidebar.path, self.sidebar.ty)
+                };
+                let dirty = if status.dirty_files == 1 { "1 dirty file".into() }
+                    else { format!("{} dirty files", status.dirty_files) };
+                format!("{target} · Insert: {} · {dirty}", self.build.ty())
+            };
+            root.label(cx, ids!(build_status)).set_text(cx, &label);
+        }
+    }
+
+    fn design_notice<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
+        session: &mut Session<L,T>, seat: Seat, req: RequestId, agent: Option<Id>, notice: &Notice) -> bool {
+        let own = seat == session.me && agent.is_none();
+        match notice {
+            Notice::Design(DesignNotice::Status(_)) => {
+                self.locate_selection(cx, root, session);
+                self.sync_design(cx, root, session);
+                if self.tab == PanelTab::Build { self.load_palette(cx, root, session); }
+            }
+            Notice::Design(DesignNotice::Reply { kind, json }) if own => {
+                let Some(request) = self.build.pending.remove(&req) else { return false };
+                let Ok(value) = super::parse_json(json) else { return true };
+                if let DesignRequest::State { path: Some(path) } = &request {
+                    if path == self.sidebar.path.as_ref() {
+                        self.sidebar.located = value.get("located").is_some_and(|v| v.get("file").and_then(|v| v.as_str()).is_some());
+                        self.sync_design(cx, root, session);
+                    }
+                    return true
+                }
+                if let DesignRequest::Palette { offset, limit, .. } = request {
+                    if let Some(mut list) = root.widget(cx, ids!(build_palette)).borrow_mut::<PaletteList>() {
+                        if let Err(why) = list.palette.page(&value, offset == 0) {
+                            root.label(cx, ids!(tweak_result)).set_text(cx, &why);
+                            return true
+                        }
+                        list.redraw(cx);
+                    }
+                    if let Some(next) = value.get("next_offset").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).filter(|&v| v > offset) {
+                        self.request_design(cx, root, session, DesignRequest::Palette { query: None, offset: next, limit });
+                    } else { self.build.loaded = true; }
+                } else {
+                    let preview = match kind {
+                        DesignReplyKind::Diff => value.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
+                        DesignReplyKind::WritePatch => value.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                        DesignReplyKind::Verify => json.as_str(),
+                        _ => return true,
+                    };
+                    root.label(cx, ids!(build_preview)).set_text(cx, if preview.is_empty() { "No changes" } else { preview });
+                    root.widget(cx, ids!(build_preview)).set_visible(cx, true);
+                }
+            }
+            Notice::Design(DesignNotice::Mutated { focus_path, .. }) => {
+                if let Some(request) = own.then(|| self.build.pending.remove(&req)).flatten() {
+                    let current = match &request {
+                        DesignRequest::Rename { path, .. } => {
+                            let current = self.sidebar.path.as_ref() == path;
+                            if current { self.sidebar.rename = Default::default(); }
+                            current
+                        }
+                        _ => true,
+                    };
+                    if let Some(path) = focus_path.as_ref().filter(|_| current) {
+                        let _ = session.request(None, Request::Select(Some(path.clone())));
+                    }
+                }
+                self.tree.loaded = false;
+                if self.tab == PanelTab::Tree {
+                    let query = self.tree.clear_for_refresh();
+                    self.send_tree(session, query);
+                }
+                root.widget(cx, ids!(build_preview)).set_visible(cx, false);
+            }
+            Notice::Refused(why) if own => {
+                match self.build.pending.remove(&req) {
+                    Some(DesignRequest::State { path: Some(_) }) => {}
+                    Some(DesignRequest::Rename { path, name, .. }) if path == self.sidebar.path.as_ref() => {
+                        let field = &mut self.sidebar.rename;
+                        field.busy = false;
+                        field.draft = Some(name);
+                        let refusal = super::parse_json(why).ok();
+                        let lines = refusal.as_ref().and_then(|v| v.get("rust_refs")?.as_arr()).into_iter().flatten()
+                            .filter_map(|r| r.get("line")?.as_u64()).map(|n| n.to_string()).collect::<Vec<_>>();
+                        field.confirm = !lines.is_empty();
+                        field.message = if field.confirm { format!("Referenced in Rust at lines {}", lines.join(", ")) } else { why.clone() };
+                        self.draw_rows(cx, root, false);
+                    }
+                    Some(_) => root.label(cx, ids!(tweak_result)).set_text(cx, why),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn show_tab(&self, cx: &mut Cx, root: &WidgetRef) {
+        let build = self.tab == PanelTab::Build;
+        root.widget(cx, ids!(tweak_build_wrap)).set_visible(cx, build);
         let props = self.tab == PanelTab::Props;
         root.widget(cx, ids!(tweak_props_wrap)).set_visible(cx, props);
         let shader = self.tab == PanelTab::Shader;
         let tree = self.tab == PanelTab::Tree;
+        let theme = self.tab == PanelTab::Theme;
+        root.widget(cx, ids!(tweak_theme_wrap)).set_visible(cx, theme);
         root.widget(cx, ids!(tweak_shader_wrap)).set_visible(cx, shader);
         root.widget(cx, ids!(tweak_tree_wrap)).set_visible(cx, tree);
-        root.widget(cx, ids!(tweak_hint)).set_visible(cx, self.sidebar.path.is_empty() && !tree);
+        root.widget(cx, ids!(tweak_hint)).set_visible(cx, self.sidebar.path.is_empty() && (props || shader));
         for (id, active) in [(ids!(tab_props), props), (ids!(tab_props_i), props),
-            (ids!(tab_shader), shader), (ids!(tab_shader_i), shader), (ids!(tab_tree), tree), (ids!(tab_tree_i), tree)] {
+            (ids!(tab_shader), shader), (ids!(tab_shader_i), shader), (ids!(tab_tree), tree), (ids!(tab_tree_i), tree),
+            (ids!(tab_theme), theme), (ids!(tab_theme_i), theme), (ids!(tab_build), build), (ids!(tab_build_i), build)] {
             set_tab_fill(cx, root.widget(cx, id), active);
         }
     }
 
+    pub(super) fn focus_for(&self, share: SessionId, item: Id) -> Option<&FocusState> {
+        let key = (share, item);
+        if self.bound == Some(key) { Some(&self.tree.focus) }
+        else { self.other_trees.get(&key).map(|tree| &tree.focus) }
+    }
+
+    pub(super) fn scale_focus_zoom(&mut self, cx: &mut Cx, root: &WidgetRef, share: SessionId, item: Id, factor: f64) {
+        let key = (share, item);
+        if self.bound == Some(key) {
+            self.tree.focus.scale_zoom(factor);
+            if self.tab == PanelTab::Tree { self.focus_header(cx, root); }
+        } else if let Some(tree) = self.other_trees.get_mut(&key) { tree.focus.scale_zoom(factor); }
+    }
+
+    fn focus_header(&self, cx: &mut Cx, root: &WidgetRef) {
+        let rule = self.tree.focus.rule();
+        let isolate = root.widget(cx, ids!(tree_isolate));
+        isolate.set_disabled(cx, !rule.controls_enabled && self.sidebar.path.is_empty());
+        set_tab_fill(cx, isolate, rule.controls_enabled);
+        let center = root.widget(cx, ids!(tree_center));
+        center.set_disabled(cx, !rule.controls_enabled);
+        set_tab_fill(cx, center, rule.center);
+        root.widget(cx, ids!(tree_zoom_out)).set_disabled(cx, !rule.controls_enabled || rule.zoom <= MIN_ZOOM);
+        root.widget(cx, ids!(tree_zoom_in)).set_disabled(cx, !rule.controls_enabled || rule.zoom >= MAX_ZOOM);
+        root.label(cx, ids!(tree_zoom)).set_text(cx, &zoom_label(rule.zoom));
+        let hint = root.label(cx, ids!(isolate_hint));
+        hint.set_visible(cx, self.tree.focus.hint.is_some());
+        hint.set_text(cx, self.tree.focus.hint.as_deref().unwrap_or(""));
+    }
+
+    fn focus_action<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, actions: &Actions,
+        session: &mut Session<L, T>) -> bool {
+        let clicked = |id| root.button(cx, id).clicked(actions);
+        if clicked(ids!(tree_isolate)) {
+            if let Some(q) = self.tree.toggle_isolate(&self.sidebar.path, self.sidebar.rect) { self.send_tree(session, q); }
+            self.draw_rows(cx, root, false);
+            return true
+        } else if clicked(ids!(tree_center)) { self.tree.focus.set_center(!self.tree.focus.center); }
+        else if clicked(ids!(tree_zoom_out)) { self.tree.focus.step_zoom(-ZOOM_STEP); }
+        else if clicked(ids!(tree_zoom_in)) { self.tree.focus.step_zoom(ZOOM_STEP); }
+        else { return false }
+        self.focus_header(cx, root);
+        true
+    }
+
     fn send_tree<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>, query: TreeQuery) -> bool {
+        Self::send_tree_for(&mut self.tree, session, query)
+    }
+
+    fn send_tree_for<L: Copy + Eq, T: Copy + Eq>(tree: &mut TreeState, session: &mut Session<L, T>, query: TreeQuery) -> bool {
         match session.request(None, Request::Tree(query.clone())) {
-            Ok(req) => { self.tree.mark_sent(req, &query); true }
-            Err(why) => { self.tree.mark_send_failed(&query, &why); false }
+            Ok(req) => { tree.mark_sent(req, &query); true }
+            Err(why) => { tree.mark_send_failed(&query, &why); false }
         }
     }
 
@@ -611,6 +1263,9 @@ impl Panel {
         if let Some(text) = input.changed(actions) { return Some(TreeAction::Filter(text)) }
         if root.button(cx, ids!(tree_refresh)).clicked(actions) { return Some(TreeAction::Refresh) }
         let tree = root.widget(cx, ids!(tweak_tree));
+        if let Some(action) = actions.iter().filter_map(|a| a.as_widget_action()).find_map(|w| {
+            (w.widget_uid == tree.widget_uid()).then(|| w.action.downcast_ref::<TreeAction>()).flatten()
+        }) { return Some(action.clone()) }
         let list = tree.borrow::<TweakList>()?;
         for (i, item) in root.portal_list(cx, ids!(tweak_tree_list)).items_with_actions(actions) {
             let Some(row) = item.borrow::<TweakRow>() else { continue };
@@ -626,8 +1281,14 @@ impl Panel {
     fn handle_tree_action<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, action: TreeAction,
         session: &mut Session<L, T>) {
         let query = match action {
+            TreeAction::Move { source, target, place } => {
+                if self.tree.filter.is_empty() {
+                    self.request_design(cx, root, session, DesignRequest::Move { path: source, target, place });
+                }
+                return
+            }
             TreeAction::Select(path) => {
-                if let Err(why) = session.request(None, Request::Select(Some(path.to_string()))) {
+                if let Err(why) = session.request(None, Request::Select(Some(path))) {
                     root.label(cx, ids!(tweak_result)).set_text(cx, &why);
                 }
                 return
@@ -660,30 +1321,45 @@ impl Panel {
                 let Some(current) = properties.borrow::<TweakList>().and_then(|list| list.rows.get(index).cloned()) else { continue };
                 let (Line::Property(painted), Line::Property(line)) = (shown.as_ref(), current.as_ref()) else { continue };
                 if !Rc::ptr_eq(&shown, &current) && !painted.same_binding(line) { continue }
-                if let PropLine::Header { open: Some(_), .. } = line {
+                if let PropLine::Header { open: Some((key, _)), .. } = line {
                     if item.view(cx, ids!(header)).finger_up(actions).is_some_and(|tap| tap.is_over && tap.was_tap()) {
-                        self.shader.consts_open = !self.shader.consts_open;
-                        redraw = true;
+                        match key {
+                            HeaderId::ShaderConstants => { self.shader.consts_open = !self.shader.consts_open; redraw = true; }
+                            HeaderId::Theme(i) => self.handle_theme_action(cx, root, session, ThemeAction::ToggleSection(*i)),
+                        }
                     }
                     continue;
                 }
                 let Some(row) = item.borrow::<TweakRow>() else { continue };
                 let Some(action) = self.sidebar.handle_sidebar_actions(cx, &item, line, actions, &row.controls, &self.live) else { continue };
                 match action {
+                    SidebarAction::Rename { name, force } => {
+                        self.sidebar.rename.confirm = false;
+                        self.sidebar.rename.busy = self.request_design(cx, root, session, DesignRequest::Rename {
+                            path: self.sidebar.path.to_string(), name, force_rust_refs: force,
+                        });
+                        redraw = true;
+                    }
                     SidebarAction::Redraw => redraw = true,
+                    SidebarAction::ClearRefusal(path, prop) => {
+                        if path.as_ref() == "theme" { self.theme.refusals.remove(&prop); }
+                        else { self.sidebar.refusals.remove(&prop); }
+                        redraw = true;
+                    }
                     SidebarAction::PaletteOpened(uid) => {
                         let swatch = item.widget(cx, ids!(swatch));
                         if swatch.widget_uid() == uid {
                             if let Some(mut pick) = swatch.borrow_mut::<fab_controls::FabColorPick>() {
-                                pick.set_palette(cx, self.palette.entries());
+                                pick.set_palette(cx, self.theme.palette.entries());
                             }
                         }
                     }
                     SidebarAction::Sets { path, edits, phase } => {
                         for (prop, value) in edits.iter() {
                             let finished = self.live.offer(&path, &prop, value, phase, |path, prop, value| {
-                                let had_refusal = self.sidebar.refusals.contains_key(prop);
-                                let sent = send_set(session, &mut self.sidebar, &mut self.edits, path, prop, value);
+                                let had_refusal = if path.as_ref() == "theme" { self.theme.refusals.contains_key(prop) }
+                                    else { self.sidebar.refusals.contains_key(prop) };
+                                let sent = send_set(session, &mut self.sidebar, &mut self.theme, &mut self.edits, path, prop, value);
                                 redraw |= had_refusal || sent.is_none() || super::props::layout_composited(prop)
                                     || matches!(line, PropLine::Prop { row, .. } if !row.comp_vals.is_empty());
                                 sent
@@ -701,7 +1377,10 @@ impl Panel {
 
     fn draw_rows(&mut self, cx: &mut Cx, root: &WidgetRef, reset_scroll: bool) {
         let (widget, lines) = match self.tab {
+            PanelTab::Build => return,
+            PanelTab::Theme => (ids!(tweak_theme), self.theme.lines()),
             PanelTab::Tree => {
+                self.focus_header(cx, root);
                 let (lines, scroll_index) = self.tree.lines(&self.sidebar.path);
                 let status = root.label(cx, ids!(tree_status));
                 status.set_text(cx, &self.tree.status);
@@ -709,8 +1388,13 @@ impl Panel {
                 status.set_visible(cx, !self.tree.status.is_empty() && !status_in_list);
                 let widget = root.widget(cx, ids!(tweak_tree));
                 let rows = {
-                    let Some(list) = widget.borrow::<TweakList>() else { return };
-                    lines.into_iter().enumerate().map(|(i, line)| {
+                    let Some(mut list) = widget.borrow_mut::<TweakList>() else { return };
+                    let edit = list.can_edit_tree;
+                    list.configure_tree_drag(cx, edit, &self.tree);
+                    lines.into_iter().enumerate().map(|(i, mut line)| {
+                        if let (TreeLine::Node { path, drop, .. }, Some((index, target, zone))) = (&mut line, &list.indicator) {
+                            if *index == i && path == target { *drop = Some(*zone); }
+                        }
                         let line = Line::Tree(line);
                         match list.rows.get(i) {
                             Some(old) if **old == line => old.clone(),
@@ -726,28 +1410,42 @@ impl Panel {
                 }
                 return
             }
-            PanelTab::Props => (ids!(tweak_properties), self.sidebar.lines(&self.palette)),
+            PanelTab::Props => (ids!(tweak_properties), self.sidebar.lines(&self.theme.palette)),
             PanelTab::Shader => {
                 let layer = self.shader.sync(cx, root, &self.sidebar);
-                let lines = layer.map_or_else(Vec::new, |l| self.shader.lines(&self.sidebar, l, &self.palette));
+                let lines = layer.map_or_else(Vec::new, |l| self.shader.lines(&self.sidebar, l, &self.theme.palette));
                 (ids!(tweak_shader_rows), lines)
             }
         };
-        replace(cx, root.widget(cx, widget), lines.into_iter().map(|p| Rc::new(Line::Property(p))).collect(), reset_scroll);
+        let widget = root.widget(cx, widget);
+        let rows = {
+            let Some(list) = widget.borrow::<TweakList>() else { return };
+            lines.into_iter().enumerate().map(|(i, prop)| {
+                let line = Line::Property(prop);
+                match list.rows.get(i) {
+                    Some(old) if **old == line => old.clone(),
+                    _ => Rc::new(line),
+                }
+            }).collect()
+        };
+        replace(cx, widget, rows, reset_scroll);
     }
 
     fn mark_changed(&mut self, cx: &mut Cx, root: &WidgetRef) {
         if let Some(list) = root.widget(cx, ids!(tweak_history)).borrow::<TweakList>() {
-            self.sidebar.props.mark_changed(&self.sidebar.path, list.rows.iter().flat_map(|line| {
+            let edits = list.rows.iter().flat_map(|line| {
                 let run = line.history_run();
                 run.first.edit().into_iter().chain(run.last.edit())
-            }));
+            });
+            self.sidebar.props.mark_changed(&self.sidebar.path, edits.clone());
+            self.theme.mark_changed(edits);
         }
         if self.tab != PanelTab::Tree { self.draw_rows(cx, root, false); }
     }
 
     fn request_props<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &mut Session<L,T>,
         agent: Option<Id>, path: &str) {
+        if agent.is_none() { self.locate_selection(cx, root, session); }
         match session.request(agent, Request::Props { path: path.to_owned() }) {
             Ok(id) => self.props = Some((id, path.to_owned())),
             Err(why) => root.label(cx, ids!(tweak_result)).set_text(cx, &why),
@@ -756,14 +1454,47 @@ impl Panel {
 
     fn refresh_after_edit<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
         session: &mut Session<L, T>, path: &str) {
+        if path == "theme" { return }
         if self.sidebar.path.as_ref() == path && !self.live.open_on(path) && !session.is_ended()
             && session.may_act(&session.me, None, &Request::Props { path: path.into() }).is_ok() {
             self.request_props(cx, root, session, None, path);
         }
     }
 
+    pub(super) fn resize_widget<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
+        session: &mut Session<L,T>, resize: &super::overlay::Resize) {
+        use super::{overlay::ResizePhase, props::live::Phase};
+        if self.bound != Some((session.share, session.item)) { return }
+        let path = if self.sidebar.path.as_ref() == resize.path.as_ref() { self.sidebar.path.clone() }
+            else { Rc::from(resize.path.as_ref()) };
+        let end = resize.phase != ResizePhase::Drag;
+        let phase = if end { Phase::End } else { Phase::Step };
+        if resize.phase == ResizePhase::Release && self.is_build_mode(session.share, session.item) {
+            self.pending_resize_bake = Some(path.clone());
+        }
+        for (prop, value) in [("width", resize.width), ("height", resize.height)] {
+            if let Some(value) = value {
+                self.live.offer(&path, prop, format!("{}", value.round().max(1.) as u64), phase, |p, k, v|
+                    send_set(session, &mut self.sidebar, &mut self.theme, &mut self.edits, p, k, v));
+            }
+        }
+        if end { self.settle_resize(cx, root, session); }
+    }
+
+    fn settle_resize<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &mut Session<L,T>) {
+        if session.is_ended() || !self.is_build_mode(session.share, session.item) {
+            self.pending_resize_bake = None;
+            return;
+        }
+        if self.pending_resize_bake.as_ref().is_some_and(|p| !self.live.open_on(p)) {
+            let path = self.pending_resize_bake.take().unwrap();
+            self.request_design(cx, root, session, DesignRequest::Bake { scope: super::BakeScope::Props, path: Some(path.to_string()), prop: None });
+            if self.sidebar.path == path { let _ = session.request(None, Request::Pick(super::At::Path(path.to_string()))); }
+        }
+    }
+
     fn set_reply<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>, req: RequestId) -> Option<Rc<str>> {
-        self.live.reply(req, |path, prop, value| send_set(session, &mut self.sidebar, &mut self.edits, path, prop, value))
+        self.live.reply(req, |path, prop, value| send_set(session, &mut self.sidebar, &mut self.theme, &mut self.edits, path, prop, value))
     }
 
     fn select(&mut self, cx: &mut Cx, root: &WidgetRef, path: &str, ty: Option<&str>, rect: Option<super::Rect>) {
@@ -777,23 +1508,154 @@ impl Panel {
             self.shader.status.clear();
             self.sidebar = Sidebar { path: Rc::from(path), collapsed: self.sidebar.collapsed, ..Default::default() };
         }
-        root.widget(cx, ids!(tweak_hint)).set_visible(cx, path.is_empty() && self.tab != PanelTab::Tree);
+        root.widget(cx, ids!(tweak_hint)).set_visible(cx, path.is_empty() && matches!(self.tab, PanelTab::Props | PanelTab::Shader));
         if let Some(ty) = ty { self.sidebar.ty = ty.to_owned(); }
         self.sidebar.rect = rect;
         self.props = None;
-        self.draw_rows(cx, root, changed);
+        if self.tab != PanelTab::Theme { self.draw_rows(cx, root, changed); }
     }
 
     fn ensure_theme<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>) {
-        if self.theme_requested || self.theme_snap.is_some() || self.theme_req.is_some() || session.is_ended() { return }
+        if self.theme.background_requested || self.theme.snapshot.is_some() || self.theme.inflight_get.is_some() || session.is_ended() { return }
         let get = Request::Theme(ThemeOp::Get);
         if session.may_act(&session.me, None, &get).is_err() { return }
-        self.theme_requested = true;
-        self.theme_req = session.request(None, get).ok();
+        self.theme.background_requested = true;
+        self.request_theme(session);
     }
 
-    fn theme_refusal(&mut self, req: RequestId) -> Option<()> {
-        self.theme_req.take_if(|pending| *pending == req).map(|_| ())
+    fn request_theme<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>) {
+        match session.request(None, Request::Theme(ThemeOp::Get)) {
+            Ok(req) => { self.theme.inflight_get = Some(req); self.theme.status = "Loading theme…".into(); }
+            Err(why) => self.theme.status = why,
+        }
+    }
+
+    fn send_install<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>, pending: PendingInstall) {
+        let PendingInstall { install, meta } = pending;
+        match session.request(None, Request::Theme(ThemeOp::Install(install))) {
+            Ok(req) => {
+                self.theme.inflight_install = Some(req);
+                self.theme.last_own_install = Some(req);
+                self.theme.installing = Some(meta);
+            }
+            Err(why) => self.theme.install_failed(meta, why),
+        }
+    }
+
+    pub(super) fn ticking_share(&self) -> Option<(SessionId, Id)> {
+        self.bound.filter(|_| self.needs_theme_tick())
+    }
+
+    pub(super) fn wants_mixer_cache(&self) -> Option<(SessionId, Id)> {
+        self.bound.filter(|_| self.theme.eq_open && !self.theme.eq_reanchor_pending && self.theme.eq_lab.is_none())
+    }
+
+    pub(super) fn needs_theme_tick(&self) -> bool {
+        self.theme.eq_open && !self.theme.eq_reanchor_pending && (self.theme.eq_lab.is_none()
+            || self.theme.eq_apply_due && self.theme.inflight_install.is_none())
+            || self.theme.tb_open && !self.theme.tb_reanchor_pending && (self.theme.tb_moving || self.theme.tb_apply_due && self.theme.inflight_install.is_none())
+    }
+
+    pub(super) fn tick_theme_at<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
+        session: &mut Session<L, T>, now: f64) {
+        if !self.needs_theme_tick() || self.bound != Some((session.share, session.item)) || session.is_ended() { return }
+        if self.theme.tb_open {
+            let next = self.theme.settle_build(now);
+            if let Some(next) = next { self.send_install(session, next); }
+            if !self.theme.tb_apply_due && self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+        } else if self.theme.eq_lab.is_none() {
+            self.theme.enter_prepared(&self.mixer_cache);
+            if self.theme.eq_lab.is_some() && self.tab == PanelTab::Theme { self.theme.sync_mixer(cx, root); }
+        } else {
+            let immediate = self.theme.eq_apply_at_once;
+            let next = self.theme.settle_mix(now);
+            let settled = next.is_some() || !self.theme.eq_apply_due || immediate;
+            if let Some(next) = next { self.send_install(session, next); }
+            if settled && self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+        }
+    }
+
+    fn handle_theme_action<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef,
+        session: &mut Session<L, T>, action: ThemeAction) {
+        let result = match action {
+            ThemeAction::Bake => {
+                self.request_design(cx, root, session, DesignRequest::Bake { scope: super::BakeScope::Theme, path: None, prop: None });
+                return
+            }
+            ThemeAction::Build(action) => {
+                if self.theme.tb_open && matches!(action, BuildAction::Fold) { self.theme.close_build_popovers(cx, root); }
+                let moving = matches!(action, BuildAction::Slider { ended: false, .. } | BuildAction::Color { ended: false, .. });
+                let pending = self.theme.build_action(action);
+                if self.needs_theme_tick() { cx.new_next_frame(); }
+                if moving {
+                    self.theme.sync_build_controls(cx, root);
+                    return
+                }
+                Ok(pending)
+            }
+            ThemeAction::Mix(action) => {
+                if self.theme.tb_open && matches!(action, MixAction::Fold) { self.theme.close_build_popovers(cx, root); }
+                let weight = matches!(action, MixAction::Weight { .. } | MixAction::Reset(_));
+                let pending = self.theme.mix_action(action, &mut self.mixer_cache);
+                if self.needs_theme_tick() { cx.new_next_frame(); }
+                if weight {
+                    self.theme.sync_weights(cx, root);
+                    return
+                }
+                Ok(pending)
+            }
+            ThemeAction::PickChoice(i) => self.theme.pick(i),
+            ThemeAction::SaveAs(text) => self.theme.save_as(&text).map(|_| None),
+            ThemeAction::DeleteSaved => {
+                let doomed = self.theme.worn.as_ref().map(|s| s.name.clone());
+                match self.theme.delete_saved() {
+                    Ok(Some(fallback)) => {
+                        if let Some(name) = doomed { self.worn_by_share.retain(|_, s| s.name != name); }
+                        let message = std::mem::take(&mut self.theme.msg);
+                        let next = self.theme.pick(fallback);
+                        self.theme.msg = message;
+                        next
+                    }
+                    Ok(None) => Ok(None), Err(e) => Err(e),
+                }
+            }
+            ThemeAction::Name(text) => {
+                if self.theme.name_text != text {
+                    self.theme.name_text = text;
+                    if self.theme.confirm.take().is_some() { self.theme.msg.clear(); }
+                }
+                Ok(None)
+            }
+            ThemeAction::ToggleSection(i) => {
+                let folded = &mut self.theme.collapsed[usize::from(i)];
+                *folded = !*folded;
+                self.draw_rows(cx, root, false);
+                return
+            }
+            ThemeAction::Filter(text) => {
+                self.theme.filter = text;
+                self.draw_rows(cx, root, true);
+                return
+            }
+        };
+        match result {
+            Ok(Some(install)) => self.send_install(session, install),
+            Err(e) => { self.theme.confirm = None; self.theme.msg = e.to_string(); }
+            Ok(None) => {}
+        }
+        self.theme.sync_header(cx, root);
+    }
+
+    fn theme_refusal<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, session: &mut Session<L, T>, req: RequestId, why: &str) -> Option<()> {
+        if self.theme.inflight_get.take_if(|r| *r == req).is_some() {
+            self.theme.status = why.into();
+        } else if self.theme.inflight_install == Some(req) {
+            let next = self.theme.install_settled(req);
+            if let Some(meta) = self.theme.installing.take() { self.theme.install_failed(meta, why.into()); }
+            if let Some(next) = next { self.send_install(session, next); }
+            if self.needs_theme_tick() { cx.new_next_frame(); }
+        } else { return None }
+        Some(())
     }
 
     pub(super) fn restore_selection<L: Copy + Eq, T: Copy + Eq>(
@@ -809,35 +1671,92 @@ impl Panel {
         }
     }
 
+    pub(super) fn background_tree_notice<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>,
+        seat: Seat, req: RequestId, notice: &Notice) {
+        let key = (session.share, session.item);
+        let tree = if self.bound == Some(key) { &mut self.tree }
+            else if let Some(tree) = self.other_trees.get_mut(&key) { tree } else { return };
+        Self::observe_tree(tree, session, seat, req, notice);
+    }
+
+    /// Only tree reads owned by this panel can complete a refresh or confirm a missing target.
+    fn observe_tree<L: Copy + Eq, T: Copy + Eq>(tree: &mut TreeState, session: &mut Session<L, T>,
+        seat: Seat, req: RequestId, notice: &Notice) -> bool {
+        let next = match notice {
+            Notice::Tree { query, tree: json } if seat == session.me => tree.apply_reply(req, query, json),
+            Notice::Refused(why) if seat == session.me => match tree.apply_refusal(req, why) {
+                Some(next) => next,
+                None => return false,
+            },
+            Notice::Picked { path, rect, .. } | Notice::Selected { path: Some(path), rect: Some(rect) }
+                if tree.focus.isolated_path.as_ref() == Some(path) => {
+                    tree.focus.update_rect(*rect);
+                    return false
+                }
+            Notice::Applied { .. } => tree.focus.isolated_path.clone().and_then(|path| {
+                let request = Request::Tree(super::tree::reveal(path.clone()));
+                if session.may_act(&session.me, None, &request).is_ok() { tree.offer_reveal(&path) } else { None }
+            }),
+            _ => return false,
+        };
+        if let Some(q) = next { Self::send_tree_for(tree, session, q); }
+        matches!(notice, Notice::Tree { .. } | Notice::Refused(_))
+    }
+
     pub fn notice<L: Copy + Eq, T: Copy + Eq>(&mut self, cx: &mut Cx, root: &WidgetRef, session: &mut Session<L, T>,
         seat: Seat, req: RequestId, agent: Option<Id>, state: &State, notice: &Notice) {
-        self.bind(cx, root, session);
+        if agent.is_some() && matches!(notice, Notice::Theme { .. }) { return }
+        if agent.is_none() {
+            self.bind(cx, root, session);
+        } else if self.bound != Some((session.share, session.item)) {
+            if matches!(notice, Notice::Applied { path, prop, .. } if path == "theme" && prop == "install") {
+                self.clear_worn(cx, root, session.share, session.item);
+            }
+            return
+        }
+        if self.design_notice(cx, root, session, seat, req, agent, notice) { return }
+        let had_isolation = self.tree.focus.isolated_path.is_some();
+        if Self::observe_tree(&mut self.tree, session, seat, req, notice) {
+            if self.tab == PanelTab::Tree { self.draw_rows(cx, root, false); }
+            return
+        }
         let dots_changed = self.tree.sync_seats(&session.view, state);
-        let selects = seat == session.me && match notice {
+        let rect_refresh = seat == session.me && req == 0
+            && matches!(notice, Notice::Selected { path: Some(p), rect: Some(_) } if p == self.sidebar.path.as_ref());
+        let selects = seat == session.me && !rect_refresh && match notice {
             Notice::Picked { .. } => self.last_selection.is_none_or(|last| req > last),
             Notice::Selected { .. } => self.last_selection.is_none_or(|last| req >= last),
             _ => false,
         };
-        if dots_changed && self.tab == PanelTab::Tree && !selects {
+        let isolation_cleared = had_isolation && self.tree.focus.isolated_path.is_none();
+        if self.tab == PanelTab::Tree && !selects && (dots_changed || isolation_cleared) {
             self.draw_rows(cx, root, false);
         }
         let who = who(state, &seat, agent);
         let text = match notice {
             Notice::Asked => format!("{who} asked to edit"),
             Notice::Allowed(true) => {
-                if seat == session.me { self.ensure_theme(session); }
+                if seat == session.me {
+                    self.ensure_theme(session);
+                    self.locate_selection(cx, root, session);
+                    if self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+                }
                 format!("{who} can edit")
             }
             Notice::Allowed(false) => {
-                if seat == session.me { self.theme_requested = false; }
+                if seat == session.me { self.theme.background_requested = false; }
                 format!("Editing permission revoked for {who}")
             }
             Notice::Theme { theme } => {
                 if let Some(snapshot) = ThemeSnapshot::parse(theme) {
-                    self.palette = snapshot.palette();
-                    self.theme_snap = Some(snapshot);
-                    self.theme_requested = true;
-                    self.theme_req = None;
+                    self.theme.palette = snapshot.palette();
+                    self.theme.snapshot = Some(snapshot);
+                    self.theme.received_snapshot();
+                    if self.needs_theme_tick() { cx.new_next_frame(); }
+                    self.theme.background_requested = true;
+                    if seat == session.me && self.theme.inflight_get == Some(req) { self.theme.inflight_get = None; }
+                    self.theme.status.clear();
+                    if self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
                     if self.tab != PanelTab::Tree { self.draw_rows(cx, root, false); }
                 }
                 return
@@ -852,7 +1771,9 @@ impl Panel {
                 format!("{who} picked {ty} at {path}")
             }
             Notice::Selected { path, rect } => {
-                if selects {
+                if rect_refresh {
+                    self.sidebar.rect = *rect;
+                } else if selects {
                     self.last_selection = Some(req);
                     let ty = path.as_deref().and_then(|p| self.tree.type_of(p)).map(str::to_owned);
                     if self.tab == PanelTab::Tree {
@@ -862,11 +1783,6 @@ impl Panel {
                     self.select(cx, root, path.as_deref().unwrap_or(""), ty.as_deref(), *rect);
                     if let Some(path) = path { self.request_props(cx, root, session, agent, path); }
                 }
-                return
-            }
-            Notice::Tree { query, tree } if seat == session.me => {
-                if let Some(next) = self.tree.apply_reply(req, query, tree) { self.send_tree(session, next); }
-                if self.tab == PanelTab::Tree { self.draw_rows(cx, root, false); }
                 return
             }
             Notice::Rows { path, rows } if seat == session.me => {
@@ -879,21 +1795,42 @@ impl Panel {
                 return
             }
             Notice::Applied { path, prop, old, new, seq } => {
-                if path == "theme" && prop != "install" {
-                    if let Some(snap) = &mut self.theme_snap {
-                        if snap.patch_token(prop, new) {
-                            self.palette = snap.palette();
-                            if self.tab != PanelTab::Tree { self.draw_rows(cx, root, false); }
+                let own_edit = seat == session.me && self.edits.remove(&req).is_some();
+                if path == "theme" {
+                    if prop == "install" {
+                        self.theme.awaiting_snapshot = true;
+                        if seat != session.me || agent.is_some() || Some(req) != self.theme.last_own_install {
+                            self.theme.close_build_popovers(cx, root);
+                            self.theme.on_external_install();
+                            self.theme.worn = None;
+                            if self.theme.confirm.take().is_some() { self.theme.msg.clear(); }
+                        } else if self.theme.inflight_install == Some(req) {
+                            if let Some(meta) = self.theme.installing.take() {
+                                self.theme.eq_stands = self.theme.eq_open && !self.theme.eq_reanchor_pending && meta.source == InstallSource::Mix;
+                                self.theme.tb_stands = self.theme.tb_open && !self.theme.tb_reanchor_pending && meta.source == InstallSource::Build;
+                                self.theme.worn = meta.saved;
+                            }
+                            if let Some(saved) = &self.theme.worn { self.theme.name_text.clone_from(&saved.name); }
+                        }
+                        self.theme.refusals.clear();
+                        if seat == session.me {
+                            if let Some(next) = self.theme.install_settled(req) { self.send_install(session, next); }
+                        }
+                        if self.needs_theme_tick() { cx.new_next_frame(); }
+                        if self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+                    } else {
+                        if own_edit { self.theme.refusals.remove(prop); }
+                        if let Some(snap) = &mut self.theme.snapshot {
+                            if snap.patch_token(prop, new) && new.starts_with('#') { self.theme.palette = snap.palette(); }
                         }
                     }
-                }
-                if seat == session.me && self.edits.remove(&req).is_some() && self.sidebar.path.as_ref() == path {
+                } else if own_edit && self.sidebar.path.as_ref() == path {
                     self.sidebar.refusals.remove(prop);
                     // Keep just the acknowledged baseline and any newer local edit.
                     self.sidebar.layout_edits.retain(|id, (p, _)| id >= &req || p != prop);
                     self.sidebar.components.retain(|id, (p, _, _)| id >= &req || p != prop);
                 }
-                if seat == session.me { self.set_reply(session, req); }
+                if seat == session.me { self.set_reply(session, req); self.settle_resize(cx, root, session); }
                 let line = applied(*seq, seat, &who, path, prop, old, new);
                 let widget = root.widget(cx, ids!(tweak_history));
                 if let Some(mut list) = widget.borrow_mut::<TweakList>() {
@@ -902,7 +1839,7 @@ impl Panel {
                         list.view.redraw(cx);
                     }
                 }
-                if self.sidebar.path.as_ref() == path && !session.is_ended() {
+                if path == "theme" || self.sidebar.path.as_ref() == path && !session.is_ended() {
                     self.mark_changed(cx, root);
                     self.refresh_after_edit(cx, root, session, path);
                 }
@@ -910,7 +1847,10 @@ impl Panel {
             }
             Notice::Ended(why) => why.clone(),
             Notice::Refused(why) if seat == session.me => {
-                if self.theme_refusal(req).is_some() { return }
+                if self.theme_refusal(cx, session, req, why).is_some() {
+                    if self.tab == PanelTab::Theme { self.theme.sync_header(cx, root); }
+                    return
+                }
                 if let Some((path, layer)) = self.proposals.remove(&req) {
                     if path == self.sidebar.path && layer == self.shader.active_layer {
                         self.shader.status.clone_from(why);
@@ -919,7 +1859,9 @@ impl Panel {
                     return;
                 }
                 if let Some((path, prop)) = self.edits.remove(&req) {
-                    if path == self.sidebar.path {
+                    if path.as_ref() == "theme" {
+                        self.theme.refusals.insert(prop, why.clone());
+                    } else if path == self.sidebar.path {
                         self.sidebar.layout_edits.remove(&req);
                         self.sidebar.components.remove(&req);
                         self.sidebar.refusals.insert(prop, why.clone());
@@ -927,12 +1869,8 @@ impl Panel {
                     if let Some(path) = self.set_reply(session, req) {
                         self.refresh_after_edit(cx, root, session, &path);
                     }
+                    self.settle_resize(cx, root, session);
                     self.draw_rows(cx, root, false);
-                    return
-                }
-                if let Some(next) = self.tree.apply_refusal(req, why) {
-                    if let Some(next) = next { self.send_tree(session, next); }
-                    if self.tab == PanelTab::Tree { self.draw_rows(cx, root, false); }
                     return
                 }
                 why.clone()

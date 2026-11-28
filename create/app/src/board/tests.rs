@@ -2,6 +2,7 @@ use super::*;
 use makepad_town_core::entity::{field, kind};
 use makepad_town_core::event::{Actor, Change, Content, Draft, Event, Id, Key, Member, Value, Via};
 use makepad_town_core::fold::State;
+use makepad_town_core::trust::{Gate, LocalPolicy};
 use makepad_town_core::key::DeviceKey;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -70,7 +71,7 @@ impl History {
     }
 
     pub(super) fn board(&mut self) -> Id {
-        self.push(Content::Entity { kind: Key::Number(kind::BOARD), project: None, derive: None, fields: vec![] }).0
+        self.push(Content::Entity { copied_from: vec![], kind: Key::Number(kind::BOARD), project: None, derive: None, fields: vec![] }).0
     }
 }
 
@@ -82,7 +83,7 @@ pub(super) fn item(kind: u16, parent: Id, [x, y, w, h]: [i64; 4], z: Option<u8>)
         let key = if z == 1 { vec![1, 2] } else { vec![z] };
         fields.push((field::Z, Value::Key(key)));
     }
-    Content::Entity { kind: Key::Number(kind), project: None, derive: None, fields }
+    Content::Entity { copied_from: vec![], kind: Key::Number(kind), project: None, derive: None, fields }
 }
 
 pub(super) fn change(entity: Id, field: Key, value: Value) -> Change {
@@ -90,7 +91,7 @@ pub(super) fn change(entity: Id, field: Key, value: Value) -> Change {
 }
 
 pub(super) fn set(changes: Vec<Change>) -> Content {
-    Content::Set { changes, label: None }
+    Content::Set { copied_from: vec![], changes, label: None }
 }
 
 fn all() -> Rect {
@@ -438,10 +439,12 @@ fn page_print_is_equal_from_shuffled_arrival() {
         if turn == 2 { events.rotate_left(3); }
         let mut state = State::default();
         for event in &events { state.receive(event); }
-        let source = page::print(&state, board).unwrap();
-        let reply = page::read(&state, board, None, None).unwrap();
-        let parsed = makepad_strict_json::parse(reply.as_bytes()).unwrap();
-        assert_eq!(parsed.get("splash").unwrap().as_str(), Some(source.as_str()));
+        let gate = Gate::new(&state, LocalPolicy::Members);
+        let source = page::print(&state, &gate, board).unwrap();
+        let source = source.as_str();
+        let reply = page::read(&state, &gate, board, None, None).unwrap();
+        let parsed = makepad_strict_json::parse(reply.as_str().as_bytes()).unwrap();
+        assert_eq!(parsed.get("splash").unwrap().as_str(), Some(source));
         if let Some(expected) = &first { assert_eq!(expected, &reply, "both Splash and revision converge"); }
         else { first = Some(reply); }
         assert!(source.starts_with(&format!("Board{{title: \"A board\" items: [Section{{id: @{} ", hex(&section))));
@@ -452,7 +455,7 @@ fn page_print_is_equal_from_shuffled_arrival() {
         assert!(source.contains("color: #001122") && source.contains("color: #11223380 shape: @ellipse"));
         let mut stack = Vec::new();
         let mut body = false;
-        for t in lex(&source) {
+        for t in lex(source) {
             match t.token() {
                 ScriptToken::OpenCurly => stack.push('}'), ScriptToken::OpenSquare => stack.push(']'),
                 ScriptToken::CloseCurly => assert_eq!(stack.pop(), Some('}')),
@@ -473,16 +476,17 @@ fn named_constructors_and_open_registers_print_losslessly_after_schema_fields() 
     let name = |s: &str| Key::Name(s.into());
     let source = |s: &str| Value::Literal(s.into());
     let schema = schema::Vocabulary::Board.schema();
-    let (section, _) = h.push(Content::Entity { kind: schema.kind_for_write(name("Section")), derive: None, project: None,
+    let (section, _) = h.push(Content::Entity { copied_from: vec![], kind: schema.kind_for_write(name("Section")), derive: None, project: None,
         fields: vec![(field::PARENT, Value::Id(board)), (name("footer"), source("accent"))] });
-    let (id, _) = h.push(Content::Entity { kind: schema.kind_for_write(name("FutureDiagram")), derive: None, project: None,
+    let (id, _) = h.push(Content::Entity { copied_from: vec![], kind: schema.kind_for_write(name("FutureDiagram")), derive: None, project: None,
         fields: vec![(field::PARENT, Value::Id(section)), (name("spec"), source("Diagram{ data: [4  2] }")),
             (name("dash"), source("[4  2] // note")), (field::LABEL, Value::Text("v".into()))] });
     h.push(set(vec![change(board, name("theme"), source("dark"))]));
-    let printed = page::print(&h.state, board).unwrap();
+    let printed = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let printed = printed.as_str();
     assert!(printed.contains(&format!("FutureDiagram{{id: @{}", makepad_town_core::hex(&id))));
     assert!(printed.ends_with("label: \"v\" dash: [4  2] // note\n spec: Diagram{ data: [4  2] }}] footer: accent}] theme: dark}"));
-    assert_eq!(board_page(&h.state, board, None).unwrap().get("splash").unwrap().as_str(), Some(printed.as_str()));
+    assert_eq!(board_page(&h.state, board, None).unwrap().get("splash").unwrap().as_str(), Some(printed));
     let view = BoardView::build(&h.state, board);
     assert_eq!(view.get(&id).unwrap().parent_section, Some(section));
     assert_eq!(view.get(&id).unwrap().kind, name("FutureDiagram"));
@@ -490,7 +494,8 @@ fn named_constructors_and_open_registers_print_losslessly_after_schema_fields() 
 
 fn board_page(state: &State, board: Id, cursor: Option<&str>) -> Result<makepad_strict_json::Value, String> {
     let after = cursor.map(|s| page::Cursor::parse(s).expect("issued cursor"));
-    let reply = page::read(state, board, None, after)?;
+    let reply = page::read(state, &Gate::new(state, LocalPolicy::Members), board, None, after)?;
+    let reply = reply.as_str();
     assert!(reply.len() <= 15_872, "the full JSON reply fits on the wire: {} bytes", reply.len());
     Ok(makepad_strict_json::parse(reply.as_bytes()).unwrap())
 }
@@ -504,7 +509,8 @@ fn oversized_node_and_title_fragments_follow_their_own_bytes() {
     let sticky = h.push(placed(kind::STICKY, board, board, 10)).0;
     let body = "雪🌱\"\\ab\n".repeat(3000);
     h.push(set(vec![change(sticky, field::TEXT, Value::Text(body.clone()))]));
-    let single = page::print(&h.state, board).unwrap();
+    let single = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let single = single.as_str();
     let expected = single.strip_prefix("Board{title: \"\" items: [").unwrap().strip_suffix("]}").unwrap();
     let mut reply = board_page(&h.state, board, None).unwrap();
     let revision = reply.get("revision").unwrap().clone();
@@ -575,7 +581,8 @@ fn sections_page_as_whole_subtrees() {
     assert!(two.get("next").unwrap().is_null() && two.get("fragment").is_none());
 
     h.push(set(vec![change(b, field::TEXT, text)]));
-    let whole = page::print(&h.state, board).unwrap();
+    let whole = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let whole = whole.as_str();
     let expected = &whole[whole.find("Section{").unwrap()..whole.find(" Shape{").unwrap()];
     let mut joined = String::new();
     let mut next = hex(&first);
@@ -705,8 +712,9 @@ fn arrange_keeps_locks_and_peer_order_across_equal_and_keyless_bounds() {
         makepad_town_core::hex(&mover), makepad_town_core::hex(&b));
     let Request::Do { action, .. } = tools::read_in_test_town(me.open_id(), "item_restack", &args).unwrap() else { panic!("expected restack") };
     let event = me.act(action, Origin::Tool).unwrap();
-    let reply = tools::action_reply(&me, &event, "item_restack");
-    assert!(reply.contains("locked item stayed") && reply.contains(&makepad_town_core::hex(&b)));
+    let gate = Gate::new(&me.state, LocalPolicy::Members);
+    let reply = tools::action_reply(&gate, &me, &event, "item_restack").unwrap();
+    assert!(reply.as_str().contains("locked item stayed") && reply.as_str().contains(&makepad_town_core::hex(&b)));
     assert_eq!(touched_by(me.event(&event).unwrap(), |id| me.event(id)), [mover]);
     assert_eq!(count(&me), n + 1);
     let mut above = original.clone();
@@ -969,7 +977,7 @@ fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
 pub(super) fn step(board: Id, target: Id, order: Vec<u8>, title: Option<&str>) -> Content {
     let mut fields = vec![(field::PARENT, Value::Id(board)), (field::TO, Value::Id(target)), (field::ORDER, Value::Key(order))];
     if let Some(title) = title { fields.push((field::TITLE, Value::Text(title.into()))); }
-    Content::Entity { kind: Key::Name(schema::STEP.into()), project: None, derive: None, fields }
+    Content::Entity { copied_from: vec![], kind: Key::Name(schema::STEP.into()), project: None, derive: None, fields }
 }
 
 #[test]
@@ -1097,7 +1105,7 @@ fn design_page_names_the_source_writer_and_only_a_revision_checked_write_can_rep
     };
     let undo = model.act(Action::Undo { of: winner }, Origin::Ui).unwrap();
     assert_eq!(model.state.entities[&item].text(field::SRC), previous, "undo restores the other whole source");
-    assert!(page::print(&model.state, board).unwrap().contains(&format!("src: @{}", hex(&undo))));
+    assert!(page::print(&model.state, &Gate::new(&model.state, LocalPolicy::Members), board).unwrap().as_str().contains(&format!("src: @{}", hex(&undo))));
 }
 
 #[test]
@@ -1112,22 +1120,25 @@ fn board_read_prints_the_path_in_order_and_it_reads_back() {
     let intro = h.push(step(board, a, vec![2], None)).0;
     let deleted = h.push(step(board, a, vec![3], None)).0;
     h.push(set(vec![change(deleted, field::DELETED, Value::Bool(true))]));
-    let printed = page::print(&h.state, board).unwrap();
+    let printed = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let printed = printed.as_str();
     assert!(printed.ends_with(&format!("] path: [Step{{id: @{} target: @{}}} Step{{id: @{} target: @{} title: \"The \\\"whole\\\" board\"}}]}}",
         hex(&intro), hex(&a), hex(&whole), hex(&board))), "the path prints after the items, in order: {printed}");
     let page = board_page(&h.state, board, None).unwrap();
-    assert_eq!(page.get("splash").unwrap().as_str(), Some(printed.as_str()));
+    assert_eq!(page.get("splash").unwrap().as_str(), Some(printed));
     assert_eq!(page.get("total").unwrap().as_u64(), Some(1), "steps are not counted as items");
 
     h.push(set(vec![change(whole, field::ORDER, Value::Key(vec![1, 2]))]));
     let moved = board_page(&h.state, board, None).unwrap();
     assert_ne!(moved.get("revision").and_then(|r| r.as_str()), page.get("revision").and_then(|r| r.as_str()), "reordering the path changes the revision");
-    let printed = page::print(&h.state, board).unwrap();
+    let printed = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let printed = printed.as_str();
     assert!(printed.find(&hex(&whole)) < printed.find(&format!("id: @{}", hex(&intro))), "the moved step prints first");
 
     // A path too long for one reply reads back through root fragments, then the items follow.
     for i in 0..120 { h.push(step(board, a, vec![10 + i], None)); }
-    let printed = page::print(&h.state, board).unwrap();
+    let printed = page::print(&h.state, &Gate::new(&h.state, LocalPolicy::Members), board).unwrap();
+    let printed = printed.as_str();
     let tail = &printed[printed.find("] path: [").unwrap()..];
     let mut reply = board_page(&h.state, board, None).unwrap();
     let mut joined = String::new();

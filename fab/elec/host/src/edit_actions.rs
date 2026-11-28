@@ -10,7 +10,7 @@ use fab_elec_lang::{board_doc::read_point_mm, map::site_text, units::parse_value
 use fab_elec_view::board::tray::placement_op;
 use fab_elec_view::{DesignSnapshot, StageFlags};
 use makepad_widgets_core::makepad_script::syntax::write::{list, quote};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 const EDIT_RETURNS: &str = "seq: int  the step it committed
@@ -79,7 +79,8 @@ const DESIGN_READ: ActionDef = ActionDef {
     label: "Read design",
     group: "Schematic",
     help: "Read the design's units with their parts and nets before an edit. The edit actions name parts by reference or path.",
-    returns: "units: [{..}]  a prefix includes each unit with matching parts
+    returns: "stage: text  next committed electronics stage when known; omitted while the primary board checks routing
+units: [{..}]  a prefix includes each unit with matching parts
   unit: text
   board: bool  whether it has a board
   parts: [{..}]
@@ -427,6 +428,10 @@ pub fn part_place(design: &Design, _docs: Option<&Docs>, tool: &str, args: &[(St
 /// Read in circuit order. Each included unit indexes its placements and pins once. Part and prefix
 /// reads collect the selected parts' nets in one pass. A miss sorts the available references.
 pub fn design_read(design: &Design, args: &[(String, String)]) -> Result<String, Diag> {
+    design_read_with_stage(design, args, None)
+}
+
+pub fn design_read_with_stage(design: &Design, args: &[(String, String)], stage: Option<fab_elec_view::flow::FlowStage>) -> Result<String, Diag> {
     use fab_elec_core::{refdes_prefix, refdes_ranges, CompId, NetId};
 
     enum Filter<'a> { All, Part(CompId), Net(NetId), Prefix(&'a str) }
@@ -491,9 +496,13 @@ pub fn design_read(design: &Design, args: &[(String, String)]) -> Result<String,
                     quote(def.map_or("", |d| &d.name)), def.is_some_and(|d| d.planned)).unwrap();
                 if let Some(role) = def.and_then(|d| d.role.as_deref()) { write!(out, " role: {}", quote(role)).unwrap(); }
                 out.push_str(" ports: [");
+                let mut ports_by_name: Option<HashMap<&str, &fab_elec_circuit::PortDef>> = None;
                 for (i, (name, nets)) in b.ports.iter().enumerate() {
                     use fab_elec_circuit::PortKind;
-                    let port = def.and_then(|d| d.ports.get(i));
+                    let port = def.and_then(|d| d.ports.get(i).filter(|p| p.name == *name).or_else(|| {
+                        ports_by_name.get_or_insert_with(|| d.ports.iter().map(|p| (p.name.as_str(), p)).collect())
+                            .get(name.as_str()).copied()
+                    }));
                     let kind = match port.map(|p| &p.kind) {
                         Some(PortKind::PowerIn) => "power_in", Some(PortKind::PowerOut) => "power_out",
                         Some(PortKind::Ground) => "ground", Some(PortKind::In) => "in", Some(PortKind::Out) => "out",
@@ -519,28 +528,19 @@ pub fn design_read(design: &Design, args: &[(String, String)]) -> Result<String,
             return Err(error("only", format_args!("no part, prefix or net {}; parts: {refs} (elec.design.read without only lists the nets)", text.escape_debug())));
         }
     }
-    out.push_str("]}");
+    out.push(']');
+    if let Some(stage) = stage { write!(out, " stage: {}", stage.name()).unwrap(); }
+    out.push('}');
     Ok(out)
 }
 
 /// Findings listed per page of `elec.check.list`: a page stays well inside a tool reply.
 const CHECK_PAGE: usize = 40;
 
-/// The family a check belongs to, as `elec.check.list` names it.
-pub(crate) fn check_family(kind: &CheckKind) -> &'static str {
-    use CheckKind::*;
-    match kind {
-        PinConflict | UndrivenInput | PowerNotDriven | UnconnectedPin | SinglePinNet | DuplicateRefdes
-        | MissingFootprint | VoltageDomain | RailBudget | OpenPort => "erc",
-        Mech | LinkPinMap | LinkMismatch | SystemVolts | SystemSource => "system",
-        SharpCorner => "route",
-        Custom(_) => "custom",
-        _ => "drc",
-    }
-}
+pub(crate) use fab_elec_view::flow::check_family;
 
 /// The check's own name (`Clearance`), or a custom check's rule name.
-fn check_name(kind: &CheckKind) -> String {
+pub(crate) fn check_name(kind: &CheckKind) -> String {
     match kind {
         CheckKind::Custom(name) => name.clone(),
         kind => format!("{kind:?}"),
@@ -586,7 +586,7 @@ fn measure_text(measure: Measure) -> String {
 
 /// A finding's item in the words the edit actions take: a part by reference, a pin as R1.2, a
 /// net by name, board copper by kind and net. O(parts) for a placed part's lookup.
-fn sel_text(design: &Design, sel: &Sel) -> String {
+pub(crate) fn sel_text(design: &Design, sel: &Sel) -> String {
     let comp = |c: &CompRef| design.unit(c.board).and_then(|unit| unit.circuit.comps.get(c.comp.ix()));
     match sel {
         Sel::Block(unit, id) => design.unit(*unit).and_then(|u| u.circuit.tree.get(id.ix()))

@@ -10,10 +10,15 @@ use std::{cell::RefCell, collections::{BTreeMap, VecDeque}, rc::Rc};
 
 const SHARE: SessionId = [17; 16];
 const ITEM: [u8; 32] = [24; 32];
-const OWNER: Seat = [1; 65];
-const ANA: Seat = [2; 65];
+const fn seat(tag: u8) -> Seat {
+    let mut key = [tag; 65];
+    key[0] = 4;
+    key
+}
+const OWNER: Seat = seat(1);
+const ANA: Seat = seat(2);
 const ANA_AGENT: [u8; 32] = [42; 32];
-const BEN: Seat = [3; 65];
+const BEN: Seat = seat(3);
 const LINK: u64 = 42;
 const TOWN: [u8; 32] = [12; 32];
 const PATH: &str = "ui.panel";
@@ -62,13 +67,17 @@ struct FakeApp {
     padding: String,
     prop_values: BTreeMap<String, String>,
     theme: String,
+    theme_base: Option<json::Value>,
     props: String,
     tree: String,
     trees: VecDeque<String>,
     /// Values the app answers with an error, as a real app refuses what is not a value of the type.
     refused_values: Vec<String>,
+    design_source: Option<FakeDesignSource>,
+    other_source: Option<FakeDesignSource>,
     /// Scripted pick answers, in order; the default pick follows once they run out.
     picks: VecDeque<Result<String, String>>,
+    typed_rects: VecDeque<Rect>,
 }
 impl AppLink<u64, u64> for FakeApp {
     fn png_still(&mut self, id: u64, window: WindowId) -> u64 {
@@ -112,12 +121,23 @@ impl AppLink<u64, u64> for FakeApp {
                 if let Some(new) = resolved.filter(|_| !self.refused_values.iter().any(|v| v == value)) {
                     let current = self.prop_values.get_mut(prop).unwrap_or(&mut self.padding);
                     let old = std::mem::replace(current, new.clone());
-                    json::obj(vec![("old", json::obj(vec![(prop, json::s(old))])),
-                        ("new", json::obj(vec![(prop, json::s(new))]))]).to_json()
+                    let mut fields = vec![("old", json::obj(vec![(prop, json::s(old))])),
+                        ("new", json::obj(vec![(prop, json::s(new))]))];
+                    if let Some(rect) = self.typed_rects.pop_front() {
+                        fields.push(("window", json::Value::Int(rect.window as i64)));
+                        fields.push(("rect", json::Value::Arr([rect.x, rect.y, rect.w, rect.h].map(json::Value::F64).to_vec())));
+                    }
+                    json::obj(fields).to_json()
                 } else {
                     ok = false;
                     format!("not a data value: {value}")
                 }
+            }
+            DesignVerb::Palette | DesignVerb::Drop | DesignVerb::Locate | DesignVerb::Preview | DesignVerb::Verify | DesignVerb::Revert | DesignVerb::PreviewChunk => {
+                let source = self.other_source.as_mut().filter(|other| args.iter().any(|(k,v)|
+                    k == "file" && *v == other.file || k == "path" && v.starts_with("/other/")));
+                source.or(self.design_source.as_mut()).expect("structural test source").answer(*verb, args)
+                    .unwrap_or_else(|why| { ok = false; why })
             }
             DesignVerb::Apply => panic!("Town never sends design apply"),
             _ => panic!("unexpected T1 verb"),
@@ -139,11 +159,33 @@ impl FakeApp {
         if arg("install") == Some("1") {
             let spec = parse_json(arg("spec").ok_or("missing install spec")?)?;
             let base = spec.get("base").and_then(json::Value::as_str).ok_or("missing base")?;
-            if spec.get("sheet") != Some(&json::Value::Null) { return Err("unknown sheet".into()) }
-            self.theme = THEME.replace(r#""base":"dark""#, &format!(r#""base":"{base}""#));
-            return Ok(json::obj(vec![("ok", json::Value::Bool(true)), ("base", json::s(base)), ("sheet", json::Value::Null)]).to_json())
+            let snapshot = parse_json(&self.theme)?;
+            let original = self.theme_base.get_or_insert_with(|| snapshot.clone());
+            let sheet = spec.get("sheet").ok_or("missing sheet")?;
+            let sheets = snapshot.get("sheets").unwrap();
+            if sheet != &json::Value::Null && !sheets.as_arr().unwrap().iter().any(|s| s.get("id") == Some(sheet)) {
+                return Err("unknown sheet".into())
+            }
+            let globals = spec.get("globals").unwrap().as_arr().unwrap();
+            let overrides = spec.get("overrides").unwrap().as_arr().unwrap();
+            let mut values = original.get("values").unwrap().clone();
+            if let json::Value::Arr(tokens) = &mut values {
+                for pair in globals.iter().chain(overrides) {
+                    let pair = pair.as_arr().unwrap();
+                    if let Some(json::Value::Obj(fields)) = tokens.iter_mut().find(|t| t.get("name") == pair.first()) {
+                        fields.iter_mut().find(|(k, _)| k == "value").unwrap().1 =
+                            json::s(pair[1].as_str().map(str::to_owned).unwrap_or_else(|| pair[1].to_json()));
+                    }
+                }
+            }
+            self.theme = json::obj(vec![("base", json::s(base)), ("sheet", sheet.clone()), ("sheets", sheets.clone()),
+                ("has_mix", json::Value::Bool(sheet == &json::Value::Null && !(globals.is_empty() && overrides.is_empty()))),
+                ("has_pins", json::Value::Bool(sheet != &json::Value::Null && !overrides.is_empty())),
+                ("edits", json::Value::Arr(vec![])), ("values", values)]).to_json();
+            return Ok(json::obj(vec![("ok", json::Value::Bool(true)), ("base", json::s(base)), ("sheet", sheet.clone())]).to_json())
         }
         let name = arg("name").ok_or("missing token")?;
+        if self.theme_base.is_none() { self.theme_base = Some(parse_json(&self.theme)?); }
         let old = self.token_value(name).ok_or("unknown token")?;
         let value = arg("value").ok_or("missing value")?;
         let new = match value.strip_prefix("theme.") {
@@ -232,9 +274,9 @@ fn ana_agent_state(sharer: Seat) -> makepad_town_core::fold::State {
     use makepad_town_core::fold::{Agent, Profile, State};
     let mut state = State::default();
     for (seat, name) in [(sharer, "Walk A"), (ANA, "Ana")] {
-        state.profiles.insert(seat, Profile { name: name.into(), colour: 0 });
+        state.profiles.insert(seat, Profile { writer: [0; 32], name: name.into(), colour: 0 });
     }
-    state.agents.insert(ANA_AGENT, Agent { owner: ANA, name: "Stylist".into(), kind: String::new() });
+    state.agents.insert(ANA_AGENT, Agent { owner: ANA, name: "Stylist".into(), kind: String::new(), custom_name: None });
     state
 }
 fn has(town: &TownApp, req: RequestId, test: impl Fn(&Notice) -> bool) -> bool {
@@ -553,7 +595,7 @@ fn stopping_one_ai_preserves_personal_consent_and_reaches_late_joiners() {
     }
     assert_eq!(s.records.len(), 2, "only the dispatched AI Set and the person's queued Set were recorded");
     let sibling = [43; 32];
-    state.agents.insert(sibling, makepad_town_core::fold::Agent { owner: ANA, name: "Painter".into(), kind: String::new() });
+    state.agents.insert(sibling, makepad_town_core::fold::Agent { owner: ANA, name: "Painter".into(), kind: String::new(), custom_name: None });
     s.host.session.set_agents(&state);
     let other = s.ana.session.request(Some(sibling), set("7")).unwrap();
     s.one();
@@ -662,12 +704,18 @@ fn typed_values_apply_as_the_app_answers() {
     }
 }
 
+// These existing tool calls exercise no theme I/O. Theme scenarios below pass their member's scratch directory and persistent cache.
+macro_rules! unused_theme_context {
+    () => { crate::tools::ThemeToolContext { themes_dir: &std::env::temp_dir().join("town-unused-theme-store"),
+        mixer_cache: &mut Default::default(), active_worn: None } };
+}
+
 fn list_apps(model: &mut Model, tools: &mut AppTools, sessions: &mut [Session<u64, u64>], waits: &mut crate::tools::AgentWaits,
     binding: &str, after: Option<&str>) -> makepad_ai_services::wire::ToolResult {
     let mut args = vec![("binding", json::s(binding))];
     if let Some(after) = after { args.push(("after", json::s(after))); }
     let call = app_tool("app_list", &json::obj(args).to_json()).unwrap();
-    tools.start("list", call, model, sessions, waits).0.expect("app discovery must answer immediately")
+    tools.start("list", call, model, sessions, waits, unused_theme_context!()).0.expect("app discovery must answer immediately")
 }
 
 fn check_app_list_pages(model: &mut Model, tools: &mut AppTools, waits: &mut crate::tools::AgentWaits, binding: &str, line: [u8; 32]) {
@@ -761,7 +809,7 @@ fn check_guest_looks(model: &mut Model, tools: &mut AppTools, waits: &mut crate:
             if let Notice::Picture { png, size } = notice {
                 assert_eq!(seat, town.session.me, "a guest receives only pictures addressed to its own seat");
                 tools.picture(&mut town.session, req, actor.unwrap(), &png, size, waits, &mut |out| results.push(out));
-            } else if let Some((out, _)) = tools.answer(&town.session, seat, req, actor, &notice, waits) {
+            } else if let Some((out, _, _)) = tools.answer(&mut town.session, seat, req, actor, &notice, waits, unused_theme_context!()) {
                 results.push(out);
             }
         }
@@ -777,14 +825,14 @@ fn check_guest_looks(model: &mut Model, tools: &mut AppTools, waits: &mut crate:
     let own_item = model.act(Action::AddApp { town, board: Some(board), geometry: [0, 0, 6400, 6400],
         session: own_share, name: "Local".into() }, Origin::Ui).unwrap();
     let mut own = Session::<u64, u64>::owner(town, own_share, own_item, ana, LINK).unwrap();
-    let out = tools.start("local", look(&hex(&own_item)), model, std::slice::from_mut(&mut own), waits).0.unwrap();
+    let out = tools.start("local", look(&hex(&own_item)), model, std::slice::from_mut(&mut own), waits, unused_theme_context!()).0.unwrap();
     assert_eq!((out.outcome, out.text.as_str()), (ToolOutcome::Refused, OWN_LOOK), "an own share names its local tool even without a picture");
     assert!(own.view.updates.is_empty(), "the own-share refusal precedes any request");
     s.host.session.bind_window(WindowId(3));
     let start = |call, tools: &mut AppTools, model: &mut Model, waits: &mut AgentWaits, s: &mut Copies| {
         let before = s.app.stills.len();
-        let sent = tools.start(call, look(&item), model, std::slice::from_mut(&mut s.ana.session), waits);
-        assert_eq!(sent, (None, Some(token)), "a guest with no share on screen holds its look for the sharer");
+        let sent = tools.start(call, look(&item), model, std::slice::from_mut(&mut s.ana.session), waits, unused_theme_context!());
+        assert_eq!(sent, (None, Some(token), None), "a guest with no share on screen holds its look for the sharer");
         s.exchange();
         let req = s.ana.session.view.looking[&(ana, agent)];
         s.host.session.drive_app(&mut s.app);
@@ -935,18 +983,23 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
         "discovery is advertised as a read tool");
     assert!(manifest.tools.iter().any(|tool| tool.name == "app_look" && tool.risk == makepad_ai_services::wire::Risk::Read),
         "the share's picture is advertised as a read tool");
-    for name in ["app_allow", "app_revoke", "app_stop", "app_stop_agent", "app_allow_agent"] {
+    for name in ["app_allow", "app_revoke", "app_stop", "app_stop_agent", "app_allow_agent", "app_theme_allow"] {
         assert!(app_tool(name, "{}").is_none() && crate::tools::read(name, "{}").is_err(), "consent has no {name} tool");
         assert!(manifest.tools.iter().all(|tool| tool.name != name), "the manifest exposes no {name} consent tool");
     }
     let calls = [("app_list", ""), ("app_look", ""), ("app_pick", r#","path":"ui.panel""#), ("app_props", r#","path":"ui.panel""#),
-        ("app_set", r#","path":"ui.panel","prop":"padding","value":"18""#), ("app_select", r#","path":null"#), ("app_edits", "")];
+        ("app_set", r#","path":"ui.panel","prop":"padding","value":"18""#), ("app_select", r#","path":null"#), ("app_edits", ""),
+        ("app_theme_get", ""), ("app_theme_set", r##","name":"color_bg_app","value":"#abc""##),
+        ("app_theme_install", r#","preset":"dark""#), ("app_theme_save", r#","name":"my_sunset""#),
+        ("app_theme_mix", r#","surprise":true"#), ("app_theme_build", ""), ("app_theme_delete", r#","name":"my_sunset""#),
+        ("app_theme_palettes", r##","color":"#ff5c39""##)];
     let (_, unknown) = Credential::issue(model.open_id()).unwrap();
     for (name, fields) in calls {
         for (arg, why) in [(String::new(), "Invalid `binding`."), (format!(r#","binding":"{unknown}""#), "This binding has ended.")] {
-            let parsed = if name == "app_list" { app_tool(name, &format!("{{{}}}", arg.trim_start_matches(','))) }
+            let parsed = if matches!(name, "app_list" | "app_theme_delete" | "app_theme_palettes") {
+                app_tool(name, &format!("{{{}}}", format!("{fields}{arg}").trim_start_matches(','))) }
                 else { app_tool(name, &format!(r#"{{"item":"{item}"{fields}{arg}}}"#)) }.unwrap();
-            let out = tools.start(name, parsed, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits).0.unwrap();
+            let out = tools.start(name, parsed, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!()).0.unwrap();
             assert_eq!((out.outcome, out.text.as_str()), (ToolOutcome::Refused, why), "{name} must explain the missing or unknown binding");
         }
     }
@@ -955,8 +1008,8 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     crate::model::tests::exchange(&mut owner, &mut model);
     model.decide_agent_request(model.open_id(), agent, peer_line, true).unwrap();
     waits.offered(&model, peer_line);
-    let cursor = |reply: &makepad_ai_services::wire::ToolResult| {
-        let page = parse_json(&reply.text).unwrap();
+    let cursor = |reply: &crate::ai_out::TownToolResult| {
+        let page = parse_json(reply.text_for_test()).unwrap();
         makepad_town_core::parse_id(page.get("last").unwrap().as_str().unwrap()).unwrap()
     };
     let mut after_peer = None;
@@ -967,9 +1020,9 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
         }
         assert_eq!(waits.traces.working(token), picked_up, "only picking up the approved peer line marks its trace working");
         for (name, fields) in calls {
-            let parsed = if name == "app_list" { app_tool(name, &format!(r#"{{"binding":"{binding}"}}"#)) }
+            let parsed = if matches!(name, "app_list" | "app_theme_delete" | "app_theme_palettes") { app_tool(name, &format!(r#"{{"binding":"{binding}"{fields}}}"#)) }
                 else { app_tool(name, &format!(r#"{{"binding":"{binding}","item":"{item}"{fields}}}"#)) }.unwrap();
-            let out = tools.start(name, parsed, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits).0.unwrap();
+            let out = tools.start(name, parsed, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!()).0.unwrap();
             assert_eq!((out.outcome, out.text.as_str()), (ToolOutcome::Refused, "Your person hasn't asked you anything."),
                 "{name} requires an owner turn, including after an approved peer request is picked up");
         }
@@ -979,9 +1032,9 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     let line = model.mention_agent(agent, "tweak the shared app".into(), None).unwrap();
     waits.offered(&model, line);
     let page = waits.wait(&mut model, "own", token, after_peer);
-    assert_eq!(page[0].outcome, ToolOutcome::Ok, "the AI picked up its own person's request");
+    assert_eq!(page[0].outcome(), ToolOutcome::Ok, "the AI picked up its own person's request");
     let invalid = app_tool("app_set", &format!(r#"{{"binding":"{binding}","item":"{item}","path":"ui","prop":"p","value":"2","allow":true}}"#)).unwrap();
-    let (out, changed) = tools.start("invalid", invalid, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits);
+    let (out, changed, _) = tools.start("invalid", invalid, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
     assert_eq!((out.unwrap().outcome, changed), (ToolOutcome::Refused, Some(token)), "a tool cannot smuggle an allow flag");
     assert_trace(&waits, line, 0, &[(Ink::Warning, "app_set refused: unexpected argument `allow`")],
         "a pre-send refusal adds only its warning to the owner's line");
@@ -990,11 +1043,11 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
 
     let set = || app_tool("app_set", &format!(r#"{{"binding":"{binding}","item":"{item}","path":"ui.panel","prop":"padding","value":"18"}}"#)).unwrap();
     let since = waits.traces.rows(&line)[0].output.len();
-    let (out, changed) = tools.start("denied", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits);
+    let (out, changed, _) = tools.start("denied", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
     assert!(out.is_none() && changed == Some(token), "a sent Set awaits the sharer's decision");
     s.one();
     while let Some((seat, req, actor, notice)) = s.ana.session.view.updates.pop_front() {
-        if let Some((result, changed)) = tools.answer(&s.ana.session, seat, req, actor, &notice, &mut waits) {
+        if let Some((result, changed, _)) = tools.answer(&mut s.ana.session, seat, req, actor, &notice, &mut waits, unused_theme_context!()) {
             assert_eq!((result.outcome, changed), (ToolOutcome::Refused, Some(token)), "the sharer's refusal refreshes the requesting AI's trace");
         }
     }
@@ -1011,11 +1064,17 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     assert_eq!(parse_json(&hidden.text), parse_json(r#"{"apps":[],"next":null}"#),
         "neither the open town's App nor a matching item in a different session town is discoverable");
     let props = app_tool("app_props", &format!(r#"{{"binding":"{binding}","item":"{item}","path":"ui.panel"}}"#)).unwrap();
-    let wrong = tools.start("wrong", props, &mut model, &mut wrong_town, &mut waits).0.unwrap();
+    let wrong = tools.start("wrong", props, &mut model, &mut wrong_town, &mut waits, unused_theme_context!()).0.unwrap();
     assert_eq!(wrong.outcome, ToolOutcome::Refused, "a matching signed item cannot route a request into another town");
     let edits = app_tool("app_edits", &format!(r#"{{"binding":"{binding}","item":"{}"}}"#, hex(&private_app))).unwrap();
-    let wrong = tools.start("wrong", edits, &mut model, &mut wrong_town, &mut waits).0.unwrap();
+    let wrong = tools.start("wrong", edits, &mut model, &mut wrong_town, &mut waits, unused_theme_context!()).0.unwrap();
     assert_eq!(wrong.outcome, ToolOutcome::Refused, "the open town's private history is outside the binding");
+    for (name, fields) in calls.into_iter().filter(|(n, _)| n.starts_with("app_theme_")) {
+        let args = format!(r#"{{"binding":"{binding}","item":"{item}"{fields}}}"#);
+        let reply = tools.start(name, app_tool(name, &args).unwrap(), &mut model, &mut wrong_town, &mut waits, unused_theme_context!()).0.unwrap();
+        let expected = if matches!(name, "app_theme_delete" | "app_theme_palettes") { "unexpected argument `item`" } else { "no active share" };
+        assert!(reply.outcome == ToolOutcome::Refused && reply.text.contains(expected), "{name} respects its town and item scope: {}", reply.text);
+    }
     let listing = |model: &mut Model, tools: &mut AppTools, s: &mut Copies, waits: &mut AgentWaits, may_edit, window| {
         let since = waits.traces.rows(&line)[0].output.len();
         let out = list_apps(model, tools, std::slice::from_mut(&mut s.ana.session), waits, &binding, None);
@@ -1054,17 +1113,17 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     ] {
         let since = waits.traces.rows(&line)[0].output.len();
         let tool = app_tool(name, &format!(r#"{{"binding":"{binding}","item":"{discovered}",{fields}}}"#)).unwrap();
-        let (out, changed) = tools.start(name, tool, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits);
+        let (out, changed, _) = tools.start(name, tool, &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
         assert!(out.is_none() && changed == Some(token), "AI calls wait for their own result and refresh the starting trace");
         assert_trace(&waits, line, since, &[(Ink::Action, start)], "a sent request records only its start before the notice");
         s.one();
         let mut answers = Vec::new();
         while let Some((seat, req, actor, notice)) = s.ana.session.view.updates.pop_front() {
-            assert!(tools.answer(&s.ana.session, owner.me(), req, actor, &notice, &mut waits).is_none(),
+            assert!(tools.answer(&mut s.ana.session, owner.me(), req, actor, &notice, &mut waits, unused_theme_context!()).is_none(),
                 "another seat's notice cannot settle {name}");
-            assert!(tools.answer(&s.ana.session, seat, req, Some([99; 32]), &notice, &mut waits).is_none(),
+            assert!(tools.answer(&mut s.ana.session, seat, req, Some([99; 32]), &notice, &mut waits, unused_theme_context!()).is_none(),
                 "a different AI's notice cannot settle {name}");
-            if let Some((out, changed)) = tools.answer(&s.ana.session, seat, req, actor, &notice, &mut waits) {
+            if let Some((out, changed, _)) = tools.answer(&mut s.ana.session, seat, req, actor, &notice, &mut waits, unused_theme_context!()) {
                 assert_eq!(changed, outcome.map(|_| token), "only an outcome with a trace line triggers a repaint");
                 assert_eq!((actor, seat), (Some(agent), ana), "AI replies keep the authenticated person's seat and AI label");
                 answers.push(out);
@@ -1085,7 +1144,7 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     assert!(edit.value(field::EDIT_AI).is_none(), "a new signed AI edit omits the legacy field entirely");
     let history_tool = || app_tool("app_edits", &format!(r#"{{"binding":"{binding}","item":"{item}"}}"#)).unwrap();
     let since = waits.traces.rows(&line)[0].output.len();
-    let out = tools.start("history", history_tool(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits).0.unwrap();
+    let out = tools.start("history", history_tool(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!()).0.unwrap();
     assert_eq!(out.outcome, ToolOutcome::Ok, "a bound agent can read signed edit history");
     assert_trace(&waits, line, since, &[(Ink::Action, "read Scene's edit history")], "history records one immediate result");
     let history = parse_json(&out.text).unwrap();
@@ -1095,25 +1154,25 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     assert_eq!(model.open_id(), private, "discovery, the live calls and history all leave the displayed town alone");
     model.open_town(town).unwrap();
     let since = waits.traces.rows(&line)[0].output.len();
-    let (out, _) = tools.start("late", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits);
+    let (out, _, _) = tools.start("late", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
     assert!(out.is_none(), "the Set is still held on the original owner's turn");
     assert_trace(&waits, line, since, &[(Ink::Action, "proposing padding 18 on panel")], "the original line owns the Set start");
     let next = model.mention_agent(agent, "a different request".into(), None).unwrap();
     waits.offered(&model, next);
     let reply = waits.wait(&mut model, "next", token, Some(cursor(&page[0])));
-    assert_eq!(reply[0].outcome, ToolOutcome::Ok, "the binding picked up the next request before the Set answer");
+    assert_eq!(reply[0].outcome(), ToolOutcome::Ok, "the binding picked up the next request before the Set answer");
     assert_eq!(model.owner_turn(token), Ok((agent, next)), "the next request is now the binding's authorized turn");
     s.one();
     let late = std::mem::take(&mut s.ana.session.view.updates);
     let replies: Vec<_> = late.into_iter().filter_map(|(seat, req, actor, n)|
-        tools.answer(&s.ana.session, seat, req, actor, &n, &mut waits)).collect();
-    let [(out, changed)] = replies.as_slice() else { panic!("the late notice must resolve its one held Set") };
+        tools.answer(&mut s.ana.session, seat, req, actor, &n, &mut waits, unused_theme_context!())).collect();
+    let [(out, changed, _)] = replies.as_slice() else { panic!("the late notice must resolve its one held Set") };
     assert_eq!((out.call_id.as_str(), out.outcome, *changed), ("late", ToolOutcome::Ok, None), "a late answer resolves its call without repainting either turn");
     assert_trace(&waits, next, 0, &[], "the new request never inherits the last Set's outcome");
     assert_trace(&waits, line, since, &[(Ink::Action, "proposing padding 18 on panel")], "a finished trace drops late output");
 
     s.ana.session.end("the sharer closed the app");
-    let (out, changed) = tools.start("closed", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits);
+    let (out, changed, _) = tools.start("closed", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
     assert_eq!((out.unwrap().outcome, changed), (ToolOutcome::Refused, Some(token)), "a closed share refuses a Set before submission");
     assert_trace(&waits, next, 0, &[(Ink::Warning, "app_set refused: share ended")], "a failed session request adds only its warning");
     let out = list_apps(&mut model, &mut tools, std::slice::from_mut(&mut s.ana.session), &mut waits, &binding, None);
@@ -1122,9 +1181,118 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     check_app_list_pages(&mut model, &mut tools, &mut waits, &binding, next);
 
     model.remove_agent(agent).unwrap();
-    let out = tools.start("inactive", history_tool(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits).0.unwrap();
+    let out = tools.start("inactive", history_tool(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!()).0.unwrap();
     assert_eq!((out.outcome, out.text.as_str()), (ToolOutcome::Refused, "This binding has ended."),
         "removing the agent immediately ends its binding's access to history");
+}
+
+#[test]
+fn wire_design_roundtrip_and_unknown_subtag_skip() {
+    use DesignRequest::*;
+    let packet = |body| Packet { share: SHARE, sender: OWNER, req: 73, agent: Some(ANA_AGENT), body };
+    let request = |r| packet(Body::Request(Request::Design(r)));
+    let notice = |n| packet(Body::Notice { seat: ANA, delivery: 19, notice: n });
+    let req_at = packet(Body::Ready).encode().len();
+    let notice_at = notice(Notice::Asked).encode().len();
+    let roundtrip = |p: Packet, tag, at: usize, subtag| {
+        let mut bytes = p.encode();
+        assert_eq!((bytes[1], bytes[at], wire::min_level(&bytes)), (tag, subtag, DESIGN_LEVEL));
+        makepad_town_core::tlv::write_tlv(&mut bytes, 0x7f, b"future");
+        assert_eq!(wire::decode(OWNER, &bytes), Ok(Some(p)), "round trip for {tag}/{subtag}");
+    };
+
+    let path = "/dock/card";
+    let target = "/dock/other";
+    let file = "src/main.splash";
+    let props = vec![("draw_bg.color".into(), "#abc".into()), ("text".into(), "Hello, 世界".into())];
+    for (subtag, r) in [
+        (1, State { path: None }),
+        (2, Palette { query: Some("view".into()), offset: 70_000, limit: wire::MAX_PALETTE_LIMIT }),
+        (3, DropTarget { window: 4, x: -0.25, y: 128.5, exclude: Some(path.into()) }),
+        (4, Diff { file: Some(file.into()), offset: u32::MAX, limit: wire::MAX_DIFF_LIMIT }),
+        (5, Verify { path: Some(path.into()) }),
+        (6, Insert { path: path.into(), place: DesignPlace::Inside, ty: "mod.View".into(), name: Some("_new".into()), props }),
+        (7, Move { path: path.into(), target: target.into(), place: DesignPlace::Before }),
+        (8, Step { path: path.into(), dir: StepDir::Up }),
+        (8, Step { path: path.into(), dir: StepDir::Down }),
+        (8, Step { path: path.into(), dir: StepDir::Out }),
+        (9, Delete { path: path.into(), force_rust_refs: true }),
+        (10, Duplicate { path: path.into(), name: None }),
+        (11, Wrap { path: path.into(), ty: "View".into(), name: Some("wrapper".into()) }),
+        (12, Rename { path: path.into(), name: "content".into(), force_rust_refs: false }),
+        (13, Bake { scope: BakeScope::Props, path: Some(path.into()), prop: Some("draw_bg.color".into()) }),
+        (13, Bake { scope: BakeScope::Theme, path: None, prop: None }),
+        (13, Bake { scope: BakeScope::All, path: None, prop: None }),
+        (14, Undo), (15, Redo), (16, Reset), (17, WritePatch { file: Some(file.into()) }),
+        (18, GhostInsert { target: target.into(), place: DesignPlace::After, ty: "Label".into() }),
+        (19, GhostMove { source: path.into(), target: target.into(), place: DesignPlace::Inside }),
+        (20, GhostCommit), (21, GhostCancel),
+    ] {
+        roundtrip(request(r), 29, req_at, subtag);
+    }
+    let reply = |kind| notice(Notice::Design(DesignNotice::Reply { kind, json: r#"{"rows":[]}"#.into() }));
+    for (i, kind) in [DesignReplyKind::State, DesignReplyKind::Palette, DesignReplyKind::DropTarget,
+        DesignReplyKind::Diff, DesignReplyKind::Verify, DesignReplyKind::WritePatch].into_iter().enumerate() {
+        let p = reply(kind);
+        assert_eq!(p.encode()[notice_at + 1], i as u8 + 1, "published reply kind");
+        roundtrip(p, 30, notice_at, 2);
+    }
+    for (subtag, n) in [
+        (1, DesignNotice::Status(r#"{"active":true}"#.into())),
+        (3, DesignNotice::Mutated { op: "rename".into(), path: path.into(), focus_path: Some(target.into()),
+            seq: u64::MAX, summary: "Renamed card".into() }),
+        (4, DesignNotice::Running { summary: "Moving card".into() }),
+    ] { roundtrip(notice(Notice::Design(n)), 30, notice_at, subtag); }
+
+    for (p, at) in [(request(Undo), req_at), (reply(DesignReplyKind::State), notice_at),
+        (reply(DesignReplyKind::State), notice_at + 1)] {
+        let mut bytes = p.encode();
+        bytes[at] = 0xff;
+        assert_eq!(wire::decode(OWNER, &bytes), Ok(None), "skip the whole frame for an unknown kind");
+    }
+    let mut nested = notice(Notice::Running(Request::Look)).encode();
+    nested.truncate(notice_at);
+    nested.extend([29, 14]);
+    assert_eq!(wire::decode(OWNER, &nested), Err("request cannot run in the app"));
+
+    for (r, after_tag, why) in [
+        (Move { path: path.into(), target: target.into(), place: DesignPlace::Before }, false, "invalid design place"),
+        (Step { path: path.into(), dir: StepDir::Up }, false, "invalid step direction"),
+        (Bake { scope: BakeScope::Theme, path: None, prop: None }, true, "invalid bake scope"),
+    ] {
+        let mut bytes = request(r).encode();
+        let at = if after_tag { req_at + 1 } else { bytes.len() - 1 };
+        bytes[at] = 0xff;
+        assert_eq!(wire::decode(OWNER, &bytes), Err(why));
+    }
+    let insert = |props| Insert { path: path.into(), place: DesignPlace::Inside, ty: "View".into(), name: None, props };
+    let mut truncated = request(insert(vec![])).encode();
+    let count_at = truncated.len() - 8;
+    truncated[count_at..].copy_from_slice(&1u64.to_le_bytes());
+    assert_eq!(wire::decode(OWNER, &truncated), Err("overlong design props count"));
+    for r in [
+        State { path: Some("p".repeat(wire::MAX_DESIGN_PATH_LEN + 1)) },
+        Palette { query: Some("a\nb".into()), offset: 0, limit: 1 },
+        Palette { query: None, offset: 0, limit: 0 },
+        DropTarget { window: 0, x: f64::INFINITY, y: 1., exclude: None },
+        Diff { file: None, offset: 0, limit: wire::MAX_DIFF_LIMIT + 1 },
+        WritePatch { file: Some(String::new()) },
+        Duplicate { path: path.into(), name: Some("a".repeat(wire::MAX_DESIGN_NAME_LEN + 1)) },
+        Wrap { path: path.into(), ty: "mod..View".into(), name: None },
+        Bake { scope: BakeScope::Props, path: None, prop: Some("draw.".into()) },
+        insert(vec![("text".into(), " ".into())]),
+        insert(vec![("text".into(), "x".repeat(wire::MAX_DESIGN_VALUE_LEN + 1))]),
+        insert(vec![("text".into(), "x".into()); wire::MAX_DESIGN_PROPS + 1]),
+    ] {
+        assert!(Request::Design(r.clone()).validate().is_err(), "reject invalid local fields");
+        assert!(wire::decode(OWNER, &request(r).encode()).is_err(), "reject invalid wire fields");
+    }
+    for n in [
+        DesignNotice::Running { summary: "".into() },
+        DesignNotice::Mutated { op: "move".into(), path: path.into(), focus_path: None, seq: 0, summary: "".into() },
+        DesignNotice::Status("{".into()),
+        DesignNotice::Reply { kind: DesignReplyKind::State, json: format!("{}0{}", "[".repeat(257), "]".repeat(257)) },
+    ] { assert!(wire::decode(OWNER, &notice(Notice::Design(n)).encode()).is_err()); }
 }
 
 #[test]
@@ -1329,7 +1497,7 @@ fn controller_relay_binds_messages_and_consent_to_the_link_epoch() {
     call.poll(cx);
     assert_eq!(call.take(TWEAK), [(ANA, payload)],
         "the relay returns one reassembled body attributed to the proved seat");
-    assert_eq!(call.take_peer(crate::call::topic::PROBE), [vec![9]], "the tweak drain leaves other topics for their consumers");
+    assert_eq!(call.take_peer_with_sender(crate::call::topic::PROBE), [(ANA, vec![9])], "the tweak drain leaves other topics for their consumers");
     hub.sessions[0].consent(ANA, true).unwrap();
     let _second = call.link_up(cx, OWNER, ANA, "Peer").unwrap();
     assert!(call.take_peer_events().is_empty(), "a clean same-seat replacement produces no loss count");
@@ -1404,7 +1572,7 @@ fn call_controller_relay_broadcasts_and_receives_across_three_peers() {
     assert!(owner.link_down(cx, ANA));
     hub.poll_call(&mut owner);
     assert_eq!(hub.sessions[0].view.allowed, [BEN].into(), "only the disconnected seat loses consent");
-    assert_eq!(owner.peer_epoch(), Some(ben_epoch));
+    assert_eq!(owner.peer_epochs().next(), Some(ben_epoch));
     assert_eq!(owner.take_peer_events(), [PeerEvent::PeerUndelivered { peer: ANA, topic: INPUT, count: 1 }],
         "Tweak consumed its own loss and left the input loss for its dispatcher");
 
@@ -1775,6 +1943,104 @@ fn tree_wire_unicasts_supersedes_populates_rects_and_gates_older_peers() {
 }
 
 #[test]
+fn mixed_level_peer_replay_gate_blocks_level5_without_hurting_level3() {
+    let edit = || Request::Design(DesignRequest::Rename { path: PATH.into(), name: "card".into(), force_rust_refs: false });
+    let query = || TreeQuery::Reveal { path: PATH.into(), limit: 1 };
+    let status = || Notice::Design(DesignNotice::Status("{}".into()));
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_peer_level(ANA, Some(DESIGN_LEVEL));
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    s.exchange(); // acknowledge the initial design status
+    assert!(s.host.session.supports_design() && s.ana.session.supports_design());
+
+    // Lose three unacknowledged deliveries, with design at the head of the mailbox.
+    for notice in [status(), Notice::Tree { query: query(), tree: TREE.into() }, Notice::Theme { theme: THEME.into() }] {
+        assert!(s.host.session.emit_to(ANA, 0, None, notice).is_some());
+    }
+    s.host.poll();
+    let tags = |frames: &[(Seat, Vec<u8>)]| frames.iter().map(|(_, b)| b[1]).collect::<Vec<_>>();
+    assert_eq!(tags(&s.ana.relay.take(TWEAK)), [30, 26, 28]);
+    s.host.session.peer_unlinked(ANA);
+    s.host.session.set_peer_level(ANA, None);
+    s.host.poll();
+    assert!(s.ana.relay.take(TWEAK).is_empty(), "mail stays ordered until the guest sends Hello");
+    s.host.session.set_peer_level(ANA, Some(THEME_LEVEL));
+    assert!(s.host.session.emit_to(ANA, 0, None, status()).is_none(), "new design mail is gated too");
+    s.host.poll();
+    let frames = s.ana.relay.take(TWEAK);
+    assert_eq!(tags(&frames), [26, 28], "the theme-level guest skips design and replays both compatible notices");
+    for (_, bytes) in frames { s.host.relay.send(ANA, TWEAK, bytes).unwrap(); }
+    s.ana.poll();
+    assert!(has(&s.ana, 0, |n| matches!(n, Notice::Tree { .. })));
+    assert!(has(&s.ana, 0, |n| matches!(n, Notice::Theme { .. })));
+    s.host.poll();
+    s.host.session.peer_unlinked(ANA);
+    s.host.poll();
+    assert!(s.ana.relay.take(TWEAK).is_empty(), "the guest acknowledged through the skipped design delivery");
+
+    // Replay in the other direction. Track the actor of the held structural edit.
+    let req = s.ana.session.request(Some(ANA_AGENT), edit()).unwrap();
+    s.ana.poll();
+    assert_eq!(tags(&s.host.relay.take(TWEAK)), [29]);
+    s.ana.session.peer_unlinked(OWNER);
+    s.ana.session.set_peer_level(OWNER, None);
+    s.ana.send(Request::Tree(query()));
+    s.ana.send(Request::Theme(ThemeOp::Get));
+    s.ana.poll();
+    assert!(tags(&s.host.relay.take(TWEAK)).iter().all(|tag| matches!(tag, 14 | 18)));
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL - 1));
+    assert!(!s.ana.session.supports_design() && s.ana.session.supports_theme() && s.ana.session.supports_tree());
+    assert!(s.ana.session.view.updates.contains(&(ANA, req, Some(ANA_AGENT), Notice::Refused(OLDER_SHARER_DESIGN.into()))));
+    assert_eq!(s.ana.session.request(None, edit()), Err(OLDER_SHARER_DESIGN.into()));
+    s.ana.poll();
+    assert_eq!(tags(&s.host.relay.take(TWEAK)), [25, 27], "the older sharer gets both compatible requests in order");
+
+    // Capability and workspace refusals both go only to the requesting seat.
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    s.allow(ANA, true);
+    let req = s.ana.send(edit());
+    s.one();
+    assert!(has(&s.ana, req, |n| matches!(n, Notice::Refused(why) if why == "This seat's copy of Makepad Town does not support structural design.")));
+    s.host.session.set_peer_level(ANA, Some(DESIGN_LEVEL));
+    let req = s.ana.send(edit());
+    s.one();
+    assert!(has(&s.ana, req, |n| matches!(n, Notice::Refused(why) if why == "no workspace root for this shared app")));
+    assert!(!has(&s.ben, req, |_| true) && s.app.sent.is_empty() && s.records.is_empty());
+
+    // Only terminal notices retire a request. Invalid JSON settles as one acknowledged refusal.
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    let reqs = [s.ana.send(edit()), s.ana.send(edit()), s.ana.send(edit()), s.ana.send(edit())];
+    let send = |s: &mut Copies, req, delivery, notice| {
+        let p = Packet { share: SHARE, sender: OWNER, req, agent: None, body: Body::Notice { seat: ANA, delivery, notice } };
+        s.host.relay.send(ANA, TWEAK, p.encode()).unwrap();
+    };
+    send(&mut s, reqs[0], 1, status());
+    send(&mut s, reqs[1], 2, Notice::Design(DesignNotice::Running { summary: "Renaming".into() }));
+    send(&mut s, reqs[2], 3, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, json: "{}".into() }));
+    send(&mut s, reqs[3], 4, Notice::Design(DesignNotice::Mutated { op: "rename".into(), path: PATH.into(),
+        focus_path: None, seq: 1, summary: "Renamed".into() }));
+    s.ana.poll();
+    let sent: Vec<_> = s.host.relay.take(TWEAK).into_iter().filter(|(_, b)| b[1] == 29)
+        .map(|(_, bytes)| wire::decode(ANA, &bytes).unwrap().unwrap().req).collect();
+    assert_eq!(sent, reqs[..2], "status and running keep their requests, reply and mutated retire theirs");
+    for (i, bad) in [DesignNotice::Status("{".into()), DesignNotice::Reply { kind: DesignReplyKind::Verify,
+        json: format!("{}0{}", "[".repeat(257), "]".repeat(257)) }].into_iter().enumerate() {
+        for _ in 0..2 { send(&mut s, reqs[i], i as u64 + 5, Notice::Design(bad.clone())); }
+    }
+    s.ana.poll();
+    let refusals: Vec<_> = s.ana.session.view.updates.iter().filter_map(|(_, id, _, n)| match n {
+        Notice::Refused(why) => Some((*id, why.as_str())), _ => None,
+    }).collect();
+    assert_eq!(refusals, [(reqs[0], parse_json("{").unwrap_err()), (reqs[1], TOO_DEEP)]);
+    assert!(matches!(&s.host.relay.take(TWEAK)[..], [(_, b)] if wire::decode(ANA, b).unwrap().unwrap().body == Body::Ack(6)));
+    s.ana.session.peer_unlinked(OWNER);
+    s.ana.poll();
+    assert!(tags(&s.host.relay.take(TWEAK)).iter().all(|tag| matches!(tag, 14 | 18)), "the malformed replies retired both requests");
+}
+
+#[test]
 fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
     let get = || Request::Theme(ThemeOp::Get);
     let set_token = |name: &str, value: &str| Request::Theme(ThemeOp::Set { name: name.into(), value: value.into() });
@@ -1829,6 +2095,11 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
     assert_eq!(s.app.sent.len(), after_alias, "ordinary token edits need no snapshot read");
     s.ana.send(set_token("space_factor", "12"));
     s.one();
+    s.host.session.set_members([OWNER, ANA]);
+    s.host.session.set_members([OWNER, ANA, BEN]);
+    s.host.session.set_peer_level(BEN, current);
+    s.exchange();
+    assert!(!has(&s.ben, 0, snapshot), "a join before the global refresh never sees stale derived values");
     s.one();
     assert!(has(&s.ben, 0, snapshot), "a changed global refreshes every capable seat");
     s.ana.send(set_token("space_factor", "12"));
@@ -1880,14 +2151,24 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
     assert!(has(&s.ben, 0, light), "a late member receives the latest cached theme");
 
     // A cached snapshot includes ordinary edits made since the last Get.
-    s.host.send(set_token("color_primary", "#010203ff"));
+    s.host.send(set_token("space_2", "11"));
+    s.one();
+    s.host.send(set_token("color_primary", "#abc"));
     s.one();
     s.host.session.set_members([OWNER, ANA]);
     s.host.session.set_members([OWNER, ANA, BEN]);
     s.host.session.set_peer_level(BEN, current);
     s.exchange();
-    assert!(has(&s.ben, 0, |n| matches!(n, Notice::Theme { theme } if theme.contains("#010203ff"))),
+    assert!(has(&s.ben, 0, |n| matches!(n, Notice::Theme { theme } if theme.contains(r##"["color_primary","#xAABBCCFF"],["space_2","11.0"]"##))),
         "a late seat sees the most recent scalar without querying the app again");
+
+    s.host.send(install("my_sunset"));
+    s.one();
+    s.one();
+    s.host.send(install("next"));
+    s.one();
+    assert!(matches!(&s.records.last().unwrap().change, Change::Applied { old, .. } if old == "my_sunset"),
+        "a custom install label survives the refresh for the next history entry");
 
     let mut mixed = Copies::new(OWNER, ANA, ITEM);
     mixed.ana.session.set_peer_level(OWNER, None);
@@ -1953,6 +2234,12 @@ fn theme_wire_broadcasts_records_edits_and_gates_older_peers_across_replay() {
     assert_eq!(r.ana.session.view.updates, expected, "each malformed delivery settles exactly once across replay");
     assert!(matches!(&r.host.relay.take(TWEAK)[..], [(_, b)] if wire::decode(ANA, b).unwrap().unwrap().body == Body::Ack(2)),
         "refused snapshots acknowledge the final delivery and remove both requests");
+}
+
+fn test_panel() -> panel::Panel {
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(theme::store::tests::scratch("panel"));
+    panel
 }
 
 fn panel_test_cx() -> test_cx::PooledCx {
@@ -2024,12 +2311,12 @@ fn color_row_shows_theme_chip_and_palette_and_binds_by_reference() {
         WidgetRef::script_from_value(vm, value)
     });
     let mut draw = draw_panel(cx, root.clone());
-    let mut panel = panel::Panel::default();
+    let mut panel = test_panel();
     let mut s = Copies::new(OWNER, ANA, ITEM);
     s.app.props = COLORS.into();
     s.app.prop_values = [("draw_bg.color".into(), "#e6a294ff".into()), ("draw_bg.border_color".into(), "#123456ff".into())].into();
     let mut state = makepad_town_core::fold::State::default();
-    state.profiles.insert(ANA, makepad_town_core::fold::Profile { name: "Peer".into(), colour: 0 });
+    state.profiles.insert(ANA, makepad_town_core::fold::Profile { writer: [0; 32], name: "Peer".into(), colour: 0 });
     let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp| {
         while let Some((seat, req, agent, notice)) = town.session.view.updates.pop_front() {
             panel.notice(cx, &root, &mut town.session, seat, req, agent, &state, &notice);
@@ -2064,6 +2351,17 @@ fn color_row_shows_theme_chip_and_palette_and_binds_by_reference() {
     let border = row(cx, "draw_bg.border_color");
     let chip = color.widget(cx, ids!(tname));
     assert!(color.widget(cx, ids!(tname_wrap)).visible() && chip.text() == "≈ theme.color_primary", "matching RGBA shows the named chip");
+    let editor_rect = color.widget(cx, ids!(editor)).area().rect(cx);
+    let chip_rect = chip.area().rect(cx);
+    assert!((color.widget(cx, ids!(value)).area().rect(cx).pos.x - border.widget(cx, ids!(value)).area().rect(cx).pos.x).abs() < 0.5,
+        "the theme chip keeps the value column aligned");
+    assert!(chip_rect.pos.y >= editor_rect.pos.y + editor_rect.size.y - 0.5 &&
+        chip_rect.pos.x + chip_rect.size.x <= editor_rect.pos.x + editor_rect.size.x + 0.5, "the chip fits below the editor");
+    s.ana.session.set_peer_level(OWNER, None);
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    draw(cx);
+    assert!(color.widget(cx, ids!(tname_wrap)).visible(), "the cached palette survives a reconnect before Hello");
+    s.ana.session.set_peer_level(OWNER, Some(THEME_LEVEL));
     assert!(!border.widget(cx, ids!(tname_wrap)).visible(), "an unmatched colour has no chip");
     let applied = |seq: u64, prop: &str, old: &str, new: &str| Notice::Applied {
         path: PATH.into(), prop: prop.into(), old: old.into(), new: new.into(), seq };
@@ -2124,7 +2422,7 @@ fn color_row_shows_theme_chip_and_palette_and_binds_by_reference() {
         old.allow(ANA, true);
         old.ana.session.view.updates.clear();
         old.ana.session.set_peer_level(OWNER, initial);
-        let mut panel = panel::Panel::default();
+        let mut panel = test_panel();
         panel.refresh(cx, &root, &old.ana.session, &state, &Default::default());
         panel.restore_selection(cx, &root, &mut old.ana.session);
         old.ana.session.set_peer_level(OWNER, Some(THEME_LEVEL - 1));
@@ -2167,7 +2465,7 @@ fn panel_pick_rows_enter_and_collaborator_history() {
     let mut s = Copies::new(owner, ANA, item);
     s.allow(ANA, true);
     s.ana.session.view.updates.clear();
-    let mut panel = panel::Panel::default();
+    let mut panel = test_panel();
     panel.refresh(cx, &root, &s.ana.session, &Default::default(), &Default::default());
     s.app.props = r##"{"props":[
         {"name":"surfaceColor","value":"#445566"},
@@ -2181,7 +2479,7 @@ fn panel_pick_rows_enter_and_collaborator_history() {
     s.one();
     let mut state = makepad_town_core::fold::State::default();
     for (seat, name) in [(owner, "Owner"), (ANA, "Peer")] {
-        state.profiles.insert(seat, makepad_town_core::fold::Profile { name: name.into(), colour: 0x446688 });
+        state.profiles.insert(seat, makepad_town_core::fold::Profile { writer: [0; 32], name: name.into(), colour: 0x446688 });
     }
     let dispatch = |panel: &mut panel::Panel, town: &mut TownApp, cx: &mut Cx| {
         while let Some((seat, req, agent, n)) = town.session.view.updates.pop_front() {
@@ -2383,7 +2681,7 @@ fn panel_pick_rows_enter_and_collaborator_history() {
     model.set_person_name("Ana").unwrap();
     let legacy_id = {
         use makepad_town_core::{entity::{field, kind}, event::{Actor, Content, Draft, Event, Key, Value, Via}, log::Log};
-        let legacy = Content::Entity { kind: Key::Number(kind::APP_EDIT), project: model.state.entities[&item].project,
+        let legacy = Content::Entity { copied_from: vec![], kind: Key::Number(kind::APP_EDIT), project: model.state.entities[&item].project,
             derive: None, fields: vec![(field::PARENT, Value::Id(item)), (field::EDIT_SEAT, Value::Key(owner.to_vec())),
                 (field::EDIT_AI, Value::Bool(true)), (field::LABEL, Value::Text("note".into())),
                 (field::WIDGET_PATH, Value::Text(PATH.into())), (field::PROPERTY, Value::Text("padding".into())),
@@ -2466,7 +2764,7 @@ fn panel_pick_rows_enter_and_collaborator_history() {
 
     s.ben.send(Request::AskEdit);
     s.exchange();
-    let mut owner_panel = panel::Panel::default();
+    let mut owner_panel = test_panel();
     owner_panel.refresh(cx, &root, &s.host.session, &Default::default(), &Default::default());
     draw(cx);
     let chips = root.portal_list(cx, ids!(tweak_seats_list));
@@ -2698,7 +2996,7 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     let board = model.act(Action::AddBoard { project: model.current_project().unwrap().id, title: "Editing".into() }, Origin::Ui).unwrap();
     let design = model.act(Action::AddDesign { board, x: 0, y: 0, preset: "phone".into(),
         title: "Layout".into(), src: "View{}".into() }, Origin::Ui).unwrap();
-    let open = |m: &mut Model, share| m.act(Action::SessionOpen { town: None, session: share,
+    let open = |m: &mut Model, share| m.act(Action::SessionOpen { town_wide: false, town: None, session: share,
         mode: SessionMode::Share { title: "Fixture".into() }, to: vec![m.call_seat(&peer).unwrap()] }, Origin::Ui).unwrap();
     open(&mut model, SHARE);
     crate::model::tests::exchange(&mut model, &mut viewer);
@@ -2725,7 +3023,7 @@ fn share_lifecycle_pins_the_board_and_inflight_write_to_the_original_town() {
     use makepad_town_core::event::{Actor, Change as FieldChange, Content, Draft, Event, Value, Via};
     let parents = makepad_town_core::log::Log::open(&viewer.home.town_log_path(&town)).unwrap().0.parents_for(&peer);
     for (field, bytes) in [(field::SESSION, vec![99; 16]), (field::SHARER, me.to_vec())] {
-        let content = Content::Set { changes: vec![FieldChange { entity: item, field: field.clone(),
+        let content = Content::Set { copied_from: vec![], changes: vec![FieldChange { entity: item, field: field.clone(),
             value: Value::Key(bytes) }], label: None };
         let event = Event::create(&viewer.device_key(), town, Draft { kind: content.kind(), kind_version: content.version(),
             actor: Actor::Human, via: Via::Ui, critical: false, parents: parents.clone(), wall_ms: 0,
@@ -3105,7 +3403,7 @@ fn shader_tab_edits_literal_inputs_live_and_saves_fn_changes_as_notes() {
         {"layer":"draw_text","drawn":false,"inputs":[{"name":"color","io":"instance"}],
             "fns":[{"name":"pixel","loc":"text.rs:9","src":"pixel: fn() {}"}]}]}"##.into();
     let state = Default::default();
-    let mut panel = panel::Panel::default();
+    let mut panel = test_panel();
     let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp| {
         while let Some((seat, req, agent, notice)) = town.session.view.updates.pop_front() {
             panel.notice(cx, &root, &mut town.session, seat, req, agent, &state, &notice);
@@ -3310,10 +3608,10 @@ fn tree_tab_expands_lazily_selects_with_seat_colours_follows_pick_and_filters() 
     s.allow(ANA, true);
     s.ana.session.view.updates.clear();
     s.allow(BEN, true);
-    let mut panel = panel::Panel::default();
+    let mut panel = test_panel();
     let mut state = State::default();
     for (seat, name, colour) in [(ANA, "Ana", 0xace021), (BEN, "Ben", 0x1865bd)] {
-        state.profiles.insert(seat, Profile { name: name.into(), colour });
+        state.profiles.insert(seat, Profile { writer: [0; 32], name: name.into(), colour });
     }
     let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp| {
         while let Some((seat, req, agent, notice)) = town.session.view.updates.pop_front() {
@@ -3493,7 +3791,7 @@ fn tree_tab_expands_lazily_selects_with_seat_colours_follows_pick_and_filters() 
         let mut older = Copies::new(OWNER, ANA, ITEM);
         older.exchange();
         older.ana.session.set_peer_level(OWNER, level);
-        let mut panel = panel::Panel::default();
+        let mut panel = test_panel();
         panel.refresh(cx, &root, &older.ana.session, &state, &Default::default());
         draw(cx);
         click(cx, tab_tree.clone(), &mut panel, &mut older.ana);
@@ -3510,4 +3808,3164 @@ fn tree_tab_expands_lazily_selects_with_seat_colours_follows_pick_and_filters() 
         older.ana.poll();
         assert!(older.host.relay.take(TWEAK).is_empty(), "the refused root never reaches the old sharer");
     }
+}
+
+#[test]
+fn theme_tab_edits_tokens_switches_presets_and_saves_replaces_deletes_in_store() {
+    use makepad_widgets::{fab_controls::FabColorPickAction, *};
+
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 420} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut draw = draw_panel(cx, root.clone());
+    let scratch = crate::model::tests::ShareHomes::new("theme-tab");
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let dir = scratch.0.join("themes");
+    let state = Default::default();
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(dir.clone());
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.app.theme = THEME.replace(r#""sheets":[]"#,
+        r#""sheets":[{"id":"macos-dark","label":"macOS dark","base":"dark","appearance":"dark"}]"#)
+        .replace(r#""values":["#, r#""values":[{"name":"font_size_p","value":"9","site":"body:1"},"#);
+    s.app.theme_base = Some(parse_json(&s.app.theme).unwrap());
+    s.allow(ANA, true);
+    s.ana.session.view.updates.clear();
+    let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp| {
+        while let Some((seat, req, agent, notice)) = town.session.view.updates.pop_front() {
+            panel.notice(cx, &root, &mut town.session, seat, req, agent, &state, &notice);
+        }
+    };
+    let click = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp, widget: WidgetRef, time| {
+        let (_, down, up) = panel_click_at(cx, &root, widget.area().rect(cx).center(), time);
+        panel.actions(cx, &root, &down, &mut town.session);
+        panel.actions(cx, &root, &up, &mut town.session);
+    };
+    let key = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp, key_code| {
+        let actions = cx.capture_actions(|cx| root.handle_event(cx,
+            &Event::KeyDown(KeyEvent { key_code, ..Default::default() }), &mut Scope::empty()));
+        panel.actions(cx, &root, &actions, &mut town.session);
+    };
+    let settle = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies| {
+        s.one();
+        dispatch(cx, panel, &mut s.ana);
+    };
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    draw(cx);
+    for tab in [ids!(tab_props), ids!(tab_shader), ids!(tab_tree), ids!(tab_theme), ids!(tweak_close)] {
+        assert!(root.widget(cx, tab).visible(), "a wide panel shows the full tab labels and Close");
+    }
+    root.borrow_mut::<View>().unwrap().walk.width = Size::Fixed(155.);
+    draw(cx);
+    for (tab, icon) in [(ids!(tab_props), ids!(tab_props_i)), (ids!(tab_shader), ids!(tab_shader_i)),
+        (ids!(tab_tree), ids!(tab_tree_i)), (ids!(tab_theme), ids!(tab_theme_i))] {
+        assert!(!root.widget(cx, tab).visible() && root.widget(cx, icon).visible(), "each narrow tab switches to its icon");
+    }
+    click(cx, &mut panel, &mut s.ana, root.widget(cx, ids!(tab_theme_i)), 1.);
+    settle(cx, &mut panel, &mut s);
+    root.borrow_mut::<View>().unwrap().walk.width = Size::Fixed(340.);
+    draw(cx);
+    let list = root.portal_list(cx, ids!(tweak_theme_list));
+    let rows = || (0..list.borrow().unwrap().range_end()).filter_map(|i| list.get_item(i));
+    let titles = || rows().filter(|(id, _)| *id == id!(SectionRow)).map(|(_, r)| r.child(id!(header)).child(id!(title)).text()).collect::<Vec<_>>();
+    assert_eq!(titles(), ["Colours", "Spacing & sizes", "Font sizes"], "the three typed sections are mounted");
+    let colours = rows().next().unwrap().1;
+    click(cx, &mut panel, &mut s.ana, colours.widget(cx, ids!(header)), 1.3);
+    draw(cx);
+    assert!(!rows().any(|(id, _)| id == id!(ColorRow)) && rows().any(|(id, _)| id == id!(NumRow)),
+        "folding Colours leaves the numeric sections visible");
+    click(cx, &mut panel, &mut s.ana, colours.widget(cx, ids!(header)), 1.6);
+    let filter = root.text_input(cx, ids!(theme_filter.input));
+    let change = cx.capture_actions(|cx| cx.widget_action(filter.widget_uid(), TextInputAction::Changed("FoNt".into())));
+    panel.actions(cx, &root, &change, &mut s.ana.session);
+    draw(cx);
+    assert_eq!(titles(), ["Font sizes"], "filtering matches token names case-insensitively");
+    let escape = cx.capture_actions(|cx| cx.widget_action(filter.widget_uid(), TextInputAction::Escaped));
+    panel.actions(cx, &root, &escape, &mut s.ana.session);
+    draw(cx);
+    let color = rows().find(|(id, r)| *id == id!(ColorRow) && r.label(cx, ids!(name)).text() == "color_bg_app").unwrap().1;
+    assert!(!color.widget(cx, ids!(tname_wrap)).visible(), "Theme token editors have no match chip");
+    assert!(rows().any(|(id, r)| id == id!(NumRow) && r.label(cx, ids!(name)).text() == "font_size_p"), "font tokens use the numeric editor");
+    let pick = root.drop_down(cx, ids!(theme_pick));
+    assert!(pick.has_labels(&["Dark","Light","Skeleton","macOS dark"].map(String::from)), "the dropdown uses the shared app's catalogue");
+
+    let swatch = color.widget(cx, ids!(swatch));
+    let send_colour = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp, event: FabColorPickAction| {
+        let actions = cx.capture_actions(|cx| cx.group_widget_actions(list.widget_uid(), color.widget_uid(),
+            |cx| cx.widget_action(swatch.widget_uid(), event)));
+        panel.actions(cx, &root, &actions, &mut town.session);
+    };
+    let before = s.app.sent.len();
+    for (i, v) in [vec4(1.,0.,0.,1.), vec4(0.,1.,0.,1.), vec4(0.,0.,1.,1.), vec4(1.,1.,1.,1.)].into_iter().enumerate() {
+        send_colour(cx, &mut panel, &mut s.ana, if i == 3 { FabColorPickAction::Ended(v) } else { FabColorPickAction::Changed(v) });
+        s.one();
+    }
+    let token_set = |op: &DesignOp, value: &str| matches!(op, DesignOp::Design { verb: DesignVerb::Theme, args } if
+        args == &[("set".into(), "1".into()), ("name".into(), "color_bg_app".into()), ("value".into(), value.into())]);
+    assert!(matches!(&s.app.sent[before..], [(_,_,op)] if token_set(op, "#ff0000ff")), "holding the reply sends only the first drag value");
+    dispatch(cx, &mut panel, &mut s.ana);
+    settle(cx, &mut panel, &mut s);
+    assert!(matches!(&s.app.sent[before+1..], [(_,_,op)] if token_set(op, "#ffffffff")), "settling sends the final value with no Props query");
+    draw(cx);
+    let history = root.portal_list(cx, ids!(tweak_history_list));
+    let entry = |cx: &Cx, i| history.get_item(i).unwrap().1.label(cx, ids!(tweak_entry)).text();
+    assert!(history.borrow().unwrap().range_end() == 1 && entry(cx, 0).ends_with("theme.color_bg_app  #1e1e1eff → #ffffffff (2 steps)"),
+        "the coalesced drag has one history run");
+    let editor = color.widget(cx, ids!(editor)).area().rect(cx);
+    for time in [2., 2.2] {
+        let (_, down, _) = panel_click_at(cx, &root, editor.pos + dvec2(12., editor.size.y * 0.5), time);
+        panel.actions(cx, &root, &down, &mut s.ana.session);
+    }
+    settle(cx, &mut panel, &mut s);
+    assert!(token_set(&s.app.sent.last().unwrap().2, "#1e1e1eff"), "double-click restores the first recorded value");
+    draw(cx);
+    let value = color.text_input(cx, ids!(value));
+    click(cx, &mut panel, &mut s.ana, color.widget(cx, ids!(value)), 3.);
+    let expr = "mix(#f00, #00f, 0.5)";
+    value.set_text(cx, expr);
+    key(cx, &mut panel, &mut s.ana, KeyCode::ReturnKey);
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert!(s.records.last().unwrap().change == Change::Note(expr.into()) && color.label(cx, ids!(refusal)).text().contains("Saved a note"),
+        "a nonliteral reaches the owner as a note and its refusal is shown on the token");
+
+    click(cx, &mut panel, &mut s.ana, color.widget(cx, ids!(value)), 3.3);
+    key(cx, &mut panel, &mut s.ana, KeyCode::Escape);
+    draw(cx);
+    assert!(!color.widget(cx, ids!(refusal)).visible(), "Escape clears the Theme row refusal");
+    click(cx, &mut panel, &mut s.ana, color.widget(cx, ids!(value)), 3.6);
+    value.set_text(cx, "theme.color_primary");
+    key(cx, &mut panel, &mut s.ana, KeyCode::ReturnKey);
+    settle(cx, &mut panel, &mut s);
+    assert!(token_set(&s.app.sent.last().unwrap().2, "theme.color_primary") &&
+        s.app.token_value("color_bg_app") == s.app.token_value("color_primary"), "the colour field accepts a typed token alias");
+    let preset = root.widget(cx, ids!(theme_pick));
+    click(cx, &mut panel, &mut s.ana, preset.clone(), 4.);
+    draw(cx);
+    key(cx, &mut panel, &mut s.ana, KeyCode::End);
+    key(cx, &mut panel, &mut s.ana, KeyCode::ReturnKey);
+    settle(cx, &mut panel, &mut s);
+    assert!(matches!(&s.app.sent.last().unwrap().2, DesignOp::Design { verb: DesignVerb::Theme, args } if
+        args[0].0 == "install" && parse_json(&args[1].1) == parse_json(r#"{"base":"dark","sheet":"macos-dark","globals":[],"overrides":[]}"#)),
+        "the mounted picker installs the sheet on its registered base");
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert!(has(&s.ben, 0, |n| matches!(n, Notice::Theme { theme } if theme.contains(r#""sheet":"macos-dark""#))),
+        "the new snapshot reaches the observer");
+    assert!(entry(cx, 1).contains("theme.install") && pick.selected_label() == "macOS dark", "the preset switch has one install history entry");
+    let choose = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp, index| {
+        let action = cx.capture_actions(|cx| cx.widget_action(preset.widget_uid(), DropDownAction::Select(index)));
+        panel.actions(cx, &root, &action, &mut town.session);
+    };
+    let name = root.text_input(cx, ids!(theme_name));
+    let save = root.widget(cx, ids!(theme_save));
+    let delete = root.widget(cx, ids!(theme_delete));
+    let msg = root.label(cx, ids!(theme_msg));
+    let file = dir.join("my_sunset.theme");
+    name.set_text(cx, "My Sunset ");
+    click(cx, &mut panel, &mut s.ana, save.clone(), 5.);
+    draw(cx);
+    assert!(file.is_file() && name.text() == "my_sunset" && pick.selected_label() == "my_sunset" && delete.visible(),
+        "save normalizes the name, writes under the injected home and selects the deletable row");
+    let original = std::fs::read_to_string(&file).unwrap();
+    s.host.send(Request::Theme(ThemeOp::Set { name: "space_2".into(), value: "17".into() }));
+    settle(cx, &mut panel, &mut s);
+    click(cx, &mut panel, &mut s.ana, save.clone(), 6.);
+    assert!(msg.text().contains("save again to replace") && std::fs::read_to_string(&file).unwrap() == original,
+        "the first replace leaves the file intact");
+    click(cx, &mut panel, &mut s.ana, save.clone(), 7.);
+    assert!(std::fs::read_to_string(&file).unwrap().contains("token\tspace_2\t17.0"), "the confirmed replacement includes the observer's live edit");
+    for builtin in ["dark", "windows_2000"] {
+        name.set_text(cx, builtin);
+        click(cx, &mut panel, &mut s.ana, save.clone(), 8.);
+        assert!(msg.text().contains("cannot be saved over") && !dir.join(format!("{builtin}.theme")).exists(),
+            "the built-in refusal protects {builtin}");
+    }
+    // A different actor's install clears the member-local file selection.
+    s.host.send(Request::Theme(ThemeOp::Install(ThemeInstall { label: "Light".into(), base: "light".into(),
+        sheet: None, globals: vec![], overrides: vec![] })));
+    settle(cx, &mut panel, &mut s);
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert!(pick.selected_label() == "Light" && !delete.visible(), "another seat's install moves the picker to its new preset");
+    choose(cx, &mut panel, &mut s.ana, 4);
+    settle(cx, &mut panel, &mut s);
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert_eq!(pick.selected_label(), "my_sunset", "the picker follows the acknowledged saved install");
+    assert!(delete.visible(), "the worn member-local file can be deleted");
+    assert_eq!(s.app.token_value("space_2").and_then(|v| v.parse::<f64>().ok()), Some(17.0),
+        "choosing a saved file installs its typed number");
+    s.allow(ANA, false);
+    dispatch(cx, &mut panel, &mut s.ana);
+    choose(cx, &mut panel, &mut s.ana, 0);
+    settle(cx, &mut panel, &mut s);
+    assert!(msg.text().contains("Ask the owner") && pick.selected_label() == "my_sunset" && delete.visible(),
+        "a refused install preserves the already worn saved theme and its delete button");
+    s.allow(ANA, true);
+    dispatch(cx, &mut panel, &mut s.ana);
+    click(cx, &mut panel, &mut s.ana, delete.clone(), 9.);
+    assert!(file.exists() && msg.text().contains("press delete again"), "the first delete leaves the saved file in place");
+    click(cx, &mut panel, &mut s.ana, delete.clone(), 10.);
+    settle(cx, &mut panel, &mut s);
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert!(!file.exists() && !delete.visible() && pick.selected_label() == "Light" && msg.text() == "deleted my_sunset",
+        "confirmed delete restores the last built-in and keeps its result visible");
+
+    let before = s.records.len();
+    choose(cx, &mut panel, &mut s.ana, 0);
+    s.one();
+    s.exchange();
+    choose(cx, &mut panel, &mut s.ana, 1);
+    choose(cx, &mut panel, &mut s.ana, 2);
+    s.ana.poll();
+    assert!(s.host.relay.take(TWEAK).is_empty(), "later choices send no install while the first reply is held");
+    dispatch(cx, &mut panel, &mut s.ana);
+    for _ in 0..3 { settle(cx, &mut panel, &mut s); }
+    assert!(matches!(&s.records[before..], [AppEdit { change: Change::Applied { new: first, .. }, .. },
+        AppEdit { change: Change::Applied { new: last, .. }, .. }] if first == "Dark" && last == "Skeleton"),
+        "the first install and the latest waiting install are the only two applied");
+    draw(cx);
+
+    s.allow(ANA, false);
+    dispatch(cx, &mut panel, &mut s.ana);
+    let before = (s.app.sent.len(), s.records.len());
+    send_colour(cx, &mut panel, &mut s.ana, FabColorPickAction::Ended(vec4(0.,1.,0.,1.)));
+    choose(cx, &mut panel, &mut s.ana, 0);
+    settle(cx, &mut panel, &mut s);
+    draw(cx);
+    assert!(color.label(cx, ids!(refusal)).text().contains("Ask the owner") && msg.text().contains("Ask the owner") &&
+        before == (s.app.sent.len(), s.records.len()), "a denied guest cannot edit a token or install a preset");
+
+    let mut older = Copies::new(OWNER, ANA, ITEM);
+    older.allow(ANA, true);
+    older.exchange(); // Deliver the grant acknowledgments before counting the tab’s traffic.
+    older.ana.session.set_peer_level(OWNER, Some(THEME_LEVEL - 1));
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(dir);
+    panel.refresh(cx, &root, &older.ana.session, &state, &Default::default());
+    panel.restore_selection(cx, &root, &mut older.ana.session);
+    draw(cx);
+    click(cx, &mut panel, &mut older.ana, root.widget(cx, ids!(tab_theme)), 11.);
+    older.ana.poll();
+    assert_eq!(root.label(cx, ids!(theme_status)).text(), OLDER_SHARER_THEME, "Theme explains the silent background compatibility refusal");
+    assert!(older.host.relay.take(TWEAK).is_empty(), "the older sharer receives zero packets from Theme");
+}
+
+#[test]
+fn theme_mix_throttles_drags_restores_on_leave_and_stands_down_for_peers() {
+    use makepad_widgets::{fab_controls::{FabSliderAction, FabSliderWidgetRefExt}, theme_tokens::{Appearance, BlendTheme}, *};
+    makepad_widgets_sheets::register();
+    let cache = std::sync::Arc::new(super::theme::lab::tests::bench());
+    let catalogue = cache.themes().filter_map(|t| match t {
+        BlendTheme::Sheet(id) => Some(json::obj(vec![("id", json::s(id)), ("label", json::s(t.label())),
+            ("base", json::s(t.base().theme_name())), ("appearance", json::s(if t.appearance() == Appearance::Dark { "dark" } else { "light" }))])),
+        _ => None,
+    }).collect();
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let v = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 420} });
+        WidgetRef::script_from_value(vm, v)
+    });
+    let mut draw = draw_panel(cx, root.clone());
+    let dir = super::theme::store::tests::scratch("mounted-mix");
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(dir.clone());
+    panel.mixer_cache.ready = Some(cache);
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.app.theme = THEME.replace(r#""sheets":[]"#, &format!(r#""sheets":{}"#, json::Value::Arr(catalogue).to_json()));
+    s.allow(ANA, true);
+    s.allow(BEN, true);
+    s.ana.session.view.updates.clear();
+    let state = Default::default();
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    let pump = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies| {
+        s.one();
+        while let Some((seat, req, agent, notice)) = s.ana.session.view.updates.pop_front() {
+            panel.notice(cx, &root, &mut s.ana.session, seat, req, agent, &state, &notice);
+        }
+    };
+    let button = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, path: &[LiveId]| {
+        let uid = root.widget(cx, path).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        panel.actions(cx, &root, &actions, &mut s.ana.session);
+    };
+    let pick = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, idx| {
+        let uid = root.widget(cx, ids!(theme_pick)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(idx)));
+        panel.actions(cx, &root, &actions, &mut s.ana.session);
+    };
+    let labels = |s: &Copies| s.records.iter().filter(|e| e.path == "theme" && e.prop == "install")
+        .filter_map(|e| match &e.change { Change::Applied { new, .. } => Some(new.clone()), _ => None }).collect::<Vec<_>>();
+    button(cx, &mut panel, &mut s, ids!(tab_theme));
+    pump(cx, &mut panel, &mut s);
+    draw(cx);
+    let fold = root.widget(cx, ids!(eq_fold));
+    let (_, press, release) = panel_click_at(cx, &root, fold.area().rect(cx).center(), 1.);
+    panel.actions(cx, &root, &press, &mut s.ana.session);
+    panel.actions(cx, &root, &release, &mut s.ana.session);
+    draw(cx);
+    let rows = root.flat_list(cx, ids!(eq_rows));
+    let count = rows.borrow().unwrap().items.len();
+    assert!(count > 22 && count == BlendTheme::group(Appearance::Dark).len(),
+        "the mixer mounts every shared dark slider including rows beyond the old 22 slots, got {count}");
+    let row = |name: &str| rows.borrow().unwrap().items.get(&LiveId::from_str(name)).unwrap().widget.clone();
+    let read = root.label(cx, ids!(eq_read));
+    let msg = root.label(cx, ids!(theme_msg));
+    assert!(fold.text() == "- mix" && row("dark").as_fab_slider().value() == 100. && read.text().contains("pairs read"),
+        "opening anchors the weights and measures readability immediately");
+    pump(cx, &mut panel, &mut s);
+    assert!(labels(&s).is_empty(), "opening and measuring sends zero installs");
+
+    let slide = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, name, weight, end| {
+        let uid = row(name).widget_uid();
+        let actions = cx.capture_actions(|cx| {
+            cx.widget_action(uid, FabSliderAction::Changed(weight));
+            if end { cx.widget_action(uid, FabSliderAction::Ended(weight)); }
+        });
+        panel.actions(cx, &root, &actions, &mut s.ana.session);
+    };
+    for i in 1..=5 {
+        slide(cx, &mut panel, &mut s, "macos-dark", f64::from(i * 10), false);
+        // Move events alone never install. One eligible frame may use the first value.
+        if i == 1 { pump(cx, &mut panel, &mut s); assert!(labels(&s).is_empty(), "a move waits for its frame"); }
+        panel.tick_theme_at(cx, &root, &mut s.ana.session, f64::from(i - 1) * 0.025);
+        pump(cx, &mut panel, &mut s);
+    }
+    assert_eq!(labels(&s), ["mix"], "five moves in 100 ms send only the first eligible install");
+    let first = s.app.token_value("color_bg_app");
+    slide(cx, &mut panel, &mut s, "macos-dark", 90., true);
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 0.101);
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    assert!(labels(&s) == ["mix", "mix"] && first != s.app.token_value("color_bg_app") && read.text().contains("pairs read · closest"),
+        "Ended in the same batch as Changed immediately installs the final blend with its contrast readout");
+    button(cx, &mut panel, &mut s, ids!(eq_relative));
+    button(cx, &mut panel, &mut s, ids!(eq_random));
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 0.102);
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    let shown: f64 = rows.borrow().unwrap().items.values().map(|r| r.widget.as_fab_slider().readout()).sum();
+    assert_eq!(shown, 100., "surprise in relative mode distributes 100 displayed parts");
+    pick(cx, &mut panel, &mut s, 1);
+    pump(cx, &mut panel, &mut s);
+    assert!(msg.text().contains("drops the mix") && labels(&s).last().unwrap() == "mix", "the first picker press keeps the mix");
+    pick(cx, &mut panel, &mut s, 1);
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    assert!(labels(&s).last().unwrap() == "Light" && row("light").as_fab_slider().value() == 100.,
+        "the second press installs the preset and the open mixer re-anchors on its refresh");
+
+    slide(cx, &mut panel, &mut s, "macos", 55., true);
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 0.103);
+    button(cx, &mut panel, &mut s, ids!(tab_props));
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    button(cx, &mut panel, &mut s, ids!(tab_theme));
+    assert_eq!(fold.text(), "- mix", "inspecting Properties leaves an open mixer alive");
+    let before = labels(&s).len();
+    button(cx, &mut panel, &mut s, ids!(eq_fold));
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    assert_eq!(&labels(&s)[before..], ["Light"], "folding a standing mix restores the captured preset exactly once");
+
+    button(cx, &mut panel, &mut s, ids!(eq_fold));
+    slide(cx, &mut panel, &mut s, "macos", 70., true);
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 1.);
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    slide(cx, &mut panel, &mut s, "macos", 80., false);
+    s.ben.send(Request::Theme(ThemeOp::Install(ThemeInstall { label: "Light".into(), base: "light".into(),
+        sheet: None, globals: vec![], overrides: vec![] })));
+    pump(cx, &mut panel, &mut s); // Applied, before the post-install snapshot.
+    let before = labels(&s).len();
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 2.);
+    button(cx, &mut panel, &mut s, ids!(eq_fold));
+    pump(cx, &mut panel, &mut s);
+    pump(cx, &mut panel, &mut s);
+    assert!(labels(&s).len() == before && labels(&s).last().unwrap() == "Light" && fold.text() == "+ mix",
+        "a peer's Applied cancels the pending settle and prevents even a pre-refresh close from restoring");
+
+    button(cx, &mut panel, &mut s, ids!(eq_fold));
+    slide(cx, &mut panel, &mut s, "macos", 60., true);
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 3.);
+    pump(cx, &mut panel, &mut s);
+    root.text_input(cx, ids!(theme_name)).set_text(cx, "saved mix");
+    button(cx, &mut panel, &mut s, ids!(theme_save));
+    pump(cx, &mut panel, &mut s);
+    let saved = super::theme::store::load_in(&dir, "saved_mix").unwrap();
+    let value = s.app.token_value("color_bg_app").unwrap();
+    assert!(saved.to_install().overrides.contains(&("color_bg_app".into(), super::theme::scalar(&value).unwrap())),
+        "save between Applied and Theme promotes the acknowledged live tokens");
+    let before = labels(&s).len();
+    button(cx, &mut panel, &mut s, ids!(eq_fold));
+    pump(cx, &mut panel, &mut s);
+    assert!(labels(&s).len() == before && root.drop_down(cx, ids!(theme_pick)).selected_label() == "saved_mix",
+        "closing after promotion preserves the worn saved mix without a restore");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn theme_builder_defers_drags_honors_locks_carousel_and_multi_seat_standdown() {
+    use makepad_widgets::{fab_controls::{FabColorPick, FabPaletteCarousel, FabPaletteCarouselAction,
+        FabSliderAction, FabSliderWidgetRefExt}, *};
+    use super::theme::{builder::{BuildLock, BuildRow, TB_COLOR_IDS, TB_LOCK_FACES}, store};
+
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let v = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 420} });
+        WidgetRef::script_from_value(vm, v)
+    });
+    let mut draw = draw_panel(cx, root.clone());
+    let dir = store::tests::scratch("mounted-builder");
+    std::fs::create_dir_all(&dir).unwrap();
+    let own = [0xff5c39ff, 0xcc9933ff, 0x387fd2ff, 0x282c30ff];
+    std::fs::write(dir.join("palettes.txt"), "#ff5c39 #cc9933 #387fd2 #282c30\n").unwrap();
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(dir.clone());
+    panel.mixer_cache.ready = Some(std::sync::Arc::new(super::theme::lab::tests::bench()));
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.allow(ANA, true);
+    s.allow(BEN, true);
+    s.ana.session.view.updates.clear();
+    let state = Default::default();
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    let pump = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies| {
+        s.one();
+        while let Some((seat, req, agent, notice)) = s.ana.session.view.updates.pop_front() {
+            panel.notice(cx, &root, &mut s.ana.session, seat, req, agent, &state, &notice);
+        }
+    };
+    let button = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, widget: WidgetRef| {
+        let a = cx.capture_actions(|cx| cx.widget_action(widget.widget_uid(), ButtonAction::Clicked(Default::default())));
+        panel.actions(cx, &root, &a, &mut s.ana.session);
+    };
+    let tick = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, now| {
+        panel.tick_theme_at(cx, &root, &mut s.ana.session, now);
+        pump(cx, panel, s);
+        pump(cx, panel, s);
+    };
+    let installs = |s: &Copies| s.records.iter().filter(|e| e.path == "theme" && e.prop == "install").count();
+    let tab = root.widget(cx, ids!(tab_theme));
+    button(cx, &mut panel, &mut s, tab);
+    pump(cx, &mut panel, &mut s);
+    draw(cx);
+    let fold = root.widget(cx, ids!(tb_fold));
+    let mix = root.widget(cx, ids!(eq_fold));
+    let at = fold.area().rect(cx).center();
+    let (_, press, release) = panel_click_at(cx, &root, at, 1.);
+    panel.actions(cx, &root, &press, &mut s.ana.session);
+    panel.actions(cx, &root, &release, &mut s.ana.session);
+    draw(cx);
+    let body = root.widget(cx, ids!(tb_body));
+    let seed_row = body.child(live_id!(tb_seed_row));
+    let cols = TB_COLOR_IDS.map(|id| seed_row.child(id));
+    let colors = || cols.each_ref().map(|col| u32::from_be_bytes(col.child(live_id!(tb_color)).borrow::<FabColorPick>().unwrap().rgba().map(|c| (c * 255.).round() as u8)));
+    let original = colors();
+    let carousel = root.widget(cx, ids!(tb_carousel));
+    let chips = || carousel.borrow::<FabPaletteCarousel>().unwrap().chip_colors(0).unwrap().map(|v| v.to_u32());
+    assert!(fold.text() == "- build" && cols.iter().all(|w| w.visible()) &&
+        cols.each_ref().map(|c| c.child(live_id!(tb_color_name)).text()) == ["Prim", "Sec", "Tert", "Surf"],
+        "the mounted fold opens all four labelled colour pickers");
+    assert_eq!(chips(), own, "the member's palette is first, ahead of the book and harmony chips");
+    tick(cx, &mut panel, &mut s, 0.);
+    assert_eq!(installs(&s), 0, "opening reads the member's palette without installing");
+
+    let count = root.widget(cx, ids!(tb_count_2));
+    button(cx, &mut panel, &mut s, count);
+    tick(cx, &mut panel, &mut s, 0.01);
+    assert!(cols[0].visible() && !cols[1].visible() && !cols[2].visible() && cols[3].visible()
+        && root.drop_down(cx, ids!(tb_text_color)).has_labels(&["None".into(), "Prim".into(), "Surf".into()])
+        && carousel.borrow::<FabPaletteCarousel>().unwrap().bands() == 2 && installs(&s) == 1,
+        "two colours trim the squares, text menu and carousel together and install once");
+    let count = root.widget(cx, ids!(tb_count_4));
+    button(cx, &mut panel, &mut s, count);
+    tick(cx, &mut panel, &mut s, 0.02);
+    assert_eq!(colors(), original, "returning to four restores the previously hidden chosen colours");
+
+    let pick = cx.capture_actions(|cx| cx.widget_action(carousel.widget_uid(), FabPaletteCarouselAction::Pick(0)));
+    let before = installs(&s);
+    panel.actions(cx, &root, &pick, &mut s.ana.session);
+    tick(cx, &mut panel, &mut s, 0.03);
+    let value = |cx: &Cx, path| root.widget(cx, path).as_fab_slider().value();
+    let (sat, light) = super::theme::builder::surface_sliders(own[3], true);
+    assert_eq!(colors(), own, "the chip sets each of the four colour squares");
+    assert_eq!(installs(&s), before + 1, "pressing the member palette installs once");
+    let slider_values = (value(cx, ids!(tb_saturation)), value(cx, ids!(tb_lightness)));
+    assert!((slider_values.0 - sat * 100.).abs() < 0.51 && (slider_values.1 - light * 100.).abs() < 0.51,
+        "the chip moves both surface sliders, got {slider_values:?}, expected {:?}", (sat * 100., light * 100.));
+    let adjust = root.widget(cx, ids!(tb_adjust));
+    let prior_book_chip = carousel.borrow::<FabPaletteCarousel>().unwrap().chip_colors(1);
+    let adjust = cx.capture_actions(|cx| cx.widget_action(adjust.widget_uid(), CheckBoxAction::Change(false)));
+    panel.actions(cx, &root, &adjust, &mut s.ana.session);
+    tick(cx, &mut panel, &mut s, 0.04);
+    assert!(installs(&s) == before + 1 && carousel.borrow::<FabPaletteCarousel>().unwrap().chip_colors(1) != prior_book_chip,
+        "Adjust regrows book chips without installing");
+
+    let spacing = root.widget(cx, ids!(tb_spacing)).widget_uid();
+    let slide = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, v| {
+        let actions = cx.capture_actions(|cx| cx.widget_action(spacing, FabSliderAction::Changed(v)));
+        panel.actions(cx, &root, &actions, &mut s.ana.session);
+    };
+    let before = installs(&s);
+    for (i, v) in [9., 10., 11., 12.].into_iter().enumerate() {
+        slide(cx, &mut panel, &mut s, v);
+        tick(cx, &mut panel, &mut s, 1. + 0.02 * i as f64);
+        assert_eq!(installs(&s), before, "each move resets the quiet interval even after the settle interval expired");
+    }
+    tick(cx, &mut panel, &mut s, 1.13);
+    draw(cx);
+    let history = root.portal_list(cx, ids!(tweak_history_list));
+    assert!(installs(&s) == before + 1 && s.app.token_value("space_factor").unwrap().parse::<f64>().unwrap() == 12.
+        && history.borrow().unwrap().range_end() == 1 && history.get_item(0).unwrap().1.label(cx, ids!(tweak_entry)).text().contains("theme.install"),
+        "one quiet tick re-derives the final spacing and consecutive installs share one history run");
+
+    let lock = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, which: BuildLock| {
+        button(cx, panel, s, which.lock_in(&body).child(TB_LOCK_FACES[0]));
+    };
+    lock(cx, &mut panel, &mut s, BuildLock::Palette);
+    lock(cx, &mut panel, &mut s, BuildLock::Row(BuildRow::Lightness));
+    let was = (colors(), value(cx, ids!(tb_lightness)), installs(&s));
+    let roll = root.widget(cx, ids!(tb_random));
+    button(cx, &mut panel, &mut s, roll);
+    tick(cx, &mut panel, &mut s, 2.);
+    assert!(colors() == was.0 && value(cx, ids!(tb_lightness)) == was.1 && value(cx, ids!(tb_spacing)) != 12.
+        && installs(&s) == was.2 + 1, "Roll keeps the locked palette and lightness and rolls the unlocked dimensions");
+
+    let pick = root.widget(cx, ids!(theme_pick)).widget_uid();
+    let preview = cx.capture_actions(|cx| cx.widget_action(pick, DropDownAction::Select(1)));
+    panel.actions(cx, &root, &preview, &mut s.ana.session);
+    pump(cx, &mut panel, &mut s);
+    assert!(root.label(cx, ids!(theme_msg)).text().contains("drops the built theme") && installs(&s) == was.2 + 1,
+        "the first preset selection asks before discarding a standing builder");
+    button(cx, &mut panel, &mut s, mix.clone());
+    tick(cx, &mut panel, &mut s, 2.1);
+    assert!(fold.text() == "+ build" && mix.text() == "- mix" && !body.visible()
+        && s.app.token_value("space_factor").unwrap().parse::<f64>().unwrap() == 10.,
+        "opening the mixer restores the builder entry and closes the builder");
+    button(cx, &mut panel, &mut s, fold.clone());
+    slide(cx, &mut panel, &mut s, 12.);
+    tick(cx, &mut panel, &mut s, 3.);
+    panel.tick_theme_at(cx, &root, &mut s.ana.session, 3.07);
+    pump(cx, &mut panel, &mut s); // Applied, before the refreshed token values.
+    let name = root.text_input(cx, ids!(theme_name));
+    name.set_text(cx, "built spacing");
+    let save = root.widget(cx, ids!(theme_save));
+    button(cx, &mut panel, &mut s, save);
+    assert!(!dir.join("built_spacing.theme").exists(), "a save following Applied waits for the shared app’s refreshed values");
+    pump(cx, &mut panel, &mut s);
+    let saved = store::load_in(&dir, "built_spacing").unwrap();
+    assert!(saved.to_install().globals.contains(&("space_factor".into(), ThemeVal::Num(12.))),
+        "save promotes a standing builder with its moved spacing in globals");
+    let before = installs(&s);
+    button(cx, &mut panel, &mut s, fold.clone());
+    tick(cx, &mut panel, &mut s, 3.2);
+    assert_eq!(installs(&s), before, "closing a promoted builder keeps the saved theme live");
+
+    button(cx, &mut panel, &mut s, mix.clone());
+    let light = root.widget(cx, ids!(eq_light));
+    button(cx, &mut panel, &mut s, light);
+    tick(cx, &mut panel, &mut s, 4.);
+    assert_eq!(installs(&s), before + 1, "the mixer changes the clean worn saved theme");
+    button(cx, &mut panel, &mut s, mix);
+    tick(cx, &mut panel, &mut s, 4.1);
+    assert!(installs(&s) == before + 2 && root.drop_down(cx, ids!(theme_pick)).selected_label() == "built_spacing"
+        && root.widget(cx, ids!(theme_delete)).visible(), "restoring a clean saved theme with overrides keeps worn and delete");
+
+    button(cx, &mut panel, &mut s, fold.clone());
+    slide(cx, &mut panel, &mut s, 15.);
+    tick(cx, &mut panel, &mut s, 5.);
+    tick(cx, &mut panel, &mut s, 5.07);
+    assert_eq!(installs(&s), before + 3, "the builder stands again before the peer changes the theme");
+    slide(cx, &mut panel, &mut s, 16.);
+    s.ben.send(Request::Theme(ThemeOp::Install(ThemeInstall { label: "Light".into(), base: "light".into(),
+        sheet: None, globals: vec![], overrides: vec![] })));
+    pump(cx, &mut panel, &mut s);
+    let before = installs(&s);
+    button(cx, &mut panel, &mut s, fold.clone());
+    tick(cx, &mut panel, &mut s, 6.);
+    assert!(installs(&s) == before && fold.text() == "+ build" && root.drop_down(cx, ids!(theme_pick)).selected_label() == "Light",
+        "a peer install disarms both the pending builder settle and a close before the refreshed snapshot");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+type ThemeResult = makepad_ai_services::wire::ToolResult;
+type ThemeEffect = crate::tools::ThemeToolEffect;
+
+struct ThemeAgent {
+    model: Model,
+    tools: AppTools,
+    waits: crate::tools::AgentWaits,
+    cache: theme::ThemeMixerCache,
+    dir: std::path::PathBuf,
+    binding: String,
+    agent: [u8; 32],
+    line: [u8; 32],
+}
+
+impl ThemeAgent {
+    fn new(mut model: Model) -> Self {
+        let code = Credential::parse(&model.agent_code(None).unwrap()).unwrap();
+        let (binding, agent) = model.agent_join_with_id(code, true).unwrap();
+        let line = model.mention_agent(agent, "work on the shared theme".into(), None).unwrap();
+        let mut waits = crate::tools::AgentWaits::default();
+        waits.offered(&model, line);
+        let token = Credential::parse(&binding).unwrap();
+        waits.wait(&mut model, "turn", token, None);
+        assert_eq!(model.owner_turn(token), Ok((agent, line)), "the fixture opens the person's own turn");
+        Self { dir: model.home.dir.join("themes"), model, tools: AppTools::default(), waits, cache: Default::default(), binding, agent, line }
+    }
+
+    fn call(&self, op: &str, item: [u8; 32], fields: &[(&str, json::Value)]) -> makepad_ai_services::wire::ServiceCall {
+        let mut args = vec![("binding", json::s(&self.binding))];
+        if !matches!(op, "delete" | "palettes") { args.push(("item", json::s(hex(&item)))); }
+        args.extend_from_slice(fields);
+        makepad_ai_services::wire::ServiceCall { tool: format!("app_theme_{op}"), call_id: op.into(), args: json::obj(args).to_json(),
+            caller: None, origin: makepad_ai_services::wire::CallOrigin::Conversation }
+    }
+
+    fn start(&mut self, s: &mut TownApp, op: &str, fields: &[(&str, json::Value)]) -> (Option<ThemeResult>, Option<ThemeEffect>) {
+        let call = self.call(op, s.session.item, fields);
+        let ctx = crate::tools::ThemeToolContext { themes_dir: &self.dir, mixer_cache: &mut self.cache, active_worn: None };
+        let (result, _, effect) = self.tools.start(op, app_tool(&call.tool, &call.args).unwrap(), &mut self.model,
+            std::slice::from_mut(&mut s.session), &mut self.waits, ctx);
+        (result, effect)
+    }
+
+    fn notices(&mut self, s: &mut TownApp, mut deliver: impl FnMut(&mut Session<u64,u64>, Seat, RequestId, Option<[u8;32]>, &Notice, Option<ThemeEffect>))
+        -> Option<ThemeResult> {
+        let mut result = None;
+        for (seat, req, agent, notice) in std::mem::take(&mut s.session.view.updates) {
+            let ctx = crate::tools::ThemeToolContext { themes_dir: &self.dir, mixer_cache: &mut self.cache, active_worn: None };
+            let effect = if let Some((reply, _, effect)) = self.tools.answer(&mut s.session, seat, req, agent, &notice, &mut self.waits, ctx) {
+                assert!(result.replace(reply).is_none(), "one call has exactly one final reply");
+                effect
+            } else { None };
+            deliver(&mut s.session, seat, req, agent, &notice, effect);
+        }
+        result
+    }
+
+    fn finish(&mut self, s: &mut Copies) -> ThemeResult {
+        for _ in 0..4 {
+            s.one();
+            if let Some(reply) = self.notices(&mut s.ana, |_,_,_,_,_,_| {}) { return reply }
+        }
+        panic!("the two phases and any previous post-install refresh must settle the call")
+    }
+
+    fn run(&mut self, s: &mut Copies, op: &str, fields: &[(&str,json::Value)]) -> ThemeResult {
+        self.start(&mut s.ana, op, fields).0.unwrap_or_else(|| self.finish(s))
+    }
+}
+
+fn theme_agents(tag: &str) -> (crate::model::tests::ShareHomes, ThemeAgent, ThemeAgent, Copies) {
+    makepad_widgets_sheets::register();
+    let (homes, mut owner, guest) = crate::model::tests::shared_town(tag);
+    owner.set_person_name("Walk A").unwrap();
+    let town = owner.open_id();
+    let item = owner.act(Action::AddApp { town, board: None, geometry: [0,0,6400,6400], session: SHARE, name: "Scene".into() }, Origin::Ui).unwrap();
+    let mut owner = ThemeAgent::new(owner);
+    let mut ana = ThemeAgent::new(guest);
+    crate::model::tests::exchange(&mut owner.model, &mut ana.model);
+    let mut s = Copies::in_town(town, owner.model.me(), ana.model.me(), item);
+    s.host.session.set_agents(&owner.model.state);
+    use makepad_widgets::theme_tokens::BlendTheme;
+    let sheets = BlendTheme::all().into_iter().filter_map(|t| match t {
+        BlendTheme::Sheet(id) => Some(json::obj(vec![("id",json::s(id)), ("label",json::s(t.label())), ("base",json::s(t.base().theme_name())),
+            ("appearance",json::s(t.appearance().label().to_ascii_lowercase()))])), _ => None,
+    }).collect::<Vec<_>>();
+    assert!(sheets.len() >= 51, "the shared catalogue includes all shipped sheets");
+    let mut tokens = parse_json(THEME).unwrap().get("values").unwrap().as_arr().unwrap().to_vec();
+    for i in tokens.len()..620 {
+        let (name, value) = if i % 10 == 0 { (format!("font_size_{i}"),"12") } else { (format!("color_surface_{i}"),"#223344ff") };
+        tokens.push(json::obj(vec![("name",json::s(name)),("value",json::s(value)),("site",json::s("theme.rs:12"))]));
+    }
+    s.app.theme = json::obj(vec![("base",json::s("dark")),("sheet",json::Value::Null),("has_mix",json::Value::Bool(false)),
+        ("has_pins",json::Value::Bool(false)),("edits",json::Value::Arr(vec![])),("values",json::Value::Arr(tokens)),("sheets",json::Value::Arr(sheets))]).to_json();
+    (homes, owner, ana, s)
+}
+
+fn theme_ok(result: ThemeResult) -> json::Value {
+    assert_eq!(result.outcome, makepad_ai_services::wire::ToolOutcome::Ok, "{} should succeed: {}", result.call_id, result.text);
+    assert!(result.text.len() <= makepad_ai_services::wire::MAX_RESULT_BYTES, "{} fits the router", result.call_id);
+    parse_json(&result.text).expect("a successful theme tool returns a complete JSON object")
+}
+
+#[test]
+fn app_theme_tools_read_edit_install_store_mix_and_build_under_consent() {
+    use makepad_ai_services::wire::ToolOutcome;
+    use json::Value::{Bool, Int};
+    let (_homes, owner, mut ana, mut s) = theme_agents("theme-ai");
+    let guest = ana.model.me();
+    let host = owner.model.me();
+    let preset = [("preset",json::s("light"))];
+    let name = [("name",json::s("my_sunset"))];
+    let token = |v| [("name",json::s("color_bg_app")),("value",json::s(v))];
+    let set = token("#223344ff");
+    let random = [("surprise",Bool(true)),("seed",Int(42))];
+    let live: [(&str, &[(&str,json::Value)]);6] = [("get",&[]), ("set",&set), ("install",&preset), ("save",&name), ("mix",&random), ("build",&[])];
+    for (op, args) in live {
+        let result = ana.run(&mut s, op, args);
+        assert_eq!((result.outcome, result.text.as_str()), (ToolOutcome::Refused,"Ask the owner to allow editing this share."), "{op} requires Allow");
+        assert_eq!(ana.waits.traces.rows(&ana.line)[0].output.last().unwrap().ink, crate::ai_trace::Ink::Warning, "{op} records a warning");
+    }
+    assert!(s.app.sent.is_empty(), "denied tools never reach the app");
+    s.allow(guest,true);
+    s.host.session.stop_agent(guest, ana.agent,true).unwrap();
+    for (op,args) in live {
+        let result = ana.run(&mut s,op,args);
+        assert!(result.outcome == ToolOutcome::Refused && result.text.contains("Walk A stopped"), "Stop overrides Allow for {op}: {}",result.text);
+    }
+    s.host.session.stop_agent(guest,ana.agent,false).unwrap();
+    s.exchange();
+    s.exchange(); // Deliver Stop acknowledgements before measuring the next calls.
+    ana.cache = Default::default();
+    s.ana.session.set_peer_level(host,Some(THEME_LEVEL-1));
+    for (op,args) in live {
+        let (result,_) = ana.start(&mut s.ana,op,args);
+        assert_eq!(result.unwrap().text,OLDER_SHARER_THEME,"{op} refuses the older sharer synchronously");
+    }
+    assert!(!ana.cache.is_preparing() && !ana.tools.needs_mixer_cache(),
+        "an older sharer's synchronous mix refusal neither prepares the resolver nor requests frames");
+    s.ana.poll();
+    assert!(s.host.relay.take(TWEAK).is_empty() && s.app.sent.is_empty(), "compatibility refusals send zero packets");
+    s.ana.session.set_peer_level(host,Some(THEME_LEVEL));
+    let mut page = theme_ok(ana.run(&mut s,"get",&[]));
+    assert_eq!(page.get("total_tokens"),Some(&Int(620)), "the tool reads the full shared catalogue");
+    let sheets = page.get("sheets").unwrap().as_arr().unwrap();
+    assert!(sheets.iter().any(|s| s.get("id") == Some(&json::s("omarchy")) && s.get("mixable") == Some(&Bool(true))),
+        "the shared catalogue identifies the extra mixable sheets");
+    let mut names = vec![];
+    loop {
+        names.extend(page.get("tokens").unwrap().as_arr().unwrap().iter().map(|t| t.get("name").unwrap().as_str().unwrap().to_owned()));
+        let Some(next) = page.get("next").unwrap().as_str() else { break };
+        page = theme_ok(ana.run(&mut s,"get",&[("after",json::s(next))]));
+    }
+    assert!(names.len() == 620 && names.windows(2).all(|w| w[0] < w[1]),"token pages cover every name in sorted order");
+    let fonts = theme_ok(ana.run(&mut s,"get",&[("filter",json::s("size")),("group",json::s("font"))]));
+    assert!(fonts.get("next") == Some(&json::Value::Null) && fonts.get("tokens").unwrap().as_arr().unwrap()
+        .iter().all(|t| t.get("name").unwrap().as_str().unwrap().starts_with("font_size")), "font groups and name filters apply together");
+    let body = theme_ok(ana.run(&mut s,"set",&set));
+    assert_eq!((body.get("name"),body.get("old"),body.get("new")), (Some(&set[0].1),Some(&json::s("#1e1e1eff")),Some(&set[1].1)), "a scalar reply carries the actual edit");
+    assert_eq!(body.get("seq"),Some(&json::s("1")), "the first edit has its signed sequence");
+    theme_ok(ana.run(&mut s,"set",&token("theme.color_primary")));
+    assert!(s.records.iter().all(|e| e.agent == Some(ana.agent) && e.seat == guest), "signed edits credit the guest and its AI");
+    for copy in [&s.ana,&s.host,&s.ben] {
+        let done = &copy.session.view.finished[&(guest,ana.agent)].0;
+        assert!(done.done_text("Scene").unwrap().starts_with("set color_bg_app "), "each seat retains the AI's completed theme edit");
+    }
+    let expr = "mix(#f00, #00f, 0.5)";
+    assert_eq!(ana.run(&mut s,"set",&token(expr)).outcome, ToolOutcome::Refused, "a nonliteral edit is refused");
+    assert_eq!(s.records.last().unwrap().change, Change::Note(expr.into()), "the refusal saves an implementer note");
+    let before = s.app.sent.len();
+    theme_ok(ana.run(&mut s,"install",&preset));
+    assert_eq!(s.app.sent.len(),before+1,"a base installs in one round trip");
+    s.one();
+    let before = s.app.sent.len();
+    let mac = theme_ok(ana.run(&mut s,"install",&[("preset",json::s("macos-dark"))]));
+    assert!(s.app.sent.len() == before+2 && mac.get("installed") == Some(&json::s("macOS dark")), "a sheet uses get then install");
+    s.one();
+    let before = s.app.sent.len();
+    assert_eq!(ana.run(&mut s,"install",&[("preset",json::s("absent"))]).outcome,ToolOutcome::Refused,"unknown sheets are refused");
+    assert_eq!(s.app.sent.len(),before+1,"unknown sheets send only the initial Get");
+    theme_ok(ana.run(&mut s,"save",&name));
+    let file = ana.dir.join("my_sunset.theme");
+    assert!(file.is_file() && !owner.dir.join("my_sunset.theme").exists(), "snapshots live in the requesting person's store");
+    assert_eq!(ana.run(&mut s,"save",&name).outcome,ToolOutcome::Refused,"replacement needs explicit consent");
+    let replacement = theme_ok(ana.run(&mut s,"save",&[name[0].clone(),("replace",Bool(true))]));
+    assert_eq!(replacement.get("replaced"),Some(&Bool(true)),"explicit replacement is reported");
+    for builtin in ["dark","macos-dark"] {
+        assert!(ana.run(&mut s,"save",&[("name",json::s(builtin))]).text.contains("library ships"),"built-in {builtin} stays protected");
+    }
+    let worn = theme_ok(ana.run(&mut s,"install",&[("saved",json::s("my_sunset"))]));
+    assert_eq!(worn.get("saved"),Some(&name[0].1),"saved installs load from the guest's store");
+    let before = s.app.sent.len();
+    theme_ok(ana.run(&mut s,"delete",&name));
+    for protected in ["dark","missing"] { assert_eq!(ana.run(&mut s,"delete",&[("name",json::s(protected))]).outcome,ToolOutcome::Refused,"cannot delete {protected}"); }
+    assert!(s.app.sent.len() == before && !file.exists(),"deletion is local and never installs");
+    s.one();
+    let weights = [("weights",json::obj(vec![("dark",Int(50)),("macos-dark",Int(50))]))];
+    assert!(ana.cache.ready.is_none() && ana.start(&mut s.ana,"mix",&weights).0.is_none(), "a cold mix starts with Get");
+    assert!(ana.cache.is_preparing() && ana.tools.needs_mixer_cache(), "an accepted mix starts warming while its Get is in flight");
+    s.one();
+    assert!(ana.notices(&mut s.ana,|_,_,_,_,_,_| {}).is_none() && ana.tools.needs_mixer_cache(), "the snapshot parks until the cache is ready");
+    let before = s.app.sent.len();
+    while ana.cache.ready.is_none() { ana.cache.step(); }
+    ana.tools.flush_mixes(std::slice::from_mut(&mut s.ana.session), &ana.cache);
+    let mixed = theme_ok(ana.finish(&mut s));
+    assert_eq!(s.app.sent.len(),before+1,"the cold rendezvous sends exactly one install");
+    assert!(mixed.get("readability").unwrap().get("measured").unwrap().as_u64().unwrap() > 0, "mix returns the installed contrast");
+    assert_eq!(mixed.get("weights").unwrap().as_arr().unwrap().iter().map(|v| v.get("share").unwrap().to_json().parse::<f64>().unwrap()).sum::<f64>(),
+        100., "default relative shares total one hundred");
+    let first = theme_ok(ana.run(&mut s,"mix",&random));
+    let second = theme_ok(ana.run(&mut s,"mix",&random));
+    assert_eq!(first.get("weights"), second.get("weights"), "seeded surprise repeats through the tool");
+    std::fs::write(ana.dir.join("palettes.txt"), "#ff5c39 #42a880 #bbc7dd #282c30\n").unwrap();
+    let palettes = theme_ok(ana.run(&mut s,"palettes",&[("color",json::s("#ff5c39")),("adjust",Bool(false))]));
+    let own = &palettes.get("palettes").unwrap().as_arr().unwrap()[0];
+    assert_eq!(own.get("label"),Some(&json::s("From your palettes")), "the person's matching palette appears first");
+    let total = palettes.get("total").unwrap().as_u64().unwrap();
+    let end = theme_ok(ana.run(&mut s,"palettes",&[("color",json::s("#ff5c39")),("adjust",Bool(false)),("offset",Int(total as i64 - 1))]));
+    let tail = &end.get("palettes").unwrap().as_arr().unwrap()[0];
+    assert!(palettes.get("palettes").unwrap().as_arr().unwrap()[1].get("label").and_then(json::Value::as_str).is_some_and(|s| s.starts_with("Combination "))
+        && tail.get("harmony").and_then(json::Value::as_str).is_some() && end.get("next_offset") == Some(&json::Value::Null),
+        "the book follows the member's palettes, with generated harmonies last");
+    for bad in [vec![("favourite",json::s("#f00")),("palette",json::Value::Arr(vec![json::s("#abc")]))],
+        vec![("harmony",json::s("single"))], vec![("palette",json::Value::Arr(vec![json::s("blue")]))]] {
+        assert_eq!(ana.start(&mut s.ana,"build",&bad).0.unwrap().outcome, ToolOutcome::Refused, "invalid builder arguments fail before touching the share");
+    }
+    let built = theme_ok(ana.run(&mut s,"build",&[("palette",own.get("shown").unwrap().clone()),("spacing",Int(12))]));
+    assert!(built.get("readability").is_some() && built.get("crowding").is_some() && s.app.token_value("space_factor").unwrap().parse::<f64>() == Ok(12.),
+        "shown colours feed the builder and spacing reaches the shared app");
+    s.one();
+    ana.cache = Default::default();
+    ana.start(&mut s.ana,"mix",&weights);
+    s.one();
+    assert!(ana.notices(&mut s.ana, |_,_,_,_,_,_| {}).is_none(), "the last mix parks before the share ends");
+    s.ana.session.end("closed");
+    let mut replies = vec![];
+    ana.tools.take_ready(std::slice::from_ref(&s.ana.session), &mut ana.waits, &mut |r| replies.push(r));
+    assert!(matches!(replies.as_slice(), [r] if r.call_id == "mix" && r.outcome == ToolOutcome::Refused && r.text == "share ended")
+        && !ana.tools.needs_mixer_cache(), "ending a share settles its parked call and releases the cache wakeup");
+}
+
+#[test]
+fn ai_theme_install_and_store_sync_stand_down_open_panel_tools() {
+    use makepad_widgets::{fab_controls::{FabColorPick, FabSliderAction}, *};
+    let (_homes, mut owner, mut ana, mut s) = theme_agents("theme-ai-panel");
+    let guest = ana.model.me();
+    s.allow(guest, true);
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let ui = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* View { tweak_panel := AppTweakPanel { width: 420 } } });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let root = ui.widget(cx,ids!(tweak_panel));
+    let mut draw = draw_panel(cx, ui.clone());
+    let mut hub = Tweaks::<u64,u64>::default();
+    hub.set_themes_dir(ana.dir.clone());
+    hub.sessions.push(Session::peer(s.ana.session.town, SHARE, s.ana.session.item, guest, owner.model.me()).unwrap());
+    let call = ana.call("get", s.ana.session.item, &[]);
+    let (pending, _) = hub.tool(cx,&ui,&mut ana.model,&call,&mut ana.waits).unwrap();
+    assert!(pending.is_none(),"a theme read starts with the panel closed");
+    hub.update(cx,&ui,&ana.model,&Default::default(),&mut ana.waits, |_| {});
+    assert!(!root.visible() && root.widget(cx,ids!(tweak_props_wrap)).visible() && !root.widget(cx,ids!(tweak_theme_wrap)).visible(),
+        "an AI theme call leaves the panel closed and the selected tab on Props");
+
+    hub.open_panel(SHARE);
+    hub.sessions[0].view.updates.push_back((guest, 0, None, Notice::Theme { theme: s.app.theme.clone() }));
+    hub.update(cx, &ui, &ana.model, &Default::default(), &mut ana.waits, |_| {});
+    let press = |cx: &mut Cx, hub: &mut Tweaks<u64,u64>, path: &[LiveId]| {
+        let uid = root.widget(cx, path).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        hub.actions(cx, &ui, &actions);
+    };
+    let tick = |cx: &mut Cx, hub: &mut Tweaks<u64,u64>, frame: u64| {
+        hub.tick_theme(cx, &ui, &Event::NextFrame(NextFrameEvent { frame, time: frame as f64 / 60., ..Default::default() }));
+    };
+    press(cx, &mut hub, ids!(tab_theme));
+    press(cx, &mut hub, ids!(eq_fold));
+    // One frame initializes the resolver, then one resolves each theme. Leave exactly one theme pending.
+    let themes = makepad_widgets::theme_tokens::BlendTheme::all().len() as u64;
+    for frame in 0..themes { tick(cx, &mut hub, frame); }
+    let read = root.label(cx, ids!(eq_read));
+    assert_eq!(read.text(), "Preparing theme mixer…", "the cold mixer still needs its final theme");
+    press(cx, &mut hub, ids!(tb_fold));
+    assert!(!hub.needs_theme_tick(), "an idle builder has no reason to finish the paused mixer");
+    let slider = root.widget(cx, ids!(tb_spacing)).widget_uid();
+    let drag = cx.capture_actions(|cx| cx.widget_action(slider, FabSliderAction::Changed(12.)));
+    hub.actions(cx, &ui, &drag);
+    assert!(hub.needs_theme_tick(), "the builder drag schedules an actual frame");
+    tick(cx, &mut hub, themes);
+    press(cx, &mut hub, ids!(eq_fold));
+    assert_eq!(read.text(), "Preparing theme mixer…", "the builder drag left the final mixer step pending");
+    tick(cx, &mut hub, themes + 1);
+    assert!(read.text().contains("pairs read") && !hub.needs_theme_tick(),
+        "the person's mixer becomes ready on its first resumed frame");
+
+    root.set_visible(cx,true);
+    let mut panel = panel::Panel::default();
+    panel.set_themes_dir(ana.dir.clone());
+    let cache = std::sync::Arc::new(theme::lab::tests::bench());
+    panel.mixer_cache.ready = Some(cache.clone());
+    owner.cache.ready = Some(cache);
+    let state = ana.model.state.clone();
+    panel.refresh(cx,&root,&s.ana.session,&state,&Default::default());
+    let deliver = |cx: &mut Cx, panel: &mut panel::Panel, ana: &mut ThemeAgent, s: &mut Copies| {
+        ana.notices(&mut s.ana, |session,seat,req,agent,n,effect| {
+            panel.notice(cx,&root,session,seat,req,agent,&state,n);
+            if let Some(effect) = effect { panel.apply_theme_tool_effect(cx,&root,effect); }
+        })
+    };
+    let pump = |cx: &mut Cx, panel: &mut panel::Panel, ana: &mut ThemeAgent, s: &mut Copies| {
+        s.one();
+        deliver(cx,panel,ana,s)
+    };
+    let button = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, path: &[LiveId]| {
+        let uid = root.widget(cx,path).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid,ButtonAction::Clicked(Default::default())));
+        panel.actions(cx,&root,&actions,&mut s.ana.session);
+    };
+    let spacing = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, value, time| {
+        let uid = root.widget(cx,ids!(tb_spacing)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid,FabSliderAction::Ended(value)));
+        panel.actions(cx,&root,&actions,&mut s.ana.session);
+        panel.tick_theme_at(cx,&root,&mut s.ana.session,time);
+    };
+    let installs = |s: &Copies| s.records.iter().filter(|e| e.path == "theme" && e.prop == "install").count();
+    button(cx,&mut panel,&mut s,ids!(tab_theme));
+    pump(cx,&mut panel,&mut ana,&mut s);
+    button(cx,&mut panel,&mut s,ids!(tb_fold));
+    draw(cx);
+
+    assert!(ana.start(&mut s.ana,"get",&[]).0.is_none(),"the AI requests its own snapshot");
+    s.one();
+    let updates = &mut s.ana.session.view.updates;
+    let i = updates.iter().position(|(_,_,ai,n)| ai == &Some(ana.agent) && matches!(n,Notice::Theme { .. })).unwrap();
+    let private = updates.remove(i).unwrap();
+    spacing(cx,&mut panel,&mut s,12.,0.);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(panel.theme_state().tb_stands && panel.theme_state().awaiting_snapshot,"the builder stands at Applied while its broadcast is outstanding");
+    root.text_input(cx,ids!(theme_name)).set_text(cx,"after reload");
+    button(cx,&mut panel,&mut s,ids!(theme_save));
+    s.ana.session.view.updates.push_front(private);
+    theme_ok(deliver(cx,&mut panel,&mut ana,&mut s).unwrap());
+    assert!(panel.theme_state().awaiting_snapshot && !ana.dir.join("after_reload.theme").exists(),
+        "a private AI snapshot cannot release the person's deferred save");
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(ana.dir.join("after_reload.theme").is_file(), "the broadcast snapshot releases the deferred save");
+
+    spacing(cx,&mut panel,&mut s,13.,1.);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    let square = root.widget(cx,ids!(tb_seed_row)).child(live_id!(tb_color_0)).child(live_id!(tb_color));
+    square.borrow_mut::<FabColorPick>().unwrap().open_popover(cx);
+    assert!(square.borrow::<FabColorPick>().unwrap().is_open() && panel.theme_state().tb_stands, "the standing builder has an open palette square");
+    let changed = root.widget(cx,ids!(tb_spacing)).widget_uid();
+    let movement = cx.capture_actions(|cx| cx.widget_action(changed,FabSliderAction::Changed(15.)));
+    panel.actions(cx,&root,&movement,&mut s.ana.session);
+    ana.start(&mut s.ana,"build",&[("spacing",json::Value::Int(14))]);
+    theme_ok(pump(cx,&mut panel,&mut ana,&mut s).unwrap());
+    assert!(!square.borrow::<FabColorPick>().unwrap().is_open() && !panel.theme_state().tb_stands
+        && panel.theme_state().tb_reanchor_pending && !panel.theme_state().tb_moving,
+        "an own-AI install closes the popover and cancels the standing builder and pending drag at Applied");
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(!panel.theme_state().tb_reanchor_pending && panel.theme_state().snapshot.as_ref().unwrap().tokens.iter()
+        .any(|t| t.name == "space_factor" && t.value.parse::<f64>() == Ok(14.)), "the refreshed snapshot re-anchors the builder");
+    let before = installs(&s);
+    button(cx,&mut panel,&mut s,ids!(tb_fold));
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert_eq!(installs(&s),before,"closing the builder preserves the AI's live theme");
+
+    button(cx,&mut panel,&mut s,ids!(eq_fold));
+    button(cx,&mut panel,&mut s,ids!(eq_random));
+    panel.tick_theme_at(cx,&root,&mut s.ana.session,2.);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(panel.theme_state().eq_stands,"the person's mix is live before the peer AI installs");
+    owner.start(&mut s.host,"mix",&[("surprise",json::Value::Bool(true)),("seed",json::Value::Int(7))]);
+    s.one(); owner.notices(&mut s.host, |_,_,_,_,_,_| {});
+    s.one(); theme_ok(owner.notices(&mut s.host, |_,_,_,_,_,_| {}).unwrap());
+    deliver(cx,&mut panel,&mut ana,&mut s);
+    assert!(!panel.theme_state().eq_stands && panel.theme_state().eq_reanchor_pending,"a peer AI's mix stands down the person's mix");
+    let before = installs(&s);
+    button(cx,&mut panel,&mut s,ids!(eq_fold));
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert_eq!(installs(&s),before,"closing the mixer preserves the peer AI's theme");
+
+    button(cx,&mut panel,&mut s,ids!(tb_fold));
+    spacing(cx,&mut panel,&mut s,12.,3.);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(panel.theme_state().tb_stands,"the builder is standing when the AI saves");
+    let name = [("name",json::s("ai_saved"))];
+    ana.start(&mut s.ana,"save",&name);
+    theme_ok(pump(cx,&mut panel,&mut ana,&mut s).unwrap());
+    let pick = root.drop_down(cx,ids!(theme_pick));
+    let delete = root.widget(cx,ids!(theme_delete));
+    assert!(pick.selected_label() == "ai_saved" && delete.visible() && !panel.theme_state().tb_stands,
+        "saving from the AI selects the local name, reveals delete and promotes the builder");
+    let before = installs(&s);
+    button(cx,&mut panel,&mut s,ids!(tb_fold));
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert_eq!(installs(&s),before,"closing the promoted builder leaves the saved theme live");
+    ana.start(&mut s.ana,"install",&[("preset",json::s("light"))]);
+    theme_ok(pump(cx,&mut panel,&mut ana,&mut s).unwrap());
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert_eq!(pick.selected_label(),"Light","a base install clears the local saved selection");
+    ana.start(&mut s.ana,"install",&[("saved",json::s("ai_saved"))]);
+    pump(cx,&mut panel,&mut ana,&mut s);
+    theme_ok(pump(cx,&mut panel,&mut ana,&mut s).unwrap());
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(pick.selected_label() == "ai_saved" && delete.visible(),"the saved install effect runs after stand-down and survives the broadcast");
+    let before = s.app.sent.len();
+    let (result,effect) = ana.start(&mut s.ana,"delete",&name);
+    theme_ok(result.unwrap());
+    panel.apply_theme_tool_effect(cx,&root,effect.unwrap());
+    pump(cx,&mut panel,&mut ana,&mut s);
+    assert!(panel.theme_state().saved_names.iter().all(|n| n != "ai_saved") && !delete.visible() && before == s.app.sent.len(),
+        "AI deletion removes its picker entry and sends no hidden install");
+
+    let mut previous = Session::<u64,u64>::peer(s.ana.session.town, [18; 16], s.ana.session.item, guest, owner.model.me()).unwrap();
+    panel.refresh(cx,&root,&previous,&state,&Default::default());
+    let tab = root.widget(cx,ids!(tab_theme)).widget_uid();
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab,ButtonAction::Clicked(Default::default())));
+    panel.actions(cx,&root,&actions,&mut previous);
+    let theme_wrap = root.widget(cx,ids!(tweak_theme_wrap));
+    let props_wrap = root.widget(cx,ids!(tweak_props_wrap));
+    assert!(root.visible() && theme_wrap.visible() && !props_wrap.visible(), "the previous share is open on Theme");
+    assert!(ana.start(&mut s.ana,"get",&[]).0.is_none(), "the AI requests the newly active share's theme");
+    s.one();
+    let updates = &mut s.ana.session.view.updates;
+    let i = updates.iter().position(|(_,_,ai,n)| ai == &Some(ana.agent) && matches!(n, Notice::Theme { .. })).unwrap();
+    let (seat,req,agent,n) = updates.remove(i).unwrap();
+    panel.notice(cx,&root,&mut s.ana.session,seat,req,agent,&state,&n);
+    assert!(theme_wrap.visible() && !props_wrap.visible(),
+        "a private reply received before the active share refresh preserves the tab: Theme={}, Props={}, panel={}",
+        theme_wrap.visible(), props_wrap.visible(), root.visible());
+
+    let (share, item) = (s.ana.session.share, s.ana.session.item);
+    ana.start(&mut s.ana, "save", &[("name", json::s("unbound_saved"))]);
+    theme_ok(pump(cx, &mut panel, &mut ana, &mut s).unwrap());
+    assert!(root.visible() && theme_wrap.visible() && !props_wrap.visible() && panel.theme_state().worn.is_none(),
+        "saving on an unbound share preserves the previous share's tab and worn theme");
+    assert_eq!(panel.worn_for(share, item), Some((share, item, "unbound_saved".into())),
+        "the private save records the worn name for its own share before binding");
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    assert!(panel.theme_state().worn.as_ref().is_some_and(|s| s.name == "unbound_saved")
+        && panel.theme_state().saved_names.iter().any(|n| n == "unbound_saved"),
+        "binding the saved share restores its worn theme and member-local picker entry");
+    button(cx, &mut panel, &mut s, ids!(tab_theme));
+    pump(cx, &mut panel, &mut ana, &mut s);
+    assert!(pick.selected_label() == "unbound_saved" && delete.visible(),
+        "opening Theme selects the restored saved theme and shows delete");
+    let saved = panel.theme_state().worn.clone().unwrap();
+    button(cx, &mut panel, &mut s, ids!(theme_delete));
+    let message = root.label(cx, ids!(theme_msg));
+    assert!(message.visible() && message.text().contains("unbound_saved"), "delete awaits confirmation for the worn theme");
+    panel.clear_worn(cx, &root, share, item);
+    assert!(panel.theme_state().worn.is_none() && pick.selected_label() != "unbound_saved" && !delete.visible(),
+        "clearing the still-bound share updates the Theme header immediately");
+    assert!(!message.visible() && root.text_input(cx, ids!(theme_name)).text() == "unbound_saved",
+        "clearing the worn theme dismisses the stale confirmation and preserves the name field");
+    // Wear it again for the unbound-install check below.
+    panel.apply_theme_tool_effect(cx, &root, ThemeEffect::InstalledSaved { share, item, saved });
+
+    let closed_ui = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* View { tweak_panel := AppTweakPanel { visible: false } } });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let closed_root = closed_ui.widget(cx, ids!(tweak_panel));
+    let mut closed = Tweaks::<u64,u64>::default();
+    closed.set_themes_dir(owner.dir.clone());
+    closed.sessions.push(Session::owner(s.host.session.town, share, item, owner.model.me(), LINK).unwrap());
+    let closed_call = |cx: &mut Cx, closed: &mut Tweaks<u64,u64>, owner: &mut ThemeAgent, app: &mut FakeApp,
+                       op: &str, args: &[(&str, json::Value)]| {
+        let call = owner.call(op, item, args);
+        assert!(closed.tool(cx, &closed_ui, &mut owner.model, &call, &mut owner.waits).unwrap().0.is_none(),
+            "the closed panel's AI {op} waits for the shared app");
+        loop {
+            let session = &mut closed.sessions[0];
+            let before = app.sent.len();
+            session.drive_app(app);
+            assert!(app.sent.len() > before, "the shared app has a request to settle for {op}");
+            app.answer(session);
+            closed.record(&mut owner.model);
+            if op == "save" {
+                assert!(matches!(closed.sessions[0].view.updates.make_contiguous(), [(_, _, Some(ai), Notice::Theme { .. })] if *ai == owner.agent),
+                    "only the private AI snapshot is queued before the first panel update");
+            }
+            let mut answer = None;
+            // On the first update, the closed panel's bind reads the store because the share has a recorded worn theme.
+            closed.update(cx, &closed_ui, &owner.model, &Default::default(), &mut owner.waits, |r| answer = Some(theme_ok(r)));
+            if let Some(answer) = answer { return answer }
+        }
+    };
+    let closed_name = json::s("closed_saved");
+    assert_eq!(closed_call(cx, &mut closed, &mut owner, &mut s.app, "save", &[("name", closed_name.clone())]).get("name"), Some(&closed_name),
+        "the AI save settles through the previously unbound hub");
+    assert!(!closed_root.visible() && closed_root.widget(cx, ids!(tweak_props_wrap)).visible()
+        && !closed_root.widget(cx, ids!(tweak_theme_wrap)).visible(), "the AI save leaves the panel closed on Props");
+    assert_eq!(closed_call(cx, &mut closed, &mut owner, &mut s.app, "get", &[]).get("worn"), Some(&closed_name),
+        "the AI reads its saved theme as worn while the panel is closed");
+
+    panel.refresh(cx, &root, &previous, &state, &Default::default());
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab, ButtonAction::Clicked(Default::default())));
+    panel.actions(cx, &root, &actions, &mut previous);
+    assert!(theme_wrap.visible() && panel.worn_for(share, item).is_some(),
+        "the previously saved share has a worn theme to invalidate while the person views another share");
+    ana.start(&mut s.ana, "install", &[("preset", json::s("light"))]);
+    theme_ok(pump(cx, &mut panel, &mut ana, &mut s).unwrap());
+    assert!(root.visible() && theme_wrap.visible() && !props_wrap.visible() && panel.worn_for(share, item).is_none(),
+        "an unbound AI install clears that share's worn name and leaves the person on Theme");
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    assert!(panel.theme_state().worn.is_none(), "binding after the AI preset install cannot restore the stale saved theme");
+
+    let other_share = [19; 16];
+    let other_item = [20; 32];
+    let mut other = Session::owner(s.host.session.town, other_share, other_item, owner.model.me(), LINK).unwrap();
+    other.ready = true;
+    closed.sessions.push(other);
+    assert!(closed.open_panel(other_share));
+    closed_call(cx, &mut closed, &mut owner, &mut s.app, "install", &[("preset", json::s("light"))]);
+    let after_switch = closed_call(cx, &mut closed, &mut owner, &mut s.app, "get", &[]);
+    assert_eq!(after_switch.get("base"), Some(&json::s("light")), "the AI installed Light on the outgoing share");
+    assert_eq!(after_switch.get("worn"), Some(&json::Value::Null), "binding the next share cannot write back the cleared name");
+
+    assert!(closed.open_panel(share));
+    closed.update(cx, &closed_ui, &owner.model, &Default::default(), &mut owner.waits, |_| {});
+    assert_eq!(closed_call(cx, &mut closed, &mut owner, &mut s.app, "get", &[]).get("worn"), Some(&json::Value::Null),
+        "returning to the share keeps its cleared worn name");
+    let tab = closed_root.widget(cx, ids!(tab_theme)).widget_uid();
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab, ButtonAction::Clicked(Default::default())));
+    closed.actions(cx, &closed_ui, &actions);
+    assert!(closed_root.widget(cx, ids!(tweak_theme_wrap)).visible()
+        && closed_root.drop_down(cx, ids!(theme_pick)).selected_label() != "closed_saved"
+        && !closed_root.widget(cx, ids!(theme_delete)).visible(), "the reopened Theme tab reflects the preset install");
+}
+
+#[test]
+fn app_theme_get_pages_large_store_edits_and_full_snapshot_within_result_limit() {
+    use makepad_ai_services::wire::{ToolOutcome, MAX_RESULT_BYTES};
+    use json::Value::{Arr, Bool, Int, Null};
+    let (_homes, _owner, mut ana, mut s) = theme_agents("theme-pages");
+    s.allow(ana.model.me(), true);
+    let mut raw = parse_json(&s.app.theme).unwrap();
+    let tokens = raw.get("values").unwrap().as_arr().unwrap().to_vec();
+    let mut expected_tokens = tokens.clone();
+    expected_tokens.sort_by(|a,b| a.get("name").unwrap().as_str().cmp(&b.get("name").unwrap().as_str()));
+    let edits: Vec<_> = expected_tokens.iter().map(|t| {
+        let lit = super::theme::literal(super::theme::scalar(t.get("value").unwrap().as_str().unwrap()).unwrap());
+        Arr(vec![t.get("name").unwrap().clone(),json::s(lit)])
+    }).collect();
+    let replace = |v: &mut json::Value, key, new| {
+        let json::Value::Obj(fields) = v else { unreachable!() };
+        fields.iter_mut().find(|(k,_)| k == key).unwrap().1 = new;
+    };
+    replace(&mut raw,"edits",Arr(edits[..3].to_vec()));
+    s.app.theme = raw.to_json();
+    std::fs::create_dir_all(&ana.dir).unwrap();
+    let saved: Vec<_> = (0..1024).map(|i| format!("member_theme_{i:04}")).collect();
+    let write_saved = |dir: &std::path::Path, name: &str| {
+        let theme = theme::store::SavedTheme::new(name,makepad_widgets::theme_tokens::Scheme::Dark);
+        std::fs::write(dir.join(format!("{name}.theme")), theme.to_text()).unwrap();
+    };
+    for name in &saved[..3] { write_saved(&ana.dir,name); }
+    let font = theme_ok(ana.run(&mut s,"get",&[("group",json::s("font")),("filter",json::s("SIZE"))]));
+    let len = |v: &json::Value, key| v.get(key).unwrap().as_arr().unwrap().len();
+    let fonts: Vec<_> = expected_tokens.iter().filter(|t| t.get("name").unwrap().as_str().unwrap().starts_with("font_size")).cloned().collect();
+    assert_eq!(font.get("tokens"),Some(&Arr(fonts)),"only filtered font tokens appear");
+    assert_eq!((len(&font,"sheets"),len(&font,"saved"),len(&font,"edits"),font.get("next")), (51,3,3,Some(&Null)),
+        "the filtered common case includes the whole catalogue, saved names, edits and tokens in one call");
+    let first = theme_ok(ana.run(&mut s,"get",&[]));
+    assert!(len(&first,"sheets") == 51 && len(&first,"saved") == 3 && len(&first,"edits") == 3 && len(&first,"tokens") > 0
+        && first.get("next").unwrap().as_str().unwrap().starts_with("tokens:"),"common unfiltered metadata fits alongside the first token rows");
+
+    for name in &saved[3..] { write_saved(&ana.dir,name); }
+    replace(&mut raw,"edits",Arr(edits.clone()));
+    s.app.theme = raw.to_json();
+    let keys = ["sheets","saved","edits","tokens"];
+    let mut lists: [Vec<json::Value>;4] = Default::default();
+    let mut cursor = None;
+    let mut last_section = 0;
+    let mut largest = 0;
+    loop {
+        let args: Vec<_> = cursor.iter().cloned().map(|v| ("after",v)).collect();
+        let reply = ana.run(&mut s,"get",&args);
+        largest = largest.max(reply.text.len());
+        let page = theme_ok(reply);
+        for (key,total) in [("total_sheets",51),("total_saved",1024),("total_edits",620),("total_tokens",620)] {
+            assert_eq!(page.get(key),Some(&Int(total)),"every page carries the complete {key}");
+        }
+        assert_eq!((page.get("base"),page.get("sheet"),page.get("has_mix"),page.get("has_pins"),page.get("worn")),
+            (Some(&json::s("dark")),Some(&Null),Some(&Bool(false)),Some(&Bool(false)),Some(&Null)), "header scalars are repeated on every page");
+        if cursor.is_none() {
+            assert!(len(&page,"sheets") == 51 && len(&page,"saved") > 0 && page.get("next").unwrap().as_str().unwrap().starts_with("saved:"),
+                "the oversized store starts after the complete sheet catalogue on page one");
+        }
+        let mut emitted = 0;
+        for (i,key) in keys.iter().enumerate() {
+            let entries = page.get(key).unwrap().as_arr().unwrap();
+            if !entries.is_empty() {
+                assert!(i >= last_section,"page sections never go backward");
+                last_section = i;
+                lists[i].extend_from_slice(entries);
+                emitted += entries.len();
+            }
+        }
+        assert!(emitted > 0, "each page advances through at least one entry");
+        let next = page.get("next").unwrap();
+        if next == &Null { break }
+        let sizes = [51,1024,620,620];
+        let section = (last_section..4).find(|&i| lists[i].len() < sizes[i]).expect("a continuation has rows remaining");
+        assert_eq!(next.as_str(), Some(format!("{}:{}", keys[section], lists[section].len()).as_str()),
+            "the cursor names the exact next row even at section boundaries");
+        cursor = Some(next.clone());
+    }
+    let expected_sheets: Vec<_> = raw.get("sheets").unwrap().as_arr().unwrap().iter().cloned().map(|mut sheet| {
+        if let json::Value::Obj(fields) = &mut sheet { fields.push(("mixable".into(), Bool(true))); }
+        sheet
+    }).collect();
+    assert_eq!(lists[0],expected_sheets,"every shipped sheet is present, mixable and in picker order");
+    assert_eq!(lists[1],saved.iter().map(json::s).collect::<Vec<_>>(),"all 1024 saved names arrive in order without duplicates");
+    assert_eq!(lists[2],edits,"all edits arrive exactly once");
+    assert_eq!(lists[3],expected_tokens,"all 620 sorted token rows arrive exactly once");
+    assert!(largest <= MAX_RESULT_BYTES, "the largest complete page fits the result limit");
+    let n = s.app.sent.len();
+    for bad in ["","color_bg_app","foo:0","saved:-1","saved:01","tokens:"] {
+        let refused = ana.start(&mut s.ana,"get",&[("after",json::s(bad))]).0.unwrap();
+        assert!(refused.outcome == ToolOutcome::Refused && refused.text.contains("invalid app_theme_get cursor"), "malformed cursor {bad:?} is refused locally");
+    }
+    s.ana.poll();
+    assert!(s.app.sent.len() == n && s.host.relay.take(TWEAK).iter().all(|(from,b)| !matches!(wire::decode(*from,b).unwrap().unwrap().body,Body::Request(_))),
+        "invalid cursors generate no wire requests");
+    let end = theme_ok(ana.run(&mut s,"get",&[("after",json::s("tokens:99999"))]));
+    assert!(keys.iter().all(|key| len(&end,key) == 0) && end.get("next") == Some(&Null),"past-end cursors terminate with empty arrays");
+    let huge = json::obj(vec![("name",json::s("color_big")),("value",json::s("#112233ff")),("site",json::s("s".repeat(20*1024)))]);
+    replace(&mut raw,"values",Arr(vec![huge]));
+    s.app.theme = raw.to_json();
+    let failed = ana.run(&mut s,"get",&[("after",json::s("tokens:0"))]);
+    assert!(failed.outcome == ToolOutcome::Failed && failed.text.contains("tokens:0") && failed.text.len() <= MAX_RESULT_BYTES,
+        "an indivisible oversized token fails explicitly without dropping data or repeating a cursor");
+}
+
+#[test]
+fn peer_literal_class_violation_refused_before_preview() {
+    use design::session::validate_design_inputs;
+    let insert = |ty: &str, name: &str, props: &[(&str, &str)]| DesignRequest::Insert {
+        path: PATH.into(), place: DesignPlace::Inside, ty: ty.into(), name: Some(name.into()),
+        props: props.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+    };
+    assert!(validate_design_inputs(&insert("mod.View", "card", &[("draw_bg.color", "#1a2b3cff")])).is_ok());
+    for (key, value) in [("pixel", "fn() { return vec4(1) }"), ("res", "crate_resource(\"x\")"),
+        ("text", "\"#(0)\""), ("text", "\"@(0)\"")] {
+        let error = validate_design_inputs(&insert("View", "card", &[(key, value)])).unwrap_err();
+        assert!(error.contains(key) && error.contains("literal class"), "{error}");
+    }
+    for props in [&[("scope.x", "1")][..], &[("draw_bg.fn", "1")], &[("a..b", "1")], &[("x", "1"), ("x", "2")]] {
+        assert!(validate_design_inputs(&insert("View", "card", props)).is_err());
+    }
+    for request in [
+        DesignRequest::GhostInsert { target: PATH.into(), place: DesignPlace::Inside, ty: "scope.View".into() },
+        DesignRequest::Wrap { path: PATH.into(), ty: "View#(0)".into(), name: None },
+        DesignRequest::Duplicate { path: PATH.into(), name: Some("let".into()) },
+        DesignRequest::Rename { path: PATH.into(), name: "a.b".into(), force_rust_refs: false },
+        insert("mod..View", "card", &[]), insert("View", "return", &[]),
+    ] {
+        assert!(validate_design_inputs(&request).is_err(), "{request:?}");
+    }
+}
+
+struct DesignTestDir(std::path::PathBuf);
+
+impl DesignTestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("town-design-{name}-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for DesignTestDir {
+    fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+}
+
+#[test]
+fn workspace_root_confinement_blocks_outside_files() {
+    use design::session::DesignSession;
+    use std::fs;
+    let fixture = DesignTestDir::new("confinement");
+    let root = fixture.0.join("app");
+    let nested = root.join("src");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace] # the shared app\n").unwrap();
+    let source = root.join("view.splash");
+    fs::write(&source, "View{}").unwrap();
+    let outside = fixture.0.join("outside.rs");
+    fs::write(&outside, "outside").unwrap();
+
+    let session = DesignSession::from_run_dir(nested.to_str());
+    assert_eq!(session.check_confined(source.to_str().unwrap()).unwrap(), source.canonicalize().unwrap());
+    for path in [&outside, &root.join("../outside.rs"), &nested, &root.join("Cargo.toml")] {
+        assert!(session.read_slot(path.to_str().unwrap()).is_err(), "accepted {}", path.display());
+    }
+    assert!(session.check_confined("").is_err());
+    assert!(session.check_confined("invalid\0.rs").is_err());
+    assert!(DesignSession::from_run_dir(None).check_confined(source.to_str().unwrap()).is_err());
+    assert!(DesignSession::from_run_dir(root.join("missing").to_str()).check_confined(source.to_str().unwrap()).is_err());
+
+    #[cfg(unix)] {
+        let link = nested.join("outside.rs");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(session.read_slot(link.to_str().unwrap()).unwrap_err().contains("outside the workspace"));
+    }
+    fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
+    let closer = DesignSession::from_run_dir(nested.to_str());
+    assert!(closer.check_confined(source.to_str().unwrap()).is_err(), "nearest git worktree must win");
+    let disk = "script_mod! { mod.UI = View{ card := View{} } }";
+    let (mut share, _cx) = structural_share(&root, disk);
+    share.allow(ANA, true);
+    let source = share.app.design_source.as_mut().unwrap();
+    let original = std::mem::replace(&mut source.file, outside.canonicalize().unwrap().to_str().unwrap().into());
+    let outside_edit = guest_design(&mut share, drag_into("/card"));
+    assert!(has(&share.ana, outside_edit, |n| matches!(n, Notice::Refused(err) if err.contains("outside the workspace"))));
+    assert!(share.app.design_source.as_ref().unwrap().live.is_none());
+    share.app.design_source.as_mut().unwrap().file = original;
+    let json::Value::Obj(mut fields) = parse_json(THEME).unwrap() else { unreachable!() };
+    fields.push(("define_file".into(), json::s(outside.to_str().unwrap())));
+    share.app.theme = json::Value::Obj(fields).to_json();
+    let bake = guest_design(&mut share, DesignRequest::Bake { scope: BakeScope::Theme, path: None, prop: None });
+    assert!(has(&share.ana, bake, |n| matches!(n, Notice::Design(DesignNotice::Mutated { path, .. }) if path == "/")),
+        "{:?}", share.ana.session.view.updates.back());
+    assert!(share.app.sent.iter().any(|(_,_,op)| matches!(op, DesignOp::Design {verb: DesignVerb::Tree,..})));
+    assert!(share.app.design_source.as_ref().unwrap().text().contains("mod.theme +:"));
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+    assert_eq!(fs::read_to_string(root.join("ui.rs")).unwrap(), disk);
+}
+
+#[test]
+fn export_new_patch_direct_fallback_and_flat_staging_preserve_existing() {
+    use design::session::{export_new_patch, write_new_patch_direct};
+    use std::{collections::BTreeSet, fs, sync::atomic::AtomicBool};
+
+    let fixture = DesignTestDir::new("export-new-patch");
+    let root = fixture.0.canonicalize().unwrap();
+    let dir = root.join("local/design");
+    let entries = || fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).collect::<BTreeSet<_>>();
+    let primary = dir.join("ui.patch");
+    assert_eq!(export_new_patch(&root, "ui", "first diff", &AtomicBool::new(false)).unwrap(), primary);
+    assert_eq!(fs::read_to_string(&primary).unwrap(), "first diff");
+    assert_eq!(entries(), BTreeSet::from([primary.clone()]), "first export left staging entries");
+
+    fs::write(&primary, "owner notes").unwrap();
+    let second = export_new_patch(&root, "ui", "second diff", &AtomicBool::new(false)).unwrap();
+    let nonce = second.file_stem().unwrap().to_str().unwrap().strip_prefix("ui-").unwrap();
+    assert_eq!(nonce.len(), 32);
+    assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(second, dir.join(format!("ui-{nonce}.patch")));
+    assert_eq!(fs::read_to_string(&primary).unwrap(), "owner notes");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second diff");
+    let published = BTreeSet::from([primary, second]);
+    assert_eq!(entries(), published, "collision left staging entries");
+    assert_eq!(export_new_patch(&root, "cancelled", "cancelled diff", &AtomicBool::new(true)).unwrap_err(),
+        "patch export cancelled");
+    assert_eq!(entries(), published, "cancellation left a staged or published file");
+
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let write = |stem| write_new_patch_direct(&dir, stem, nonce, "direct diff");
+    let primary = dir.join("___a__.patch");
+    assert_eq!(write("../a/é").unwrap(), primary);
+    assert_eq!(fs::read_to_string(&primary).unwrap(), "direct diff");
+    fs::write(&primary, "owner").unwrap();
+    let fallback = dir.join(format!("___a__-{nonce}.patch"));
+    assert_eq!(write("../a/é").unwrap(), fallback);
+    assert_eq!(fs::read_to_string(&primary).unwrap(), "owner");
+    assert_eq!(fs::read_to_string(fallback).unwrap(), "direct diff");
+
+    #[cfg(unix)]
+    {
+        let sentinel = root.join("sentinel");
+        fs::write(&sentinel, "sentinel").unwrap();
+        let missing = root.join("missing");
+        for (stem, target) in [("link", &sentinel), ("dangling", &missing)] {
+            let link = dir.join(format!("{stem}.patch"));
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let fallback = dir.join(format!("{stem}-{nonce}.patch"));
+            assert_eq!(write(stem).unwrap(), fallback);
+            assert_eq!(fs::read_to_string(fallback).unwrap(), "direct diff");
+            assert_eq!(fs::read_link(&link).unwrap(), *target, "direct export changed the symlink");
+        }
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "sentinel");
+        assert!(!missing.exists(), "direct export followed the dangling link");
+    }
+}
+
+#[test]
+fn disk_commit_refuses_when_disk_changed_externally() {
+    use design::{patch::unified_patch, session::DesignSession};
+    use makepad_widgets::makepad_platform::script_mod_doc::{DocKind, ScriptModDoc};
+    use std::fs;
+    let fixture = DesignTestDir::new("commit");
+    let root = &fixture.0;
+    let file = root.join("view.rs");
+    let first = root.join("first.rs");
+    let original = "script_mod! { mod.Card = View{} }\n";
+    let edited = "script_mod! { mod.Card = View{width: 12} }\n";
+    let mut design = DesignSession::with_root(root.clone());
+    for path in [&first, &file] {
+        fs::write(path, original).unwrap();
+        let mut slot = design.read_slot(path.to_str().unwrap()).unwrap();
+        slot.working = ScriptModDoc::parse(&slot.path, edited.to_owned(), DocKind::RustScriptMod).unwrap();
+        std::sync::Arc::make_mut(&mut design.files).insert(slot.path.clone(), slot);
+    }
+    let key = file.canonicalize().unwrap().to_str().unwrap().to_owned();
+
+    fs::write(&file, "// external change\n").unwrap();
+    let err = design.commit_to_disk().unwrap_err();
+    assert_eq!(err, "file changed on disk; reset or export patch first");
+    assert_eq!(fs::read_to_string(&first).unwrap(), original, "another dirty file was committed before the refusal");
+    assert!(!first.with_added_extension("town-tmp").exists());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "// external change\n");
+    let slot = &design.files[&key];
+    assert_eq!(slot.disk_text, original);
+    assert_eq!(slot.working.text, edited);
+    assert!(unified_patch(root, &file, &slot.disk_text, &slot.working.text).unwrap().contains("+script_mod!"));
+    let temp = file.with_added_extension("town-tmp");
+    assert!(!temp.exists(), "failed commit left a temp file");
+
+    fs::write(&file, original).unwrap();
+    fs::write(&temp, "owned by another writer").unwrap();
+    assert!(design.commit_to_disk().unwrap_err().contains(temp.canonicalize().unwrap().to_str().unwrap()));
+    assert_eq!(fs::read_to_string(&temp).unwrap(), "owned by another writer");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    fs::remove_file(&temp).unwrap();
+    design.commit_to_disk().unwrap();
+    assert_eq!(fs::read_to_string(&first).unwrap(), edited);
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+    assert_eq!(design.state_view().dirty_files, 0);
+    assert_eq!(design.files[&key].disk_hash, design.files[&key].working.hash());
+    assert!(!temp.exists());
+}
+
+#[test]
+fn disk_commit_quarantines_only_provably_dead_town_temps() {
+    use design::session::DesignSession;
+    use makepad_widgets::makepad_platform::script_mod_doc::ScriptModDoc;
+    use std::{fs, path::Path, sync::Arc};
+
+    let fixture = DesignTestDir::new("crashed-temp");
+    let root = fixture.0.canonicalize().unwrap();
+    let file = root.join("view.rs");
+    let original = "script_mod! { mod.Card = View{} }\n";
+    let edited = "script_mod! { mod.Card = View{width: 12} }\n";
+    let mut design = DesignSession::with_root(root.clone());
+    let edit = |design: &mut DesignSession, path: &Path, text: &str| {
+        let mut slot = design.read_slot(path.to_str().unwrap()).unwrap();
+        slot.working = ScriptModDoc::parse(&slot.path, text.into(), slot.working.kind).unwrap();
+        Arc::make_mut(&mut design.files).insert(slot.path.clone(), slot);
+    };
+    let no_crashes = || assert!(fs::read_dir(&root).unwrap().all(|entry|
+        entry.unwrap().path().extension().is_none_or(|ext| ext != "crashed")), "refusal created a .crashed file");
+    let ambiguous = |design: &mut DesignSession, path: &Path| {
+        assert_eq!(design.commit_to_disk().unwrap_err(), format!("temporary source already exists: {}", path.display()),
+            "refusal must identify the ambiguous entry");
+        assert_eq!(fs::read_to_string(&file).unwrap(), original, "refusal changed the source");
+        no_crashes();
+    };
+    fs::write(&file, original).unwrap();
+    edit(&mut design, &file, edited);
+    for suffix in ["town-tmp", "town-tmp.bad", "town-tmp.0.123", "town-tmp.123.0", "town-tmp.01.123",
+        "town-tmp.1.+2", "town-tmp.1.02", "town-tmp.1.2.3"] {
+        let path = file.with_added_extension(suffix);
+        fs::write(&path, "foreign").unwrap();
+        ambiguous(&mut design, &path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "foreign", "refusal changed {suffix}");
+        fs::remove_file(path).unwrap();
+    }
+    // Apple file systems refuse a non-UTF-8 name (EILSEQ), so such a temp cannot exist there.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        let path = root.join(OsStr::from_bytes(b"view.rs.town-tmp.42.\xff"));
+        fs::write(&path, "foreign bytes").unwrap();
+        ambiguous(&mut design, &path);
+        assert_eq!(fs::read(&path).unwrap(), b"foreign bytes", "a non-UTF-8 name stays untouched");
+        fs::remove_file(path).unwrap();
+    }
+
+    let pid = std::process::id();
+    let absent = file.with_added_extension("town-tmp.4294967295.12345");
+    let Some(start) = makepad_remote::group::start_time(pid).filter(|&t| t > 0) else {
+        fs::write(&absent, "unknown writer").unwrap();
+        ambiguous(&mut design, &absent);
+        assert_eq!(fs::read_to_string(&absent).unwrap(), "unknown writer", "a blind probe preserves the temp");
+        fs::remove_file(absent).unwrap();
+        design.commit_to_disk().unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), edited, "legacy staging still commits");
+        return;
+    };
+    let live = file.with_added_extension(format!("town-tmp.{pid}.{start}"));
+    fs::write(&live, "in progress").unwrap();
+    assert_eq!(design.commit_to_disk().unwrap_err(), format!("temporary source is in use by pid {pid}: {}", live.display()),
+        "refusal identifies the live process and its temp");
+    assert_eq!(fs::read_to_string(&live).unwrap(), "in progress", "refusal changed a live writer's temp");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original, "a live writer blocks the commit");
+    no_crashes();
+    fs::remove_file(live).unwrap();
+
+    let wrong_start = if start == 1 { 2 } else { start ^ 1 };
+    let dead_suffix = format!("town-tmp.{pid}.{wrong_start}");
+    let dead = file.with_added_extension(&dead_suffix);
+    let crashed = file.with_added_extension(format!("town.{pid}.{wrong_start}.crashed"));
+    #[cfg(unix)]
+    {
+        let sentinel = root.join("sentinel");
+        fs::write(&sentinel, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &dead).unwrap();
+        ambiguous(&mut design, &dead);
+        assert_eq!(fs::read_link(&dead).unwrap(), sentinel, "refusal preserved the symlink");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "sentinel", "refusal preserved the symlink target");
+        fs::remove_file(&dead).unwrap();
+    }
+    #[cfg(any(unix, windows))]
+    {
+        fs::write(&dead, "locked").unwrap();
+        let locked = fs::File::open(&dead).unwrap();
+        locked.try_lock().unwrap();
+        assert_eq!(design.commit_to_disk().unwrap_err(), format!("temporary source is in use by pid {pid}: {}", dead.display()),
+            "a held lock protects the temp even when the process start differs");
+        no_crashes();
+        drop(locked);
+        assert_eq!(fs::read_to_string(&dead).unwrap(), "locked", "refusal preserved the locked temp");
+        assert_eq!(fs::read_to_string(&file).unwrap(), original, "a locked temp blocks the commit");
+    }
+
+    let first = root.join("first.rs");
+    fs::write(&first, original).unwrap();
+    edit(&mut design, &first, edited);
+    let first_dead = first.with_added_extension(&dead_suffix);
+    fs::write(&first_dead, "first crash").unwrap();
+    let blocker = file.with_added_extension("town-tmp");
+    fs::write(&blocker, "foreign").unwrap();
+    ambiguous(&mut design, &blocker);
+    assert_eq!(fs::read_to_string(&first_dead).unwrap(), "first crash", "a later refusal prevented earlier quarantine");
+    assert_eq!(fs::read_to_string(&first).unwrap(), original, "a later refusal prevented earlier replacement");
+    fs::remove_file(blocker).unwrap();
+
+    fs::write(&absent, "absent writer").unwrap();
+    fs::write(&dead, "crashed partial write").unwrap();
+    design.commit_to_disk().unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited, "recovery installed the edit");
+    assert!(!dead.exists() && !absent.exists(), "recovery cleared both stale names");
+    assert_eq!(fs::read_to_string(&crashed).unwrap(), "crashed partial write", "preserved the previous process's temp");
+    assert_eq!(fs::read_to_string(file.with_added_extension("town.4294967295.12345.crashed")).unwrap(), "absent writer",
+        "preserved the absent writer's temp");
+
+    fs::write(&crashed, "older crash").unwrap();
+    fs::write(&dead, "newer crash").unwrap();
+    edit(&mut design, &file, original);
+    design.commit_to_disk().unwrap();
+    let numbered = file.with_added_extension(format!("town.{pid}.{wrong_start}.1.crashed"));
+    let both_crashes = || {
+        assert_eq!(fs::read_to_string(&crashed).unwrap(), "older crash", "preserved the older crash");
+        assert_eq!(fs::read_to_string(&numbered).unwrap(), "newer crash", "preserved the newer crash under its own name");
+    };
+    assert!(!dead.exists(), "the second crash also cleared the stale name");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original, "an existing crash allowed another commit");
+    both_crashes();
+    edit(&mut design, &file, edited);
+    design.commit_to_disk().unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited, "later commits ignore the quarantined files");
+    both_crashes();
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn quarantine_refuses_when_stale_temp_is_replaced_after_preflight() {
+    use design::session::{collect_stale_temps, quarantine_crashed_temp, StaleTemp};
+    use std::fs;
+    let fixture = DesignTestDir::new("quarantine-replaced");
+    let root = fixture.0.canonicalize().unwrap();
+    let file = root.join("view.rs");
+    let me = std::process::id();
+    let (pid, start) = makepad_remote::group::start_time(me).filter(|&t| t > 0)
+        .map_or((u32::MAX, 1), |start| (me, start));
+    let wrong_start = if start == 1 { 2 } else { start ^ 1 };
+    let dead = file.with_added_extension(format!("town-tmp.{pid}.{wrong_start}"));
+    fs::write(&dead, "old crash").unwrap();
+    let preflight = || {
+        let mut stale = Vec::new();
+        collect_stale_temps(&file, Some(start), &mut stale).unwrap();
+        assert_eq!(stale.len(), 1);
+        stale
+    };
+    let refused = |stale: &StaleTemp| {
+        assert_eq!(quarantine_crashed_temp(stale).unwrap_err(),
+            format!("temporary source already exists: {}", dead.display()));
+        assert!(fs::read_dir(&root).unwrap().all(|e| e.unwrap().path().extension().is_none_or(|ext| ext != "crashed")));
+    };
+    let stale = preflight();
+    let replacement = root.join("replacement");
+    fs::write(&replacement, "fresh writer").unwrap();
+    fs::rename(&replacement, &dead).unwrap();
+    refused(&stale[0]);
+    assert_eq!(fs::read_to_string(&dead).unwrap(), "fresh writer");
+
+    #[cfg(unix)]
+    {
+        let second = preflight();
+        let sentinel = root.join("sentinel");
+        fs::write(&sentinel, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &replacement).unwrap();
+        fs::rename(&replacement, &dead).unwrap();
+        refused(&second[0]);
+        assert_eq!(fs::read_link(&dead).unwrap(), sentinel);
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "sentinel");
+    }
+}
+
+#[test]
+fn map_live_to_pre_ghost_across_edits() {
+    use design::session::map_live_to_pre_ghost;
+    use makepad_widgets::makepad_script::syntax::edit::Replace;
+    // "abCDxy12!" -> "abGHOSTxy!" (replacement followed by deletion).
+    let edits = [Replace::new(2..4, "GHOST"), Replace::new(6..8, "")];
+    for (live, pre) in [(0, 0), (1, 1), (7, 4), (8, 5), (9, 8), (10, 9)] {
+        assert_eq!(map_live_to_pre_ghost(live, &edits), Ok(pre), "live offset {live}");
+    }
+    for live in 2..7 {
+        assert_eq!(map_live_to_pre_ghost(live, &edits).unwrap_err(), "cannot target the active ghost");
+    }
+}
+
+enum VerifyFailure { ReloadError, PendingReload, MalformedOkPendingReload, RolledBack }
+
+#[derive(Default)]
+struct FakeDesignSource {
+    palette: Option<String>,
+    file: String,
+    disk: String,
+    live: Option<String>,
+    previous_live: Option<String>,
+    chunks: Vec<u8>,
+    mismatch: bool,
+    verify_calls: usize,
+    verify_failure: Option<VerifyFailure>,
+}
+
+impl FakeDesignSource {
+    fn text(&self) -> &str { self.live.as_deref().unwrap_or(&self.disk) }
+
+    fn answer(&mut self, verb: DesignVerb, args: &[(String, String)]) -> Result<String, String> {
+        use makepad_widgets::design_data::locate::source_hash;
+        let arg = |k| args.iter().find(|(key,_)| key == k).map(|(_,v)| v.as_str());
+        let decoded = |s: &str| makepad_ai_hub::makepad_base64::base64_decode(s.as_bytes()).unwrap();
+        match verb {
+            DesignVerb::Palette => Ok(self.palette.clone().unwrap_or_else(|| r#"{"palette":[{"name":"View","group":"layout"},{"name":"Grid","group":"layout"},{"name":"Label","group":"text"}]}"#.into())),
+            DesignVerb::Drop => Ok("null".into()),
+            DesignVerb::Locate => {
+                let path = arg("path").unwrap();
+                let name = widget_name(path);
+                let text = self.text();
+                let start = text.find(&format!("{name} :=")).ok_or("widget missing")?;
+                let open = start + text[start..].find('{').unwrap();
+                Ok(format!(r#"{{"file":{},"file_hash":"{:016x}","block":0,"open":{open},"preview":{}}}"#,
+                    json::s(&self.file).to_json(), source_hash(text), self.live.is_some()))
+            }
+            DesignVerb::Verify => {
+                self.verify_calls += 1;
+                let reply = match self.verify_failure.take() {
+                    Some(VerifyFailure::ReloadError) => r#"{"ok":false,"rolled_back":false,"errors":["reload failed"]}"#,
+                    Some(VerifyFailure::PendingReload) => r#"{"ok":false,"pending_reload":true,"errors":[]}"#,
+                    Some(VerifyFailure::MalformedOkPendingReload) => r#"{"ok":true,"pending_reload":true,"errors":[]}"#,
+                    Some(VerifyFailure::RolledBack) => {
+                        self.live = self.previous_live.take();
+                        r#"{"ok":false,"rolled_back":true,"errors":["script error"]}"#
+                    }
+                    None => r#"{"ok":true,"errors":[]}"#,
+                };
+                Ok(reply.into())
+            }
+            DesignVerb::PreviewChunk => {
+                assert_eq!(arg("file"), Some(self.file.as_str()));
+                let seq: usize = arg("seq").unwrap().parse().unwrap();
+                if seq == 0 { self.chunks.clear(); }
+                self.chunks.extend(decoded(arg("data").unwrap()));
+                Ok(format!(r#"{{"ok":true,"next_seq":{}}}"#, seq+1))
+            }
+            DesignVerb::Preview | DesignVerb::Revert => {
+                assert_eq!(arg("file"), Some(self.file.as_str()));
+                let next = if matches!(verb, DesignVerb::Revert) { None }
+                else if let Some(edits) = arg("edits") {
+                    if std::mem::take(&mut self.mismatch) { return Err(r#"{"err":"hash_mismatch"}"#.into()); }
+                    assert_eq!(arg("base_hash").unwrap(), format!("{:016x}", source_hash(self.text())));
+                    let bytes = decoded(edits);
+                    let edits = parse_json(std::str::from_utf8(&bytes).unwrap()).unwrap();
+                    let mut next = self.text().to_owned();
+                    for edit in edits.as_arr().unwrap().iter().rev() {
+                        let [a,b,text] = edit.as_arr().unwrap() else { panic!("invalid edit triple") };
+                        next.replace_range(a.as_u64().unwrap() as usize..b.as_u64().unwrap() as usize, text.as_str().unwrap());
+                    }
+                    Some(next)
+                } else if arg("upload").is_some() {
+                    Some(String::from_utf8(std::mem::take(&mut self.chunks)).unwrap())
+                } else { Some(arg("text").unwrap().into()) };
+                self.previous_live = std::mem::replace(&mut self.live, next);
+                Ok(format!(r#"{{"ok":true,"file_hash":"{:016x}","pending_reload":true,"errors":[]}}"#, source_hash(self.text())))
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn structural_share(root: &std::path::Path, disk: &str) -> (Copies, Cx) {
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_agents(&ana_agent_state(OWNER));
+    let cx = configure_design_share(&mut s, root, disk);
+    (s, cx)
+}
+
+fn structural_copies(root: &std::path::Path, disk: &str, pool: &makepad_widgets::makepad_platform::thread::TaskPool) -> Copies {
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_agents(&ana_agent_state(OWNER));
+    configure_design_with_pool(&mut s, root, disk, pool);
+    s
+}
+
+fn configure_design_share(s: &mut Copies, root: &std::path::Path, disk: &str) -> Cx {
+    let cx = Cx::new(Box::new(|_,_| {}));
+    configure_design_with_pool(s, root, disk, &cx.task_pool());
+    cx
+}
+
+fn configure_design_with_pool(s: &mut Copies, root: &std::path::Path, disk: &str, pool: &makepad_widgets::makepad_platform::thread::TaskPool) {
+    let path = root.join("ui.rs");
+    std::fs::write(&path, disk).unwrap();
+    s.host.session.set_workspace_root(root.to_owned());
+    s.host.session.configure_design_worker(pool);
+    s.app.design_source = Some(FakeDesignSource { file: path.canonicalize().unwrap().to_str().unwrap().into(),
+        disk: disk.into(), ..Default::default() });
+    let owner = s.host.session.me;
+    for peer in [s.ana.session.me, BEN] { s.host.session.set_peer_level(peer, Some(DESIGN_LEVEL)); }
+    s.ana.session.set_peer_level(owner, Some(DESIGN_LEVEL));
+    s.ben.session.set_peer_level(owner, Some(DESIGN_LEVEL));
+}
+
+fn settle_design(s: &mut Copies) {
+        s.one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.host.session.has_unsettled_edits() {
+            assert!(std::time::Instant::now() < deadline, "structural pipeline failed to settle");
+            s.one();
+            std::thread::yield_now();
+        }
+}
+
+#[test]
+fn guest_structural_edit_requires_allow_consent_and_records_attribution() {
+    let fixture = DesignTestDir::new("peer-insert");
+    let path = fixture.0.join("ui.rs");
+    let disk = "fn selected() { id!(card); }\nscript_mod! { mod.UI = View{ root := View{} } }\n";
+    let (mut s, _cx) = structural_share(&fixture.0, disk);
+    let send = |s: &mut Copies, r| s.ana.session.request(Some(ANA_AGENT), Request::Design(r)).unwrap();
+    let insert = |name: &str, value: &str| DesignRequest::Insert { path: "/root".into(), place: DesignPlace::Inside,
+        ty: "View".into(), name: Some(name.into()), props: vec![("width".into(),"12".into()), ("draw_bg.color".into(),value.into())] };
+    let state = || DesignRequest::State { path: None };
+    let finish = settle_design;
+
+    let query = send(&mut s, state());
+    finish(&mut s);
+    assert!(has(&s.ana, query, |n| matches!(n, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, .. }))));
+    assert!(!s.ben.session.view.agents.contains_key(&(ANA, ANA_AGENT)), "private read announced its AI");
+    let denied = send(&mut s, insert("card", "#abc"));
+    finish(&mut s);
+    assert!(has(&s.ana, denied, |n| matches!(n, Notice::Refused(v) if v.contains("allow editing"))));
+    assert!(!has(&s.ben, denied, |_| true));
+    s.allow(ANA, true);
+    let invalid = send(&mut s, insert("bad", "crate_resource(\"x\")"));
+    finish(&mut s);
+    assert!(has(&s.ana, invalid, |n| matches!(n, Notice::Refused(v) if v.contains("literal class"))));
+    assert!(s.app.sent.is_empty() && s.records.is_empty());
+
+    s.allow(ANA, false);
+    s.host.session.bind_window(WindowId(0));
+    let wrong_window = send(&mut s, DesignRequest::DropTarget { window: 1, x: 0., y: 0., exclude: None });
+    finish(&mut s);
+    assert!(has(&s.ana, wrong_window, |n| matches!(n, Notice::Refused(v) if v.contains("outside this share"))));
+    assert!(s.app.sent.is_empty());
+    let palette = send(&mut s, DesignRequest::Palette { query: Some("LAYOUT".into()), offset: 1, limit: 1 });
+    finish(&mut s);
+    assert!(has(&s.ana, palette, |n| matches!(n, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::Palette, json })
+        if parse_json(json).is_ok_and(|v| v.get("total") == Some(&json::Value::Int(2))
+            && v.get("palette").and_then(json::Value::as_arr).is_some_and(|p| p.len()==1 && p[0].get("name")==Some(&json::s("Grid")))))));
+    let drop = send(&mut s, DesignRequest::DropTarget { window: 0, x: 1., y: 2., exclude: None });
+    finish(&mut s);
+    assert!(has(&s.ana, drop, |n| matches!(n, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::DropTarget, json }) if json == "null")));
+    let verify = send(&mut s, DesignRequest::Verify { path: None });
+    finish(&mut s);
+    assert!(has(&s.ana, verify, |n| matches!(n, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::Verify, .. }))));
+    s.allow(ANA, true);
+
+    let verify_calls = |s: &Copies| s.app.design_source.as_ref().unwrap().verify_calls;
+    let before = verify_calls(&s);
+    let id = send(&mut s, insert("card", "#1a2b3cff"));
+    let queued = send(&mut s, state());
+    s.one(); // locate answered; preparation and preview still own the FIFO
+    assert!(!has(&s.ana, queued, |_| true));
+    finish(&mut s);
+    s.one();
+    assert_eq!(verify_calls(&s) - before, 1, "an accepted edit verifies its preview once");
+    assert!(has(&s.ana, queued, |n| matches!(n, Notice::Design(DesignNotice::Reply { .. }))));
+    assert!(matches!(&s.records[..], [AppEdit { seat: ANA, agent: Some(ANA_AGENT), path, prop,
+        change: Change::Applied { seq: 1, .. } }] if path == "/root" && prop == "design:insert"));
+    assert!(has(&s.ben, id, |n| matches!(n, Notice::Design(DesignNotice::Running { .. }))));
+    assert!(has(&s.ben, id, |n| matches!(n, Notice::Design(DesignNotice::Mutated { path, focus_path, seq: 1, .. })
+        if path == "/root" && focus_path.as_deref() == Some("/root/card"))));
+    assert_eq!(s.ben.session.view.design.undo, 1);
+    let inserted = s.app.design_source.as_ref().unwrap().text().to_owned();
+    assert!(inserted.contains("card :=") && inserted.contains("#x1a2b3cff") && !inserted.contains("\"draw_bg.color\""), "{inserted}");
+
+    // The app rejected verify after accepting the preview. Restore the previous override
+    // before releasing the FIFO, including when the compact preview required a full sync.
+    let app = s.app.design_source.as_mut().unwrap();
+    app.mismatch = true;
+    app.verify_failure = Some(VerifyFailure::ReloadError);
+    let bad = send(&mut s, insert("second", "#fff"));
+    finish(&mut s);
+    assert!(has(&s.ana, bad, |n| matches!(n, Notice::Refused(v) if v == "reload failed")));
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), inserted);
+    assert_eq!(s.records.len(), 1);
+    assert_eq!(s.ben.session.view.design.undo, 1);
+
+    let preview_and_verify = |s: &Copies, from: usize| s.app.sent[from..].iter().filter_map(|(_, _, op)| match op {
+        DesignOp::Design { verb: verb @ (DesignVerb::Preview | DesignVerb::Revert | DesignVerb::Verify), .. } => Some(verb.wire_name()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    for failure in [VerifyFailure::PendingReload, VerifyFailure::MalformedOkPendingReload] {
+        let before = verify_calls(&s);
+        let from = s.app.sent.len();
+        let records = s.records.len();
+        s.app.design_source.as_mut().unwrap().verify_failure = Some(failure);
+        let pending = send(&mut s, insert("second", "#fff"));
+        finish(&mut s);
+        assert_eq!(verify_calls(&s) - before, 2, "the candidate and its restore each verify once");
+        assert_eq!(preview_and_verify(&s, from), ["preview", "verify", "preview", "verify"],
+            "a pending reply goes directly to restoring the previous preview");
+        assert!(has(&s.ana, pending, |n| matches!(n, Notice::Refused(v) if v == "target app did not finish reload before verify")),
+            "the guest sees why the pending candidate was refused");
+        assert_eq!(s.app.design_source.as_ref().unwrap().text(), inserted, "Town restores the previous preview text");
+        assert_eq!(s.records.len(), records, "pending reload published an edit record");
+    }
+
+    let before = verify_calls(&s);
+    let from = s.app.sent.len();
+    s.app.design_source.as_mut().unwrap().verify_failure = Some(VerifyFailure::RolledBack);
+    let rolled_back = send(&mut s, insert("second", "#fff"));
+    finish(&mut s);
+    assert_eq!(verify_calls(&s) - before, 1, "an app-side rollback verifies only the candidate");
+    assert_eq!(preview_and_verify(&s, from), ["preview", "verify"],
+        "Town sends no restore preview or revert after an app-side rollback");
+    assert!(has(&s.ana, rolled_back, |n| matches!(n, Notice::Refused(v) if v == "script error")),
+        "the guest sees the app's script error");
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), inserted, "the app restored its prior override");
+
+    for (r, op, undo, redo) in [(DesignRequest::Undo,"undo",0,1), (DesignRequest::Redo,"redo",1,0)] {
+        let id = send(&mut s,r);
+        finish(&mut s);
+        assert!(has(&s.ben, id, |n| matches!(n, Notice::Design(DesignNotice::Mutated { op: actual, path, .. }) if actual == op && path == "/")));
+        assert_eq!((s.ana.session.view.design.undo,s.ana.session.view.design.redo), (undo,redo));
+    }
+    let rename = |force| DesignRequest::Rename { path: "/root/card".into(), name: "renamed".into(), force_rust_refs: force };
+    let refused = send(&mut s, rename(false));
+    finish(&mut s);
+    assert!(has(&s.ana, refused, |n| matches!(n, Notice::Refused(v) if parse_json(v).is_ok_and(|w|
+        w.get("rust_refs").and_then(json::Value::as_arr).is_some_and(|r| r[0].get("line") == Some(&json::Value::Int(1)))))));
+    for (r, op) in [
+        (rename(true), "rename"),
+        (DesignRequest::Duplicate { path: "/root/renamed".into(), name: Some("other".into()) }, "duplicate"),
+        (DesignRequest::Step { path: "/root/other".into(), dir: StepDir::Up }, "up"),
+        (DesignRequest::Step { path: "/root/other".into(), dir: StepDir::Down }, "down"),
+        (DesignRequest::Wrap { path: "/root/other".into(), ty: "View".into(), name: Some("wrapper".into()) }, "wrap"),
+        (DesignRequest::Move { path: "/root/renamed".into(), target: "/root/wrapper".into(), place: DesignPlace::Inside }, "move"),
+        (DesignRequest::Step { path: "/root/wrapper/renamed".into(), dir: StepDir::Out }, "out"),
+        (DesignRequest::Delete { path: "/root/renamed".into(), force_rust_refs: false }, "delete"),
+        (DesignRequest::Reset, "reset"),
+    ] {
+        let id = send(&mut s,r);
+        finish(&mut s);
+        assert!(has(&s.ana, id, |n| matches!(n, Notice::Design(DesignNotice::Mutated { op: actual, .. }) if actual == op)),
+            "{op}: {:?}", s.ana.session.view.updates.back());
+    }
+    assert_eq!(s.ben.session.view.design.dirty_files, 0);
+    let records = s.records.len();
+    let interrupted = send(&mut s, insert("pending", "#abc"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.app.design_source.as_ref().unwrap().live.is_none() {
+        s.one();
+        assert!(std::time::Instant::now() < deadline, "preview was never installed");
+        std::thread::yield_now();
+    }
+    s.allow(ANA, false); // after Preview and before Verify: revert the previously unopened file
+    finish(&mut s);
+    assert!(has(&s.ana, interrupted, |n| matches!(n, Notice::Refused(v) if v.contains("revoked"))));
+    assert_eq!(s.records.len(), records);
+    assert!(s.app.design_source.as_ref().unwrap().live.is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(),disk);
+    s.host.session.stop_agent(ANA, ANA_AGENT, true).unwrap();
+    let stopped = send(&mut s, state());
+    finish(&mut s);
+    assert!(has(&s.ana, stopped, |n| matches!(n, Notice::Refused(v) if v.contains("stopped"))));
+
+    // Inject an append failure at the real signed-record boundary after successful Verify.
+    let unsaved = s.host.session.request(None, Request::Design(insert("unsaved", "#fff"))).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.host.session.next_record().is_none() {
+        s.host.session.drive_app(&mut s.app);
+        s.app.answer(&mut s.host.session);
+        assert!(std::time::Instant::now() < deadline, "verified edit never reached the recorder");
+        std::thread::yield_now();
+    }
+    s.host.session.record_failed("signed append failed");
+    finish(&mut s);
+    assert!(has(&s.host, unsaved, |n| matches!(n, Notice::Refused(v) if v == "signed append failed")));
+    assert!(!has(&s.ben, unsaved, |n| matches!(n, Notice::Design(DesignNotice::Mutated { .. }))));
+    assert!(s.app.design_source.as_ref().unwrap().live.is_none());
+
+}
+
+fn drag_into(target: &str) -> DesignRequest {
+    DesignRequest::GhostInsert { target: target.into(), place: DesignPlace::Inside, ty: "Label".into() }
+}
+
+fn guest_design(s: &mut Copies, request: DesignRequest) -> RequestId {
+    let id = s.ana.session.request(Some(ANA_AGENT), Request::Design(request)).unwrap();
+    settle_design(s);
+    id
+}
+
+fn design_reply_value(town: &TownApp, id: RequestId, wanted: DesignReplyKind) -> json::Value {
+    town.session.view.updates.iter().rev().find_map(|(_,req,_,notice)| match notice {
+        Notice::Design(DesignNotice::Reply { kind, json }) if *req == id && *kind == wanted => parse_json(json).ok(),
+        _ => None,
+    }).unwrap_or_else(|| panic!("missing design reply {wanted:?}: {:?}", town.session.view.updates.back()))
+}
+
+#[test]
+fn ghost_move_squashes_and_commits_without_extra_reload() {
+    let fixture = DesignTestDir::new("ghost-move");
+    let disk = "script_mod! { mod.UI = View{ a := View{label := View{}} b := View{} } }";
+    let (mut s, _cx) = structural_share(&fixture.0, disk);
+    s.allow(ANA, true);
+    let pick = r#"{"window":0,"rect":[1,2,3,4],"ref":"/a/label_2","type":"Label"}"#;
+    s.app.picks.push_back(Ok(pick.into()));
+    guest_design(&mut s, drag_into("/a"));
+    let ghost = s.ben.session.view.design.ghost.as_ref().expect("verified dwell");
+    assert_eq!(ghost.seat, ANA);
+    assert_eq!(ghost.rect.unwrap().w, 3., "pick used the fresh child name");
+    let held = s.ben.session.view.design.json();
+    let calls = s.app.sent.len();
+    let cancel = s.host.send(Request::Design(DesignRequest::GhostCancel));
+    settle_design(&mut s);
+    let state = design_reply_value(&s.host, cancel, DesignReplyKind::State);
+    assert_eq!(state.get("ghost"), held.get("ghost"), "a non-holder leaves Ana's preview intact");
+    assert_eq!(s.app.sent.len(), calls, "cancelling another seat's ghost makes no app calls");
+    guest_design(&mut s, drag_into("/a"));
+    let contested = s.host.send(Request::Design(DesignRequest::GhostCommit));
+    settle_design(&mut s);
+    assert!(has(&s.host, contested, |n| matches!(n, Notice::Refused(e) if e.contains("dragging"))));
+    assert_eq!(s.app.sent.len(), calls, "same-target and other-holder requests must not reload");
+    let read = guest_design(&mut s, DesignRequest::Diff { file: None, offset: 0, limit: 2048 });
+    assert_eq!(design_reply_value(&s.ana, read, DesignReplyKind::Diff).get("patch"), Some(&json::s("")));
+    let write = s.host.send(Request::Design(DesignRequest::WritePatch { file: None }));
+    settle_design(&mut s);
+    let saved = design_reply_value(&s.host, write, DesignReplyKind::WritePatch);
+    assert_eq!(std::fs::read_to_string(saved.get("path").unwrap().as_str().unwrap()).unwrap(), "");
+    let owner_patch = saved.get("path").unwrap().as_str().unwrap();
+    std::fs::write(owner_patch, "owner review notes").unwrap();
+    let export = guest_design(&mut s, DesignRequest::WritePatch { file: None });
+    let exported = design_reply_value(&s.ana, export, DesignReplyKind::WritePatch);
+    let peer_patch = exported.get("path").unwrap().as_str().unwrap();
+    assert_ne!(peer_patch, owner_patch);
+    assert_eq!(std::fs::read_to_string(owner_patch).unwrap(), "owner review notes");
+    assert_eq!(std::fs::read_to_string(peer_patch).unwrap(), "", "export omits the active ghost");
+    s.app.picks.push_back(Err("widget moved".into()));
+    guest_design(&mut s, drag_into("/b"));
+    assert!(s.ben.session.view.design.ghost.as_ref().unwrap().rect.is_none());
+    let before_commit = s.app.sent.len();
+    assert_eq!(s.ben.session.view.design.undo, 0);
+    assert!(s.records.is_empty());
+    let id = guest_design(&mut s, DesignRequest::GhostCommit);
+    assert!(has(&s.ana, id, |n| matches!(n, Notice::Design(DesignNotice::Mutated { focus_path, .. })
+        if focus_path.as_deref() == Some("/b/label"))));
+    assert_eq!(s.app.sent.len(), before_commit);
+    assert_eq!(s.app.sent.iter().filter(|(_,_,op)| matches!(op, DesignOp::Design {verb: DesignVerb::Preview,..})).count(), 2);
+    assert_eq!(s.ben.session.view.design.undo, 1);
+    assert!(s.ben.session.view.design.ghost.is_none());
+    assert!(matches!(&s.records[..], [AppEdit { seat: ANA, agent: Some(ANA_AGENT), prop, .. }] if prop=="design:insert"));
+    let live = s.app.design_source.as_ref().unwrap().text();
+    assert!(!live.contains("label_2") && live.find("b :=").unwrap() < live.find("label := Label").unwrap(), "{live}");
+    guest_design(&mut s, DesignRequest::Undo);
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk);
+
+    let move_to = |target: &str| DesignRequest::GhostMove { source: "/a/label".into(),
+        target: target.into(), place: DesignPlace::Inside };
+    guest_design(&mut s, move_to("/b"));
+    let start = s.app.sent.len();
+    let moved = guest_design(&mut s, move_to("/a"));
+    assert!(has(&s.ana, moved, |n| matches!(n, Notice::Design(DesignNotice::Reply {..}))),
+        "{:?}", s.ana.session.view.updates.back());
+    assert_eq!(s.app.sent[start..].iter().filter(|(_,_,op)| matches!(op, DesignOp::Design {verb: DesignVerb::Locate,..})).count(), 1);
+    guest_design(&mut s, DesignRequest::GhostCancel);
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk);
+    assert_eq!(s.ana.session.view.design.redo, 1, "provisional edits preserve redo history");
+    let cancel = guest_design(&mut s, DesignRequest::GhostCancel);
+    assert_eq!(design_reply_value(&s.ana, cancel, DesignReplyKind::State).get("ghost"), Some(&json::Value::Null),
+        "cancelling an already retracted ghost returns the settled state");
+    let commit = guest_design(&mut s, DesignRequest::GhostCommit);
+    assert!(has(&s.ana, commit, |n| matches!(n, Notice::Refused(e) if e == "no active ghost to settle")));
+
+    let other = fixture.0.join("other.splash");
+    let other_disk = "View{ target := View{} }";
+    std::fs::write(&other, other_disk).unwrap();
+    s.app.other_source = Some(FakeDesignSource { file: other.canonicalize().unwrap().to_str().unwrap().into(),
+        disk: other_disk.into(), ..Default::default() });
+    guest_design(&mut s, drag_into("/b"));
+    guest_design(&mut s, drag_into("/other/target"));
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk, "moving files restored the old preview");
+    assert!(s.app.other_source.as_ref().unwrap().text().contains("label := Label"));
+    let insert = s.host.send(Request::Design(DesignRequest::Insert { path: "/a".into(), place: DesignPlace::Inside,
+        ty: "View".into(), name: Some("saved".into()), props: vec![] }));
+    settle_design(&mut s);
+    assert!(has(&s.host, insert, |n| matches!(n, Notice::Design(DesignNotice::Mutated { .. }))));
+    assert_eq!(s.app.other_source.as_ref().unwrap().text(), other_disk, "committed mutation settled the other seat's drag");
+    assert!(s.ben.session.view.design.ghost.is_none());
+    let saved = s.app.design_source.as_ref().unwrap().text().to_owned();
+    guest_design(&mut s, drag_into("/b"));
+    let read = guest_design(&mut s, DesignRequest::Diff { file: None, offset: 0, limit: 32768 });
+    let diff = design_reply_value(&s.ana, read, DesignReplyKind::Diff);
+    let diff = diff.get("patch").unwrap().as_str().unwrap();
+    assert!(diff.contains("saved := View") && !diff.contains("label := Label"), "{diff}");
+    s.host.session.peer_unlinked(ANA);
+    settle_design(&mut s);
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), saved, "disconnect restored the existing dirty override");
+}
+
+#[test]
+fn ghost_auto_retracts_on_peer_disconnect_or_stop() {
+    let fixture = DesignTestDir::new("ghost-cleanup");
+    let disk = "script_mod! { mod.UI = View{ root := View{} } }";
+    let (mut s, _cx) = structural_share(&fixture.0, disk);
+    for reason in ["Stop", "Revoke", "Disconnect", "Departure", "End"] {
+        s.allow(ANA, true);
+        guest_design(&mut s, drag_into("/root"));
+        assert!(s.ben.session.view.design.ghost.is_some(), "{reason}: ghost never installed");
+        match reason {
+            "Stop" => s.host.session.stop_agent(ANA, ANA_AGENT, true).unwrap(),
+            "Revoke" => s.allow(ANA, false),
+            "Disconnect" => s.host.session.peer_unlinked(ANA),
+            "Departure" => s.host.session.set_members([OWNER, BEN]),
+            _ => s.host.session.end("closed"),
+        }
+        settle_design(&mut s);
+        assert!(s.ben.session.view.design.ghost.is_none(), "{reason} left a lease");
+        assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk, "{reason} left provisional source");
+        assert!(s.app.design_source.as_ref().unwrap().live.is_none(), "{reason} left a new override");
+        assert_eq!(s.ben.session.view.design.undo, 0);
+        if reason == "Stop" { s.host.session.stop_agent(ANA, ANA_AGENT, false).unwrap(); }
+        if reason == "Departure" {
+            s.host.session.set_members([OWNER, ANA, BEN]);
+            s.host.session.set_peer_level(ANA, Some(DESIGN_LEVEL));
+        }
+    }
+    assert!(s.records.is_empty());
+    assert!(s.host.session.view.design.ghost.is_none(), "owner view still shows the ended drag");
+
+    let (mut disconnected, _cx2) = structural_share(&fixture.0, disk);
+    disconnected.allow(ANA, true);
+    guest_design(&mut disconnected, drag_into("/root"));
+    let before_end = disconnected.app.sent.len();
+    disconnected.host.session.link_ended(LINK, "app closed");
+    settle_design(&mut disconnected);
+    assert!(disconnected.ben.session.view.design.ghost.is_none());
+    assert_eq!(disconnected.app.sent.len(), before_end, "closed link received a restore command");
+}
+
+#[test]
+fn bake_props_and_theme_writes_valid_macro_safe_ast_patch() {
+    use makepad_widgets::makepad_platform::script_mod_doc::{DocKind, ScriptModDoc};
+    let fixture = DesignTestDir::new("bake");
+    let disk = "script_mod! { mod.UI = View{ panel := View{} } }\n";
+    let (mut s, _cx) = structural_share(&fixture.0, disk);
+    s.allow(ANA, true);
+    s.app.theme = THEME.replace("color_primary", "color_accent");
+    s.app.props = ROWS.replace("padding", "draw_bg.color");
+    s.list();
+    s.host.send(Request::Set { path: PATH.into(), prop: "draw_bg.color".into(), value: "#1a2b3cff".into() });
+    s.one();
+    s.host.send(Request::Theme(ThemeOp::Install(ThemeInstall { base: "dark".into(), sheet: None, label: "Custom".into(),
+        globals: vec![("space_2".into(), ThemeVal::Num(12.))], overrides: vec![("color_accent".into(), ThemeVal::Color(0x112233ff))] })));
+    s.one();
+    s.one();
+    s.host.send(Request::Theme(ThemeOp::Set { name: "color_accent".into(), value: "#336699ff".into() }));
+    s.one();
+    s.app.props = ROWS.into();
+    s.list();
+    s.host.send(set("unrepresentable value"));
+    s.one();
+    let bake = guest_design(&mut s, DesignRequest::Bake { scope: BakeScope::All, path: Some(PATH.into()), prop: None });
+    assert!(has(&s.ana, bake, |n| matches!(n, Notice::Design(DesignNotice::Mutated {op,..}) if op=="bake")),
+        "{:?}", s.ana.session.view.updates.back());
+    let report = design_reply_value(&s.ana, bake, DesignReplyKind::State);
+    assert_eq!(report.get("baked"), Some(&json::Value::Bool(true)));
+    assert_eq!(report.get("skipped"), Some(&json::Value::Arr(vec![json::Value::Arr(vec![json::s(PATH), json::s("padding")])])));
+    let read = guest_design(&mut s, DesignRequest::Diff { file: Some("ui.rs".into()), offset: 0, limit: 32768 });
+    let page = design_reply_value(&s.ana, read, DesignReplyKind::Diff);
+    let diff = page.get("patch").unwrap().as_str().unwrap();
+    assert!(diff.starts_with("--- a/ui.rs\n+++ b/ui.rs") && diff.contains("#x1a2b3cff") && diff.contains("#x336699FF")
+        && diff.contains("mod.theme +:") && diff.contains("space_2") && !diff.contains("112233FF"), "{diff}");
+    let live = s.app.design_source.as_ref().unwrap().text();
+    ScriptModDoc::parse("ui.rs", live.into(), DocKind::RustScriptMod).unwrap().block_syntax(0).unwrap();
+    assert_eq!(std::fs::read_to_string(fixture.0.join("ui.rs")).unwrap(), disk);
+    let start = s.app.sent.len();
+    let retry = guest_design(&mut s, DesignRequest::Bake { scope: BakeScope::Props, path: None, prop: None });
+    let retry_report = design_reply_value(&s.ana, retry, DesignReplyKind::State);
+    assert_eq!(retry_report.get("baked"), Some(&json::Value::Bool(false)));
+    assert_eq!(retry_report.get("skipped"), report.get("skipped"), "skipped values remain unbaked");
+    assert_eq!(s.app.sent.len(), start, "already-baked properties should not be located or previewed");
+}
+
+#[test]
+fn build_tab_hides_commit_for_guest_and_disables_edits_until_allowed() {
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 220} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    let mut panel = panel::Panel::default();
+    let state = Default::default();
+    let refresh = |cx: &mut Cx, panel: &mut panel::Panel, town: &TownApp| {
+        panel.refresh(cx, &root, &town.session, &state, &Default::default());
+    };
+    let bake = root.button(cx, ids!(design_bake));
+    let commit = root.widget(cx, ids!(design_commit));
+    s.ana.session.view.design.dirty_files = 1;
+    refresh(cx, &mut panel, &s.ana);
+    let mut draw = draw_panel(cx, root.clone());
+    draw(cx);
+    let button = if root.widget(cx, ids!(tab_build)).visible() { ids!(tab_build) } else { ids!(tab_build_i) };
+    let (_, _, click) = panel_click_at(cx, &root, root.widget(cx, button).area().rect(cx).center(), 1.);
+    panel.actions(cx, &root, &click, &mut s.ana.session);
+    draw(cx);
+    assert!(root.widget(cx, ids!(tweak_build_wrap)).visible());
+    assert_eq!(root.label(cx, ids!(build_status)).text(), OLDER_SHARER_DESIGN);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    refresh(cx, &mut panel, &s.ana);
+    assert!(root.widget(cx, ids!(tweak_ask)).visible() && !bake.borrow().unwrap().enabled());
+    assert!(!commit.visible(), "a guest cannot commit dirty files");
+    s.allow(ANA, true);
+    refresh(cx, &mut panel, &s.ana);
+    assert!(bake.borrow().unwrap().enabled() && !commit.visible());
+    s.ana.session.set_peer_level(OWNER, Some(THEME_LEVEL));
+    refresh(cx, &mut panel, &s.ana);
+    assert!(!bake.borrow().unwrap().enabled(), "the older sharer cannot perform a structural edit");
+    refresh(cx, &mut panel, &s.host);
+    assert!(!commit.visible(), "a clean owner session has nothing to commit");
+    s.host.session.view.design.dirty_files = 1;
+    refresh(cx, &mut panel, &s.host);
+    assert!(commit.visible());
+}
+
+#[test]
+fn build_status_distinguishes_selected_type_from_insert_type() {
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = script_eval!(vm, { mod.widgets.AppTweakPanel{width: 360} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut panel = test_panel();
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    let session = &mut s.ana.session;
+    session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    let state = Default::default();
+    let path = "/increment_button";
+    let picked = |ty: &str| Notice::Picked { path: path.into(), ty: ty.into(),
+        rect: super::Rect { window: 0, x: 0., y: 0., w: 40., h: 20. } };
+    panel.notice(cx, &root, session, ANA, 1, None, &state, &picked("Button"));
+    let tab = root.button(cx, ids!(tab_build));
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab.widget_uid(), ButtonAction::Clicked(Default::default())));
+    panel.actions(cx, &root, &actions, session);
+    let status = root.label(cx, ids!(build_status));
+    assert_eq!(status.text(), "/increment_button (Button) · Insert: View · 0 dirty files");
+
+    let palette = parse_json(r#"{"palette":[{"name":"Label","group":"Text"}]}"#).unwrap();
+    root.widget(cx, ids!(build_palette)).borrow_mut::<super::design::view::PaletteList>().unwrap().palette.page(&palette, true).unwrap();
+    draw_panel(cx, root.clone())(cx);
+    let entry = root.portal_list(cx, ids!(palette_rows)).get_item(1).expect("mounted Label entry").1;
+    assert_eq!(entry.text(), "Label");
+    let (_, _, click) = panel_click_at(cx, &root, entry.area().rect(cx).center(), 1.);
+    panel.actions(cx, &root, &click, session);
+    assert_eq!(status.text(), "/increment_button (Button) · Insert: Label · 0 dirty files");
+
+    session.view.design.dirty_files = 1;
+    panel.refresh(cx, &root, session, &state, &Default::default());
+    assert_eq!(status.text(), "/increment_button (Button) · Insert: Label · 1 dirty file");
+    panel.notice(cx, &root, session, ANA, 2, None, &state, &picked(""));
+    panel.refresh(cx, &root, session, &state, &Default::default());
+    assert_eq!(status.text(), "/increment_button · Insert: Label · 1 dirty file");
+    panel.notice(cx, &root, session, ANA, 3, None, &state, &Notice::Selected { path: None, rect: None });
+    panel.refresh(cx, &root, session, &state, &Default::default());
+    assert_eq!(status.text(), "Select a widget · Insert: Label · 1 dirty file");
+}
+
+#[test]
+fn props_box_row_and_tree_filter_fit_without_clipping_at_narrow_widths() {
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = script_eval!(vm, { mod.widgets.AppTweakPanel{} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut panel = test_panel();
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.allow(ANA, true);
+    s.ana.session.view.updates.clear();
+    s.app.props = r#"{"props":[{"name":"margin","value":"4"},{"name":"padding","value":"8"}]}"#.into();
+    let state = Default::default();
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    panel.notice(cx, &root, &mut s.ana.session, ANA, 1, None, &state, &Notice::Picked { path: PATH.into(),
+        ty: "View".into(), rect: super::Rect { window: 0, x: 0., y: 0., w: 40., h: 20. } });
+    s.one();
+    while let Some((seat, req, agent, notice)) = s.ana.session.view.updates.pop_front() {
+        panel.notice(cx, &root, &mut s.ana.session, seat, req, agent, &state, &notice);
+    }
+    let mut draw = draw_panel(cx, root.clone());
+    let mut draw_at = |cx: &mut Cx, width| {
+        let walk = root.walk(cx);
+        root.as_view().set_walk(cx, Walk { width: Size::Fixed(width), ..walk });
+        draw(cx);
+        let bounds = root.area().rect(cx);
+        assert_eq!(bounds.size.x, width, "panel width under test");
+        bounds
+    };
+    let list = root.portal_list(cx, ids!(tweak_properties_list));
+    for width in [220., 240., 360.] {
+        let bounds = draw_at(cx, width);
+        for prop in ["margin", "padding"] {
+            let row = (0..list.borrow().unwrap().range_end()).filter_map(|i| list.get_item(i))
+                .find(|(id, row)| *id == id!(BoxRow) && row.label(cx, ids!(name)).text() == prop)
+                .expect("mounted inset property").1;
+            for id in [id!(leg_top), id!(leg_left), id!(frame), id!(leg_right), id!(leg_bottom)] {
+                let rect = row.widget(cx, &[id]).area().rect(cx);
+                assert!(rect.size.x > 0. && rect.pos.x >= bounds.pos.x &&
+                    rect.pos.x + rect.size.x <= bounds.pos.x + bounds.size.x, "{prop} {id} at {width}: {rect:?}");
+                if width == 360. {
+                    if id == id!(leg_left) || id == id!(leg_right) { assert_eq!(rect.size.x, 64., "{prop} {id}"); }
+                    if id == id!(frame) { assert!(rect.size.x > 64., "{prop} frame receives the remaining space"); }
+                }
+            }
+        }
+    }
+    let tab = root.button(cx, ids!(tab_tree));
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab.widget_uid(), ButtonAction::Clicked(Default::default())));
+    panel.actions(cx, &root, &actions, &mut s.ana.session);
+    for width in [240., 360.] {
+        let bounds = draw_at(cx, width);
+        let filter = root.widget(cx, ids!(tree_filter)).area().rect(cx);
+        let refresh = root.widget(cx, ids!(tree_refresh)).area().rect(cx);
+        assert!(filter.size.x > 0. && refresh.size.x > 0. && (filter.pos.y - refresh.pos.y).abs() < 6.,
+            "tree controls share a line at {width}: {filter:?}, {refresh:?}");
+        assert!(refresh.pos.x + refresh.size.x <= bounds.pos.x + bounds.size.x, "refresh fits at {width}");
+    }
+}
+
+#[test]
+fn palette_filter_narrows_rows_and_preserves_category_headers() {
+    use design::view::{Palette, PaletteRow::{Entry, Group}};
+    let mut palette = Palette::default();
+    palette.page(&parse_json(r#"{"palette":[{"name":"View","group":"Layout"},{"name":"Button","group":"Controls"},{"name":"IconButton","group":"Controls"},{"name":"Label","group":"Text"}]}"#).unwrap(), true).unwrap();
+    palette.filter("BtN".into());
+    assert_eq!(palette.rows, [Group("Controls".into()), Entry("Button".into()), Entry("IconButton".into())]);
+    palette.filter("text".into());
+    assert_eq!(palette.rows, [Group("Text".into()), Entry("Label".into())]);
+    palette.filter("unknown".into());
+    assert!(palette.rows.is_empty());
+}
+
+#[test]
+fn identity_row_rename_validates_identifier_and_emits_design_rename() {
+    use makepad_widgets::*;
+    let fixture = DesignTestDir::new("panel-rename");
+    let disk = "fn selected() { id!(panel); }\nscript_mod! { mod.UI = View{ panel := View{} } }";
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let mut s = structural_copies(&fixture.0, disk, &cx.task_pool());
+    s.allow(ANA, true);
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 360} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut panel = panel::Panel::default();
+    let state = Default::default();
+    let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, town: &mut TownApp| {
+        while let Some((seat, req, agent, notice)) = town.session.view.updates.pop_front() {
+            panel.notice(cx, &root, &mut town.session, seat, req, agent, &state, &notice);
+        }
+    };
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    dispatch(cx, &mut panel, &mut s.ana);
+    s.one(); // Service the theme read issued when this guest received Allow.
+    s.ana.send(Request::Pick(At::Path(PATH.into())));
+    s.one();
+    dispatch(cx, &mut panel, &mut s.ana);
+    settle_design(&mut s); // Locate the picked literal.
+    s.one(); // Supply its reflected property rows.
+    dispatch(cx, &mut panel, &mut s.ana);
+    let mut draw = draw_panel(cx, root.clone());
+    draw(cx);
+    let list = root.portal_list(cx, ids!(tweak_properties_list));
+    let row = (0..list.borrow().unwrap().range_end()).filter_map(|i| list.get_item(i))
+        .find(|(id, _)| *id == id!(IdentityRow)).unwrap().1;
+    let name = row.text_input(cx, ids!(name_field));
+    assert!(!name.is_read_only(), "located guest selection should be editable: active={}, calls={:?}", s.ana.session.view.design.active, s.app.sent);
+    let _ = panel_click_at(cx, &root, name.area().rect(cx).center(), 1.);
+    let submit = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies, text: &str| {
+        name.set_text(cx, text);
+        let enter = cx.capture_actions(|cx| root.handle_event(cx,
+            &Event::KeyDown(KeyEvent { key_code: KeyCode::ReturnKey, ..Default::default() }), &mut Scope::empty()));
+        panel.actions(cx, &root, &enter, &mut s.ana.session);
+    };
+    let before = s.app.sent.len();
+    submit(cx, &mut panel, &mut s, "123 bad");
+    draw(cx);
+    assert!(row.label(cx, ids!(refusal)).text().contains("identifier"));
+    s.one();
+    assert_eq!(s.app.sent.len(), before, "an invalid identifier sends nothing");
+    let _ = panel_click_at(cx, &root, name.area().rect(cx).center(), 2.);
+    submit(cx, &mut panel, &mut s, "header_bar");
+    settle_design(&mut s);
+    dispatch(cx, &mut panel, &mut s.ana);
+    draw(cx);
+    assert!(row.label(cx, ids!(refusal)).text().contains("Referenced in Rust at lines 1"));
+    assert!(row.widget(cx, ids!(rename_confirm)).visible());
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk, "refusal preserves the source");
+    let (_, _, click) = panel_click_at(cx, &root, row.button(cx, ids!(rename_anyway)).area().rect(cx).center(), 3.);
+    panel.actions(cx, &root, &click, &mut s.ana.session);
+    settle_design(&mut s);
+    assert!(s.app.design_source.as_ref().unwrap().text().contains("header_bar :="), "confirmed Rename edits the widget");
+}
+
+#[test]
+fn theme_tab_routes_bake_to_app_or_d1_design() {
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let ui = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* View{tweak_panel := AppTweakPanel{width: 360}} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let root = ui.widget(cx, ids!(tweak_panel));
+    let mut panel = test_panel();
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.allow(ANA, true);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    let homes = crate::model::tests::ShareHomes::new("panel-board-bake");
+    let mut model = Model::open(&homes.0).unwrap().0;
+    panel.refresh(cx, &root, &s.ana.session, &model.state, &Default::default());
+    let click = |cx: &mut Cx, path| {
+        let uid = root.button(cx, path).widget_uid();
+        cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())))
+    };
+    for path in [ids!(tab_theme), ids!(theme_bake)] {
+        let action = click(cx, path);
+        panel.actions(cx, &root, &action, &mut s.ana.session);
+    }
+    s.ana.poll();
+    assert!(s.host.relay.net.borrow().inbox[&OWNER].iter().any(|(_, _, body)| matches!(
+        wire::decode(ANA, body), Ok(Some(Packet { body: Body::Request(Request::Design(DesignRequest::Bake { scope: BakeScope::Theme, path: None, prop: None })), .. }))
+    )), "the shared app receives a theme-only bake");
+
+    let board = model.act(crate::model::Action::AddBoard { project: model.project().id, title: "Board".into() }, Origin::Ui).unwrap();
+    let item = model.act(crate::model::Action::AddDesign { board, x: 0, y: 0, preset: "phone".into(),
+        title: "Card".into(), src: "View { title := Label{} }".into() }, Origin::Ui).unwrap();
+    let callback = cx.tweak_callback;
+    cx.tweak_callback = Some(|_, op, _| match op {
+        "design_theme" => Ok(THEME.into()), "design_palette" => Ok(r#"{"palette":[]}"#.into()), _ => unreachable!(),
+    });
+    let mut hub = Tweaks::<u64,u64>::default();
+    hub.set_themes_dir(panel.themes_dir());
+    hub.select_board_design(Some(item));
+    hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
+    assert!(root.visible() && root.widget(cx, ids!(tweak_build_wrap)).visible(), "the board opens Build without a live share");
+    cx.tweak_callback = callback;
+    let action = click(cx, ids!(tab_theme));
+    hub.board_design_actions(cx, &ui, &action, &mut model);
+    let action = click(cx, ids!(theme_bake));
+    let id = hub.board_design_actions(cx, &ui, &action, &mut model).expect("signed design write");
+    let snapshot = design::d1::read_design(&model.state, item).unwrap();
+    assert_eq!(snapshot.revision, id);
+    assert!(snapshot.src.contains("mod.theme +: {") && snapshot.src.contains("color_primary: #e6a294ff"), "baked source: {}", snapshot.src);
+    assert!(snapshot.src.contains("title := Label{}"), "baking preserves widget source");
+    assert!(hub.board_design_actions(cx, &ui, &action, &mut model).is_none(), "rebaking the same theme emits no write");
+    let action = click(cx, ids!(tab_build));
+    hub.board_design_actions(cx, &ui, &action, &mut model);
+    let action = click(cx, ids!(insert_inside));
+    let write = hub.board_design_actions(cx, &ui, &action, &mut model).expect("structural insertion on the board");
+    let snapshot = design::d1::read_design(&model.state, item).unwrap();
+    assert_eq!(snapshot.revision, write);
+    assert_eq!(design::d1::list_widgets(&snapshot.src).unwrap().len(), 3);
+    hub.select_board_design(None);
+    hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
+    assert!(!root.visible(), "deselecting the design closes its panel");
+}
+
+impl ThemeAgent {
+    fn design_call(&self, item: [u8; 32], op: &str, fields: &str) -> makepad_ai_services::wire::ServiceCall {
+        let json::Value::Obj(mut fields) = parse_json(fields).unwrap() else { panic!("test call needs arguments") };
+        fields.extend([("item".into(), json::s(hex(&item))), ("binding".into(), json::s(&self.binding))]);
+        makepad_ai_services::wire::ServiceCall { tool: format!("app_design_{op}"), call_id: op.into(),
+            args: json::Value::Obj(fields).to_json(), caller: None, origin: makepad_ai_services::wire::CallOrigin::Conversation }
+    }
+
+    fn start_design(&mut self, seat: &mut TownApp, op: &str, fields: &str) -> Option<ThemeResult> {
+        let call = self.design_call(seat.session.item, op, fields);
+        let ctx = crate::tools::ThemeToolContext { themes_dir: &self.dir, mixer_cache: &mut self.cache, active_worn: None };
+        let (reply, _, effect) = self.tools.start(op, app_tool(&call.tool, &call.args).unwrap(), &mut self.model,
+            std::slice::from_mut(&mut seat.session), &mut self.waits, ctx);
+        assert!(effect.is_none(), "{op} never sends a panel effect");
+        reply
+    }
+
+    fn run_design(&mut self, s: &mut Copies, op: &str, fields: &str) -> ThemeResult {
+        if let Some(reply) = self.start_design(&mut s.ana, op, fields) { return reply }
+        settle_design(s);
+        self.notices(&mut s.ana, |_, _, _, _, _, effect| assert!(effect.is_none()))
+            .unwrap_or_else(|| panic!("missing final reply for {op}"))
+    }
+}
+
+#[test]
+fn ai_design_tools_roundtrip_all_structural_ops() {
+    let (homes, _owner, mut ai, mut s) = theme_agents("design-tools-roundtrip");
+    let disk = "fn uses_card() { id!(card); }\nscript_mod! { mod.UI = View{ panel := View{ a := View{} b := View{} } } }\n";
+    let _cx = configure_design_share(&mut s, &homes.0, disk);
+    let state = theme_ok(ai.run_design(&mut s, "state", r#"{"path":"/panel"}"#));
+    assert_eq!(state.get("dirty_files"), Some(&json::Value::Int(0)));
+    assert_eq!(state.get("located").unwrap().get("rust_refs"), Some(&json::Value::Arr(vec![])));
+    let palette = theme_ok(ai.run_design(&mut s, "palette", r#"{"query":"layout","offset":1,"limit":1}"#));
+    assert_eq!(palette.get("items").unwrap().as_arr().unwrap()[0].get("name"), Some(&json::s("Grid")));
+    theme_ok(ai.run_design(&mut s, "patch", r#"{"op":"verify","path":"/panel"}"#));
+    let empty = theme_ok(ai.run_design(&mut s, "patch", r#"{"op":"diff"}"#));
+    assert_eq!(empty.get("patch"), Some(&json::s("")));
+    let denied = ai.run_design(&mut s, "patch", r#"{"op":"write_patch"}"#);
+    assert_eq!(denied.outcome, makepad_ai_services::wire::ToolOutcome::Refused);
+    s.allow(ai.model.me(), true);
+    let insert = theme_ok(ai.run_design(&mut s, "insert", r#"{"path":"/panel","place":"inside","ty":"View","name":"card","props":{"width":"12"}}"#));
+    assert_eq!(insert.get("focus_path"), Some(&json::s("/panel/card")));
+    assert_eq!(insert.get("name"), Some(&json::s("card")));
+    for (op, fields, expected) in [
+        ("move", r#"{"path":"/panel/card","target":"/panel/b","place":"before"}"#, "move"),
+        ("move", r#"{"path":"/panel/card","direction":"up"}"#, "up"),
+        ("move", r#"{"path":"/panel/card","direction":"down"}"#, "down"),
+        ("move", r#"{"path":"/panel/card","direction":"out"}"#, "out"),
+        ("duplicate", r#"{"path":"/card","name":"copy"}"#, "duplicate"),
+        ("wrap", r#"{"path":"/copy","ty":"View","name":"frame"}"#, "wrap"),
+    ] {
+        let result = theme_ok(ai.run_design(&mut s, op, fields));
+        assert_eq!(result.get("op"), Some(&json::s(expected)));
+        assert!(result.get("seq").is_some(), "{op} identifies the signed edit");
+    }
+    for (op, args) in [("rename", r#"{"path":"/card","name":"tile"}"#), ("delete", r#"{"path":"/card"}"#)] {
+        let refusal = ai.run_design(&mut s, op, args);
+        assert_eq!(refusal.outcome, makepad_ai_services::wire::ToolOutcome::Refused);
+        assert!(!parse_json(&refusal.text).unwrap().get("rust_refs").unwrap().as_arr().unwrap().is_empty());
+    }
+    let rename = theme_ok(ai.run_design(&mut s, "rename", r#"{"path":"/card","name":"tile","force_rust_refs":true}"#));
+    assert_eq!(rename.get("old_path"), Some(&json::s("/card")));
+    assert_eq!(rename.get("name"), Some(&json::s("tile")));
+    let delete = theme_ok(ai.run_design(&mut s, "delete", r#"{"path":"/tile"}"#));
+    assert_eq!(delete.get("path"), Some(&json::s("/tile")));
+    s.list();
+    s.host.send(set("12"));
+    s.one();
+    let baked = theme_ok(ai.run_design(&mut s, "bake", r#"{"scope":"props","path":"ui.panel","prop":"padding"}"#));
+    assert_eq!(baked.get("baked"), Some(&json::Value::Bool(true)));
+    let noop = theme_ok(ai.run_design(&mut s, "bake", r#"{"scope":"props"}"#));
+    assert_eq!(noop.get("baked"), Some(&json::Value::Bool(false)));
+    s.host.send(Request::Theme(ThemeOp::Set { name: "space_2".into(), value: "16".into() }));
+    s.one();
+    let theme = theme_ok(ai.run_design(&mut s, "bake", r#"{"scope":"theme","path":"ui.panel"}"#));
+    assert_eq!(theme.get("baked"), Some(&json::Value::Bool(true)));
+    let diff = theme_ok(ai.run_design(&mut s, "patch", r#"{"op":"diff","file":"ui.rs"}"#));
+    let patch = diff.get("patch").unwrap().as_str().unwrap();
+    assert!(patch.contains("frame :=") && patch.contains("space_2"), "{patch}");
+    let export = theme_ok(ai.run_design(&mut s, "patch", r#"{"op":"write_patch","file":"ui.rs"}"#));
+    let path = std::path::Path::new(export.get("path").unwrap().as_str().unwrap());
+    assert!(path.starts_with(homes.0.canonicalize().unwrap().join("local/design")));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), patch);
+    for (op, redo) in [("undo", 1), ("redo", 0), ("reset", 0)] {
+        let result = theme_ok(ai.run_design(&mut s, "history", &json::obj(vec![("op", json::s(op))]).to_json()));
+        assert_eq!(result.get("op"), Some(&json::s(op)));
+        assert_eq!(result.get("redo"), Some(&json::Value::Int(redo)));
+        assert_eq!(result.get("dirty_files"), Some(&json::Value::Int(if op == "reset" { 0 } else { 1 })));
+    }
+    assert_eq!(s.app.design_source.as_ref().unwrap().text(), disk);
+    assert_eq!(std::fs::read_to_string(homes.0.join("ui.rs")).unwrap(), disk);
+}
+
+#[test]
+fn ai_design_rejects_non_literal_class_props_and_invalid_args() {
+    let (_homes, _owner, mut ai, mut s) = theme_agents("design-args");
+    s.ana.session.set_peer_level(s.host.session.me, Some(DESIGN_LEVEL));
+    for (op, args) in [
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","allow":true}"#),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","name":"bad-name"}"#),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","name":"fn"}"#),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"scope.View"}"#),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","props":{"draw":"fn(){}"}}"#),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","props":{"src":"crate_resource(1)"}}"#),
+        ("insert", r##"{"path":"/root","place":"inside","ty":"View","props":{"value":"#(1)"}}"##),
+        ("insert", r#"{"path":"/root","place":"inside","ty":"View","props":{"value":"@(1)"}}"#),
+        ("move", r#"{"path":"/root","target":"/x","place":"before","direction":"up"}"#),
+        ("move", r#"{"path":"/root"}"#), ("move", r#"{"path":"/root","target":"/x"}"#),
+        ("move", r#"{"path":"/root","place":"before"}"#),
+        ("patch", r#"{"op":"diff","path":"/x"}"#), ("patch", r#"{"op":"write_patch","offset":0}"#),
+        ("patch", r#"{"op":"verify","file":"ui.rs"}"#),
+    ] {
+        let result = ai.start_design(&mut s.ana, op, args).expect("invalid arguments must settle before dispatch");
+        assert_eq!(result.outcome, makepad_ai_services::wire::ToolOutcome::Refused, "{op}: {args}");
+        assert!(!result.text.is_empty(), "{op} gives a reason");
+    }
+    s.one();
+    assert!(s.records.is_empty() && s.app.sent.is_empty(), "argument errors never reach the shared app");
+}
+
+#[test]
+fn ai_design_patch_and_palette_paginate_within_max_result_bytes() {
+    let (homes, _owner, mut ai, mut s) = theme_agents("design-pages");
+    let disk = format!("script_mod! {{ mod.UI = View{{ panel := Label{{text: \"{}\"}} }} }}\n", "雪\\n".repeat(10_300));
+    let _cx = configure_design_share(&mut s, &homes.0, &disk);
+    let items: Vec<_> = (0..500).map(|i| json::obj(vec![("name", json::s(format!("Widget{i}"))),
+        ("group", json::s("Layout")), ("body", json::s("{width: Fill}"))])).collect();
+    s.app.design_source.as_mut().unwrap().palette = Some(json::obj(vec![("palette", json::Value::Arr(items.clone()))]).to_json());
+    let mut collected = Vec::new();
+    loop {
+        let args = format!(r#"{{"offset":{},"limit":500}}"#, collected.len());
+        let page = theme_ok(ai.run_design(&mut s, "palette", &args));
+        assert_eq!(page.get("total"), Some(&json::Value::Int(500)));
+        assert_eq!(page.get("offset"), Some(&json::Value::Int(collected.len() as i64)));
+        let rows = page.get("items").unwrap().as_arr().unwrap();
+        assert!(!rows.is_empty());
+        collected.extend_from_slice(rows);
+        if page.get("next_offset") == Some(&json::Value::Null) { break }
+        assert_eq!(page.get("next_offset"), Some(&json::Value::Int(collected.len() as i64)));
+    }
+    assert_eq!(collected, items);
+    let empty = theme_ok(ai.run_design(&mut s, "palette", r#"{"offset":501}"#));
+    assert!(empty.get("items").unwrap().as_arr().unwrap().is_empty());
+    assert_eq!(empty.get("next_offset"), Some(&json::Value::Null));
+
+    s.allow(ai.model.me(), true);
+    theme_ok(ai.run_design(&mut s, "rename", r#"{"path":"/panel","name":"message"}"#));
+    let exported = theme_ok(ai.run_design(&mut s, "patch", r#"{"op":"write_patch"}"#));
+    let full = std::fs::read_to_string(exported.get("path").unwrap().as_str().unwrap()).unwrap();
+    assert!(full.len() >= 100 * 1024);
+    let inside = full.find('雪').unwrap() + 1;
+    let args = format!(r#"{{"op":"diff","offset":{inside},"limit":1}}"#);
+    let part = theme_ok(ai.run_design(&mut s, "patch", &args));
+    let start = full.ceil_char_boundary(inside);
+    assert_eq!(part.get("offset"), Some(&json::Value::Int(start as i64)));
+    assert_eq!(part.get("patch"), Some(&json::s(&full[start..start + 1])));
+    assert_eq!(part.get("next_offset"), Some(&json::Value::Int(start as i64 + 1)));
+
+    let mut collected = String::new();
+    loop {
+        let args = format!(r#"{{"op":"diff","offset":{},"limit":32768}}"#, collected.len());
+        let page = theme_ok(ai.run_design(&mut s, "patch", &args));
+        assert_eq!(page.get("offset"), Some(&json::Value::Int(collected.len() as i64)));
+        assert_eq!(page.get("total_bytes"), Some(&json::Value::Int(full.len() as i64)));
+        let part = page.get("patch").unwrap().as_str().unwrap();
+        assert!(!part.is_empty());
+        collected.push_str(part);
+        if page.get("next_offset") == Some(&json::Value::Null) { break }
+        assert_eq!(page.get("next_offset"), Some(&json::Value::Int(collected.len() as i64)));
+    }
+    assert_eq!(collected, full);
+}
+
+#[test]
+fn ai_design_partial_bake_and_failed_ghost_promotion_publish_the_settled_state() {
+    let (homes, _owner, mut ai, mut s) = theme_agents("design-settlement");
+    let _cx = configure_design_share(&mut s, &homes.0, "script_mod! { mod.UI = View{ panel := View{} } }");
+    s.allow(ai.model.me(), true);
+    s.list();
+    s.host.send(set("unrepresentable value"));
+    s.one();
+    s.app.props = ROWS.replace("padding", "width");
+    s.list();
+    s.host.send(Request::Set { path: PATH.into(), prop: "width".into(), value: "24".into() });
+    s.one();
+    let result = theme_ok(ai.run_design(&mut s, "bake", r#"{"scope":"props","path":"ui.panel"}"#));
+    let skipped = json::Value::Arr(vec![json::Value::Arr(vec![json::s(PATH), json::s("padding")])]);
+    assert_eq!(result.get("baked"), Some(&json::Value::Bool(true)));
+    assert_eq!(result.get("skipped"), Some(&skipped), "the AI keeps the partial-bake report until the signed mutation");
+    assert_eq!(result.get("dirty_files"), Some(&json::Value::Int(1)));
+    assert!(result.get("seq").is_some());
+    let retry = theme_ok(ai.run_design(&mut s, "bake", r#"{"scope":"props"}"#));
+    assert_eq!(retry.get("baked"), Some(&json::Value::Bool(false)));
+    assert_eq!(retry.get("skipped"), Some(&skipped));
+
+    s.ana.send(Request::Design(drag_into("/panel")));
+    settle_design(&mut s);
+    assert!(s.ana.session.view.design.ghost.is_some());
+    let req = s.ana.send(Request::Design(DesignRequest::GhostCommit));
+    s.exchange();
+    s.host.session.drive_app(&mut s.app);
+    assert!(s.host.session.next_record().is_some(), "ghost promotion is awaiting its signed append");
+    s.host.session.link_ended(LINK, "app closed");
+    s.exchange();
+    assert!(s.ana.session.view.design.ghost.is_some(), "link loss retains the preview awaiting its append");
+    s.ana.session.view.updates.clear();
+    s.host.session.record_failed("append refused");
+    settle_design(&mut s);
+    assert!(has(&s.ana, req, |n| matches!(n, Notice::Refused(why) if why == "append refused")));
+    assert!(has(&s.ana, 0, |n| matches!(n, Notice::Design(DesignNotice::Status(raw))
+        if design::DesignStateView::read(raw).is_some_and(|v| v.ghost.is_none()))));
+    assert!(s.ana.session.view.design.ghost.is_none(), "the owner publishes the cleared ghost to the guest");
+}
+
+#[test]
+fn ai_design_tools_never_open_panel_or_switch_tab() {
+    use makepad_widgets::*;
+    let (homes, mut owner, _guest, mut s) = theme_agents("design-panel");
+    let _cx = configure_design_share(&mut s, &homes.0, "script_mod! { mod.UI = View{ panel := View{ row := View{} } } }");
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let ui = cx.with_vm(|vm| {
+        let v = vm.eval(script! { use mod.widgets.* View { tweak_panel := AppTweakPanel { visible: false } } });
+        WidgetRef::script_from_value(vm, v)
+    });
+    let root = ui.widget(cx, ids!(tweak_panel));
+    let item = s.host.session.item;
+    let mut hub = Tweaks::default();
+    hub.set_themes_dir(owner.dir.clone());
+    hub.sessions.push(s.host.session);
+    hub.update(cx, &ui, &owner.model, &Default::default(), &mut owner.waits, |_| {});
+    for (tab, wrap) in [(None, ids!(tweak_props_wrap)), (Some(ids!(tab_theme)), ids!(tweak_theme_wrap)),
+        (Some(ids!(tab_shader)), ids!(tweak_shader_wrap))] {
+        if let Some(tab) = tab {
+            assert!(hub.open_panel(SHARE));
+            hub.update(cx, &ui, &owner.model, &Default::default(), &mut owner.waits, |_| {});
+            let button = root.widget(cx, tab).widget_uid();
+            let actions = cx.capture_actions(|cx| cx.widget_action(button, ButtonAction::Clicked(Default::default())));
+            hub.actions(cx, &ui, &actions);
+        }
+        let current = root.widget(cx, wrap);
+        for (op, args) in [
+            ("state", "{}"), ("palette", "{}"),
+            ("insert", r#"{"path":"/panel","place":"inside","ty":"View","name":"card"}"#),
+            ("move", r#"{"path":"/panel/card","direction":"up"}"#),
+            ("duplicate", r#"{"path":"/panel/card","name":"copy"}"#),
+            ("wrap", r#"{"path":"/panel/copy","name":"group_box","ty":"View"}"#),
+            ("rename", r#"{"path":"/panel/card","name":"tile"}"#),
+            ("delete", r#"{"path":"/panel/tile"}"#),
+            ("bake", r#"{"scope":"props"}"#), ("patch", r#"{"op":"diff"}"#), ("history", r#"{"op":"reset"}"#),
+        ] {
+            let call = owner.design_call(item, op, args);
+            assert!(hub.tool(cx, &ui, &mut owner.model, &call, &mut owner.waits).unwrap().0.is_none());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut result = None;
+            while result.is_none() {
+                assert!(std::time::Instant::now() < deadline, "{op} did not settle");
+                let session = &mut hub.sessions[0];
+                session.drive_app(&mut s.app);
+                s.app.answer(session);
+                hub.record(&mut owner.model);
+                hub.update(cx, &ui, &owner.model, &Default::default(), &mut owner.waits, |r| result = Some(r));
+                assert_eq!(root.visible(), tab.is_some(), "{op} changed panel visibility");
+                assert!(current.visible(), "{op} changed the person's tab");
+                std::thread::yield_now();
+            }
+            theme_ok(result.unwrap());
+            assert!(hub.sessions[0].view.selections.is_empty(), "{op} changed the person's selection");
+        }
+    }
+}
+
+#[test]
+fn ai_design_mutating_tools_respect_allow_and_stop() {
+    use makepad_ai_services::wire::ToolOutcome;
+    use makepad_town_core::{entity::field, event::Value};
+    let (homes, mut owner, mut ai, mut s) = theme_agents("design-consent");
+    let _cx = configure_design_share(&mut s, &homes.0, "script_mod! { mod.UI = View{ panel := View{} } }");
+    let insert = r#"{"path":"/panel","place":"inside","ty":"View","name":"card"}"#;
+    let denied = ai.run_design(&mut s, "insert", insert);
+    assert_eq!(denied.outcome, ToolOutcome::Refused);
+    assert!(denied.text.contains("allow editing") && s.app.sent.is_empty() && s.records.is_empty());
+    let seat = ai.model.me();
+    s.allow(seat, true);
+    theme_ok(ai.run_design(&mut s, "insert", insert));
+    let [edit] = s.records.as_slice() else { panic!("one signed structural edit expected") };
+    assert_eq!((edit.seat, edit.agent), (seat, Some(ai.agent)));
+    let town = s.host.session.town;
+    let saved = owner.model.act(Action::RecordAppEdit { town, item: s.host.session.item, edit: edit.clone() }, Origin::Ui).unwrap();
+    crate::model::tests::exchange(&mut owner.model, &mut ai.model);
+    assert_eq!(ai.model.tweak_board_state(town).unwrap().0.entities[&saved].value(field::EDIT_AGENT), Some(&Value::Id(ai.agent)));
+
+    let before = s.app.design_source.as_ref().unwrap().text().to_owned();
+    for stop in [true, false] {
+        let pending = r#"{"path":"/panel","place":"inside","ty":"View","name":"pending"}"#;
+        assert!(ai.start_design(&mut s.ana, "insert", pending).is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.app.design_source.as_ref().unwrap().text().contains("pending :=") {
+            assert!(std::time::Instant::now() < deadline, "the accepted insert must reach preview");
+            s.one();
+            std::thread::yield_now();
+        }
+        assert!(ai.notices(&mut s.ana, |_, _, _, _, _, _| {}).is_none(), "Running cannot complete the pending edit");
+        if stop { s.host.session.stop_agent(seat, ai.agent, true).unwrap(); } else { s.host.session.end("share ended"); }
+        settle_design(&mut s);
+        let refused = ai.notices(&mut s.ana, |_, _, _, _, _, _| {}).expect("cancellation settles the held AI call");
+        assert_eq!(refused.outcome, ToolOutcome::Refused);
+        assert!(refused.text.contains(if stop { "stopped" } else { "share ended" }), "{}", refused.text);
+        assert_eq!(s.app.design_source.as_ref().unwrap().text(), before, "cancellation restores the preceding preview");
+        assert_eq!(s.records.len(), 1, "a cancelled insert leaves no signed edit");
+        if stop { s.host.session.stop_agent(seat, ai.agent, false).unwrap(); s.exchange(); }
+    }
+}
+
+#[test]
+fn tree_drop_zone_computes_before_inside_after_and_blocks_descendant() {
+    use tree::{drop_zone, DropIndicator::*};
+    for ty in ["View", "Grid", "Masonry", "KeyboardView"] {
+        for (y, expected) in [(0., Before), (24., Before), (25., Inside), (74., Inside), (75., After), (100., After)] {
+            assert_eq!(drop_zone("a", "b", ty, y, 100.), Some(expected), "{ty} at {y}%");
+        }
+    }
+    for ty in ["Button", "Window", "Dock", "Modal", "Splitter", "PageFlip"] {
+        assert_eq!(drop_zone("a", "b", ty, 49., 100.), Some(Before), "{ty} upper half");
+        assert_eq!(drop_zone("a", "b", ty, 50., 100.), Some(After), "{ty} lower half");
+    }
+    for (source, target) in [("a.b", "a.b.c"), ("/dock", "/dock/card"), ("/dock", "/dock"), ("/", "/dock")] {
+        assert_eq!(drop_zone(source, target, "View", 5., 10.), None, "{source} onto {target}");
+    }
+    assert_eq!(drop_zone("/dock/View", "/dock/View.2", "View", 5., 10.), Some(Inside));
+    for (source, target) in [("", "/dock"), ("", ""), ("/dock", ""), ("/", "dock")] {
+        assert!(!tree::is_self_or_descendant(source, target), "{source:?} is not an ancestor of {target:?}");
+    }
+    for (y, height, expected) in [(-0.001, 100., Some(Before)), (100.001, 100., Some(After)),
+        (f64::NAN, 100., None), (1., 0., None), (1., f64::INFINITY, None)] {
+        assert_eq!(drop_zone("a", "b", "View", y, height), expected, "row geometry {y}/{height}");
+    }
+}
+
+fn tree_drop_uniform(cx: &Cx, face: &makepad_widgets::View) -> f32 {
+    use makepad_widgets::*;
+    let vars = &face.draw_bg.draw_vars;
+    let inputs = &cx.draw_shaders[vars.draw_shader_id.unwrap().index].mapping.dyn_instances;
+    let drop = inputs.inputs.iter().find(|i| i.id == id!(drop_mode)).expect("Tree row has drop_mode");
+    vars.dyn_instances[vars.dyn_instances.len() - inputs.total_slots + drop.offset]
+}
+
+#[test]
+fn design_drag_overlay_and_tree_read_theme_tokens() {
+    use crate::{board::canvas::BoardCanvas, call::SharePanel};
+    use makepad_widgets::*;
+
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.init_cx_os();
+    cx.with_vm(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::script_mod(vm);
+    });
+
+    let check = |cx: &mut Cx, theme_id: LiveId| {
+        let (share, board, portal, colors) = cx.with_vm(|vm| {
+            let value = script_eval!(vm, { mod.widgets.SharePanel{} });
+            let share = SharePanel::script_from_value(vm, value);
+            let value = script_eval!(vm, { mod.widgets.BoardCanvas{} });
+            let board = BoardCanvas::script_from_value(vm, value);
+            let row = View::script_proto(vm);
+            let value = super::tree::view::tree_list_value(vm, row);
+            let portal = WidgetRef::script_from_value(vm, value);
+            let themes = vm.module(id!(themes));
+            let theme = vm.value(themes, theme_id).as_object().unwrap();
+            let colors = [id!(color_primary), id!(color_on_primary), id!(color_drag_target_preview)].map(|role| {
+                let value = vm.value(theme, role);
+                Vec4f::script_from_value(vm, value)
+            });
+            (share, board, portal, colors)
+        });
+        for ghost in [share.ghost_ink(), board.design_ghost()] {
+            assert_eq!([ghost.color, ghost.on_color, ghost.veil_color], colors, "{theme_id} ghost inks");
+            assert!(crate::theme::wcag_contrast(ghost.color, ghost.on_color) >= 4.5, "{theme_id} ghost label contrast");
+        }
+        let row = portal.as_portal_list().borrow_mut().unwrap().item(cx, 0, id!(TreeRow));
+        let face = row.view(cx, ids!(tree_face));
+        let face = face.borrow().unwrap();
+        let vars = &face.draw_bg.draw_vars;
+        for (role, color) in [(id!(drop_line), colors[0]), (id!(drop_veil), colors[2])] {
+            assert_eq!(vars.uniform_range(cx, role).map(|(_, slots)| slots), Some(4), "{role} uniform");
+            let mut rgba = [0.; 4];
+            vars.get_uniform(cx, role, &mut rgba);
+            assert_eq!(rgba, [color.x, color.y, color.z, color.w], "{theme_id} tree {role}");
+        }
+        colors
+    };
+    let dark = check(&mut cx, id!(dark));
+    cx.with_vm(|vm| vm.with_reload(|vm| {
+        script_eval!(vm, {
+            mod.theme = mod.themes.light
+            mod.prelude.workspace.theme = mod.theme
+            mod.theme.color_drag_target_preview = #x30609080
+        });
+        crate::board::canvas::script_mod(vm);
+        crate::call::script_mod(vm);
+    }));
+    let light = check(&mut cx, id!(light));
+    for (dark, light) in dark.into_iter().zip(light) {
+        assert_ne!(dark, light, "each tested role must change on reload");
+    }
+}
+
+#[test]
+fn tree_row_bind_resets_drop_uniform_on_reuse() {
+    use makepad_widgets::*;
+    use super::tree::{DropIndicator, TreeLine};
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let portal = cx.with_vm(|vm| {
+        let row = View::script_proto(vm);
+        let value = super::tree::view::tree_list_value(vm, row);
+        WidgetRef::script_from_value(vm, value)
+    });
+    let row = portal.as_portal_list().borrow_mut().unwrap().item(cx, 0, id!(TreeRow));
+    let line = |drop| TreeLine::Node { path: "node".into(), depth: 0, label: "Node".into(), ty: "View".into(),
+        dim: false, has_children: false, expanded: false, selected: false, even: false, seats: vec![], drop };
+    let face = row.view(cx, ids!(tree_face));
+    for (drop, expected) in [(Some(DropIndicator::Before), 1.), (None, 0.)] {
+        line(drop).draw_tree(cx, &row.borrow::<View>().unwrap(), true);
+        assert_eq!(tree_drop_uniform(cx, &face.borrow().unwrap()), expected, "same row rebound with {drop:?}");
+    }
+}
+
+#[test]
+fn tree_drop_disabled_while_filter_active() {
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 285} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut draw = draw_panel(cx, root.clone());
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    let mut panel = test_panel();
+    s.app.tree = TREE.replace(r#""path":"/dock","#, r#""path":"","#);
+    let state = Default::default();
+    panel.refresh(cx, &root, &s.host.session, &state, &Default::default());
+    draw(cx);
+    let tab = root.button(cx, ids!(tab_tree));
+    let (_, press, release) = panel_click_at(cx, &root, tab.area().rect(cx).center(), 1.);
+    for batch in [&press, &release] { panel.actions(cx, &root, batch, &mut s.host.session); }
+    s.one();
+    while let Some((seat, req, agent, notice)) = s.host.session.view.updates.pop_front() {
+        panel.notice(cx, &root, &mut s.host.session, seat, req, agent, &state, &notice);
+    }
+    draw(cx);
+    let widget = root.widget(cx, ids!(tweak_tree));
+    let portal = root.portal_list(cx, ids!(tweak_tree_list));
+    let face = portal.get_item(0).unwrap().1.view(cx, ids!(tree_face));
+    let rect = face.area().rect(cx);
+    let abs = rect.center();
+    let window_id = makepad_widgets::WindowId(1, 1);
+    widget.handle_event(cx, &Event::Drag(DragEvent {
+        abs, window_id, modifiers: Default::default(), handled: Default::default(), response: std::sync::Arc::new(std::sync::Mutex::new(DragResponse::None)),
+        items: std::sync::Arc::new(vec![DragItem::String { value: "/other".into(), internal_id: Some(live_id!(town_design_node)) }]),
+    }), &mut Scope::empty());
+    draw(cx);
+    assert_eq!(tree_drop_uniform(cx, &face.borrow().unwrap()), 3., "unfiltered container shows Inside");
+    widget.handle_event(cx, &Event::MouseDown(MouseDownEvent { abs, window_id, button: MouseButton::PRIMARY,
+        time: 2., modifiers: Default::default(), handled: Default::default() }), &mut Scope::empty());
+    let mut tree = super::tree::TreeState::default();
+    tree.offer_search("card".into());
+    widget.borrow_mut::<panel::TweakList>().unwrap().configure_tree_drag(cx, true, &tree);
+    draw(cx);
+    assert_eq!(tree_drop_uniform(cx, &face.borrow().unwrap()), 0., "filter clears the pending indicator");
+    widget.handle_event(cx, &Event::MouseMove(MouseMoveEvent { abs: abs + dvec2(8., 0.), window_id,
+        time: 2.1, modifiers: Default::default(), handled: Default::default(), lock_delta: DVec2::default() }), &mut Scope::empty());
+    assert!(cx.drag_visual().is_none(), "filter cancels a press before crossing the drag threshold");
+}
+
+fn palette_picture(drop: bool, x: f64) -> design::drag::DesignPictureEvent {
+    use makepad_widgets::*;
+    use super::design::drag::DesignPictureEvent;
+    let items = std::sync::Arc::new(vec![DragItem::String { value: "Button".into(), internal_id: Some(live_id!(town_design_palette)) }]);
+    let point = dvec2(x, 12.);
+    if drop { DesignPictureEvent::Drop { item: ITEM, window: 0, point, items } }
+    else { DesignPictureEvent::Hover { item: ITEM, window: 0, point, items } }
+}
+
+fn sent_drag_packets(s: &mut Copies) -> Vec<(RequestId, DesignRequest)> {
+    s.ana.poll();
+    s.host.relay.take(TWEAK).into_iter().filter_map(|(sender, b)| {
+        let p = wire::decode(sender, &b).unwrap().unwrap();
+        if let Body::Request(Request::Design(r)) = p.body { Some((p.req, r)) } else { None }
+    }).collect()
+}
+
+fn drop_reply() -> Notice {
+    Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::DropTarget, json:
+        r#"{"target_path":"/host","container_path":"/host","place":"inside","flow":"col","target_rect":[0,0,40,30],"container_rect":[0,0,40,30]}"#.into() })
+}
+
+#[test]
+fn canvas_drag_fast_drop_before_dwell_commits_directly() {
+    use makepad_widgets::{TimerEvent, Timer};
+    let cx = &mut Cx::new(Box::new(|_,_| {}));
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    let mut drag = design::drag::DragController::default();
+    for pending in [false, true] {
+        drag.picture(cx, &mut s.ana.session, &palette_picture(false, 10.));
+        let packets = sent_drag_packets(&mut s);
+        let [(req, DesignRequest::DropTarget { exclude: None, .. })] = packets.as_slice() else { panic!("expected one palette hit query: {packets:?}") };
+        let mut timer = Timer::empty();
+        if !pending {
+            assert!(drag.notice(cx, &mut s.ana.session, *req, &drop_reply()));
+            timer = drag.timer(SHARE);
+            assert_ne!(timer.0, 0);
+        }
+        drag.picture(cx, &mut s.ana.session, &palette_picture(true, 10.));
+        drag.event(cx, &mut s.ana.session, &Event::DragEnd);
+        if pending {
+            assert!(sent_drag_packets(&mut s).is_empty(), "drop waits for its unresolved hit");
+            assert!(drag.notice(cx, &mut s.ana.session, *req, &drop_reply()));
+        }
+        drag.event(cx, &mut s.ana.session, &Event::Timer(TimerEvent { timer_id: timer.0, time: None }));
+        assert!(matches!(sent_drag_packets(&mut s).as_slice(), [(_, DesignRequest::Insert { path, place: DesignPlace::Inside, ty, .. })]
+            if path == "/host" && ty == "Button"), "drop commits once without a late ghost, pending={pending}");
+    }
+    // Two releases can both precede the first peer reply. Resolve them in order.
+    drag.picture(cx, &mut s.ana.session, &palette_picture(true, 10.));
+    drag.event(cx, &mut s.ana.session, &Event::DragEnd);
+    drag.picture(cx, &mut s.ana.session, &palette_picture(true, 20.));
+    drag.event(cx, &mut s.ana.session, &Event::DragEnd);
+    let queries = sent_drag_packets(&mut s);
+    let [(first, DesignRequest::DropTarget { x: 10., .. })] = queries.as_slice() else { panic!("first drop owns the query slot") };
+    drag.notice(cx, &mut s.ana.session, *first, &drop_reply());
+    let packets = sent_drag_packets(&mut s);
+    let [(_, DesignRequest::Insert { .. }), (second, DesignRequest::DropTarget { x: 20., .. })] = packets.as_slice()
+        else { panic!("release the first edit before querying the second drop: {packets:?}") };
+    drag.notice(cx, &mut s.ana.session, *second, &drop_reply());
+    assert!(matches!(sent_drag_packets(&mut s).as_slice(), [(_, DesignRequest::Insert { .. })]));
+}
+
+#[test]
+fn canvas_drag_dwell_then_cancel_retracts_ghost() {
+    use makepad_widgets::{TimerEvent, KeyEvent, KeyCode};
+    let cx = &mut Cx::new(Box::new(|_,_| {}));
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    let mut drag = design::drag::DragController::default();
+    drag.picture(cx, &mut s.ana.session, &palette_picture(false, 10.));
+    drag.picture(cx, &mut s.ana.session, &palette_picture(false, 13.));
+    let packets = sent_drag_packets(&mut s);
+    let [(req, DesignRequest::DropTarget { x: 10., .. })] = packets.as_slice() else { panic!("one in-flight pointer query: {packets:?}") };
+    drag.notice(cx, &mut s.ana.session, *req, &drop_reply());
+    let timer = drag.timer(SHARE);
+    let packets = sent_drag_packets(&mut s);
+    let [(req, DesignRequest::DropTarget { x: 13., .. })] = packets.as_slice() else { panic!("coalesced latest pointer: {packets:?}") };
+    drag.notice(cx, &mut s.ana.session, *req, &drop_reply());
+    assert_eq!(drag.timer(SHARE).0, timer.0, "motion over the same placement preserves dwell");
+    let tick = Event::Timer(TimerEvent { timer_id: timer.0, time: None });
+    drag.event(cx, &mut s.ana.session, &tick);
+    let packets = sent_drag_packets(&mut s);
+    let [(req, DesignRequest::GhostInsert { target, .. })] = packets.as_slice() else { panic!("dwell starts exactly one preview: {packets:?}") };
+    assert_eq!(target, "/host");
+    drag.event(cx, &mut s.ana.session, &Event::KeyDown(KeyEvent { key_code: KeyCode::Escape, ..Default::default() }));
+    assert!(drag.caret(SHARE).is_none() && sent_drag_packets(&mut s).is_empty(), "local hint clears while provisional operation settles");
+    drag.notice(cx, &mut s.ana.session, *req, &Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, json: "{}".into() }));
+    drag.event(cx, &mut s.ana.session, &tick);
+    let packets = sent_drag_packets(&mut s);
+    let [(cancel, DesignRequest::GhostCancel)] = packets.as_slice() else { panic!("late preview must be retracted exactly once: {packets:?}") };
+    let state = Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, json: "{}".into() });
+    drag.notice(cx, &mut s.ana.session, *cancel, &state);
+
+    for retracted in [true, false] {
+        drag.picture(cx, &mut s.ana.session, &palette_picture(false, 10.));
+        let query = sent_drag_packets(&mut s)[0].0;
+        drag.notice(cx, &mut s.ana.session, query, &drop_reply());
+        let tick = Event::Timer(TimerEvent { timer_id: drag.timer(SHARE).0, time: None });
+        drag.event(cx, &mut s.ana.session, &tick);
+        let packets = sent_drag_packets(&mut s);
+        let [(preview, DesignRequest::GhostInsert { .. })] = packets.as_slice() else { panic!("expected a preview") };
+        drag.notice(cx, &mut s.ana.session, *preview, &state);
+        if retracted { drag.sync_status(&s.ana.session); }
+        drag.picture(cx, &mut s.ana.session, &palette_picture(true, 10.));
+        let packets = sent_drag_packets(&mut s);
+        if retracted {
+            assert!(matches!(packets.as_slice(), [(_, DesignRequest::Insert { .. })]), "owner already retracted the preview");
+        } else {
+            assert!(matches!(packets.as_slice(), [(_, DesignRequest::GhostCommit)]), "an acknowledged preview commits in place");
+        }
+    }
+}
+
+#[test]
+fn live_resize_refreshes_selection_ring_and_handles_before_release() {
+    use super::{design::drag::DesignPictureEvent, overlay::{ResizePhase, ResizePress, Selections, SizeHandle, size_handle_rects}};
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 285} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_peer_level(ANA, Some(DESIGN_LEVEL));
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    s.host.session.bind_window(super::WindowId(0));
+    s.host.session.window(super::WindowId(0), [420., 220.]);
+    s.allow(ANA, true);
+    s.app.props = r##"{"props":[{"name":"width","value":"66","set":true},{"name":"draw_bg.color","value":"#fff","set":true}],"cascade":[]}"##.into();
+    s.app.prop_values = [("width".into(), "66".into()), ("draw_bg.color".into(), "#fff".into())].into();
+    s.list();
+    let original = super::Rect { window: 0, x: 354., y: 0., w: 66., h: 28. };
+    let grown = super::Rect { x: 324., w: 96., ..original };
+    s.app.picks.push_back(Ok(format!(r#"{{"window":0,"rect":[354,0,66,28],"path":"{PATH}","type":"Button"}}"#)));
+    s.host.send(Request::Pick(At::Path(PATH.into())));
+    s.one();
+    s.ana.send(Request::Select(Some(PATH.into())));
+    s.exchange();
+    let state = Default::default();
+    let mut panel = test_panel();
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    s.ana.session.view.updates.clear();
+    panel.restore_selection(cx, &root, &mut s.ana.session);
+    assert_eq!(panel.sidebar_rect(), Some(original));
+    let tab = root.button(cx, ids!(tab_build));
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab.widget_uid(), ButtonAction::Clicked(Default::default())));
+    panel.actions(cx, &root, &actions, &mut s.ana.session);
+    assert!(panel.is_build_mode(SHARE, ITEM));
+    sent_drag_packets(&mut s); // Drain the queries from restoring the panel and opening Build.
+
+    let selections = |view: &SeatView| Selections::new(0, [420., 220.], view, &state)
+        .with_design(SHARE, view, &ANA, true, true, None);
+    let rings = selections(&s.ana.session.view);
+    let tf = rings.transform(makepad_widgets::Rect { pos: dvec2(0., 0.), size: dvec2(420., 220.) });
+    let [(right, handle), (_, bottom), _] = size_handle_rects(&tf, original);
+    assert_eq!(right, SizeHandle::Right);
+    let start = handle.center();
+    let mut press = ResizePress::begin(ITEM, tf, &rings, event::DigitId(live_id!(test_mouse)), start).unwrap();
+    let drag = |cx: &mut Cx, press: &mut ResizePress, dx| {
+        let actions = cx.capture_actions(|cx| press.update(cx, tab.widget_uid(), start + dvec2(dx, 0.), ResizePhase::Drag));
+        let action = actions[0].as_widget_action().unwrap();
+        let Some(DesignPictureEvent::Resize { resize, .. }) = action.action.downcast_ref() else { panic!("expected resize") };
+        resize.clone()
+    };
+    let revisions = [s.host.session.view.selection_revision, s.ana.session.view.selection_revision];
+    s.app.typed_rects.push_back(grown);
+    let resize = drag(cx, &mut press, 30.);
+    panel.resize_widget(cx, &root, &mut s.ana.session, &resize);
+    s.one();
+    for (view, revision) in [&s.host.session.view, &s.ana.session.view].into_iter().zip(revisions) {
+        for seat in [OWNER, ANA] { assert_eq!(view.selections[&seat].rect, Some(grown)); }
+        assert!(view.selection_revision > revision, "the edit invalidates both seats' overlays before release");
+    }
+    let rings = selections(&s.ana.session.view);
+    assert_eq!(rings.local_selection, Some((PATH.into(), grown)));
+    let tf = rings.transform(makepad_widgets::Rect { pos: dvec2(0., 0.), size: dvec2(420., 220.) });
+    let [(_, new_right), (_, new_bottom), (_, corner)] = size_handle_rects(&tf, rings.local_selection.unwrap().1);
+    assert_eq!(new_right, handle, "the right edge is anchored");
+    assert_eq!(new_bottom.center(), bottom.center() - dvec2(15., 0.));
+    assert_eq!(corner.center(), dvec2(handle.center().x, new_bottom.center().y), "the corner follows both edges");
+    while let Some((seat, req, agent, notice)) = s.ana.session.view.updates.pop_front() {
+        panel.notice(cx, &root, &mut s.ana.session, seat, req, agent, &state, &notice);
+    }
+    assert_eq!(panel.sidebar_rect(), Some(grown));
+    assert!(root.label(cx, ids!(tweak_result)).text().ends_with(&format!(" set {PATH}.width to 96")));
+    s.ana.poll();
+    assert!(s.host.relay.take(TWEAK).into_iter().all(|(sender, body)| {
+        !matches!(wire::decode(sender, &body).unwrap().unwrap().body, Body::Request(Request::Props { .. } | Request::Pick(_)))
+    }), "geometry refresh after restoring a selection must not read props or re-pick");
+    assert_eq!(drag(cx, &mut press, 35.).width, Some(101.), "the second step uses the width at finger down");
+
+    let revisions = [s.host.session.view.selection_revision, s.ana.session.view.selection_revision];
+    s.host.session.view.updates.clear();
+    s.app.typed_rects.push_back(grown);
+    s.ana.send(Request::Set { path: PATH.into(), prop: "draw_bg.color".into(), value: "#f00".into() });
+    s.one();
+    assert_eq!(s.app.prop_values["draw_bg.color"], "#f00");
+    for (view, revision) in [&s.host.session.view, &s.ana.session.view].into_iter().zip(revisions) {
+        assert_eq!(view.selection_revision, revision);
+        assert!(!view.updates.iter().any(|(_, _, _, n)| matches!(n, Notice::Selected { .. })));
+    }
+}
+
+#[test]
+fn size_handle_drag_updates_live_walk_under_zoom() {
+    use super::{design::drag::DesignPictureEvent, focus::FocusState, overlay::{ResizePhase, ResizePress, Selections, SizeHandle}};
+    use makepad_widgets::*;
+    let mut pool = panel_test_cx();
+    let cx = &mut *pool;
+    let root = cx.with_vm(|vm| {
+        let value = vm.eval(script! { use mod.widgets.* AppTweakPanel{width: 285} });
+        WidgetRef::script_from_value(vm, value)
+    });
+    let mut s = Copies::new(OWNER, ANA, ITEM);
+    s.host.session.set_peer_level(ANA, Some(DESIGN_LEVEL));
+    s.ana.session.set_peer_level(OWNER, Some(DESIGN_LEVEL));
+    s.app.props = r#"{"props":[{"name":"width","value":"40","set":true},{"name":"height","value":"20","set":true}],"cascade":[]}"#.into();
+    s.app.prop_values = [("width".into(),"40".into()), ("height".into(),"20".into())].into();
+    s.allow(ANA, true);
+    s.list();
+    let mut panel = test_panel();
+    let state = Default::default();
+    panel.refresh(cx, &root, &s.ana.session, &state, &Default::default());
+    let rect = super::Rect { window: 0, x: 50., y: 30., w: 40., h: 20. };
+    panel.notice(cx, &root, &mut s.ana.session, ANA, 1, None, &state, &Notice::Picked { path: PATH.into(), ty: "View".into(), rect });
+    let tab = root.button(cx, ids!(tab_build));
+    let actions = cx.capture_actions(|cx| cx.widget_action(tab.widget_uid(), ButtonAction::Clicked(Default::default())));
+    panel.actions(cx, &root, &actions, &mut s.ana.session);
+    assert!(panel.is_build_mode(SHARE, ITEM), "the local seat opened Build");
+    sent_drag_packets(&mut s); // Discard the tab's read-only palette and property queries.
+
+    let mut focus = FocusState::default();
+    focus.toggle_isolate(Some((PATH, Some(rect))));
+    focus.step_zoom(1.);
+    let mut view = SeatView::default();
+    view.selections.insert(ANA, Selection { path: PATH.into(), rect: Some(rect), agent: None });
+    let rings = Selections::new(0, [200., 100.], &view, &state).with_focus(focus)
+        .with_design(SHARE, &view, &ANA, true, true, None);
+    let tf = rings.transform(makepad_widgets::Rect { pos: dvec2(15., 8.), size: dvec2(200., 100.) });
+    let start = tf.app_to_screen(dvec2(90., 40.));
+    assert_eq!(super::overlay::hit_size_handle(&tf, &rings, start), Some(SizeHandle::Right));
+    let corner = |delta| super::overlay::resize_from_drag(&tf, rect, SizeHandle::Corner, start, start + delta);
+    assert_eq!(corner(dvec2(21.4, -3.4)), (Some(51.), Some(18.)), "round each app-space dimension");
+    assert_eq!(corner(dvec2(-100., -60.)), (Some(1.), Some(1.)), "both dimensions retain one point");
+    let uid = tab.widget_uid();
+    let mut press = ResizePress::begin(ITEM, tf, &rings, event::DigitId(live_id!(test_mouse)), start).unwrap();
+    for (phase, dx, count) in [(ResizePhase::Drag, 21.4, 1), (ResizePhase::Drag, 21.2, 0), (ResizePhase::Release, 100.4, 1)] {
+        let actions = cx.capture_actions(|cx| press.update(cx, uid, start + dvec2(dx, 0.), phase));
+        assert_eq!(actions.len(), count, "sub-point jitter within the same width emits no action: {dx}");
+        if actions.is_empty() { continue }
+        let action = actions[0].as_widget_action().unwrap();
+        let Some(DesignPictureEvent::Resize { resize, .. }) = action.action.downcast_ref() else { panic!("expected resize") };
+        panel.resize_widget(cx, &root, &mut s.ana.session, resize);
+    }
+    let dispatch = |cx: &mut Cx, panel: &mut panel::Panel, s: &mut Copies| {
+        while let Some((seat, req, agent, notice)) = s.ana.session.view.updates.pop_front() {
+            if matches!(notice, Notice::Applied { .. } | Notice::Refused(_)) {
+                panel.notice(cx, &root, &mut s.ana.session, seat, req, agent, &state, &notice);
+            }
+        }
+    };
+    s.one();
+    assert_eq!(s.app.prop_values["width"], "51", "21.4 screen points at 2× add 11 whole app points");
+    dispatch(cx, &mut panel, &mut s);
+    s.one();
+    assert_eq!(s.app.prop_values["width"], "90", "release outside the picture uses the original rect and inverse transform");
+    assert_eq!(s.app.prop_values["height"], "20", "Right touches only width");
+    assert!(sent_drag_packets(&mut s).is_empty(), "bake waits for the last width acknowledgement");
+    dispatch(cx, &mut panel, &mut s);
+    s.ana.poll();
+    let requests: Vec<_> = s.host.relay.take(TWEAK).into_iter().filter_map(|(sender, body)| {
+        match wire::decode(sender, &body).unwrap().unwrap().body { Body::Request(r) => Some(r), _ => None }
+    }).collect();
+    assert_eq!(requests.iter().filter(|r| matches!(r, Request::Design(DesignRequest::Bake { scope: BakeScope::Props, path: Some(p), prop: None }) if p == PATH)).count(), 1);
+    assert!(requests.contains(&Request::Pick(At::Path(PATH.into()))), "settled geometry is picked again");
 }

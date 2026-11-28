@@ -9,6 +9,8 @@
 
 #[path = "common/wait.rs"]
 mod idle_wait;
+#[path = "common/part_editor.rs"]
+mod part_editor;
 use idle_wait::wait_poll;
 use makepad_script::syntax::{self, Node};
 use makepad_strict_json::Value;
@@ -116,7 +118,7 @@ object(block)
 
     // ---- the tree lists the program; picking a feature selects it ----
     // Design is the workspace the app opens in.
-    show_tab(&app, "Features");
+    show_tab(&app, "Parts");
     let row = Selector::role(Role::ListItem).name("base Box block level 1");
     app.locator(row.clone()).wait_visible().select();
     wait_name(&app, "1 feature");
@@ -132,8 +134,8 @@ object(block)
     assert_eq!(built.field("can_undo").and_then(|f| f.value.ident()), Some("true"), "a typed edit commits an undo step");
 
     // ---- the Add menu inserts a ready solid (sketch + extrude) as one step ----
-    show_tab(&app, "Features");
-    app.locator(Selector::role(Role::Button).name("Add feature")).wait_visible().press();
+    app.locator(Selector::role(Role::Button).name("Modify")).wait_visible().press();
+    app.locator(Selector::role(Role::MenuItem).name("Add feature")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("From a sketch")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Extrude")).wait_visible().press();
     let extruded = |v: &Node| script(v).field("solids").and_then(|f| f.value.items()).expect("the solids").iter().any(|s| s.field("type").and_then(|f| f.value.name()) == Some("Extrude"));
@@ -209,7 +211,7 @@ object(bracket)
     assert!(reply.contains("solid: \"block/bracket\""), "{reply}");
 
     // ---- the strip lists the selected part's steps, named as a person says them ----
-    show_tab(&app, "Features");
+    show_tab(&app, "Parts");
     let root = wait_poll(&app, || {
         app.widget_snapshot().nodes().into_iter().find(|w| w.visible() && w.node.role == Role::ListItem && w.node.name.starts_with("base ") && w.node.name.ends_with("bracket level 1")).map(|w| w.node.name.clone()).ok_or("no feature row for the bracket".to_string())
     });
@@ -244,6 +246,7 @@ object(bracket)
     wait_name(&app, "Showing step 2 of 3");
     let before = head_of(&text(&call(&app, "inspect", r#"{"program":false}"#).expect("inspect")));
     app.press_key(KeyCode::ReturnKey);
+    part_editor::open(&app);
     wait_name(&app, "Editing step 2 of 3: Round 2 mm · Esc: done");
     let radius = Selector::role(Role::SpinButton).name("Radius");
     let controls = app.widget_snapshot().nodes();
@@ -281,6 +284,7 @@ object(bracket)
     wait_name(&app, "Showing step 2 of 3");
     app.locator(Selector::role(Role::ListItem).name(renamed)).select();
     app.press_key(KeyCode::ReturnKey);
+    part_editor::open(&app);
     wait_name(&app, "Editing step 2 of 3: Round 3 mm");
     let round_radius = Selector::role(Role::SpinButton).name("Round radius");
     let before = head_of(&text(&call(&app, "inspect", "{}").unwrap()));
@@ -331,7 +335,7 @@ fn round_at_a_marked_step_and_undo(app: TestApp) {
     let reply = text(&call(&app, "script", &batch).expect("two legs"));
     let committed = head_of(&reply);
     assert_eq!(script(&inspect(&app)).field("source").unwrap().value.string(), Some(source), "the two-leg fixture is the committed script: {reply}");
-    show_tab(&app, "Features");
+    show_tab(&app, "Parts");
     let root = wait_poll(&app, || app.widget_snapshot().nodes().into_iter()
         .find(|w| w.visible() && w.node.role == Role::ListItem && w.node.name.ends_with("bracket level 1"))
         .map(|w| w.node.name).ok_or_else(|| "no root feature for the two legs".to_string()));

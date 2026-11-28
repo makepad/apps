@@ -32,7 +32,7 @@ script_mod! {
         caption_window_gap := View{width: 72 height: 1}
         caption_title := Label{
             width: Fill padding: 0 max_lines: 1 text_overflow: Ellipsis
-            text: "Makepad Town" draw_text +: {color: palette.muted text_style: theme.font_code{font_size: 9}}
+            text: "Makepad Town" draw_text +: {color: palette.muted text_style: theme.font_regular{font_size: 9}}
         }
         recording := View{
             visible: false width: Fit height: Fit flow: Right spacing: 6 align: Align{y: 0.5}

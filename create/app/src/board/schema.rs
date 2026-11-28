@@ -33,7 +33,7 @@ pub struct Field {
 }
 
 #[derive(Clone, Copy)]
-pub enum Literal { Bytes, Reference, Units, Color, Text, Enum, Bool, Anchor, Children }
+pub enum Literal { Bytes, Reference, Units, Int, Color, Text, Enum, Bool, Anchor, Children }
 
 #[derive(Clone)]
 pub enum Source { Register(Key), Writer(Key), DesignPreset, Identity, RootTitle, Body, Children }
@@ -53,6 +53,12 @@ static APP_FIELDS: [Field; 2] = [
     register("sharer", Literal::Bytes, field::SHARER),
 ];
 
+static IMAGE_FIELDS: [Field; 3] = [
+    register("poster", Literal::Reference, field::POSTER),
+    register("media", Literal::Text, field::MEDIA),
+    register("duration", Literal::Int, field::DURATION),
+];
+
 const BOARD: Schema = Schema {
     root: constructor(kind::BOARD, "Board", &[
         Field { name: "title", form: Literal::Text, source: Source::RootTitle }, ITEMS,
@@ -60,7 +66,7 @@ const BOARD: Schema = Schema {
     kinds: &[
         constructor(kind::STICKY, "Sticky", &[]),
         constructor(kind::TEXT_BLOCK, "TextBlock", &[]),
-        constructor(kind::IMAGE, "Image", &[]),
+        constructor(kind::IMAGE, "Image", &IMAGE_FIELDS),
         constructor(kind::FILE, "File", &[]),
         constructor(kind::WEB_LINK, "WebLink", &[]),
         constructor(kind::SHAPE, "Shape", &[]),

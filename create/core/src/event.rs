@@ -345,6 +345,8 @@ pub mod kind {
     pub const SERVICE: u16 = 14;
     /// A person takes back one of their own chat messages.
     pub const RETRACT: u16 = 15;
+    /// Reserved for intake clearance.
+    pub const INTAKE: u16 = 16;
 }
 
 /// Tagged fields: `tag u8 | len u32 | bytes`, in order; a tag may repeat.
@@ -412,6 +414,10 @@ impl Key {
             }
         }
         match (self, value) {
+            (Self::Number(40 | 42..=44), _) => matches!(value, Value::Text(_) | Value::Null),
+            (Self::Number(41), _) => matches!(value, Value::Int(_) | Value::Null),
+            (Self::Number(45..=47), _) => false,
+            (Self::Number(48), _) => matches!(value, Value::Int(_)),
             (Self::Name(name), Value::Literal(src)) => crate::literal::is_identifier(name) && crate::literal::is_literal(src),
             (Self::Name(_), _) | (_, Value::Literal(_)) => false,
             _ => true,
@@ -441,6 +447,7 @@ pub enum Content {
     AgentChat { chat: Chat, agent: ChatAgent },
     AgentAdded { name: String, kind: String },
     AgentRemoved { agent: Id },
+    AgentRenamed { agent: Id, name: String },
     Session(SessionOp),
     Said { session: SessionId, lines: Vec<SaidLine> },
     Provides { services: Vec<Service> },
@@ -449,11 +456,121 @@ pub enum Content {
     Done { job: JobId, text: String },
     Failed { job: JobId, why: Failure },
     Shared { session: SessionId, agent: Id, line: Id },
-    Entity { kind: Key, project: Option<Id>, derive: Option<(Id, CharId)>, fields: Vec<(Key, Value)> },
-    Set { changes: Vec<Change>, label: Option<String> },
+    Entity { kind: Key, project: Option<Id>, derive: Option<(Id, CharId)>, fields: Vec<(Key, Value)>, copied_from: Vec<CopyRef> },
+    Set { changes: Vec<Change>, label: Option<String>, copied_from: Vec<CopyRef> },
     Undo { of: Id },
     Retract { of: Id },
     Text { doc: Id, ops: Vec<TextOp> },
+}
+
+/// Repeated top-level ENTITY/SET tag for copy-by-code provenance.
+pub const TAG_COPIED_FROM: u8 = 47;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CopyRef {
+    /// Implicit for a creation (including a derived task), explicit for a set.
+    pub target_entity: Option<Id>,
+    pub target_field: Key,
+    pub sources: Vec<CopySource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CopySource {
+    Record(Id),
+    /// The source field's authoring event at the time of the copy.
+    EntityField { entity: Id, field: Key, writer: Id },
+    DocLine { doc: Id, events: Vec<Id> },
+    SharePeer { peer: PublicKey },
+}
+
+/// Canonicalize before signing or indexing. The wire codec preserves the signed order.
+pub fn normalize_copy_refs(refs: &mut Vec<CopyRef>) {
+    let mut targets = std::collections::BTreeMap::new();
+    for mut reference in refs.drain(..) {
+        if reference.sources.is_empty() { continue }
+        for source in &mut reference.sources {
+            if let CopySource::DocLine { events, .. } = source {
+                events.sort_unstable();
+                events.dedup();
+            }
+        }
+        targets.entry((reference.target_entity, reference.target_field))
+            .or_insert_with(Vec::new).append(&mut reference.sources);
+    }
+    refs.extend(targets.into_iter().map(|((target_entity, target_field), mut sources)| {
+        sources.sort_unstable();
+        sources.dedup();
+        CopyRef { target_entity, target_field, sources }
+    }));
+}
+
+// Provenance keys require exactly one representation, including in numeric-only versions.
+fn copy_key(number: Option<&[u8]>, name: Option<&[u8]>, open: bool) -> Option<Key> {
+    match (number, name) {
+        (Some(n), None) => Some(Key::Number(u16::from_le_bytes(n.try_into().ok()?))),
+        (None, Some(s)) if open => Some(Key::Name(std::str::from_utf8(s).ok()?.into())),
+        _ => None,
+    }
+}
+
+impl CopySource {
+    fn encode(&self) -> Vec<u8> {
+        let w = FieldWriter::default();
+        match self {
+            Self::Record(id) => w.bytes(1, &[1]).bytes(2, id),
+            Self::EntityField { entity, field, writer } =>
+                field.encode(w.bytes(1, &[2]).bytes(2, entity), 3, 4).bytes(5, writer),
+            Self::DocLine { doc, events } => {
+                let mut w = w.bytes(1, &[3]).bytes(2, doc);
+                for event in events { w = w.bytes(6, event); }
+                w
+            }
+            Self::SharePeer { peer } => w.bytes(1, &[4]).bytes(2, peer),
+        }.finish()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let fields = fields(bytes)?;
+        let kind = single_field(&fields, 1)?;
+        let id = single_field(&fields, 2)?;
+        let number = optional_field(&fields, 3)?;
+        let name = optional_field(&fields, 4)?;
+        let writer = optional_field(&fields, 5)?;
+        let mut events = fields.iter().filter(|f| f.0 == 6).map(|f| f.1.try_into().ok());
+        let no_field = number.is_none() && name.is_none() && writer.is_none();
+        Some(match kind {
+            [1] if no_field && events.next().is_none() => Self::Record(id.try_into().ok()?),
+            [2] if events.next().is_none() => Self::EntityField {
+                entity: id.try_into().ok()?, field: copy_key(number, name, true)?, writer: writer?.try_into().ok()?,
+            },
+            [3] if no_field => Self::DocLine { doc: id.try_into().ok()?, events: events.collect::<Option<_>>()? },
+            [4] if no_field && events.next().is_none() && id.first() == Some(&4) => Self::SharePeer { peer: id.try_into().ok()? },
+            _ => return None,
+        })
+    }
+}
+
+impl CopyRef {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = FieldWriter::default();
+        if let Some(entity) = &self.target_entity { w = w.bytes(1, entity); }
+        w = self.target_field.encode(w, 2, 3);
+        for source in &self.sources { w = w.bytes(4, &source.encode()); }
+        w.finish()
+    }
+
+    fn decode(bytes: &[u8], set: bool, open: bool) -> Option<Self> {
+        let fields = fields(bytes)?;
+        let target_entity = match (set, optional_field(&fields, 1)?) {
+            (true, Some(id)) => Some(id.try_into().ok()?),
+            (false, None) => None,
+            _ => return None,
+        };
+        let target_field = copy_key(optional_field(&fields, 2)?, optional_field(&fields, 3)?, open)?;
+        let sources = fields.iter().filter(|f| f.0 == 4).map(|f| CopySource::decode(f.1)).collect::<Option<Vec<_>>>()?;
+        if sources.is_empty() { return None }
+        Some(Self { target_entity, target_field, sources })
+    }
 }
 
 pub type JobId = [u8; 16];
@@ -489,7 +606,7 @@ pub fn structurally_void(kind: u16, actor: Actor) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionOp {
-    Open { session: SessionId, mode: SessionMode, to: Vec<Id> },
+    Open { session: SessionId, mode: SessionMode, to: Vec<Id>, town_wide: bool },
     Join { session: SessionId },
     Leave { session: SessionId, secs: Option<u32>, why: LeaveWhy },
     Decline { session: SessionId, why: DeclineWhy },
@@ -545,7 +662,7 @@ impl SessionOp {
     fn encode(&self) -> Vec<u8> {
         let op = |tag, session: &SessionId| FieldWriter::default().bytes(1, &[tag]).bytes(2, session);
         match self {
-            Self::Open { session, mode, to } => {
+            Self::Open { session, mode, to, town_wide } => {
                 let w = op(1, session);
                 let mut w = match mode {
                     SessionMode::Call { video: false } => w.bytes(3, &[1]),
@@ -553,6 +670,7 @@ impl SessionOp {
                     SessionMode::Share { title } => w.bytes(3, &[2]).text(5, title),
                 };
                 for seat in to { w = w.bytes(6, seat); }
+                if *town_wide { w = w.bytes(9, &[]); }
                 w
             }
             Self::Join { session } => op(2, session),
@@ -579,17 +697,20 @@ impl SessionOp {
                     _ => return None,
                 };
                 let to = fields.iter().filter(|f| f.0 == 6).map(|f| f.1.try_into().ok()).collect::<Option<_>>()?;
-                Self::Open { session, mode, to }
+                let town_wide = match optional_field(fields, 9)? {
+                    None => false, Some([]) => true, _ => return None,
+                };
+                Self::Open { session, mode, to, town_wide }
             }
-            [2] if !has(3..=8) => Self::Join { session },
-            [3] if !has(3..=6) => {
+            [2] if !has(3..=9) => Self::Join { session },
+            [3] if !has(3..=6) && !has(9..=9) => {
                 let secs = match optional_field(fields, 7)? {
                     Some(bytes) => Some(u32::from_le_bytes(bytes.try_into().ok()?)),
                     None => None,
                 };
                 Self::Leave { session, secs, why: LeaveWhy::decode(get(8)?)? }
             }
-            [4] if !has(3..=7) => Self::Decline { session, why: DeclineWhy::decode(get(8)?)? },
+            [4] if !has(3..=7) && !has(9..=9) => Self::Decline { session, why: DeclineWhy::decode(get(8)?)? },
             _ => return None,
         })
     }
@@ -815,7 +936,7 @@ fn content_shape(kind: u16, version: u8, bytes: &[u8]) -> Option<Vec<u8>> {
     if !ContentForm::for_version(kind, version).is_some_and(ContentForm::is_open) { return None }
     let mut shape = FieldWriter::default();
     match Content::decode(kind, version, bytes)? {
-        Content::Entity { kind, project, derive, fields } => {
+        Content::Entity { kind, project, derive, fields, .. } => {
             shape = kind.encode(shape, 1, 5);
             if let Some(id) = project { shape = shape.bytes(2, &id); }
             if let Some((doc, at)) = derive {
@@ -843,7 +964,7 @@ impl Content {
             Content::Town { .. } => kind::TOWN,
             Content::Profile { .. } => kind::PROFILE,
             Content::Chat(_) | Content::AgentChat { .. } => kind::CHAT,
-            Content::AgentAdded { .. } | Content::AgentRemoved { .. } => kind::AGENT,
+            Content::AgentAdded { .. } | Content::AgentRemoved { .. } | Content::AgentRenamed { .. } => kind::AGENT,
             Content::Session(_) => kind::SESSION,
             Content::Said { .. } => kind::SAID,
             Content::Provides { .. } | Content::Request { .. } | Content::Taken { .. } | Content::Done { .. }
@@ -860,9 +981,11 @@ impl Content {
         // A v1 reader must never assign the signing event's id to a derived task.
         let extended = |key: &Key, value: &Value| matches!(key, Key::Name(_)) || matches!(value, Value::Literal(_));
         match self {
-            Self::Entity { kind, fields, .. } if matches!(kind, Key::Name(_)) || fields.iter().any(|(k, v)| extended(k, v)) => 3,
+            Self::Entity { kind, fields, copied_from, .. } if matches!(kind, Key::Name(_)) || fields.iter().any(|(k, v)| extended(k, v))
+                || copied_from.iter().any(|r| matches!(r.target_field, Key::Name(_))) => 3,
             Self::Entity { derive: Some(_), .. } => 2,
-            Self::Set { changes, .. } if changes.iter().any(|c| extended(&c.field, &c.value)) => 2,
+            Self::Set { changes, copied_from, .. } if changes.iter().any(|c| extended(&c.field, &c.value))
+                || copied_from.iter().any(|r| matches!(r.target_field, Key::Name(_))) => 2,
             _ => 1,
         }
     }
@@ -902,6 +1025,7 @@ impl Content {
             Content::Profile { name, colour } => FieldWriter::default().text(1, name).bytes(2, &colour.to_le_bytes()).finish(),
             Content::AgentAdded { name, kind } => FieldWriter::default().bytes(1, &[1]).text(2, name).text(3, kind).finish(),
             Content::AgentRemoved { agent } => FieldWriter::default().bytes(1, &[2]).bytes(4, agent).finish(),
+            Content::AgentRenamed { agent, name } => FieldWriter::default().bytes(1, &[3]).bytes(4, agent).text(2, name).finish(),
             Content::Chat(chat) | Content::AgentChat { chat, .. } => {
                 let mut w = FieldWriter::default().text(1, &chat.text);
                 if let Self::AgentChat { agent, .. } = self {
@@ -921,7 +1045,7 @@ impl Content {
                 }
                 w.finish()
             }
-            Content::Entity { kind, project, derive, fields } => {
+            Content::Entity { kind, project, derive, fields, copied_from } => {
                 let mut w = kind.encode(FieldWriter::default(), 1, 5);
                 if let Some(project) = project {
                     w = w.bytes(2, project);
@@ -932,9 +1056,10 @@ impl Content {
                 for (field, value) in fields {
                     w = w.bytes(3, &encode_field(field, None, value));
                 }
+                for reference in copied_from { w = w.bytes(TAG_COPIED_FROM, &reference.encode()); }
                 w.finish()
             }
-            Content::Set { changes, label } => {
+            Content::Set { changes, label, copied_from } => {
                 let mut w = FieldWriter::default();
                 for change in changes {
                     w = w.bytes(1, &encode_field(&change.field, Some(&change.entity), &change.value));
@@ -942,6 +1067,7 @@ impl Content {
                 if let Some(label) = label {
                     w = w.text(2, label);
                 }
+                for reference in copied_from { w = w.bytes(TAG_COPIED_FROM, &reference.encode()); }
                 w.finish()
             }
             Content::Text { doc, ops } => {
@@ -1000,6 +1126,8 @@ impl Content {
     pub fn decode(kind: u16, version: u8, content: &[u8]) -> Option<Content> {
         let form = ContentForm::for_version(kind, version)?;
         let fields = fields(content)?;
+        let copies = |set, open| fields.iter().filter(|f| f.0 == TAG_COPIED_FROM)
+            .map(|f| CopyRef::decode(f.1, set, open)).collect::<Option<Vec<_>>>();
         let text = |tag: u8| -> Option<String> {
             match fields.iter().find(|f| f.0 == tag) {
                 Some((_, v)) => String::from_utf8(v.to_vec()).ok(),
@@ -1014,6 +1142,10 @@ impl Content {
                     kind: std::str::from_utf8(single_field(&fields, 3)?).ok()?.to_owned(),
                 },
                 [2] => Self::AgentRemoved { agent: id(single_field(&fields, 4)?)? },
+                [3] => Self::AgentRenamed {
+                    agent: id(single_field(&fields, 4)?)?,
+                    name: std::str::from_utf8(single_field(&fields, 2)?).ok()?.to_owned(),
+                },
                 _ => return None,
             },
             ContentForm::Member => Content::Member(Member::decode(&fields)?),
@@ -1075,7 +1207,7 @@ impl Content {
                     Some((key, value))
                 });
                 let fields = if open { entries.collect::<Option<_>>()? } else { entries.flatten().collect() };
-                Content::Entity { kind, project, derive, fields }
+                Content::Entity { kind, project, derive, fields, copied_from: copies(false, open)? }
             }
             ContentForm::Set { open } => {
                 let label = match fields.iter().find(|f| f.0 == 2) {
@@ -1087,7 +1219,7 @@ impl Content {
                     Some(Change { entity: entity?, field, value })
                 });
                 let changes = if open { entries.collect::<Option<_>>()? } else { entries.flatten().collect() };
-                Content::Set { changes, label }
+                Content::Set { changes, label, copied_from: copies(true, open)? }
             }
             ContentForm::Text => {
                 let doc = id(fields.iter().find(|f| f.0 == 1)?.1)?;
@@ -1149,6 +1281,10 @@ impl Cached for Key {
     fn load(input: &mut &[u8]) -> Option<Self> {
         match u8::load(input)? { 0 => Some(Self::Number(u16::load(input)?)), 1 => Some(Self::Name(String::load(input)?)), _ => None }
     }
+}
+impl Cached for CopySource {
+    fn save(&self, out: &mut Vec<u8>) { self.encode().save(out); }
+    fn load(input: &mut &[u8]) -> Option<Self> { Self::decode(&Vec::<u8>::load(input)?) }
 }
 impl Cached for Value {
     fn save(&self, out: &mut Vec<u8>) { encode_field(&Key::Number(0), None, self).save(out); }
@@ -1271,7 +1407,8 @@ mod tests {
             Content::Chat(Chat { text: "@Ben hi".into(), mentions: vec![id, [9; 32]], ..Chat::default() }),
             Content::AgentChat { chat: Chat { quote: Some(id), tasks: vec![id], ..Chat::default() }, agent: ChatAgent::Author(id) },
             Content::AgentAdded { name: "Kit".into(), kind: "local".into() }, Content::AgentRemoved { agent: id },
-            Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: true }, to: vec![id] }),
+            Content::AgentRenamed { agent: id, name: "Kit".into() }, Content::AgentRenamed { agent: id, name: String::new() },
+            Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: true }, to: vec![id], town_wide: false }),
             Content::Session(SessionOp::Join { session }), Content::Session(SessionOp::Leave { session, secs: Some(3), why: LeaveWhy::Ended }),
             Content::Session(SessionOp::Decline { session, why: DeclineWhy::Busy }),
             Content::Said { session, lines: vec![SaidLine { at_ms: 1, dur_ms: 2, text: "Ben".into() }] },
@@ -1279,12 +1416,12 @@ mod tests {
             Content::Request { job: session, service: Service::Tasks, session, project: Some(id), provider: point },
             Content::Taken { job: session }, Content::Done { job: session, text: "done".into() },
             Content::Failed { job: session, why: Failure::NoModel("absent".into()) }, Content::Shared { session, agent: id, line: id },
-            Content::Entity { kind: Key::Number(1234), derive: None, project: None, fields: fields.clone() },
-            Content::Entity { kind: Key::Number(4567), derive: Some(([3; 32], CharId { event: [4; 32], index: 7 })), project: Some([2; 32]), fields },
-            Content::Entity { kind: Key::Name("Card".into()), derive: None, project: None, fields: vec![] },
-            Content::Set { changes, label: Some("tidied this board".into()) },
-            Content::Set { changes: vec![Change { entity: id, field: Key::Name("colour".into()), value: Value::Literal("red".into()) }], label: None },
-            Content::Set { changes: vec![], label: None }, Content::Undo { of: [3; 32] },
+            Content::Entity { copied_from: vec![], kind: Key::Number(1234), derive: None, project: None, fields: fields.clone() },
+            Content::Entity { copied_from: vec![], kind: Key::Number(4567), derive: Some(([3; 32], CharId { event: [4; 32], index: 7 })), project: Some([2; 32]), fields },
+            Content::Entity { copied_from: vec![], kind: Key::Name("Card".into()), derive: None, project: None, fields: vec![] },
+            Content::Set { copied_from: vec![], changes, label: Some("tidied this board".into()) },
+            Content::Set { copied_from: vec![], changes: vec![Change { entity: id, field: Key::Name("colour".into()), value: Value::Literal("red".into()) }], label: None },
+            Content::Set { copied_from: vec![], changes: vec![], label: None }, Content::Undo { of: [3; 32] },
             Content::Text { doc: id, ops: vec![TextOp::Insert { anchor: BreakRef::Root, text: "Ben".into() },
                 TextOp::Delete { from: at, to: at }, TextOp::Attr { at: BreakRef::Char(at), attr: 1, value: Value::Int(2) },
                 TextOp::Move { block: BreakRef::Inserted(0), after: BreakRef::Root }] },
@@ -1304,7 +1441,7 @@ mod tests {
         let session = [42; 16];
         let line = SaidLine { at_ms: 1234, dur_ms: 987, text: "hello".into() };
         let said = Content::Said { session, lines: vec![line.clone(), SaidLine { at_ms: 9, dur_ms: 0, text: "é".into() }] };
-        let open = |mode| SessionOp::Open { session, mode, to: vec![[1; 32], [9; 32]] };
+        let open = |mode| SessionOp::Open { session, mode, to: vec![[1; 32], [9; 32]], town_wide: true };
         let ops = [
             open(SessionMode::Call { video: true }), open(SessionMode::Call { video: false }),
             open(SessionMode::Share { title: "Canvas".into() }), SessionOp::Join { session },
@@ -1323,9 +1460,24 @@ mod tests {
         }
 
         let op = |code, id: &[u8]| FieldWriter::default().bytes(1, &[code]).bytes(2, id);
+        let card_bytes = op(1, &session).bytes(3, &[1]).bytes(6, &[1; 32]).finish();
+        for town_wide in [false, true] {
+            let content = Content::Session(SessionOp::Open {
+                session, mode: SessionMode::Call { video: false }, to: vec![[1; 32]], town_wide,
+            });
+            let mut expected = card_bytes.clone();
+            if town_wide { expected.extend([9, 0, 0, 0, 0]); }
+            assert_eq!(content.encode(), expected, "only town-wide opens append the five-byte marker after the seats");
+            assert_eq!(Content::decode(kind::SESSION, 1, &expected), Some(content), "session v1 retains the explicit scope");
+        }
         for (case, invalid) in [
             ("repeated op", op(2, &session).bytes(1, &[2])), ("unknown op", op(99, &session)),
             ("short session id", op(2, &session[..15])), ("unknown mode", op(1, &session).bytes(3, &[0])),
+            ("nonempty scope", op(1, &session).bytes(3, &[1]).bytes(9, &[0])),
+            ("repeated scope", op(1, &session).bytes(3, &[1]).bytes(9, &[]).bytes(9, &[])),
+            ("scope on join", op(2, &session).bytes(9, &[])),
+            ("scope on leave", op(3, &session).bytes(8, &[1]).bytes(9, &[])),
+            ("scope on decline", op(4, &session).bytes(8, &[1]).bytes(9, &[])),
             ("nonempty video", op(1, &session).bytes(3, &[1]).bytes(4, &[0])),
             ("repeated video", op(1, &session).bytes(3, &[1]).bytes(4, &[]).bytes(4, &[])),
             ("invalid title", op(1, &session).bytes(3, &[2]).bytes(5, &[0xff])),
@@ -1356,7 +1508,7 @@ mod tests {
             .bytes(1, &unknown)
             .bytes(1, &encode_field(&Key::Number(4), Some(&entity), &Value::Null))
             .finish();
-        assert_eq!(Content::decode(kind::SET, 1, &bytes), Some(Content::Set {
+        assert_eq!(Content::decode(kind::SET, 1, &bytes), Some(Content::Set { copied_from: vec![],
             changes: vec![Change { entity, field: Key::Number(2), value: Value::Int(6) }, Change { entity, field: Key::Number(4), value: Value::Null }],
             label: None,
         }), "known changes on both sides survive an unknown value");
@@ -1369,9 +1521,9 @@ mod tests {
         let source = Value::Literal("Private{secret: 1234}".into());
         let name = Key::Name("diagram".into());
         for content in [
-            Content::Entity { kind: Key::Name("FutureCard".into()), project: None, derive: None,
+            Content::Entity { copied_from: vec![], kind: Key::Name("FutureCard".into()), project: None, derive: None,
                 fields: vec![(name.clone(), source.clone())] },
-            Content::Set { changes: vec![Change { entity: [1; 32], field: name, value: source }],
+            Content::Set { copied_from: vec![], changes: vec![Change { entity: [1; 32], field: name, value: source }],
                 label: Some("private group".into()) },
         ] {
             let bytes = content.encode();

@@ -24,6 +24,22 @@ pub use pair::ledctl_pair;
 /// requirements add it.
 pub const LEDCTL_REQ: &str = include_str!("../ledctl.req.splash");
 
+/// The committed document sets at each stage of the brief-to-board controller.
+pub mod brief_ledctl {
+    pub const BRIEF: &str = include_str!("../brief_ledctl/stage0_brief.req.splash");
+    pub const REQUIREMENTS: &[(&str, &str)] = &[("brief_ledctl.req.splash", include_str!("../brief_ledctl/stage1_req.req.splash"))];
+    pub const ARCHITECTURE: &[(&str, &str)] = &[
+        ("brief_ledctl.blocks.splash", include_str!("../brief_ledctl/stage2_arch.blocks.splash")),
+        ("brief_ledctl.ckt.splash", include_str!("../brief_ledctl/stage2_arch.ckt.splash")),
+    ];
+    pub const PARTS: &[(&str, &str)] = &[("brief_ledctl.part.splash", include_str!("../brief_ledctl/stage3_parts.part.splash"))];
+    pub const PRICES: &str = include_str!("../brief_ledctl/stage3_prices.json");
+    pub const SCHEMATIC: &[(&str, &str)] = &[
+        ("brief_ledctl.blocks.splash", include_str!("../brief_ledctl/stage4_schematic.blocks.splash")),
+        ("brief_ledctl.ckt.splash", include_str!("../brief_ledctl/stage4_schematic.ckt.splash")),
+    ];
+}
+
 /// ledctl's documents.
 const LEDCTL: [(&str, &str); 3] = [
     ("ledctl.ckt.splash", include_str!("../ledctl.ckt.splash")),

@@ -15,7 +15,7 @@ script_mod! {
         show_bg: true draw_bg +: {color: fab.color_editor}
         list := mod.widgets.ReqList{
             color_ok: fab.color_ok color_error: fab.color_error color_warning: fab.color_warning
-            color_text_muted: fab.color_text_muted color_text_dim: fab.color_text_dim
+            color_text_muted: fab.color_text_dim color_text_dim: fab.color_text_dim
         }
     }
 }

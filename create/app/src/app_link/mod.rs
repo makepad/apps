@@ -45,6 +45,7 @@ pub struct AppKey {
 }
 impl AppKey {
     pub(crate) fn pid(&self) -> u32 { self.pid }
+    pub(crate) fn run_dir(&self) -> Option<&str> { self.run_dir.as_deref() }
 
     /// The registry's process identity. Restart hints only relate two different instances.
     fn instance(&self) -> (u32, u64, &Path) {
@@ -308,10 +309,32 @@ impl ThumbnailLinks {
     }
 }
 
+type ScanResult = (Vec<LocalApp>, Vec<(String, String)>);
+
 struct Scan {
     request: SyncSender<()>,
-    result: Receiver<(Vec<LocalApp>, Vec<(String, String)>)>,
+    requested: Arc<AtomicU64>,
+    result: Receiver<(u64, ScanResult)>,
 }
+
+fn run_scan_worker(
+    rx: Receiver<()>,
+    requested: Arc<AtomicU64>,
+    tx: SyncSender<(u64, ScanResult)>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    mut discover: impl FnMut() -> ScanResult,
+) {
+    while rx.recv().is_ok() {
+        // Snapshot before reading the registry. A later request queues or shares the next token.
+        let generation = requested.load(Ordering::Acquire);
+        let found = discover();
+        if tx.send((generation, found)).is_err() {
+            break;
+        }
+        wake();
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputQuit {
     Ready,
@@ -324,7 +347,8 @@ pub struct AppLinks {
     apps: Vec<LocalApp>,
     /// Running apps the last scan found but cannot link, with the reason.
     unreachable: Vec<(String, String)>,
-    scanning: bool,
+    scan_requested: u64,
+    scan_completed: u64,
     links: HashMap<LinkId, Link>,
     active: Vec<LinkId>,
     scan: Option<Scan>,
@@ -341,7 +365,8 @@ impl Default for AppLinks {
             env: None,
             apps: vec![],
             unreachable: vec![],
-            scanning: false,
+            scan_requested: 0,
+            scan_completed: 0,
             links: HashMap::new(),
             active: Vec::new(),
             scan: None,
@@ -372,24 +397,25 @@ impl AppLinks {
         if self.scan.is_none() {
             let (request, rx) = mpsc::sync_channel(1);
             let (tx, result) = mpsc::sync_channel(1);
+            let requested = Arc::new(AtomicU64::new(0));
+            let worker_requested = requested.clone();
             let (reg, own, wake) = (env.registry.clone(), self.own, env.signal.clone());
             (env.spawn)(
                 "app-discovery",
                 Box::new(move || {
                     let registry = reg.unwrap_or_else(makepad_remote::discovery::registry_dir);
-                    while rx.recv().is_ok() {
-                        if tx.send(endpoint::discover_all(&registry, own)).is_err() {
-                            break;
-                        }
-                        wake();
-                    }
+                    run_scan_worker(rx, worker_requested, tx, wake, || {
+                        endpoint::discover_all(&registry, own)
+                    });
                 }),
             );
-            self.scan = Some(Scan { request, result });
+            self.scan = Some(Scan { request, requested, result });
         }
+        self.scan_requested += 1;
+        let scan = self.scan.as_ref().unwrap();
+        scan.requested.store(self.scan_requested, Ordering::Release);
         // A pending scan reads the entire registry; concurrent refresh requests coalesce.
-        let _ = self.scan.as_ref().unwrap().request.try_send(());
-        self.scanning = true;
+        let _ = scan.request.try_send(());
     }
     pub fn apps(&self) -> &[LocalApp] {
         &self.apps
@@ -400,7 +426,7 @@ impl AppLinks {
     }
     /// A scan was asked for and has not answered yet.
     pub fn scanning(&self) -> bool {
-        self.scanning
+        self.scan.is_some() && self.scan_completed < self.scan_requested
     }
     pub fn link(&mut self, app: &AppKey) -> LinkId {
         let id = LinkId(self.serial());
@@ -699,10 +725,19 @@ impl AppLinks {
             self.events.push(AppLinkEvent::PngStill { id: *id, ticket: *ticket, result });
             false
         });
+        let mut scan_disconnected = false;
         if let Some(scan) = &self.scan {
-            while let Ok((apps, unreachable)) = scan.result.try_recv() {
+            loop {
+                let (generation, (apps, unreachable)) = match scan.result.try_recv() {
+                    Ok(reply) => reply,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        scan_disconnected = true;
+                        break;
+                    }
+                };
                 self.unreachable = unreachable;
-                self.scanning = false;
+                self.scan_completed = self.scan_completed.max(generation);
                 self.events.push(AppLinkEvent::Apps);
                 for (&id, link) in &mut self.links {
                     let Some(watch) = &mut link.restart else {
@@ -721,6 +756,9 @@ impl AppLinks {
                 }
                 self.apps = apps;
             }
+        }
+        if scan_disconnected {
+            self.scan = None;
         }
         std::mem::take(&mut self.events)
     }

@@ -36,6 +36,7 @@ pub(super) enum Body {
     Text,
     Section,
     Frame,
+    Media,
     /// A kind this build has no look for: a plain card that names it.
     Card,
 }
@@ -54,6 +55,7 @@ impl Body {
             Key::Number(kind::TEXT_BLOCK) => Self::Text,
             Key::Number(kind::SECTION) => Self::Section,
             Key::Number(kind::DESIGN) => Self::Frame,
+            Key::Number(kind::IMAGE) => Self::Media,
             _ => Self::Card,
         }
     }
@@ -126,6 +128,7 @@ pub(super) fn surface(body: Body, colour: Vec4f, size: DVec2, preset: &str, look
         Body::Frame => Surface { radius: frame_radius(preset).min(short * 0.2), border: 1., border_color: look.frame_line,
             ..Surface::FLAT },
         Body::Card => Surface { radius: 8f32.min(short * 0.15), shade: 0.04, rim: 0.15, ..Surface::FLAT },
+        Body::Media => Surface { radius: 8f32.min(short * 0.15), border: 1., border_color: look.frame_line, ..Surface::FLAT },
         Body::Text => Surface::FLAT,
     }
 }
@@ -134,7 +137,7 @@ pub(super) fn surface(body: Body, colour: Vec4f, size: DVec2, preset: &str, look
 pub(super) fn lift(body: Body) -> Option<Lift> {
     match body {
         Body::Note => Some(Lift { blur: 9., offset: 5., alpha: 0.2, contact: 0.3, contact_blur: 1.5 }),
-        Body::Shape(_) | Body::Card => Some(Lift { blur: 6., offset: 3., alpha: 0.16, contact: 0.25, contact_blur: 1. }),
+        Body::Shape(_) | Body::Card | Body::Media => Some(Lift { blur: 6., offset: 3., alpha: 0.16, contact: 0.25, contact_blur: 1. }),
         Body::Frame => Some(Lift { blur: 18., offset: 10., alpha: 0.3, contact: 0.25, contact_blur: 1.5 }),
         Body::Text | Body::Section => None,
     }
@@ -196,7 +199,7 @@ pub(super) fn place(body: Body, r: Rect) -> Place {
         centre_y: true, bold: false };
     match body {
         Body::Note => fit(inset(r, short * 0.12, short * 0.12), (h * 0.24).min(w * 0.2)),
-        Body::Card | Body::Shape(CanvasShape::Box) => fit(inset(r, short * 0.1, short * 0.1), short * 0.2),
+        Body::Media | Body::Card | Body::Shape(CanvasShape::Box) => fit(inset(r, short * 0.1, short * 0.1), short * 0.2),
         Body::Shape(CanvasShape::Ellipse) => fit(centred(r, w * 0.707, h * 0.707), short * 0.2),
         Body::Shape(CanvasShape::Circle) => fit(centred(r, short * 0.707, short * 0.707), short * 0.2),
         Body::Shape(CanvasShape::Diamond) => fit(centred(r, w * 0.5, h * 0.5), short * 0.16),

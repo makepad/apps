@@ -477,11 +477,15 @@ mod tests {
         app.refresh(cx);
         use makepad_call::driver::{std_spawn, VoiceSource};
         use makepad_create::call::{CallEnv, Message};
+        use makepad_town_core::share::hello::MediaCaps;
         app.call.configure(CallEnv { files: Default::default(), signal: std::sync::Arc::new(|| {}), voice: VoiceSource::Synthetic { tone_hz: 700. },
             devices_path: dir.join("devices"), spawn: std_spawn(), jobs: std_spawn() });
         let port = app.call.link_up(cx, [1; 65], [2; 65], "Ada").unwrap();
+        let town_id = app.model.as_ref().unwrap().open_id();
+        app.call.set_open_town(Some((town_id, vec![([2; 65], "Ada".into())])));
+        app.call.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
         let session = [5; 16];
-        port.messages_in.try_send(Message::Share { session, title: "Drawing".into(), w: 1600., h: 1000., ext: Default::default() }.encode()).unwrap();
+        port.messages_in.try_send(Message::Share { session, title: "Drawing".into(), w: 1600., h: 1000., ext: makepad_create::call::ShareOfferExt { town: Some(town_id), ..Default::default() } }.encode()).unwrap();
         app.call.poll(cx);
         app.show_call(cx);
         let size = dvec2(1050., 640.);
@@ -583,7 +587,7 @@ mod tests {
         app.open_page(cx, Page::Home);
         assert!(!page.visible() && app.call.shown().share.watching.is_none(), "leaving for another page closes the watch");
         let other = [7; 16];
-        port.messages_in.try_send(Message::Share { session: other, title: "Notes".into(), w: 600., h: 400., ext: Default::default() }.encode()).unwrap();
+        port.messages_in.try_send(Message::Share { session: other, title: "Notes".into(), w: 600., h: 400., ext: makepad_create::call::ShareOfferExt { town: Some(town_id), ..Default::default() } }.encode()).unwrap();
         app.call.poll(cx);
         app.show_call(cx);
         let buttons_now = draw_buttons(&mut app, cx);
@@ -896,7 +900,7 @@ mod tests {
         let close_ended = page.widget(cx, ids!(close_ended));
         for (session, detached) in [([8; 16], false), ([9; 16], true)] {
             let share = Live::Share(session);
-            port.messages_in.try_send(Message::Share { session, title: "Drawing".into(), w: 96., h: 64., ext: Default::default() }.encode()).unwrap();
+            port.messages_in.try_send(Message::Share { session, title: "Drawing".into(), w: 96., h: 64., ext: makepad_create::call::ShareOfferExt { town: Some(town_id), ..Default::default() } }.encode()).unwrap();
             app.call.poll(cx);
             app.show_call(cx);
             app.open_node(cx, Node::Live(share));
@@ -941,8 +945,10 @@ mod tests {
         assert_eq!(app.view.pane, Pane::Chat);
         app.call.link_down(cx, [2; 65]);
         let port = app.call.link_up(cx, [1; 65], [2; 65], "").unwrap();
+        app.call.set_open_town(Some((town_id, vec![([2; 65], String::new())])));
+        app.call.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
         let call_id = [6; 16];
-        port.messages_in.try_send(Message::Ring { call_id, secret: [3; 32], video: false, ext: Default::default() }.encode()).unwrap();
+        port.messages_in.try_send(Message::Ring { call_id, secret: [3; 32], video: false, ext: makepad_create::call::RingExt { town: Some(town_id), ..Default::default() } }.encode()).unwrap();
         app.call.poll(cx);
         app.show_call(cx);
         assert_eq!((app.view.page, app.view.pane), (Page::Home, Pane::Chat), "an incoming ring leaves the open pane alone");
@@ -1017,7 +1023,7 @@ mod tests {
         assert_eq!(project.label(cx, ids!(share_problem)).text(), "The selected window is no longer in the list.",
             "the project must explain why the selected share could not start");
 
-        port.messages_in.try_send(Message::Ring { call_id: [7; 16], secret: [4; 32], video: false, ext: Default::default() }.encode()).unwrap();
+        port.messages_in.try_send(Message::Ring { call_id: [7; 16], secret: [4; 32], video: false, ext: makepad_create::call::RingExt { town: Some(town_id), ..Default::default() } }.encode()).unwrap();
         app.call.poll(cx);
         app.show_call(cx);
         app.open_node(cx, Node::Live(Live::Call));
@@ -1042,7 +1048,7 @@ mod tests {
         for (peer, reason) in [(None, "No one else is connected yet"),
             (Some((2, "Anna")), "Anna isn't connected yet"), (Some((3, "Bea")), "No one else is connected yet")] {
             if let Some((key, name)) = peer {
-                app.view.members.seats.push(MemberSeat { id: MemberId::Computer([key; 65]), seat: Seat::Peer,
+                app.view.members.seats.push(MemberSeat { id: MemberId::Seat([key; 32]), devices: Vec::new(), seat: Seat::Peer, tone: None, live: None,
                     name: name.into(), presence: makepad_create::view::Presence::Away, status: String::new() });
                 app.view.member_revision += 1;
             }

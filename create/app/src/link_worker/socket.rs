@@ -2,11 +2,12 @@
 
 use super::{local_network_off, timed_out, WAKE};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
 pub(super) trait LinkSocket {
     fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn lan_address(&self, public: SocketAddrV4) -> Result<SocketAddrV4, String>;
     fn send_to(&self, bytes: &[u8], to: SocketAddr) -> io::Result<usize>;
     fn recv_from_within(&self, buf: &mut [u8], wait: Duration) -> io::Result<(usize, SocketAddr)>;
     /// Read queued datagrams until the inbox is empty or the caller has seen enough.
@@ -31,7 +32,14 @@ fn drain(buf: &mut [u8], mut read: impl FnMut(&mut [u8]) -> io::Result<(usize, S
 impl LinkSocket for UdpSocket {
     fn local_addr(&self) -> io::Result<SocketAddr> { self.local_addr() }
 
-    fn send_to(&self, bytes: &[u8], to: SocketAddr) -> io::Result<usize> { self.send_to(bytes, to) }
+    fn lan_address(&self, public: SocketAddrV4) -> Result<SocketAddrV4, String> {
+        super::lan_address(self, public)
+    }
+
+    fn send_to(&self, bytes: &[u8], to: SocketAddr) -> io::Result<usize> {
+        makepad_network::lan::check("p2p send", to)?;
+        self.send_to(bytes, to)
+    }
 
     fn recv_from_within(&self, buf: &mut [u8], wait: Duration) -> io::Result<(usize, SocketAddr)> {
         self.set_read_timeout(Some(wait))?;
@@ -73,7 +81,7 @@ impl WakeLine {
         match &self.socket {
             WakeSocket::Udp(socket) => socket.send_to(WAKE, self.to),
             #[cfg(test)]
-            WakeSocket::Mem(socket) => socket.send_to(WAKE, self.to),
+            WakeSocket::Mem(socket) => socket.send_wake(self.to),
         }
     }
 }
@@ -82,12 +90,13 @@ impl WakeLine {
 pub(super) mod mem {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Arc, Condvar, Mutex, Weak};
+    use std::sync::{Arc, Condvar, Mutex};
 
     #[derive(Default)]
     struct Queue {
         packets: VecDeque<(SocketAddr, Vec<u8>)>,
         reading: bool,
+        waiters: usize,
         fault: Option<io::ErrorKind>,
         closed: bool,
     }
@@ -100,9 +109,11 @@ pub(super) mod mem {
 
     #[derive(Default)]
     struct Routes {
-        sockets: BTreeMap<SocketAddr, Weak<Inbox>>,
+        sockets: BTreeMap<SocketAddr, Arc<Inbox>>,
         address: Option<Ipv4Addr>,
         watch_punch: Option<std::sync::mpsc::Sender<SocketAddr>>,
+        watch_sends: Option<std::sync::mpsc::Sender<(SocketAddr, SocketAddr)>>,
+        hairpin: BTreeMap<SocketAddr, SocketAddr>,
         closed: bool,
     }
 
@@ -123,14 +134,38 @@ pub(super) mod mem {
             (net, recv)
         }
 
+        fn bound_inbox(&self, addr: SocketAddr, operation: &str) -> Arc<Inbox> {
+            let inbox = self.routes.lock().unwrap().sockets.get(&addr).cloned();
+            inbox.unwrap_or_else(|| panic!("{operation}({addr}): no bound socket at that address"))
+        }
+
         pub fn fail_receive(&self, addr: SocketAddr, error: io::ErrorKind) {
-            let inbox = self.routes.lock().unwrap().sockets[&addr].upgrade().unwrap();
-            inbox.queue.lock().unwrap().fault = Some(error);
+            let inbox = self.bound_inbox(addr, "fail_receive");
+            let mut queue = inbox.queue.lock().unwrap();
+            if queue.closed {
+                drop(queue);
+                panic!("fail_receive({addr}): socket closed before injecting receive error");
+            }
+            queue.fault = Some(error);
             inbox.ready.notify_all();
         }
 
         pub fn bind(&self, port: u16) -> io::Result<MemSocket> {
             MemSocket::bind(&self.routes, port)
+        }
+
+        pub fn bind_addr(&self, addr: SocketAddr) -> io::Result<MemSocket> {
+            MemSocket::bind_addr(&self.routes, addr)
+        }
+
+        pub fn watch_sends(&self) -> std::sync::mpsc::Receiver<(SocketAddr, SocketAddr)> {
+            let (send, recv) = std::sync::mpsc::channel();
+            self.routes.lock().unwrap().watch_sends = Some(send);
+            recv
+        }
+
+        pub fn set_hairpin(&self, local: SocketAddr, public: SocketAddr) {
+            self.routes.lock().unwrap().hairpin.insert(public, local);
         }
 
         pub fn binder(&self) -> impl Fn(u16) -> io::Result<MemSocket> + 'static {
@@ -140,16 +175,24 @@ pub(super) mod mem {
 
         /// After a send, the worker has handled it and sent any reply once it waits to read again.
         pub fn wait_for_reader(&self, addr: SocketAddr) {
-            let inbox = self.routes.lock().unwrap().sockets[&addr].upgrade().unwrap();
-            let queue = inbox.queue.lock().unwrap();
-            drop(inbox.ready.wait_while(queue, |q| !q.reading || !q.packets.is_empty() || q.fault.is_some()).unwrap());
+            let inbox = self.bound_inbox(addr, "wait_for_reader");
+            let mut queue = inbox.queue.lock().unwrap();
+            queue.waiters += 1;
+            inbox.ready.notify_all();
+            queue = inbox.ready.wait_while(queue, |q| {
+                !q.closed && (!q.reading || !q.packets.is_empty() || q.fault.is_some())
+            }).unwrap();
+            queue.waiters -= 1;
+            let closed = queue.closed;
+            drop(queue);
+            assert!(!closed, "wait_for_reader({addr}): socket closed while waiting for reader");
         }
 
         /// Queued packets still arrive. Subsequent empty reads complete as logical timeouts.
         pub fn close(&self) {
             let mut routes = self.routes.lock().unwrap();
             routes.closed = true;
-            for inbox in routes.sockets.values().filter_map(Weak::upgrade) {
+            for inbox in routes.sockets.values() {
                 inbox.queue.lock().unwrap().closed = true;
                 inbox.ready.notify_all();
             }
@@ -170,17 +213,22 @@ pub(super) mod mem {
 
     impl MemSocket {
         fn bind(routes: &Arc<Mutex<Routes>>, port: u16) -> io::Result<Self> {
+            let ip = routes.lock().unwrap().address.unwrap_or(Ipv4Addr::LOCALHOST);
+            Self::bind_addr(routes, (ip, port).into())
+        }
+
+        fn bind_addr(routes: &Arc<Mutex<Routes>>, addr: SocketAddr) -> io::Result<Self> {
             let mut table = routes.lock().unwrap();
             if table.closed { return Err(io::ErrorKind::NotConnected.into()); }
             let timed = table.address.is_some();
-            let ip = table.address.unwrap_or(Ipv4Addr::LOCALHOST);
+            let port = addr.port();
             let sockets = &mut table.sockets;
             let ports = if port == 0 { 1..=u16::MAX } else { port..=port };
-            let addr = ports.map(|p| SocketAddr::from((ip, p)))
-                .find(|addr| sockets.get(addr).and_then(Weak::upgrade).is_none())
+            let addr = ports.map(|p| SocketAddr::new(addr.ip(), p))
+                .find(|addr| !sockets.contains_key(addr))
                 .ok_or(io::ErrorKind::AddrInUse)?;
             let inbox = Arc::new(Inbox::default());
-            sockets.insert(addr, Arc::downgrade(&inbox));
+            sockets.insert(addr, inbox.clone());
             Ok(Self { routes: routes.clone(), addr, timed, inbox })
         }
 
@@ -195,21 +243,55 @@ pub(super) mod mem {
         pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             Self::pop(&mut self.inbox.queue.lock().unwrap(), buf)
         }
+
+        fn deliver(routes: &Routes, from: SocketAddr, bytes: &[u8], to: SocketAddr) -> io::Result<usize> {
+            if let Some(inbox) = routes.sockets.get(&to) {
+                inbox.queue.lock().unwrap().packets.push_back((from, bytes.to_vec()));
+                inbox.ready.notify_all();
+            }
+            Ok(bytes.len())
+        }
+
+        pub(super) fn send_wake(&self, to: SocketAddr) -> io::Result<usize> {
+            Self::deliver(&self.routes.lock().unwrap(), self.addr, WAKE, to)
+        }
+    }
+
+    impl Drop for MemSocket {
+        fn drop(&mut self) {
+            {
+                let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+                if routes.sockets.get(&self.addr).is_some_and(|cur| Arc::ptr_eq(cur, &self.inbox)) {
+                    routes.sockets.remove(&self.addr);
+                }
+            }
+            self.inbox.queue.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+            self.inbox.ready.notify_all();
+        }
     }
 
     impl LinkSocket for MemSocket {
         fn local_addr(&self) -> io::Result<SocketAddr> { Ok(self.addr) }
 
+        fn lan_address(&self, _public: SocketAddrV4) -> Result<SocketAddrV4, String> {
+            match self.addr {
+                SocketAddr::V4(lan) if makepad_network::p2p::words::lan_candidate_ok(lan) => Ok(lan),
+                _ => Err("no usable local IPv4 address".into()),
+            }
+        }
+
         fn send_to(&self, bytes: &[u8], to: SocketAddr) -> io::Result<usize> {
             let routes = self.routes.lock().unwrap();
+            if let Some(watch) = &routes.watch_sends { let _ = watch.send((self.addr, to)); }
             if bytes.first() == Some(&makepad_network::p2p::punch::KIND) {
                 if let Some(watch) = &routes.watch_punch { let _ = watch.send(self.addr); }
             }
-            if let Some(inbox) = routes.sockets.get(&to).and_then(Weak::upgrade) {
-                inbox.queue.lock().unwrap().packets.push_back((self.addr, bytes.to_vec()));
-                inbox.ready.notify_all();
+            if let Some(&local) = routes.hairpin.get(&to) {
+                let from = routes.hairpin.iter().find_map(|(&public, &addr)| (addr == self.addr).then_some(public));
+                Self::deliver(&routes, from.unwrap_or(self.addr), bytes, local)
+            } else {
+                Self::deliver(&routes, self.addr, bytes, to)
             }
-            Ok(bytes.len())
         }
 
         fn recv_from_within(&self, buf: &mut [u8], wait: Duration) -> io::Result<(usize, SocketAddr)> {
@@ -232,6 +314,35 @@ pub(super) mod mem {
         fn wake_line(&self) -> io::Result<WakeLine> {
             let socket = Self::bind(&self.routes, 0)?;
             Ok(WakeLine { from: socket.addr, socket: WakeSocket::Mem(socket), to: self.addr })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn dropped_mem_socket_releases_port_while_old_inbox_is_held_and_wakes_waiters() {
+            let net = MemNet::default();
+            let addr: SocketAddr = "192.0.2.7:4500".parse().unwrap();
+            let first = net.bind_addr(addr).unwrap();
+            let old = net.routes.lock().unwrap().sockets[&addr].clone();
+            drop(first);
+            assert!(old.queue.lock().unwrap().closed, "dropping the socket closes the retained inbox");
+            let rebound = net.bind_addr(addr).expect("an inbox reference must not hold the port");
+            let current = rebound.inbox.clone();
+            std::thread::scope(|scope| {
+                let missing = scope.spawn(|| net.wait_for_reader(SocketAddr::new(addr.ip(), 4501)));
+                let error = missing.join().expect_err("an unbound address must fail immediately");
+                assert!(error.downcast_ref::<String>().is_some_and(|s| s.contains("no bound socket")),
+                    "the diagnostic identifies an unbound socket");
+                let waiting = scope.spawn(|| net.wait_for_reader(addr));
+                drop(current.ready.wait_while(current.queue.lock().unwrap(), |q| q.waiters == 0).unwrap());
+                drop(rebound);
+                let error = waiting.join().expect_err("closing the socket must wake and fail its reader wait");
+                assert!(error.downcast_ref::<String>().is_some_and(|s| s.contains("socket closed while waiting for reader")),
+                    "the diagnostic distinguishes a socket closed during the wait");
+            });
         }
     }
 }

@@ -18,6 +18,7 @@ use crate::states::{SheetIndex, StatesOf};
 use fab_elec_board::{Connectivity, RuleMatrix, ZoneFill};
 use fab_elec_cam::Export;
 use fab_elec_circuit::Violation;
+pub use fab_elec_circuit::CheckKind;
 use crate::live::sim::{LiveScreen, SimLive};
 use fab_elec_core::{BoardId, CompId, CompRef, Diag, DocId, ItemId, NetId, Sel};
 use fab_elec_design::{By, Design, DesignOp, Focus, Place, SystemNet, TextEdit, TimeCursor};
@@ -200,9 +201,25 @@ pub enum ProposalAuthor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalFinding {
+    pub unit: String,
+    /// The check's family as published (erc, drc, factory, case, system, route, custom).
+    pub family: &'static str,
+    pub kind: CheckKind,
+    pub severity: fab_elec_core::Severity,
+    pub title: String,
+    pub message: String,
+    pub items: String,
+    pub fix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProposalChecks {
-    pub counts: std::collections::BTreeMap<(fab_elec_circuit::CheckKind, fab_elec_core::Severity), usize>,
+    pub counts: std::collections::BTreeMap<(CheckKind, fab_elec_core::Severity), usize>,
     pub pending: bool,
+    /// Every non-awaiting finding, errors first. Pages and display limits belong to the readers.
+    pub findings: Vec<ProposalFinding>,
+    pub pending_labels: Vec<String>,
 }
 
 /// Requirement verdicts for the whole proposed project. Detail entries are (name, reason)
@@ -530,6 +547,8 @@ pub struct ElecLive {
     /// requirements document. The same Arc until a judged input changes.
     pub requirements: Option<Arc<ReqShown>>,
     pub bom: Option<Arc<crate::bom::Shown>>,
+    pub imported_catalog: Arc<Vec<fab_elec_lang::CatalogEntry>>,
+    pub price_book: Option<Arc<fab_elec_bom::prices::Library>>,
 }
 
 /// The project's requirements as the Requirements editor and the bar's chip show them
@@ -557,7 +576,7 @@ pub enum ElecPanel {
 
 impl ElecLive {
     pub fn new(snap: Arc<DesignSnapshot>) -> ElecLive {
-        ElecLive { snap, ended_proposals: None, proposals_reloading: false, previewing: None, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None, requirements: None, bom: None }
+        ElecLive { snap, ended_proposals: None, proposals_reloading: false, previewing: None, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None, requirements: None, bom: None, imported_catalog: Arc::default(), price_book: None }
     }
 
     fn preview_in<'a>(&self, snap: &'a DesignSnapshot, chosen: Option<ProposalId>) -> Option<&'a Arc<ProposalView>> {

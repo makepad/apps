@@ -1,6 +1,10 @@
 use super::{AppLinkEnv, WindowId};
 use makepad_call::driver::codec::{Codecs, Decoder, Packet, Picture};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+const LATE_PICTURE_POLL_MIN: Duration = Duration::from_millis(10);
+const LATE_PICTURE_POLL_MAX: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PictureWant {
@@ -293,43 +297,71 @@ impl PictureSlot {
         let mut held: Option<Arc<Picture>> = None;
         let mut last_published_size = None;
         let mut seen_version = 0;
+        let mut owed_pts = None;
+        let mut retry_wait = LATE_PICTURE_POLL_MIN;
         loop {
-            let (unit, want, wake) = {
+            let (unit, want, wake, timed_out) = {
                 let mut s = self.state.lock().unwrap();
-                while !s.closed && s.unit.is_none()
-                    && !(s.want.active() && s.want_version != seen_version && held.is_some())
-                {
-                    s = self.ready.wait(s).unwrap();
+                let mut deadline = None;
+                let mut timed_out = false;
+                loop {
+                    if s.closed { return }
+                    if !s.want.active() {
+                        owed_pts = None;
+                        deadline = None;
+                    }
+                    let resized = s.want.active() && s.want_version != seen_version && held.is_some();
+                    if s.unit.is_some() || resized { break }
+                    if owed_pts.is_some() && decoder.is_some() {
+                        let at = *deadline.get_or_insert_with(|| Instant::now() + retry_wait);
+                        let left = at.saturating_duration_since(Instant::now());
+                        if left.is_zero() { timed_out = true; break }
+                        s = self.ready.wait_timeout(s, left).unwrap().0;
+                    } else {
+                        s = self.ready.wait(s).unwrap();
+                    }
                 }
-                if s.closed { return; }
                 seen_version = s.want_version;
-                (s.unit.take(), s.want, s.wake.clone())
+                (s.unit.take(), s.want, s.wake.clone(), timed_out)
             };
 
-            let new_picture = unit.is_some();
-            let mut displaced = None;
-            if let Some(unit) = unit {
-                if unit.key {
-                    if decoder.as_mut().is_some_and(|d| !d.accepts(&unit.data)) {
-                        decoder = None;
-                    }
-                    if decoder.is_none() {
-                        match codecs.decoder() {
-                            Ok(mut d) => {
-                                d.accepts(&unit.data);
-                                decoder = Some(d);
-                            }
-                            Err(why) => {
-                                self.close_with(&why);
-                                return;
-                            }
+            if let Some(key) = unit.as_ref().filter(|u| u.key) {
+                if decoder.as_mut().is_some_and(|d| !d.accepts(&key.data)) {
+                    decoder = None;
+                    owed_pts = None;
+                }
+                if decoder.is_none() {
+                    match codecs.decoder() {
+                        Ok(mut d) => {
+                            d.accepts(&key.data);
+                            decoder = Some(d);
+                        }
+                        Err(why) => {
+                            let note = format!("Preview couldn't decode: {why}");
+                            makepad_widgets::log!("{note}");
+                            self.close_with(&note);
+                            return;
                         }
                     }
                 }
-                let Some(d) = &mut decoder else { continue };
-                if let Err(why) = d.push_into(&unit.data, unit.pts_100ns, &mut pictures) {
+            }
+
+            let mut new_picture = false;
+            let mut displaced = None;
+            if let Some(d) = &mut decoder {
+                let decoded = if let Some(unit) = unit {
+                    owed_pts = Some(unit.pts_100ns.max(0));
+                    retry_wait = LATE_PICTURE_POLL_MIN;
+                    Some(d.push_into(&unit.data, unit.pts_100ns, &mut pictures))
+                } else if owed_pts.is_some() {
+                    Some(d.ready_into(&mut pictures))
+                } else {
+                    None
+                };
+                if let Some(Err(why)) = decoded {
                     makepad_widgets::log!("Window preview decode failed: {why}");
                     decoder = None;
+                    owed_pts = None;
                     pictures.clear();
                     let mut s = self.state.lock().unwrap();
                     if !s.closed {
@@ -338,12 +370,19 @@ impl PictureSlot {
                     }
                     continue;
                 }
-                let Some(newest) = pictures.pop() else { continue };
-                for earlier in pictures.drain(..) { d.recycle(earlier.nv12); }
-                displaced = held.replace(Arc::new(newest));
+                if let Some(newest) = pictures.pop() {
+                    if owed_pts == Some(newest.pts_100ns) { owed_pts = None; }
+                    retry_wait = LATE_PICTURE_POLL_MIN;
+                    for earlier in pictures.drain(..) { d.recycle(earlier.nv12); }
+                    displaced = held.replace(Arc::new(newest));
+                    new_picture = true;
+                } else if timed_out {
+                    retry_wait = (retry_wait * 2).min(LATE_PICTURE_POLL_MAX);
+                }
             }
 
-            let pic = held.as_ref().unwrap();
+            let Some(pic) = held.as_ref() else { continue };
+            if !want.active() { continue }
             let size = fit_even(pic.width, pic.height, want.max_w, want.max_h);
             if !new_picture && last_published_size == Some(size) { continue; }
             let (width, height) = size;

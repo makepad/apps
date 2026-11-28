@@ -113,6 +113,14 @@ impl Model {
         std::mem::take(&mut self.files.views.changed_status)
     }
 
+    /// Records a transfer status update for `(town, id)` and marks it changed for `take_transfer_changes`.
+    pub fn record_transfer_status(&mut self, town: TownId, id: Id, status: Option<Status>) {
+        let views = &mut self.files.views;
+        if views.status.get(&(town, id)) == status.as_ref() { return }
+        views.changed_status.insert((town, id));
+        if let Some(status) = status { views.status.insert((town, id), status); } else { views.status.remove(&(town, id)); }
+    }
+
     /// False when the link command is retained for the next frame. The store can be stalled
     /// independently; neither the authorization map nor this mailbox reads it.
     pub fn publish_blobs(&mut self) -> bool { self.publish_blob_policy(AT_ONCE) }
@@ -134,7 +142,7 @@ impl Model {
                 Some((revision, eligible)) if revision == self.carrier_revision => eligible,
                 _ => {
                     let eligible = self.peers.as_ref().is_ok_and(|p| p.device(&peer)
-                        .is_some_and(|d| d.state == DeviceState::Active && !d.paused));
+                        .is_some_and(|d| d.state == DeviceState::Active));
                     a.eligibility = Some((self.carrier_revision, eligible));
                     eligible
                 }

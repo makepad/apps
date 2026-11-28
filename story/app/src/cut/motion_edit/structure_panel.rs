@@ -452,7 +452,9 @@ pub fn pump(page: &mut VideoCut, cx: &mut Cx, ui: &WidgetRef) {
         }
         if st.params_body.as_ref() != Some(&body) {
             st.params_body = Some(body.clone());
-            desk_ref.widget(cx, ids!(st_params)).as_splash().set_text(cx, &body);
+            let splash = desk_ref.widget(cx, ids!(st_params)).as_splash();
+            splash.set_grants(HostGrants::CLIPBOARD);
+            splash.set_text(cx, &body);
         }
         show_stacks(cx, &desk_ref, None, None);
         desk_ref.widget(cx, ids!(st_tree)).redraw(cx);
@@ -479,7 +481,9 @@ pub fn pump(page: &mut VideoCut, cx: &mut Cx, ui: &WidgetRef) {
     let body = if selected.as_deref() == Some("Motion.post") && item.is_none() { String::new() } else { params_body(&session.source, shown) };
     if st.params_body.as_ref() != Some(&body) {
         st.params_body = Some(body.clone());
-        desk_ref.widget(cx, ids!(st_params)).as_splash().set_text(cx, &body);
+        let splash = desk_ref.widget(cx, ids!(st_params)).as_splash();
+        splash.set_grants(HostGrants::CLIPBOARD);
+        splash.set_text(cx, &body);
     }
     desk_ref.widget(cx, ids!(st_tree)).redraw(cx);
 }
@@ -901,6 +905,7 @@ Motion{
         });
         // The isolate binds no bare `stage`: a row naming it errs, so the
         // check below sees what the panel would log.
+        splash.as_splash().set_grants(HostGrants::CLIPBOARD);
         splash.as_splash().set_text(&mut cx, "Label{text: \"x\" draw_text +: {color: stage.label}}");
         assert!(!splash.as_splash().last_errors().is_empty(), "a body naming a bare `stage` reports its error");
         let mut checked = 0;
@@ -909,6 +914,7 @@ Motion{
             if body.is_empty() {
                 continue;
             }
+            splash.as_splash().set_grants(HostGrants::CLIPBOARD);
             splash.as_splash().set_text(&mut cx, &body);
             assert_eq!(splash.as_splash().last_errors(), Vec::<String>::new(), "{}'s parameters:\n{body}", node.path);
             checked += 1;

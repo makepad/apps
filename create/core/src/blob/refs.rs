@@ -145,7 +145,7 @@ mod tests {
     fn blob_id(n: u8) -> Id { id(u64::from(n), &[n; 32]) }
 
     fn entity(fields: Vec<(Key, Value)>) -> Content {
-        Content::Entity { kind: Key::Number(entity_kind::FILE), project: None, derive: None, fields }
+        Content::Entity { copied_from: vec![], kind: Key::Number(entity_kind::FILE), project: None, derive: None, fields }
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
         let mut m = Maker::fresh(2, 1, false);
         let item = m.add(0, Actor::Human, entity(vec![(field::BLOB, value(1))]), None);
         let erased = m.add(0, Actor::Human, entity(vec![
-            (field::BLOB, value(2)), (Key::Number(40), value(1)), (Key::Number(41), value(2)),
+            (field::BLOB, value(2)), (Key::Number(65000), value(1)), (Key::Number(65001), value(2)),
         ]), None);
         let mut original = Log::found(&dir.join("original"), m.events[0].clone()).unwrap();
         original.append_all(m.events[1..].to_vec()).unwrap();
@@ -186,9 +186,9 @@ mod tests {
             assert_eq!(index.sweep(names), files, "only exact lowercase store names for unreachable blobs");
         }
 
-        let overwrite = Content::Set { changes: vec![Change { entity: item, field: field::BLOB, value: value(3) }],
+        let overwrite = Content::Set { copied_from: vec![], changes: vec![Change { entity: item, field: field::BLOB, value: value(3) }],
             label: None };
-        let delete = Content::Set { changes: vec![Change { entity: item, field: field::DELETED, value: Value::Bool(true) }],
+        let delete = Content::Set { copied_from: vec![], changes: vec![Change { entity: item, field: field::DELETED, value: Value::Bool(true) }],
             label: None };
         let text = Content::Text { doc: item, ops: vec![TextOp::Attr { at: BreakRef::Root, attr: 99, value: value(4) }] };
         for (step, content) in [overwrite, delete, text].into_iter().enumerate() {
@@ -223,7 +223,7 @@ mod tests {
         let author_seat = m.invite(1, 2);
         let accepted = m.accept(2, author_seat, None);
         let membership = m.events.len();
-        let witness = m.add(2, Actor::Human, entity(vec![(field::BLOB, value(7)), (Key::Number(40), value(8))]), None);
+        let witness = m.add(2, Actor::Human, entity(vec![(field::BLOB, value(7)), (Key::Number(65000), value(8))]), None);
         // A second witness for blob 8 is above the first witness's send boundary. It stays
         // valid when the first is void, so neither witness alone then satisfies both rules.
         m.add(0, Actor::Human, entity(vec![(field::BLOB, value(8))]), Some(vec![author_seat]));

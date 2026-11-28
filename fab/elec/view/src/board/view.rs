@@ -3270,6 +3270,9 @@ impl BoardPane {
         Some(LineKey::Idle { unrouted: conn.unrouted.len(), selected, left })
     }
 
+    /// Route all open nets with this pane's selected routing method.
+    pub fn route_all(&mut self, cx: &mut Cx) { self.route_pressed(cx, LineButton::RouteAll); }
+
     /// A press on the route line: route the board's unrouted nets, or the selection's, or re-route
     /// the nets the last route left open.
     fn route_pressed(&mut self, cx: &mut Cx, button: LineButton) {

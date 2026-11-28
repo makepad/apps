@@ -158,7 +158,7 @@ pub struct Preview {
     min_span: [i128; 2],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Guide {
     pub line: f64,
     pub start: f64,
@@ -446,7 +446,17 @@ fn snap_to(moving: Rect, targets: impl Iterator<Item = Rect>, handle: Option<Han
     result
 }
 
-fn ticks(value: f64) -> Option<i64> {
+/// Snap a fixed-size footprint using the same local lines and zoom tolerance as a new item.
+pub(super) fn snap_rect(view: Option<&BoardView>, rect: Rect, zoom: f64, alt: bool) -> (Rect, [Option<Guide>; 2]) {
+    let Some(view) = view.filter(|_| !alt && zoom > 0.) else { return (rect, [None; 2]) };
+    let limit = 6. / zoom;
+    let ids = snap_neighbours(view, rect, limit);
+    let snap = snap_to(rect, ids.iter().filter_map(|id| view.get(id).map(|item| item.rect)), None, limit);
+    let [dx, dy] = snap.delta;
+    (Rect::new(rect.x0 + dx, rect.y0 + dy, rect.x1 + dx, rect.y1 + dy), snap.guides)
+}
+
+pub(super) fn ticks(value: f64) -> Option<i64> {
     let n = (value * 64.).round();
     ((i64::MIN as f64..-(i64::MIN as f64)).contains(&n)).then_some(n as i64)
 }

@@ -186,7 +186,10 @@ fn the_plates_panel_lists_opens_makes_finds_renames_removes_and_trashes_plates()
                     .collect();
                 let row_h = on_screen.iter().map(|(_, r)| r.h).fold(0.0, f32::max);
                 let shown: Vec<(String, makepad_test::Rect)> = on_screen.into_iter().filter(|(_, r)| r.h >= row_h - 0.5).collect();
-                let bare: Vec<String> = shown.iter().filter(|(_, r)| !thumbs.iter().any(|t| r.y <= t.y + t.h * 0.5 && t.y + t.h * 0.5 <= r.y + r.h)).map(|(name, _)| name.clone()).collect();
+                let bare: Vec<String> = shown.iter().filter(|(_, r)| !thumbs.iter().any(|t| {
+                    let (cx, cy) = (t.x + t.w * 0.5, t.y + t.h * 0.5);
+                    r.x <= cx && cx <= r.x + r.w && r.y <= cy && cy <= r.y + r.h
+                })).map(|(name, _)| name.clone()).collect();
                 if !bare.is_empty() {
                     if painted.len() != painted_before || bare != last_bare {
                         last_progress = Instant::now();

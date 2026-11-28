@@ -498,9 +498,7 @@ impl Widget for FabSlicerPanel {
             let rect = self.view.widget(cx, ids!(body.rows)).borrow::<FabSlicerRows>().and_then(|rows| rows.row_rect(cx, key));
             if let Some(rect) = rect {
                 self.reveal = None;
-                if let Some(mut body) = self.view.view(cx, ids!(body)).borrow_mut() {
-                    body.scroll_into_view_abs(cx, rect);
-                }
+                self.view.scroll_shadow_view(cx, ids!(body)).scroll_into_view_abs(cx, rect);
             }
         }
         step

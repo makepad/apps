@@ -39,12 +39,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn calibration_item(app: &TestApp, selector: Selector) -> makepad_test::Locator {
+    calibration_item_toward(app, selector, true)
+}
+
+fn calibration_item_toward(app: &TestApp, selector: Selector, down: bool) -> makepad_test::Locator {
     let panel = app.locator(Selector::role(Role::TabPanel).name("Printers")).snapshot().bounds;
     let query = selector.as_query();
     let item = app.locator(selector);
     app.wait_until(|| {
         if item.try_snapshot().is_ok() { return None; }
-        app.scroll_at(f64::from(panel.x + panel.w * 0.5), f64::from(panel.y + panel.h * 0.5), 0.0, f64::from(panel.h * 0.5), None);
+        app.scroll_at(f64::from(panel.x + panel.w * 0.5), f64::from(panel.y + panel.h * 0.5), 0.0, f64::from(panel.h * if down { 0.5 } else { -0.5 }), None);
         Some(format!("scrolling the printer's Settings to {query}"))
     });
     // The other steps have the same buttons in their folded bodies. Act on the exact
@@ -301,8 +305,17 @@ object(block)
 
     // ---- Calibrate (the printer idle again): the clearance part becomes the plate and slices ----
     report(sim, IDLE);
-    open_clearance(&app);
-    calibration_item(&app, Selector::role(Role::Button).name("Make test part")).press();
+    calibration_item(&app, Selector::role(Role::DisclosureButton).name("Settings")).expand();
+    calibration_item(&app, Selector::role(Role::StaticText).name("Calibrating Simulated printer with Fab PLA"));
+    calibration_item(&app, Selector::role(Role::DisclosureButton).name("Pressure advance")).expand();
+    calibration_item(&app, Selector::role(Role::StaticText).name("K 0.035 (from Fab dual nozzle 0.4)"));
+    let clearance = calibration_item_toward(&app, Selector::role(Role::DisclosureButton).name("Clearance"), false);
+    let section = format!("{}.", clearance.snapshot().node.path);
+    clearance.expand();
+    let make = app.widget_snapshot().nodes().into_iter().find(|item|
+        item.node.path.starts_with(&section) && item.node.role == Role::Button && item.node.name == "Make test part")
+        .expect("the Clearance section has its own Make test part button");
+    calibration_item(&app, Selector::path(make.node.path)).press();
     wait_for_within(&app, Duration::from_secs(60), || match call(&app, "inspect", r#"{"program":false}"#).map(|l| text(&l)).expect("inspect").contains("block/block") {
         true => Err("the test part never became the plate".to_string()),
         false => Ok(()),
@@ -329,9 +342,18 @@ object(block)
     calibration_item(&app, Selector::role(Role::StaticText).text_contains("Saved for Mechanics"));
     wait_name(&app, "Saved for Mechanics");
     let files: Vec<PathBuf> = std::fs::read_dir(results).unwrap().flatten().flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten().map(|f| f.path())).collect();
-    assert_eq!(files.len(), 1, "one results file: {files:?}");
-    let stored = std::fs::read_to_string(&files[0]).unwrap();
+    use fab_calibrate::{results::names, Results};
+    let owner = Results::owner_path_in(results, "printer:Simulated printer", "Fab PLA");
+    let preset = Results::path_in(results, "Fab dual nozzle 0.4", "Fab PLA");
+    assert!(files.len() == 2 && files.contains(&owner) && files.contains(&preset), "only the original preset and the new owner file exist: {files:?}");
+    let stored = std::fs::read_to_string(owner).unwrap();
     assert!(stored.contains("c_xy = 0.3\n"), "the answer 5 is stored as its clearance: {stored}");
+    let preset = Results::load_in(results, "Fab dual nozzle 0.4", "Fab PLA");
+    assert_eq!(preset.values.len(), 1, "the preset still contains just its original measurement");
+    assert_eq!(preset.get(names::PRESSURE_ADVANCE), Some(0.035), "the preset pressure advance survives the owner's save");
+    let other = Results::load_effective_in(results, Some("printer:Other"), "Fab dual nozzle 0.4", "Fab PLA");
+    assert_eq!(other.get(names::C_XY), None, "another printer does not inherit the owner's clearance");
+    assert_eq!(other.get(names::PRESSURE_ADVANCE), Some(0.035), "another printer shares the preset fallback");
 }
 
 fn wait_no_name(app: &TestApp, prefix: &str) {
@@ -852,6 +874,9 @@ fn monitor_follows_a_simulated_printer_and_calibrate_stores_the_answer() {
     let dir: PathBuf = std::env::temp_dir().join(format!("fab-monitor-sim-{}", std::process::id()));
     let results = dir.join("results");
     std::fs::create_dir_all(&results).unwrap();
+    let mut preset = fab_calibrate::Results::new("Fab dual nozzle 0.4", "Fab PLA");
+    preset.values.insert(fab_calibrate::results::names::PRESSURE_ADVANCE.into(), 0.035);
+    preset.save_in(&results).unwrap();
     let sim = dir.join("reports.jsonl");
     std::fs::write(&sim, format!("{IDLE}\n{}\n", on_the_job("PREPARE", 2, 0, 0, 40))).unwrap();
     let started = wall_now() - 36000.0;

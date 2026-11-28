@@ -3,7 +3,7 @@ use fab_elec_design::action::{ActionDef, FieldDef, FieldKind, Risk};
 
 pub const PROPOSE: ActionDef = ActionDef {
     name: "elec.step.propose", label: "Propose a step", group: "Steps",
-    help: "Propose a stage's documents together. It appears in the person's Review strip and is checked on the pool. The reply comes when the check finishes. A refusal gives its reason. Only the person can accept it.",
+    help: "Propose a stage's documents together. It appears in the person's Review strip and is checked on the pool. The reply comes when the check finishes. A refusal gives its reason. Only the person can accept it. Each \"replace\" edit takes the whole file text.",
     returns: "id: int
 shown: int  the verified revision shown for review
 state: text  ready
@@ -17,6 +17,17 @@ checks: {..}
     severity: text
     count: int
   pending: bool
+  findings: [{..}]  candidate findings on this page, errors first
+    unit: text
+    family: text  erc, drc, factory, case, system, route, custom, or another check family
+    severity: text
+    kind: text
+    message: text
+    items: text
+    fix: text  when available
+  total: int  all settled findings
+  next: int  next findings_from offset, when more remain
+  pending_labels: [text]  checks still pending, when present
 requirements: {..}  the person's requirements judged on the proposed design; absent when the project has none
   pass: int
   fail: int
@@ -63,6 +74,17 @@ pub const LIST: ActionDef = ActionDef {
       severity: text
       count: int
     pending: bool
+    findings: [{..}]  candidate findings on this page, errors first
+      unit: text
+      family: text  erc, drc, factory, case, system, route, custom, or another check family
+      severity: text
+      kind: text
+      message: text
+      items: text
+      fix: text  when available
+    total: int  all settled findings
+    next: int  next findings_from offset, when more remain
+    pending_labels: [text]  checks still pending, when present
   requirements: {..}  the person's requirements judged on the proposed design; absent when the project has none
     pass: int
     fail: int
@@ -74,7 +96,9 @@ pub const LIST: ActionDef = ActionDef {
     unjudged: [{..}]  each requirement the proposal cannot settle yet
       name: text
       why: text",
-    fields: &[], inputs: &[], risk: Risk::Read, keys: "",
+    fields: &[FieldDef { name: "findings_from", kind: FieldKind::Int { min: 0, max: i64::MAX }, required: false, default: "0",
+        help: "Start each proposal's finding page at this offset. Use checks.next for the following page." }],
+    inputs: &[], risk: Risk::Read, keys: "",
 };
 
 pub static ACTIONS: &[ActionDef] = &[PROPOSE, LIST];

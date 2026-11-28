@@ -1274,7 +1274,8 @@ fn lookup(c: Shared) -> Native {
 fn part_of(c: &Ctx, v: &V) -> Result<usize, String> {
     match v {
         V::Handle(Handle::Part(p)) => Ok(*p),
-        V::Str(name) => c.part_names.get(name).copied().ok_or_else(|| format!("no part named {name} is defined (e.define(\"{name}\", {{..}}))")),
+        // Keep the import explanation until imported definitions can join a project.
+        V::Str(name) => c.part_names.get(name).copied().ok_or_else(|| format!("no part named {name} is defined in this project (e.define(\"{name}\", {{..}})); a part that is only in the local import library is not in this project yet")),
         other => Err(format!("expected a part or a part name, got {}", other.describe())),
     }
 }

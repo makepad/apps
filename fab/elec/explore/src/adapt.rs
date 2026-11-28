@@ -414,11 +414,15 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
         };
         let sides: HashMap<_, _> = def.into_iter().flat_map(|d| &d.sheet.sides)
             .map(|(name, side)| (name, side_of(*side))).collect();
+        let mut ports_by_name: Option<HashMap<&str, &circuit::PortDef>> = None;
         let ports = b
             .ports
             .iter()
             .enumerate().map(|(i, (name, nets))| {
-                let pdef = def.and_then(|d| d.ports.get(i));
+                let pdef = def.and_then(|d| d.ports.get(i).filter(|p| p.name == *name).or_else(|| {
+                    ports_by_name.get_or_insert_with(|| d.ports.iter().map(|p| (p.name.as_str(), p)).collect())
+                        .get(name.as_str()).copied()
+                }));
                 let side = sides.get(name).copied();
                 let kind = pdef.map(|p| block_port_kind(&p.kind)).unwrap_or(PortKind::Passive);
                 let ground = pdef.is_some_and(|p| p.kind == circuit::PortKind::Ground);

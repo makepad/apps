@@ -1,5 +1,6 @@
 //! Derived, offline BOM and board fabrication figures. The host owns snapshots and file I/O.
 pub mod sheet;
+pub mod shortlist;
 pub mod board_facts;
 pub mod cost;
 pub mod rates;

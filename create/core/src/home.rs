@@ -5,10 +5,10 @@
 
 mod computer_label;
 
-use crate::{event::TownId, home_writer::{HomeWriter, PrivateFiles}, key::PublicKey};
+use crate::{event::TownId, fold::FinalClosure, home_writer::{HomeWriter, PrivateFiles}, key::PublicKey};
 mod lock;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,23 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 
 const POLICY_SET_ASIDE_PREFIX: &str = "town.before-policy-";
+
+fn strict_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    if s.len() != N * 2 { return None }
+    let mut out = [0; N];
+    for (byte, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        let &[hi, lo] = pair else { return None };
+        *byte = nibble(hi)? << 4 | nibble(lo)?;
+    }
+    Some(out)
+}
 
 pub fn is_policy_set_aside(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(POLICY_SET_ASIDE_PREFIX))
@@ -214,18 +231,41 @@ impl Home {
         self.append_home_line(&format!("shared town {}", crate::hex(town)))
     }
 
-    pub fn close_final(&self, town: &TownId, peer: &PublicKey) -> io::Result<()> {
-        self.append_home_line(&format!("final exchange closed {} {}", crate::hex(town), crate::hex(peer)))
+    pub fn close_final(&self, town: &TownId, peer: &PublicKey, closure: FinalClosure) -> io::Result<()> {
+        let line = match closure.normalized() {
+            Some(FinalClosure::Removal(id)) => format!(
+                "final exchange closed {} {} {}", crate::hex(town), crate::hex(peer), crate::hex(&id)),
+            Some(FinalClosure::Fork([lo, hi])) => format!(
+                "final exchange closed {} {} {} {}", crate::hex(town), crate::hex(peer), crate::hex(&lo), crate::hex(&hi)),
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "fork closure requires two distinct events")),
+        };
+        self.append_home_line(&line)
     }
 
-    pub fn closed_finals(&self) -> io::Result<BTreeSet<(TownId, PublicKey)>> {
+    pub fn closed_finals(&self) -> io::Result<BTreeMap<(TownId, PublicKey), BTreeSet<FinalClosure>>> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid final exchange closure");
         let record = self.home_record()?;
-        record.split(|&b| b == b'\n').filter_map(|line| line.strip_prefix(b"final exchange closed "))
-            .map(|fields| {
-                let pair = std::str::from_utf8(fields).ok().and_then(|s| s.split_once(' '))
-                    .and_then(|(town, peer)| Some((crate::parse_id(town)?, makepad_network::tls::from_hex(peer)?)));
-                pair.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid final exchange closure"))
-            }).collect()
+        let mut out: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for line in record.split(|&b| b == b'\n') {
+            if line == b"final exchange closed" { return Err(invalid()) }
+            let Some(fields) = line.strip_prefix(b"final exchange closed ") else { continue };
+            let text = std::str::from_utf8(fields).map_err(|_| invalid())?;
+            let parts: Vec<_> = text.split(' ').collect();
+            let (town, peer, closure) = match parts.as_slice() {
+                [town, peer] if strict_hex::<32>(town).is_some() && strict_hex::<65>(peer).is_some() => {
+                    continue; // An id-less legacy closure allows a fresh exchange.
+                }
+                [town, peer, id] => (town, peer, FinalClosure::Removal(strict_hex(id).ok_or_else(invalid)?)),
+                [town, peer, a, b] => {
+                    let closure = FinalClosure::fork(strict_hex(a).ok_or_else(invalid)?, strict_hex(b).ok_or_else(invalid)?);
+                    (town, peer, closure.ok_or_else(invalid)?)
+                }
+                _ => return Err(invalid()),
+            };
+            let pair = (strict_hex(town).ok_or_else(invalid)?, strict_hex(peer).ok_or_else(invalid)?);
+            out.entry(pair).or_default().insert(closure);
+        }
+        Ok(out)
     }
 
     pub fn town_checkpoint(&self, town: &crate::event::TownId) -> PathBuf {
@@ -382,6 +422,46 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_finals_round_trips_scoped_closures_skips_legacy_lines_and_rejects_malformed() {
+        let dir = crate::log::tests::temp_dir("scoped-closures-home");
+        let home = Home::open(&dir).unwrap();
+        let (t1, p1, t2, p2) = ([1; 32], [2; 65], [3; 32], [4; 65]);
+        let (r1, r2, lo, hi) = ([5; 32], [6; 32], [0xab; 32], [0xcd; 32]);
+        for id in [r1, r2, r1] { home.close_final(&t1, &p1, FinalClosure::Removal(id)).unwrap(); }
+        let removals = BTreeSet::from([FinalClosure::Removal(r1), FinalClosure::Removal(r2)]);
+        assert_eq!(home.closed_finals().unwrap(), BTreeMap::from([((t1, p1), removals.clone())]),
+            "distinct removals round-trip and a duplicate line counts once");
+        home.close_final(&t2, &p2, FinalClosure::Fork([hi, lo])).unwrap();
+        let prefix = "final exchange closed";
+        let pair = format!("{} {}", crate::hex(&t2), crate::hex(&p2));
+        let (low, high) = (crate::hex(&lo), crate::hex(&hi));
+        let journal = std::fs::read_to_string(home.record_path()).unwrap();
+        assert!(journal.lines().any(|line| line == format!("{prefix} {pair} {low} {high}")),
+            "writing reversed siblings puts the lower id first on disk");
+        assert_eq!(home.close_final(&t2, &p2, FinalClosure::Fork([hi, hi])).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput, "a caller cannot close on two identical siblings");
+        home.append_home_line(&format!("{prefix} {} {}", crate::hex(&t1), crate::hex(&p2))).unwrap();
+        assert_eq!(home.closed_finals().unwrap(), BTreeMap::from([
+            ((t1, p1), removals), ((t2, p2), BTreeSet::from([FinalClosure::Fork([lo, hi])])),
+        ]), "a valid legacy line is dropped and all scoped closures survive");
+
+        let bad_lines = [
+            prefix.to_owned(), format!("{prefix} {low}"), format!("{prefix} {low} xx"),
+            format!("{prefix} {pair} {}", low.to_uppercase()), format!("{prefix} {pair} {}", low.replacen('a', ":", 1)),
+            format!("{prefix} {pair} ab"), format!("{prefix} {pair} {low} {low}"),
+            format!("{prefix} {pair} {low} {high} {low}"), format!("{prefix} {pair} {low} "),
+            format!("{prefix} {pair}  {low}"), format!("{prefix} {pair} {}", "é".repeat(32)),
+        ];
+        for line in bad_lines.iter().map(String::as_bytes).chain([b"final exchange closed \xff".as_slice()]) {
+            std::fs::write(home.record_path(), [journal.as_bytes(), line, b"\n"].concat()).unwrap();
+            assert_eq!(home.closed_finals().unwrap_err().kind(), io::ErrorKind::InvalidData,
+                "a malformed closure fails the whole journal read: {:?}", String::from_utf8_lossy(line));
+        }
+        drop(home);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_blocked_journal_preserves_peer_backups_and_precedes_the_archive_move() {

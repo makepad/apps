@@ -269,8 +269,8 @@ script_mod! {
             none := mod.widgets.FabCard{
                 visible: true
                 margin: Inset{bottom: 10}
-                title := mod.widgets.FabTitleLabel{ text: "" }
-                text := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                title := mod.widgets.FabTitleLabel{ text: "" draw_text +: { color: fab.color_text_well } }
+                text := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
             }
             before := mod.widgets.FabPrinterSections{part: 0}
             // the printer in use: everything it reports, its trays, the print's question and its
@@ -471,8 +471,8 @@ script_mod! {
             jobs_none := mod.widgets.FabCard{
                 visible: false
                 margin: Inset{bottom: 10}
-                title := mod.widgets.FabTitleLabel{ text: "No printer in use." }
-                text := mod.widgets.FabLabelDim{ width: Fill text: "Use one of the printers below: its job, its profile, colours and slice, shows in its section." }
+                title := mod.widgets.FabTitleLabel{ text: "No printer in use." draw_text +: { color: fab.color_text_well } }
+                text := mod.widgets.FabLabelDim{ width: Fill text: "Use one of the printers below: its job, its profile, colours and slice, shows in its section." draw_text +: { color: fab.color_text_well_dim } }
             }
             jobs_before := mod.widgets.FabPrinterJobs{part: 0}
             // the printer in use: its job (profile, colours, slice), then the jobs sent to it
@@ -1040,10 +1040,16 @@ fn confirm_report(p: &PrintState) -> Option<&fab_printer_link::Snapshot> {
 /// What the confirm card asks or says: the print's question once its slice is ready, how far the
 /// slice is before that (with its progress), and what to do when none is on its way. The card
 /// follows the slice, so the question comes the moment the slice does.
-fn confirm_question(p: &PrintState, printer: &fab_printer_link::Snapshot, empty_plate: bool) -> (String, Option<f32>) {
+pub fn confirm_question(p: &PrintState, printer: &fab_printer_link::Snapshot, empty_plate: bool) -> (String, Option<f32>) {
     let name = &printer.name;
     if empty_plate {
         return ("The plate is empty: there is nothing to print yet.".into(), None);
+    }
+    if let Some(stage) = p.calibration_wait() {
+        return (format!("Preparing the print for {name}: {stage}…"), None);
+    }
+    if p.calibration_error.is_some() {
+        return (format!("Cannot print on {name}: the plate failed to rebuild for this calibration."), None);
     }
     match &p.status {
         SliceStatus::Running { progress, stage } => (format!("Preparing the print for {name}: {stage}…"), Some(*progress)),
@@ -1081,23 +1087,70 @@ fn picked_name(names: &[String], id: LiveId) -> Option<String> {
     names.iter().find(|n| LiveId::from_str(n) == id).cloned()
 }
 
+fn first_line<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+    s.lines().next().filter(|line| !line.trim().is_empty()).unwrap_or(fallback)
+}
+
+fn file_failure(why: &str) -> String {
+    format!("Export failed: {}", first_line(why, "could not write the file"))
+}
+
+/// The filament export's own status line, and whether it is a failure.
+pub fn export_line(p: &PrintState) -> Option<(String, bool)> {
+    match &p.export {
+        ExportStatus::Idle => None,
+        ExportStatus::Exporting => Some((p.calibration_wait().map_or_else(|| "Exporting…".into(), |stage| format!("Exporting · {stage}…")), false)),
+        ExportStatus::Written(path) => Some((format!("Wrote {}", path.display()), false)),
+        ExportStatus::Failed(why) => Some((file_failure(why), true)),
+    }
+}
+
+/// An active filament or resin export failure.
+pub fn export_failure(p: &PrintState) -> Option<String> {
+    if let ExportStatus::Failed(why) = &p.export {
+        return Some(file_failure(why));
+    }
+    p.resin.as_ref().filter(|r| r.export.starts_with("Export failed:"))
+        .map(|r| first_line(&r.export, "Export failed").to_owned())
+}
+
+/// The failure to show over a plate outside the Sliced view.
+pub fn stage_failure(p: &PrintState) -> Option<String> {
+    export_failure(p).or_else(|| (p.calibration_error.is_some() || matches!(p.status, SliceStatus::Failed(_))).then(|| slice_status(p).0))
+}
+
 /// The slice's status line and progress.
 pub fn slice_status(p: &PrintState) -> (String, Option<f32>) {
     // a resin printer's slice is its layer stack
     if let Some(r) = &p.resin {
         return (r.status(), None);
     }
+    if let Some(stage) = p.calibration_wait() {
+        let export = if matches!(p.export, ExportStatus::Exporting) { "Exporting · " } else { "" };
+        let status = if let SliceStatus::Done { seconds } = p.status { format!("Sliced in {seconds:.1} s. ") } else { String::new() };
+        return (format!("{status}{export}{stage}…"), None);
+    }
+    if let Some(err) = &p.calibration_error {
+        let prefix = if matches!(p.export, ExportStatus::Failed(_)) { "Export failed — calibration rebuild failed" } else { "Calibration rebuild failed" };
+        return (format!("{prefix}: {}", first_line(err, "the plate could not rebuild for this calibration")), None);
+    }
     match &p.status {
-        SliceStatus::Idle if p.preview.is_none() => ("Not sliced yet.".to_string(), None),
-        SliceStatus::Idle => (String::new(), None),
-        SliceStatus::Running { progress, stage } => (format!("{stage}…"), Some(*progress)),
+        SliceStatus::Idle => {
+            let line = export_line(p).map_or_else(|| if p.preview.is_none() { "Not sliced yet.".into() } else { String::new() }, |(t, _)| t);
+            (line, None)
+        }
+        SliceStatus::Running { progress, stage } => {
+            let prefix = if matches!(p.export, ExportStatus::Exporting) { "Exporting · " } else { "" };
+            (format!("{prefix}{stage}…"), Some(*progress))
+        }
         SliceStatus::Done { seconds } => {
             let mut t = format!("Sliced in {seconds:.1} s.");
             if p.stale {
                 t.push_str(" The plate changed since: slice again.");
             }
-            if let Some(e) = &p.exported {
-                t.push_str(&format!(" Wrote {}", e.display()));
+            if let Some((line, _)) = export_line(p) {
+                t.push(' ');
+                t.push_str(&line);
             }
             if let Some(w) = &p.fit_warning {
                 t.push_str(&format!(" {w}."));
@@ -1474,11 +1527,7 @@ impl FabPrinterPanel {
         // calibration: for the printer and filament the job uses
         let cal = &p.calibrate;
         v.widget(cx, ids!(body.calibrate_part)).set_visible(cx, true);
-        v.label(cx, ids!(body.calibrate_part.cal_context)).set_text(cx, &if cal.printer.is_empty() || cal.filament.is_empty() {
-            "Choose a printer and filament in the Job editor".to_string()
-        } else {
-            format!("For {} · {}", cal.printer, cal.filament)
-        });
+        v.label(cx, ids!(body.calibrate_part.cal_context)).set_text(cx, &cal.context_text());
         v.label(cx, ids!(body.calibrate_part.cal_status)).set_visible(cx, !cal.status.is_empty());
         v.label(cx, ids!(body.calibrate_part.cal_status)).set_text(cx, &cal.status);
         // the camera: in Status, or floating over the window (then a line and the way back)
@@ -1573,7 +1622,7 @@ impl FabPrinterPanel {
         confirm.label(cx, ids!(check)).set_text(cx, &check);
         let blocker = p.send_blocked.as_deref();
         // Accepted printability errors stay named, above whatever else stops Start print.
-        let accepted = p.errors_accepted().then(|| p.errors_text()).flatten();
+        let accepted = (p.calibration_wait().is_none() && p.calibration_error.is_none() && p.errors_accepted()).then(|| p.errors_text()).flatten();
         let said: Vec<&str> = accepted.as_deref().into_iter().chain(blocker).collect();
         confirm.label(cx, ids!(blocker)).set_text(cx, &said.join("\n"));
         confirm.label(cx, ids!(blocker)).set_visible(cx, !said.is_empty());
@@ -1685,8 +1734,12 @@ impl FabPrinterPanel {
 
     /// Where the printability errors are, one press each: the confirm card's button. The errors.
     fn show_issue(&self, cx: &mut Cx, confirm: &WidgetRef, p: &PrintState) -> Vec<usize> {
-        let errors = p.print_errors();
         let show = confirm.button(cx, ids!(show_issue));
+        if p.calibration_error.is_some() || p.calibration_wait().is_some() {
+            show.set_visible(cx, false);
+            return Vec::new();
+        }
+        let errors = p.print_errors();
         show.set_visible(cx, !errors.is_empty());
         if !errors.is_empty() {
             let next = self.next_issue % errors.len();
@@ -1957,6 +2010,33 @@ impl Widget for FabPrinterPanel {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn export_wording_keeps_success_quiet_and_failure_actionable() {
+        let mut p = PrintState::default();
+        assert_eq!(export_line(&p), None);
+        assert_eq!(slice_status(&p).0, "Not sliced yet.");
+        p.export = ExportStatus::Exporting;
+        assert_eq!(slice_status(&p).0, "Exporting…");
+        p.status = SliceStatus::Running { progress: 0.5, stage: "Planning".into() };
+        assert_eq!(slice_status(&p), ("Exporting · Planning…".into(), Some(0.5)));
+        p.status = SliceStatus::Done { seconds: 1.25 };
+        p.export = ExportStatus::Written("plate.gcode.3mf".into());
+        assert_eq!(export_line(&p), Some(("Wrote plate.gcode.3mf".into(), false)));
+        assert_eq!(slice_status(&p).0, "Sliced in 1.2 s. Wrote plate.gcode.3mf");
+        assert_eq!(stage_failure(&p), None);
+        p.export = ExportStatus::Failed("write refused\nmore detail".into());
+        assert_eq!(slice_status(&p).0, "Sliced in 1.2 s. Export failed: write refused");
+        assert_eq!(export_line(&p), Some(("Export failed: write refused".into(), true)));
+        assert_eq!(stage_failure(&p).as_deref(), Some("Export failed: write refused"));
+        p.export = ExportStatus::Failed(String::new());
+        assert_eq!(export_failure(&p).as_deref(), Some("Export failed: could not write the file"));
+        p.export = ExportStatus::Idle;
+        p.status = SliceStatus::Failed("bad slice".into());
+        assert_eq!(stage_failure(&p).as_deref(), Some("Slice failed: bad slice"));
+        p.resin = Some(resin::ResinShow { export: "Export failed: layer write refused\nmore detail".into(), ..Default::default() });
+        assert_eq!(stage_failure(&p).as_deref(), Some("Export failed: layer write refused"));
+    }
 
     #[test]
     fn split_printer_scopes_follow_the_surface_that_was_drawn() {

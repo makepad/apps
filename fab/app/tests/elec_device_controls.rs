@@ -108,7 +108,7 @@ fn boards_drawn(app: &TestApp) -> Option<bool> {
 
 /// The board toggle's lit state, once it shows.
 fn board_toggle(app: &TestApp) -> Option<bool> {
-    app.locator(Selector::role(Role::ToggleButton).name("Show board")).try_snapshot().ok().and_then(|n| n.checked())
+    app.locator(Selector::role(Role::ToggleButton).name("Circuit board")).try_snapshot().ok().and_then(|n| n.checked())
 }
 
 /// A JSON number, whole or not.
@@ -168,11 +168,12 @@ fn the_device_view_takes_each_press_and_turn_and_the_board_toggle_hides_the_boar
     let result = run_with_config(config, |app: TestApp| {
         app.locator(Selector::role(Role::Window)).wait_visible();
         workspace(&app, "3D modeling");
+        app.locator(Selector::role(Role::Button).name("View options")).wait_visible().press();
 
         // Design: the board in place, its toggle on; off hides it, on shows it again.
         wait_until(&app, "viewport", "the board drawn with its toggle on", || board_toggle(&app) == Some(true) && boards_drawn(&app) == Some(true));
         for on in [false, true] {
-            app.locator(Selector::role(Role::ToggleButton).name("Show board")).wait_visible().press();
+            app.locator(Selector::role(Role::ToggleButton).name("Circuit board")).wait_visible().press();
             taken(&app, "viewport", &format!("the toggle {} and the board {}", if on { "on" } else { "off" }, if on { "drawn" } else { "hidden" }),
                 || board_toggle(&app) == Some(on) && boards_drawn(&app) == Some(on));
         }

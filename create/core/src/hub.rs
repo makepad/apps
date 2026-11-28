@@ -17,6 +17,39 @@ use std::{
 
 pub const RETRY_MS: u64 = 2_000;
 pub const FAREWELL_MS: u64 = 2_000;
+pub const BLOCKED_NETWORKS: &str = "Couldn't reach it: both networks block direct links.";
+pub const SAME_NETWORK_LAN_OFF_HERE: &str =
+    "The other computer is on your network, but this Town\nhas the local network off. Turn it on, then try again.";
+pub const SAME_NETWORK_PEER_LAN_OFF: &str =
+    "The other computer is on your network, but its Town has\nthe local network off. Turn it on there, then try again.";
+pub const SAME_NETWORK_NO_LOCAL_ADDRESS: &str =
+    "Both computers share an address, but this computer\nhas no local network address. Check your network.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReason {
+    LocalLanOff,
+    PeerLanOff,
+    NoLocalAddress,
+}
+
+impl BlockReason {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::LocalLanOff => SAME_NETWORK_LAN_OFF_HERE,
+            Self::PeerLanOff => SAME_NETWORK_PEER_LAN_OFF,
+            Self::NoLocalAddress => SAME_NETWORK_NO_LOCAL_ADDRESS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordsRejected {
+    StaleAttempt,
+    NotReady,
+    OlderInvite,
+    AlreadyPairing,
+}
+
 const KEEP_MAPPING: u64 = 20_000;
 const PROVE_WAIT_MS: u64 = 20_000;
 
@@ -131,6 +164,7 @@ pub enum Event {
     WordsChanged,
     Phase(Status),
     Note(&'static str),
+    Blocked(BlockReason),
     Linked { peer: connect::Peer, words: Option<(Invite, Invite)> },
     Path(PublicKey, Remembered),
     Lost { why: String, sent_bytes: u64 },
@@ -402,24 +436,22 @@ pub struct Slot {
     repunch: Repunch,
     traffic: PeerTraffic,
     same_network: bool,
+    lan_allowed: bool,
     events: Vec<Event>,
 }
 
 impl Slot {
     pub fn new(device: Arc<DeviceKey>, start: Start) -> Self {
-        let (phase, known, same_network) = match start {
-            Start::Words { same_network } => (SlotPhase::Idle, None, same_network),
-            Start::Known { pin, path } => {
-                let phase =
-                    if path == Remembered::default() { SlotPhase::Idle } else { SlotPhase::Backoff { retry_at: 0 } };
-                (phase, Some((pin, path)), false)
-            }
-        };
-        Self {
+        Self::with_lan(device, start, true)
+    }
+
+    fn with_lan(device: Arc<DeviceKey>, start: Start, lan_allowed: bool) -> Self {
+        let mut slot = Self {
             device,
-            phase,
-            known,
-            same_network,
+            phase: SlotPhase::Idle,
+            known: None,
+            same_network: matches!(start, Start::Words { same_network: true }),
+            lan_allowed,
             generation: 0,
             wanted: true,
             wake: Some(0),
@@ -436,8 +468,21 @@ impl Slot {
             repunch: Repunch::None,
             traffic: Default::default(),
             events: Vec::new(),
+        };
+        if let Start::Known { pin, path } = start {
+            slot.known = Some((pin, path));
+            if slot.effective_path(path) != Remembered::default() {
+                slot.phase = SlotPhase::Backoff { retry_at: 0 };
+            }
         }
+        slot
     }
+
+    fn effective_path(&self, path: Remembered) -> Remembered {
+        if self.lan_allowed { path } else { Remembered { lan: None, ..path } }
+    }
+
+    fn include_lan(&self) -> bool { self.same_network && self.lan_allowed }
 
     fn check_address(&mut self, lan: Option<SocketAddrV4>, transaction: [u8; 12]) {
         let Some(w) = &mut self.watch else { return };
@@ -448,24 +493,31 @@ impl Slot {
         self.events.push(Event::Reflect(w.server, w.request(transaction)));
     }
 
-    fn words(&mut self, own: Invite, peer: Invite, name: String, now: u64) {
+    fn words(&mut self, own: Invite, peer: Invite, name: String, now: u64) -> Result<(), WordsRejected> {
         if self.phase != SlotPhase::Idle {
-            return;
+            return Err(WordsRejected::AlreadyPairing);
         }
-        let Some(words) = &mut self.words else { return };
+        let words = self.words.as_mut().ok_or(WordsRejected::NotReady)?;
         if words.own != own {
             self.events.push(Event::Note("words for an older invite of ours, ignored"));
-            return;
+            return Err(WordsRejected::OlderInvite);
         }
-        if discover::assess(own.nat, peer.nat) == discover::Assessment::NotPossible
-            && connect::lan_candidate(&own, &peer).is_none()
-        {
-            self.fail("Couldn't reach it: both networks block direct links.".into());
-            return;
+        let lan = connect::lan_candidate(&own, &peer);
+        let same_public_block = (lan.is_none() && own.addr.ip() == peer.addr.ip()).then(|| {
+            if !self.lan_allowed { BlockReason::LocalLanOff }
+            else if own.lan.is_some() { BlockReason::PeerLanOff }
+            else { BlockReason::NoLocalAddress }
+        });
+        if discover::assess(own.nat, peer.nat) == discover::Assessment::NotPossible && lan.is_none() {
+            self.fail(same_public_block.map_or(BLOCKED_NETWORKS, BlockReason::text).into());
+            return Ok(());
         }
         self.first_tag = Some(connect::invite_tag(&own, &peer));
         words.matched = Some((peer, name));
         self.events.push(Event::Note("words matched"));
+        if let Some(reason) = same_public_block {
+            self.events.push(Event::Blocked(reason));
+        }
         if let Some(watch) = &mut self.watch {
             watch.next = now;
         }
@@ -473,6 +525,7 @@ impl Slot {
         if !self.watch.as_ref().is_some_and(|w| w.confirm_until.is_some()) {
             self.events.push(Event::Punch);
         }
+        Ok(())
     }
 
     fn punch(&mut self, random: [u8; 72], now: Now) {
@@ -480,6 +533,11 @@ impl Slot {
             return;
         }
         let result = if let Some((pin, path)) = self.known {
+            let path = self.effective_path(path);
+            if path == Remembered::default() {
+                self.phase = SlotPhase::Idle;
+                return;
+            }
             let Some((_, tags)) = &self.tags else { return };
             self.first_tag = None;
             let mode = Mode::Reconnect(Reconnect { device: self.device.clone(), peers: vec![pin] });
@@ -646,7 +704,7 @@ impl Slot {
         }
         self.lost("the socket was lost".into(), self.sent_bytes());
         if let Some((_, path)) = self.known {
-            if path == Remembered::default() { self.phase = SlotPhase::Idle; }
+            if self.effective_path(path) == Remembered::default() { self.phase = SlotPhase::Idle; }
             else { self.backoff(now, 0); }
         } else if self.words.is_some() {
             if self.words.as_ref().is_some_and(|w| w.matched.is_some()) {
@@ -1034,6 +1092,7 @@ impl SyncInboxes {
 /// One UDP port. Wanted peers each own one slot alongside the optional words slot. Retiring streams remain reachable solely by their existing stream ID.
 pub struct Hub {
     device: Arc<DeviceKey>,
+    lan_allowed: bool,
     slots: BTreeMap<Carrier, Slot>,
     tags: TagTable,
     streams: BTreeMap<[u8; 8], Attempt>,
@@ -1053,8 +1112,15 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(device: Arc<DeviceKey>) -> Self {
+        Self::with_lan(device, true)
+    }
+
+    pub fn lan_allowed(&self) -> bool { self.lan_allowed }
+
+    pub fn with_lan(device: Arc<DeviceKey>, lan_allowed: bool) -> Self {
         Self {
             device,
+            lan_allowed,
             slots: BTreeMap::new(),
             tags: TagTable::default(),
             streams: BTreeMap::new(),
@@ -1183,21 +1249,23 @@ impl Hub {
         for (peer, (mut pin, mut path)) in wanted {
             let key = Carrier::Peer(peer);
             if let Some(s) = self.slots.get_mut(&key).filter(|s| s.wanted) {
-                if let Some((known, memory)) = &mut s.known {
+                if let Some((known, memory)) = &s.known {
                     path.public = path.public.or(memory.public);
                     path.lan = path.lan.or(memory.lan);
                     // A punch at an obsolete destination can otherwise last forever.
-                    let new_target = *memory != path && matches!(s.phase, SlotPhase::Idle | SlotPhase::Punching);
-                    *memory = path;
-                    if known.min_version >= pin.min_version && !new_target {
+                    let new_target = s.effective_path(*memory) != s.effective_path(path)
+                        && matches!(s.phase, SlotPhase::Idle | SlotPhase::Punching);
+                    let min_version = known.min_version;
+                    s.known = Some((*known, path));
+                    if min_version >= pin.min_version && !new_target {
                         continue;
                     }
-                    pin.min_version = pin.min_version.max(known.min_version);
+                    pin.min_version = pin.min_version.max(min_version);
                 }
                 self.close(key, now.ms, false);
             }
             self.displace(key);
-            let mut s = Slot::new(self.device.clone(), Start::Known { pin, path });
+            let mut s = Slot::with_lan(self.device.clone(), Start::Known { pin, path }, self.lan_allowed);
             s.generation = self.fresh();
             Self::configure_tags(&mut s, connect::probe_hour(now.unix_secs));
             self.slots.insert(key, s);
@@ -1215,7 +1283,7 @@ impl Hub {
             self.rebuild_tags();
         }
         self.reflector = None;
-        let mut slot = Slot::new(self.device.clone(), Start::Words { same_network });
+        let mut slot = Slot::with_lan(self.device.clone(), Start::Words { same_network }, self.lan_allowed);
         slot.generation = self.fresh();
         let at = Attempt { carrier: Carrier::Words, generation: slot.generation };
         slot.show(Status::FindingAddress);
@@ -1449,13 +1517,13 @@ impl Hub {
         }
     }
 
-    pub fn words(&mut self, at: Attempt, own: Invite, peer: Invite, name: String, now: u64) {
-        if let Some(s) = self.words_slot(at) {
-            s.words(own, peer, name, now);
-            if let Some(tag) = s.first_tag {
-                self.tags.insert(tag, Carrier::Words);
-            }
+    pub fn words(&mut self, at: Attempt, own: Invite, peer: Invite, name: String, now: u64) -> Result<(), WordsRejected> {
+        let s = self.words_slot(at).ok_or(WordsRejected::StaleAttempt)?;
+        s.words(own, peer, name, now)?;
+        if let Some(tag) = s.first_tag {
+            self.tags.insert(tag, Carrier::Words);
         }
+        Ok(())
     }
 
     /// Accept host results only for the words attempt that requested them.
@@ -1489,10 +1557,10 @@ impl Hub {
             slot.fail("No current invite key.".into());
             return;
         };
-        let lan = lan.filter(|a| makepad_network::p2p::words::lan_candidate_ok(*a));
+        let lan = lan.filter(|a| slot.include_lan() && makepad_network::p2p::words::lan_candidate_ok(*a));
         let own = Invite { nat: hint, addr, lan, commit: Invite::commitment(hint, addr, lan, &key.public()) };
         slot.events.push(Event::Invite(own.clone()));
-        let watch = AddressWatch::new(server, addr, lan, slot.same_network, opened);
+        let watch = AddressWatch::new(server, addr, lan, slot.include_lan(), opened);
         self.wait_for_words(at, session, own, Some(watch));
     }
 
@@ -1532,7 +1600,7 @@ impl Hub {
         if let Some((addr, server)) = choice.address.and_then(|addr| {
             result.answers.iter().find(|(_, seen)| *seen == Some(addr.into())).map(|(server, _)| (addr, *server))
         }) {
-            s.events.push(Event::OpenInvite { server, addr, hint: choice.hint, include_lan: s.same_network });
+            s.events.push(Event::OpenInvite { server, addr, hint: choice.hint, include_lan: s.include_lan() });
         } else {
             s.fail("couldn't learn this machine's public address: is it online?".into());
         }
@@ -1790,6 +1858,105 @@ pub fn describe(failure: &Failure) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_public_address_without_lan_reports_which_side_has_lan_off() {
+        use BlockReason::{LocalLanOff, NoLocalAddress, PeerLanOff};
+        let ana = Arc::new(DeviceKey::generate().unwrap());
+        let server = "203.0.113.1:3478".parse().unwrap();
+        let addr: SocketAddrV4 = "198.51.100.10:4100".parse().unwrap();
+        let local = Some("192.168.77.10:4100".parse().unwrap());
+        let peer_lan = Some("192.168.77.20:4200".parse().unwrap());
+        let time = |ms| Now { ms, unix_secs: ms / 1000 };
+        for (allowed, lan, remote, reason, nat) in [
+            (false, local, peer_lan, LocalLanOff, Hint::ConeUnknownFiltering),
+            (true, local, None, PeerLanOff, Hint::ConeUnknownFiltering),
+            (true, None, peer_lan, NoLocalAddress, Hint::ConeUnknownFiltering),
+            (false, local, peer_lan, LocalLanOff, Hint::Symmetric),
+        ] {
+            let mut hub = Hub::with_lan(ana.clone(), allowed);
+            let at = hub.start_words(true, time(0));
+            let peer = Invite { addr: SocketAddrV4::new(*addr.ip(), 4200), nat, lan: remote, commit: 1 };
+            let submit = |hub: &mut Hub, at, own: &Invite| hub.words(at, own.clone(), peer.clone(), "Ana".into(), 0);
+            assert_eq!(submit(&mut hub, at, &peer), Err(WordsRejected::NotReady));
+
+            hub.reflect(at, Query::new(&[server], Style::Padded, &mut |tx| tx.fill(1), 0), 0);
+            for out in hub.poll(time(0), BatchEnd::Drained) {
+                if let Event::Reflect(to, request) = out.event {
+                    hub.handle(to, &reflect::answer(&request, addr.into()).unwrap(), 0);
+                }
+            }
+            assert!(hub.poll(time(0), BatchEnd::Drained).iter().any(|out| matches!(out.event,
+                Event::OpenInvite { include_lan, .. } if include_lan == allowed)));
+            hub.open_invite(at, InviteSession::open(0).unwrap(), server, addr, nat, lan, 0);
+            let own = hub.poll(time(0), BatchEnd::Drained).into_iter().find_map(|out| match out.event {
+                Event::Invite(own) => Some(own),
+                _ => None,
+            }).unwrap();
+            assert_eq!(own.lan, lan.filter(|_| allowed));
+            assert_eq!(own.to_words().len(), if own.lan.is_some() { 14 } else { 10 });
+            assert_eq!(submit(&mut hub, at, &peer), Err(WordsRejected::OlderInvite));
+            let obsolete = Attempt { generation: at.generation + 1, ..at };
+            assert_eq!(submit(&mut hub, obsolete, &own), Err(WordsRejected::StaleAttempt));
+            assert_eq!(submit(&mut hub, at, &own), Ok(()));
+            let matched = hub.poll(time(0), BatchEnd::Drained);
+            let punching = matched.iter().any(|out| matches!(out.event, Event::Punch));
+            if nat == Hint::Symmetric {
+                assert!(matched.iter().any(|out| matches!(&out.event, Event::Failed(why) if why == SAME_NETWORK_LAN_OFF_HERE)));
+                assert!(!punching);
+                continue;
+            }
+            assert!(matched.iter().any(|out| matches!(out.event, Event::Note("words matched"))));
+            assert!(matched.iter().any(|out| matches!(out.event, Event::Blocked(r) if r == reason)));
+            assert!(matched.iter().any(|out| matches!(out.event, Event::CheckAddress { include_lan, .. } if include_lan == allowed)));
+            assert!(punching);
+            assert_eq!(submit(&mut hub, at, &own), Err(WordsRejected::AlreadyPairing));
+            hub.punch(at, [7; 72], time(0));
+            let sent = hub.poll(time(0), BatchEnd::Drained);
+            let unanswered = hub.poll(time(15_000), BatchEnd::Drained);
+            assert!(unanswered.iter().any(|out| matches!(out.event, Event::Phase(Status::Reaching { secs: 15 }))));
+            let destinations: Vec<_> = sent.iter().chain(&unanswered).filter_map(|out| match out.event {
+                Event::Send(to, _) => Some(to),
+                _ => None,
+            }).collect();
+            assert!(destinations.contains(&peer.addr.into()));
+            assert!(destinations.iter().all(|to| *to == peer.addr.into() && !makepad_network::lan::is_local_network(to.ip())));
+            hub.cancel_words(15_000);
+            assert_eq!(submit(&mut hub, at, &own), Err(WordsRejected::StaleAttempt));
+        }
+    }
+
+    #[test]
+    fn known_peer_with_lan_off_dials_only_a_remembered_public_address() {
+        let mut hub = Hub::with_lan(Arc::new(DeviceKey::generate().unwrap()), false);
+        let peer = DeviceKey::generate().unwrap().public();
+        let pin = Pin { device: peer, min_version: crate::link::VERSION };
+        let carrier = Carrier::Peer(peer);
+        let now = Now { ms: 0, unix_secs: 0 };
+        let mut path = Remembered { public: None, lan: Some("192.168.77.20:4200".parse().unwrap()) };
+        hub.set_wanted([(pin, path)], now);
+        let idle = hub.attempt(carrier).unwrap();
+        assert_eq!(hub.phase(carrier), Some(SlotPhase::Idle));
+        assert!(!hub.poll(now, BatchEnd::Drained).iter().any(|out| matches!(out.event,
+            Event::Punch | Event::Reconnecting(..) | Event::Phase(Status::Backoff { .. }) | Event::Send(..))));
+
+        path.lan = Some("192.168.77.20:4201".parse().unwrap());
+        hub.set_wanted([(pin, path)], now);
+        assert_eq!(hub.attempt(carrier), Some(idle), "changing only the disabled LAN path keeps the attempt");
+
+        let public = "198.51.100.20:4200".parse().unwrap();
+        path.public = Some(public);
+        hub.set_wanted([(pin, path)], now);
+        let at = hub.attempt(carrier).unwrap();
+        assert!(hub.poll(now, BatchEnd::Drained).iter().any(|out| out.attempt == at && matches!(out.event, Event::Punch)));
+        hub.punch(at, [7; 72], now);
+        let destinations: Vec<_> = hub.poll(now, BatchEnd::Drained).into_iter().filter_map(|out| match out.event {
+            Event::Send(to, _) => Some(to),
+            _ => None,
+        }).collect();
+        assert!(destinations.contains(&public), "the public address must be probed");
+        assert!(destinations.iter().all(|to| *to == public), "unexpected probe destinations: {destinations:?}");
+    }
 
     #[test]
     fn known_device_reports_backoff_reaching_and_stopped() {

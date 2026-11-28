@@ -46,7 +46,7 @@ script_mod! {
 
     mod.widgets.FabLabelMuted = mod.widgets.FabLabel{
         draw_text +: {
-            color: fab.color_text_muted
+            color: fab.color_text_dim
         }
     }
 
@@ -108,10 +108,10 @@ script_mod! {
         label_walk: Walk{ width: Fit height: Fit }
         // The property kit's field face: no frame at rest, only the keyboard focus ring.
         draw_bg +: {
-            color: theme.prop_field
-            color_hover: theme.prop_field_hover
+            color: fab.color_btn_bg
+            color_hover: fab.color_field_hover
             color_down: theme.prop_field_active
-            color_focus: theme.prop_field
+            color_focus: fab.color_btn_bg
             color_disabled: fab.color_editor_alt
             border_radius: fab.radius
             border_size: 1.0
@@ -124,10 +124,10 @@ script_mod! {
         }
         draw_text +: {
             ink_centered: true
-            color: fab.color_text
-            color_hover: fab.color_text_active
-            color_down: fab.color_text_active
-            color_focus: fab.color_text
+            color: fab.color_btn_ink
+            color_hover: fab.color_btn_ink_hover
+            color_down: fab.color_btn_ink_down
+            color_focus: fab.color_btn_ink_focus
             color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
@@ -199,7 +199,7 @@ script_mod! {
         draw_bg +: {
             color: fab.color_accent
             color_hover: fab.color_accent_hover
-            color_down: fab.color_accent_dim
+            color_down: fab.color_accent_down
             color_focus: fab.color_accent
         }
         // its words on the accent's bright face: black, under the pointer and pressed too
@@ -231,10 +231,10 @@ script_mod! {
         }
         draw_text +: {
             ink_centered: true
-            color: fab.color_text
-            color_hover: fab.color_text_active
-            color_down: fab.color_text_active
-            color_focus: fab.color_text
+            color: fab.color_flat_ink
+            color_hover: fab.color_flat_ink_hover
+            color_down: fab.color_flat_ink_down
+            color_focus: fab.color_flat_ink_focus
             color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
@@ -325,15 +325,19 @@ script_mod! {
             border_size: 0.0
         }
         draw_icon +: {
+            focus: instance(0.0)
+            focus_tint: uniform(fab.flat_focus_tint)
             hover: instance(0.0)
             down: instance(0.0)
             disabled: instance(0.0)
-            color: fab.color_text
-            color_hover: fab.color_text_active
-            color_down: fab.color_text_active
+            color: fab.color_flat_ink
+            color_focus: fab.color_flat_ink_focus
+            color_hover: fab.color_flat_ink_hover
+            color_down: fab.color_flat_ink_down
             color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
+                    .mix(self.color_focus, self.focus * self.focus_tint)
                     .mix(self.color_hover, self.hover)
                     .mix(self.color_down, self.down)
                     .mix(self.color_disabled, self.disabled)
@@ -395,6 +399,7 @@ script_mod! {
                     apply: {
                         draw_bg: {focus: 0.0}
                         draw_text: {focus: 0.0}
+                        draw_icon: {focus: 0.0}
                     }
                 }
                 on: AnimatorState{
@@ -402,6 +407,7 @@ script_mod! {
                     apply: {
                         draw_bg: {focus: 1.0}
                         draw_text: {focus: 1.0}
+                        draw_icon: {focus: 1.0}
                     }
                 }
             }
@@ -416,14 +422,14 @@ script_mod! {
         height: 22
         icon_walk: Walk{ width: fab.icon_size height: fab.icon_size }
         draw_bg +: {
-            color_hover: theme.prop_field_hover
-            color_down: theme.prop_field_active
+            color_hover: fab.color_field_hover
+            color_down: fab.color_action_down
             border_radius: theme.prop_radius
         }
         draw_icon +: {
-            color: theme.prop_ink_dim
-            color_hover: theme.color_text
-            color_down: theme.color_text
+            color: fab.color_action_ink
+            color_hover: fab.color_flat_ink_hover
+            color_down: fab.color_flat_ink_down
         }
     }
 
@@ -446,11 +452,11 @@ script_mod! {
         // The property kit's choice look: field faces framed only by the keyboard focus ring, the
         // answer a lighter face in the full ink, the others in the quiet ink.
         draw_bg +: {
-            color: theme.prop_field
-            color_hover: theme.prop_field_hover
+            color: fab.color_field
+            color_hover: fab.color_field_hover
             color_down: theme.prop_field_active
-            color_active: theme.prop_choice_on
-            color_focus: theme.prop_field
+            color_active: fab.color_choice_on
+            color_focus: fab.color_field
             color_disabled: fab.color_editor_alt
             border_radius: fab.radius
             border_size: 1.0
@@ -464,11 +470,11 @@ script_mod! {
         }
         draw_text +: {
             ink_centered: true
-            color: fab.color_text_dim
-            color_hover: fab.color_text_active
-            color_down: fab.color_text_active
-            color_active: fab.color_text
-            color_focus: fab.color_text_dim
+            color: fab.color_segment_ink
+            color_hover: fab.color_segment_ink_hover
+            color_down: fab.color_segment_ink_down
+            color_active: fab.color_segment_ink_active
+            color_focus: fab.color_segment_ink
             color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
@@ -480,16 +486,18 @@ script_mod! {
             down: instance(0.0)
             active: instance(0.0)
             disabled: instance(0.0)
-            color: fab.color_text_dim
-            color_hover: fab.color_text_active
-            color_active: fab.color_text
+            color: fab.color_segment_ink
+            color_hover: fab.color_segment_ink_hover
+            color_down: fab.color_segment_ink_down
+            color_active: fab.color_segment_ink_active
             color_disabled: fab.color_disabled_ink
             // premultiplied with the glyph's coverage, as DrawSvg's own colour is (the inks carry
             // alpha)
             get_color: fn() {
                 let base = self.eval_gradient()
                 let ink = self.color
-                    .mix(self.color_hover, self.hover)
+                    .mix(self.color_hover, self.hover * (1.0 - self.active))
+                    .mix(self.color_down, self.down * (1.0 - self.active))
                     .mix(self.color_active, self.active)
                     .mix(self.color_disabled, self.disabled)
                 return vec4(ink.rgb * ink.a * base.a, ink.a * base.a) * self.opacity
@@ -590,6 +598,7 @@ script_mod! {
         height: 24
         padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
         draw_bg +: {
+            vertex: fn() { self.vertex_pos = self.clip_and_transform_vertex(self.rect_pos, self.rect_size) }
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(6.0, self.rect_size.y - 2.0, self.rect_size.x - 12.0, 2.0, 0.5)
@@ -598,6 +607,7 @@ script_mod! {
             }
         }
         draw_text +: {
+            pixel: fn() { return self.sample_text_pixel() }
             color: mix(fab.color_text_dim, fab.color_text, 0.5)
             color_hover: fab.color_text
             color_down: fab.color_text
@@ -637,16 +647,17 @@ script_mod! {
             down: instance(0.0)
             active: instance(0.0)
             disabled: instance(0.0)
-            color: fab.color_text
-            color_hover: fab.color_text_active
-            color_down: fab.color_text_active
+            color: fab.color_toggle_ink
+            color_hover: fab.color_toggle_ink_hover
+            color_down: fab.color_toggle_ink_down
             // on the accent's bright face, while on: black (the sheet's ink on the accent)
-            color_active: fab.color_text_on_accent
+            color_active: fab.color_toggle_ink_active
             color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
-                    .mix(self.color_active, self.active)
                     .mix(self.color_hover, self.hover * (1.0 - self.active))
+                    .mix(self.color_down, self.down * (1.0 - self.active))
+                    .mix(self.color_active, self.active)
                     .mix(self.color_disabled, self.disabled)
             }
         }
@@ -838,7 +849,7 @@ script_mod! {
             size: uniform(13.0)
             border_radius: uniform(1.5)
             mark_at_end: uniform(0.0)
-            color: uniform(theme.prop_field)
+            color: uniform(fab.color_field)
             border_color: uniform(#x00000000)
             border_color_hover: uniform(#xffffff20)
             border_color_focus: uniform(#xffffff20)
@@ -898,7 +909,7 @@ script_mod! {
             size: uniform(13.0)
             border_radius: uniform(1.5)
             mark_at_end: uniform(0.0)
-            color: uniform(theme.prop_field)
+            color: uniform(fab.color_field)
             border_color: uniform(#x00000000)
             border_color_hover: uniform(#xffffff20)
             border_color_focus: uniform(#xffffff20)
@@ -959,11 +970,11 @@ script_mod! {
         margin: Inset{top: 0 bottom: 0 left: 0 right: 0}
         empty_text: ""
         draw_bg +: {
-            color: theme.prop_field
-            color_hover: uniform(theme.prop_field_hover)
-            color_focus: uniform(theme.prop_field_hover)
-            color_down: uniform(theme.prop_field_hover)
-            color_empty: uniform(theme.prop_field)
+            color: fab.color_input_field
+            color_hover: uniform(fab.color_input_field_hover)
+            color_focus: uniform(fab.color_input_field_hover)
+            color_down: uniform(fab.color_input_field_hover)
+            color_empty: uniform(fab.color_input_field)
             color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
             border_radius: theme.prop_radius
             border_color: uniform(#x00000000)
@@ -974,10 +985,20 @@ script_mod! {
         }
         draw_text +: {
             ink_centered: true
-            color: fab.color_text
+            color: fab.color_text_input
+            color_hover: fab.color_text_input
+            color_focus: fab.color_text_input
+            color_down: fab.color_text_input
+            color_disabled: fab.color_text_input_muted
+            color_empty: fab.color_text_input_dim
+            color_empty_hover: fab.color_text_input_dim
+            color_empty_focus: fab.color_text_input_dim
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
+        }
+        draw_cursor +: {
+            color: fab.color_text_input
         }
     }
 
@@ -1068,7 +1089,7 @@ script_mod! {
     mod.widgets.FabSearchBase = #(FabSearch::register_widget(vm))
     mod.widgets.FabSearch = set_type_default() do mod.widgets.FabSearchBase{
         width: Fill
-        height: 28
+        height: #(SEARCH_REST)
         flow: Overlay
         row := View{
             width: Fill
@@ -1086,11 +1107,11 @@ script_mod! {
                 draw_bg +: {
                     border_radius: theme.prop_radius
                     border_size: 1.0
-                    color: theme.prop_field
-                    color_hover: uniform(theme.prop_field_hover)
-                    color_focus: uniform(theme.prop_field_hover)
-                    color_down: uniform(theme.prop_field_hover)
-                    color_empty: uniform(theme.prop_field)
+                    color: fab.color_input_field
+                    color_hover: uniform(fab.color_input_field_hover)
+                    color_focus: uniform(fab.color_input_field_hover)
+                    color_down: uniform(fab.color_input_field_hover)
+                    color_empty: uniform(fab.color_input_field)
                     color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
                     border_color: uniform(#x00000000)
                     border_color_hover: uniform(#xffffff20)
@@ -1101,13 +1122,20 @@ script_mod! {
                 }
                 draw_text +: {
                     ink_centered: true
-                    color: fab.color_text
-                    color_empty: fab.color_text_muted
-                    color_empty_hover: fab.color_text_dim
-                    color_empty_focus: fab.color_text_dim
+                    color: fab.color_text_input
+                    color_hover: fab.color_text_input
+                    color_focus: fab.color_text_input
+                    color_down: fab.color_text_input
+                    color_disabled: fab.color_text_input_muted
+                    color_empty: fab.color_text_input_dim
+                    color_empty_hover: fab.color_text_input_dim
+                    color_empty_focus: fab.color_text_input_dim
                     text_style: theme.font_regular{
                         font_size: fab.font_size_ui
                     }
+                }
+                draw_cursor +: {
+                    color: fab.color_text_input
                 }
             }
             // the magnifier, as big as the toolbars' icons, centred in the search at rest (28)
@@ -1246,8 +1274,34 @@ script_mod! {
     // shared sheet and before every panel, so all of the app's rows take it.
     mod.widgets.PropRow = mod.widgets.PropRow{ label +: { draw_text +: { color: fab.color_text } } }
     mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{ label +: { draw_text +: { color: fab.color_text } } }
-    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{ label +: { draw_text +: { color: fab.color_text } } }
-    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropDropDown = mod.widgets.PropDropDown{
+        draw_bg +: { color: uniform(fab.color_field) }
+        draw_text +: { color: fab.color_text color_dim: uniform(fab.color_text_dim) }
+    }
+    mod.widgets.PropSegmented = mod.widgets.PropSegmented{
+        draw_bg +: { color: fab.color_field }
+        draw_text +: { color: fab.color_text_dim }
+        draw_text_selected +: { color: fab.color_text }
+    }
+    mod.widgets.PropChoice = mod.widgets.PropChoice{
+        seg +: { draw_bg +: { color: fab.color_field } draw_text +: { color: fab.color_text_dim } draw_text_selected +: { color: fab.color_text } }
+        pick +: { draw_bg +: { color: uniform(fab.color_field) } draw_text +: { color: fab.color_text color_dim: uniform(fab.color_text_dim) } }
+    }
+    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{
+        label +: { draw_text +: { color: fab.color_text } }
+        value +: { pick +: { draw_bg +: { color: uniform(fab.color_field) } draw_text +: { color: fab.color_text color_dim: uniform(fab.color_text_dim) } } }
+    }
+    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{
+        label +: { draw_text +: { color: fab.color_text } }
+        value +: { choice +: {
+            seg +: { draw_bg +: { color: fab.color_field } draw_text +: { color: fab.color_text_dim } draw_text_selected +: { color: fab.color_text } }
+            pick +: { draw_bg +: { color: uniform(fab.color_field) } draw_text +: { color: fab.color_text color_dim: uniform(fab.color_text_dim) } }
+        } }
+    }
+    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{
+        label +: { draw_text +: { color: fab.color_text } }
+        value +: { check +: { draw_bg +: { color: uniform(fab.color_field) } } }
+    }
     // A section has no plate: its header alone carries a shade under the panel
     // (`fab.color_section`), square, no line, and answers the pointer with its title, not a lit
     // box (lit by `section_headers`). The bar is inset as the rows are (`prop_pad` each side), so
@@ -1267,8 +1321,9 @@ script_mod! {
         // inherited, read-only) quieter still
         draw_label +: {color: fab.color_text text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}}
         labelled_value_color: fab.color_text_dim
-        muted_color: fab.color_text_muted
+        muted_color: fab.color_text_dim
         draw_bg +: {
+            color: uniform(fab.color_field)
             fill_color: uniform(#xffffff10)
             fill_color_hover: uniform(#xffffff28)
             fill_color_drag: uniform(#xffffff40)
@@ -1327,7 +1382,6 @@ script_mod! {
             grip +: {cursor: MouseCursor.Move}
         }}
     }
-    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{ label +: { draw_text +: { color: fab.color_text } } }
 
     // Fab's number rows: their fields carry units, so a field keeps room for `-360.0 mm`
     // between its arrow zones before its row puts it under the label.
@@ -2030,12 +2084,15 @@ pub struct FabSearch {
     label_text: String,
     #[rust]
     focus_on_draw: bool,
+    #[rust]
+    glyph_open: Option<bool>,
 }
 
 impl ScriptHook for FabSearch {
     fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
         if apply.is_reload() {
             self.label_text.clear();
+            self.glyph_open = None;
         }
     }
 }
@@ -2170,8 +2227,16 @@ impl Widget for FabSearch {
         let rest = SEARCH_REST.min(full);
         let eased = 1.0 - (1.0 - self.open).powi(3);
         let width = rest + (full - rest) * eased;
-        if input.visible() != self.is_open() {
-            input.set_visible(cx, self.is_open());
+        let open = self.is_open();
+        if input.visible() != open {
+            input.set_visible(cx, open);
+        }
+        if self.glyph_open != Some(open) {
+            self.glyph_open = Some(open);
+            let mut glyph = self.view.widget(cx, ids!(row.glyph_slot.glyph));
+            script_apply_eval!(cx, glyph, {
+                draw_icon +: { color: if #(open) { mod.fab.color_text_input_dim } else { mod.fab.color_text_muted } }
+            });
         }
         let mut walk = walk;
         walk.margin.left += full - width;
@@ -2188,7 +2253,7 @@ impl Widget for FabSearch {
 }
 
 /// A search at rest: its magnifier's square, the toolbar field's height.
-const SEARCH_REST: f64 = 28.0;
+pub(crate) const SEARCH_REST: f64 = 28.0;
 
 #[cfg(test)]
 #[test]

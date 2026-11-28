@@ -47,6 +47,21 @@ impl LayoutKind {
     }
 }
 
+impl crate::tweak::props::view::RenameField {
+    pub(in crate::tweak) fn bind(&self, cx: &mut Cx, row: &View, path: &str, ty: &str, new_binding: bool) {
+        let input = row.text_input(cx, ids!(name_field));
+        input.set_is_read_only(cx, !self.editable || self.busy);
+        if new_binding && cx.has_key_focus(input.area()) { cx.set_key_focus(Area::Empty); }
+        let name = self.draft.as_deref().unwrap_or_else(|| crate::tweak::widget_name(path));
+        if input.text() != name { input.set_text(cx, name); }
+        row.label(cx, ids!(type_label)).set_text(cx, ty);
+        let message = row.label(cx, ids!(refusal));
+        message.set_text(cx, &self.message);
+        message.set_visible(cx, !self.message.is_empty());
+        row.widget(cx, ids!(rename_confirm)).set_visible(cx, self.editable && self.confirm);
+    }
+}
+
 impl LayoutValues {
     /// A composite has several properties. Its individual field labels reset the same
     /// named Set that editing the field would send. Box legs use their scrubber's Reset.
@@ -77,12 +92,9 @@ impl LayoutValues {
     }
 
     pub(in crate::tweak) fn draw_sidebar(&self, cx: &mut Cx, item: &WidgetRef, kind: LayoutKind,
-        path: &str, ty: &str, new_binding: bool, controls: &mut LayoutControls) {
+        new_binding: bool, controls: &mut LayoutControls) {
         match kind {
-            LayoutKind::Identity => {
-                item.child(live_id!(name_field)).set_text(cx, crate::tweak::widget_name(path));
-                item.child(live_id!(type_label)).set_text(cx, ty);
-            }
+            LayoutKind::Identity => unreachable!("identity has its own editable binding"),
             LayoutKind::Size => {
                 item.child(live_id!(name)).set_text(cx, "size");
                 let size_col = item.child(live_id!(size_col));

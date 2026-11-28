@@ -316,6 +316,18 @@ pub enum SliceStatus {
     Failed(String),
 }
 
+/// The state of the plate's G-code export.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ExportStatus {
+    #[default]
+    Idle,
+    /// Waiting for a slice to settle, or packaging and writing the file.
+    Exporting,
+    Written(std::path::PathBuf),
+    /// The local reason packaging or writing the file failed.
+    Failed(String),
+}
+
 /// One layer of the preview, a stretch of the print's time on it.
 #[derive(Clone, Copy, Debug)]
 pub struct PreviewLayer {
@@ -1169,6 +1181,10 @@ impl Default for Playback {
 
 #[derive(Default)]
 pub struct PrintState {
+    /// Waiting for the target's effective calibration, then for a plate built with its measurements.
+    pub calibration_pending: bool,
+    pub calibration_plate_pending: bool,
+    pub calibration_error: Option<String>,
     /// The Slicer's choice: the ticked test prints instead of the whole plate.
     pub test_mode: bool,
     /// The whole plate's print time and grams, while its slice stands for the plate as it is.
@@ -1226,8 +1242,8 @@ pub struct PrintState {
     pub streaming: bool,
     /// The plate's contours as edited, while its toolpaths are on their way.
     pub live_contours: Option<LiveContours>,
-    /// Where the last export went.
-    pub exported: Option<std::path::PathBuf>,
+    /// Outcome of the plate's last G-code export.
+    pub export: ExportStatus,
     /// Bumped on every change the viewport must redraw for.
     pub revision: u64,
     pub printers: Printers,
@@ -1404,9 +1420,16 @@ impl PrintState {
         self.trees.iter().enumerate().filter(|(_, t)| t.object == object && t.tips.contains(first)).find_map(|(i, t)| Some((i, t.branch_of(tips)?)))
     }
 
+    pub fn calibration_wait(&self) -> Option<&'static str> {
+        if self.calibration_pending { Some("Loading calibration") }
+        else if self.calibration_plate_pending { Some("Updating the plate for calibration") }
+        else { None }
+    }
+
     /// Print and Export take a settled, current slice only.
     pub fn can_send(&self) -> bool {
-        self.preview.is_some() && !self.stale && self.settled && !matches!(self.status, SliceStatus::Running { .. })
+        self.preview.is_some() && !self.stale && self.settled && self.calibration_wait().is_none()
+            && self.calibration_error.is_none() && !matches!(self.status, SliceStatus::Running { .. })
     }
 
     /// Why the shown slice cannot start printing. Its printability errors stop it until the person
@@ -1593,7 +1616,7 @@ impl PrintState {
         self.status = shown.status;
         self.unprinted = shown.unprinted;
         self.print_check = shown.print_check;
-        self.exported = None;
+        self.export = ExportStatus::Idle;
         self.streamed = None;
         self.stale = false;
         self.stale_parts = None;
@@ -2374,7 +2397,7 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
             PrintOption::PlateClear => state.print_options.plate_clear = *on,
         },
         PrintAction::SendToPrinter { ticket, .. } => {
-            if matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if ticket == card) {
+            if state.calibration_wait().is_none() && state.calibration_error.is_none() && matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if ticket == card) {
                 state.confirm_print = None;
                 state.print_options.plate_clear = false;
             }

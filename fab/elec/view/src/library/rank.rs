@@ -1,94 +1,42 @@
-//! Pure catalog search, with stable exact, prefix and substring ranks.
-
+//! The Library's catalog fields, ranked by the same offline ranker as the parts action.
 use super::{default_text, package_code, quantity_text};
+use fab_elec_bom::prices::Prices;
+use fab_elec_bom::shortlist::{rank_candidates, Candidate, RankMode, ShortlistContext, ShortlistEntry, ShortlistQuery};
 use fab_elec_lang::{CatalogEntry, CatalogKind};
-use fab_elec_parts::PartKind;
 pub use fab_elec_parts::lifecycle_rank;
 
-/// Where the person's preference puts an entry among equal matches: approved parts first, then
-/// by lifecycle (active, unstated, NRND, obsolete).
-fn preference(entry: &CatalogEntry) -> (bool, u8) {
-    let (approved, lifecycle) = entry.part.as_ref().map_or((false, None), |part| (part.approved, part.lifecycle));
-    (!approved, lifecycle_rank(lifecycle))
+pub fn rank_with_context(entries: &[CatalogEntry], query: &str, ctx: &ShortlistContext<'_>, prices: &Prices) -> Vec<ShortlistEntry> {
+    let tokens: Vec<_> = entries.iter().map(|entry| {
+        let mut extra: Vec<_> = entry.pins.iter().map(|pin| pin.name.clone()).collect();
+        if let Some(code) = entry.part.as_ref().and_then(|p| p.footprint.as_ref()).and_then(|fp| package_code(&fp.name)) {
+            extra.push(code.into());
+        }
+        for (_, literal) in &entry.defaults {
+            let value = default_text(literal);
+            extra.push(value.into());
+            extra.extend(quantity_text(value));
+        }
+        extra
+    }).collect();
+    let candidates: Vec<_> = entries.iter().zip(&tokens).map(|(e, extra)| Candidate {
+        lib: &e.lib, name: &e.name, title: &e.title, stem: &e.stem, summary: &e.summary,
+        kind_label: match e.kind { CatalogKind::Passive => "passive", CatalogKind::Part => "part", CatalogKind::Block => "block" },
+        extra_tokens: extra, part: e.part.as_deref(),
+    }).collect();
+    rank_candidates(&candidates, ctx, prices, &ShortlistQuery { text: query, kind: None, limit: 0, mode: RankMode::Search })
 }
 
-/// Matching catalog indices, best first; equal scores prefer approved, then active parts, and
-/// otherwise keep catalog order. Every query word must match a field (`approved`, `active`,
-/// `nrnd` and `obsolete` among them), and the weakest word sets the rank. O(n log n) in matches.
 pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    let words: Vec<_> = query.split_whitespace().collect();
-    let offered = entries.iter().enumerate().filter(|(_, entry)| {
-        !entry.part.as_ref().is_some_and(|part| part.kind == PartKind::PowerFlag)
-    });
-    if words.is_empty() {
-        let mut all: Vec<usize> = offered.map(|(index, _)| index).collect();
-        all.sort_by_key(|&index| preference(&entries[index]));
-        return all;
-    }
-    // Three buckets keep match quality first; a stable sort orders each by preference.
-    let mut ranked: [Vec<usize>; 3] = Default::default();
-    for (index, entry) in offered {
-        let kind = match entry.kind {
-            CatalogKind::Passive => "passive",
-            CatalogKind::Part => "part",
-            CatalogKind::Block => "block",
-        };
-        let mut fields: Vec<_> = [entry.name.as_str(), entry.title.as_str(), kind]
-            .into_iter()
-            .chain(entry.pins.iter().map(|pin| pin.name.as_str()))
-            .map(str::to_lowercase)
-            .collect();
-        if let Some(part) = &entry.part {
-            if part.approved {
-                fields.push("approved".into());
-            }
-            if let Some(lc) = part.lifecycle {
-                fields.push(lc.name().into());
-            }
-        }
-        if let Some(fp) = entry.part.as_ref().and_then(|part| part.footprint.as_ref()) {
-            fields.push(fp.name.to_lowercase());
-            if let Some(code) = package_code(&fp.name) {
-                fields.push(code.to_string());
-            }
-        }
-        for (_, text) in &entry.defaults {
-            let value = default_text(text);
-            fields.push(value.to_lowercase());
-            if let Some(sheet) = quantity_text(value) {
-                fields.push(sheet.to_lowercase());
-            }
-        }
-        let score = words.iter().try_fold(0, |worst, &word| {
-            let best = fields.iter().filter_map(|field| {
-                if field.as_str() == word {
-                    Some(0)
-                } else if field.starts_with(word) {
-                    Some(1)
-                } else if field.contains(word) {
-                    Some(2)
-                } else {
-                    None
-                }
-            }).min()?;
-            Some(worst.max(best))
-        });
-        if let Some(score) = score {
-            ranked[score].push(index);
-        }
-    }
-    for bucket in &mut ranked {
-        bucket.sort_by_key(|&index| preference(&entries[index]));
-    }
-    ranked.into_iter().flatten().collect()
+    let empty = Default::default();
+    let ctx = ShortlistContext { pinned: &[], used_parts: &empty, imported_ids: &empty };
+    rank_with_context(entries, query, &ctx, &Prices::default()).into_iter().map(|r| r.index).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fab_elec_lang::CatalogPin;
-    use fab_elec_parts::{Lifecycle, PartDef, PinKind};
+    use fab_elec_parts::{Lifecycle, PartDef, PartKind, PinKind};
     use std::sync::Arc;
 
     #[test]

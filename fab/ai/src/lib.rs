@@ -1008,6 +1008,16 @@ impl WorkingId {
     }
 }
 
+/// What a build was made of: the document's head, and the build inputs that change without the
+/// bed being built again at once (the tolerance exact parts slice at, whether fields are meshed).
+/// A build put aside is stamped as made under the bed's inputs, so it is put aside only while
+/// these are the bed's now: one made at an old tolerance is built again when it comes back.
+#[derive(Clone, Copy, PartialEq)]
+struct BuiltOf {
+    head: [u8; 32],
+    print_chord: u64,
+    mesh_fields: bool,
+}
 
 pub struct Session {
     pub working_id: Arc<WorkingId>,
@@ -1072,8 +1082,9 @@ pub struct Session {
     /// the bed with its undo history: switching back takes it from here, so undo goes on where it
     /// was, and the most recent show their build again.
     kept: Vec<Doc>,
-    /// The document's head when it was last built: a build put aside with it is its own.
-    built_head: Option<[u8; 32]>,
+    /// What the document's last build was made of: a build put aside with it is its own only
+    /// while that is still what the bed builds with ([`BuiltOf`]).
+    built_of: Option<BuiltOf>,
     /// The app's own print setup (machine, process, filaments and paint) for a plate: what as-printed
     /// checks slice with. None: Fab's default process.
     pub print_setup: Option<PrintSetupFn>,
@@ -1920,7 +1931,7 @@ impl Session {
         let mut eval = Evaluator::new(machine);
         // the calibrated filament sets kept (one that cannot be read, fab.colour_read names)
         eval.calibrated = Arc::new(fab_model::colour_sets::load_all(&documents).0);
-        Session { holds_bodies: false, test_mode: false, working_id: Default::default(), test_bed: None, marks: Default::default(), picks: Default::default(), volume_bases: BTreeMap::new(), weak_memo: Arc::default(), strength_before: None, tubes_memo: Arc::default(), plan_memo: Arc::default(), orient_was: None, strength_head: None, model: FabModel::new("Untitled"), eval, path: None, documents, last: None, compiled: None, draft: None, serial: 0, params: None, autosaved: autosave::Snapshot::default(), store: None, plate: None, demo: None, thumb: None, thumb_autosaved: false, saved: None, made_waiting: None, made_last: None, plates_rev: 0, demos: Demos::default(), env_for: None, on_model_open: None, switched: 0, kept: Vec::new(), built_head: None, print_setup: None, support_memo: Default::default(), slices: None, joint_checks: None, author: None, outside_edits: BTreeMap::new() }
+        Session { holds_bodies: false, test_mode: false, working_id: Default::default(), test_bed: None, marks: Default::default(), picks: Default::default(), volume_bases: BTreeMap::new(), weak_memo: Arc::default(), strength_before: None, tubes_memo: Arc::default(), plan_memo: Arc::default(), orient_was: None, strength_head: None, model: FabModel::new("Untitled"), eval, path: None, documents, last: None, compiled: None, draft: None, serial: 0, params: None, autosaved: autosave::Snapshot::default(), store: None, plate: None, demo: None, thumb: None, thumb_autosaved: false, saved: None, made_waiting: None, made_last: None, plates_rev: 0, demos: Demos::default(), env_for: None, on_model_open: None, switched: 0, kept: Vec::new(), built_of: None, print_setup: None, support_memo: Default::default(), slices: None, joint_checks: None, author: None, outside_edits: BTreeMap::new() }
     }
 
     /// The accepted build's meshes stay in this session's evaluator; the bed's also tells the
@@ -1937,7 +1948,7 @@ impl Session {
         self.compiled = Some(c.clone());
         self.last = Some(ev.clone());
         self.draft = None;
-        self.built_head = Some(self.model.head().content);
+        self.built_of = Some(self.built_now());
         self.keep_bodies();
         (c, ev)
     }
@@ -1964,6 +1975,11 @@ impl Session {
     /// whether fields are meshed (an export's) and the tolerance exact parts slice at. Not the
     /// print colours: the app maps them for each plate on the bed, and a build takes them without
     /// being built again. Not the view's: a build put back shows as the view shows it now.
+    /// What a build made now is made of ([`BuiltOf`]).
+    fn built_now(&self) -> BuiltOf {
+        BuiltOf { head: self.model.head().content, print_chord: self.eval.print_chord.to_bits(), mesh_fields: self.eval.mesh_fields }
+    }
+
     fn build_stamp(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2691,7 +2707,12 @@ impl Session {
     }
 
     pub fn rebuild(&mut self) -> Result<Arc<Evaluated>, String> {
-        let (c, ev) = self.model.evaluate(&mut self.eval, None).map_err(|f| f.to_string())?;
+        self.rebuild_eval().map_err(|f| f.to_string())
+    }
+
+    /// Rebuild under the current print profile, keeping the evaluator's diagnostic.
+    pub fn rebuild_eval(&mut self) -> Result<Arc<Evaluated>, fab_model::eval::Failure> {
+        let (c, ev) = self.model.evaluate(&mut self.eval, None)?;
         Ok(self.keep(c, ev).1)
     }
 
@@ -2839,15 +2860,17 @@ impl Session {
         };
         let env_moved = !doc.model.env().same(&env);
         doc.model.set_env(env);
+        doc.model.set_context(fab_model::program::CompileContext::from_profile(&self.eval.profile));
         doc.model.set_steps(self.model.steps().clone(), self.model.logged().clone());
         let reuse = doc.built.filter(|b| b.2 == stamp && !env_moved);
         // the document's own build goes aside with it
         let built = match (&self.compiled, &self.last) {
-            (Some(c), Some(ev)) if self.built_head == Some(self.model.head().content) => Some((c.clone(), ev.clone(), stamp)),
+            (Some(c), Some(ev)) if self.built_of == Some(self.built_now())
+                && ev.profile == self.eval.profile && ev.machine.same_volume(&self.eval.machine) => Some((c.clone(), ev.clone(), stamp)),
             _ => None,
         };
         // the bed's build as it is, for a switch that does not happen
-        let was = (self.compiled.clone(), self.last.clone(), self.built_head, self.eval.mapped.clone(), self.eval.inspected());
+        let was = (self.compiled.clone(), self.last.clone(), self.built_of, self.eval.mapped.clone(), self.eval.inspected());
         let previous = Doc {
             working_id: std::mem::replace(&mut self.working_id, doc.working_id),
             model: std::mem::replace(&mut self.model, doc.model),
@@ -2880,7 +2903,7 @@ impl Session {
                 };
                 self.compiled = Some(c);
                 self.last = Some(ev.clone());
-                self.built_head = Some(self.model.head().content);
+                self.built_of = Some(self.built_now());
                 self.keep_bodies();
                 Ok(ev)
             }
@@ -2923,7 +2946,8 @@ impl Session {
             Err(e) => {
                 // the document's build, when it was made, goes back aside with it
                 let built = match (&self.compiled, &self.last) {
-                    (Some(c), Some(ev)) if self.built_head == Some(self.model.head().content) => Some((c.clone(), ev.clone(), stamp)),
+                    (Some(c), Some(ev)) if self.built_of == Some(self.built_now())
+                        && ev.profile == self.eval.profile && ev.machine.same_volume(&self.eval.machine) => Some((c.clone(), ev.clone(), stamp)),
                     _ => None,
                 };
                 let doc = Doc {
@@ -2937,8 +2961,8 @@ impl Session {
                     thumb: std::mem::replace(&mut self.thumb, previous.thumb),
                     built,
                 };
-                let (compiled, last, built_head, mapped, inspected) = was;
-                (self.compiled, self.last, self.built_head, self.eval.mapped) = (compiled, last, built_head, mapped);
+                let (compiled, last, built_of, mapped, inspected) = was;
+                (self.compiled, self.last, self.built_of, self.eval.mapped) = (compiled, last, built_of, mapped);
                 self.keep_bodies();
                 self.eval.put_back(inspected);
                 if let Some(at) = kept {
@@ -3639,7 +3663,7 @@ impl Session {
         let anchored = |c: &Change| matches!(c, Change::Place { arg: PlaceArg::Center(_) | PlaceArg::Corner(_), .. });
         if !edits.iter().any(anchored) { return Ok(Vec::new()); }
 
-        let preview = self.built_head != Some(self.model.head().content) || self.last.is_none() || edits.iter().any(|c| match c {
+        let preview = self.built_of.is_none_or(|b| b.head != self.model.head().content) || self.last.is_none() || edits.iter().any(|c| match c {
             Change::AddInstance { .. } | Change::RemoveInstance { .. } | Change::Param { .. } => true,
             Change::Place { arg: PlaceArg::Rotate(_) | PlaceArg::Scale(_) | PlaceArg::Show(_), .. } => true,
             Change::Place { instance, .. } if anchored(c) => self.compiled.as_ref().and_then(|c| c.instance(instance)).is_none(),
@@ -4555,6 +4579,41 @@ mod annotate_tests;
 mod supports_tests;
 #[cfg(test)]
 mod plates_tests;
+
+#[test]
+fn session_take_refuses_stale_profile_build_on_switch_back() {
+    let root = std::env::temp_dir().join(format!("fab-profile-switch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut session = Session::new(Machine::dual_nozzle_350(), root.join("documents"));
+    session.store = Some(plates::PlateStore::under(&root.join("plates"), &root.join("documents")));
+    let save = |name: &str, body: &str| {
+        let file = root.join(format!("{name}.fab.splash"));
+        let script = format!("{name}.cad.splash");
+        let model = FabModel::with_script(name, &script, &format!("{}{body}", fab_model::program::EMPTY));
+        project::save(&model, &file).unwrap();
+        file
+    };
+    let hinge = save("thin_hinge", r#"let a = m.box({size: [6mm 2.6mm 6mm] at: [0 1.3mm 0]})
+let b = m.box({size: [6mm 2.6mm 6mm] at: [10mm 1.3mm 0]})
+let pa = m.union(a, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let pb = m.union(b, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let h = m.hinge(pa, pb, {at: [5mm 0 0] plate: 0.4mm})
+object(pa, name: "Probe")
+"#);
+    let beta = save("beta", "object(m.box({size: [2mm 2mm 2mm]}))");
+    let original = session.open(&hinge).expect("the default clearance fits the thin hinge");
+    let hinge_id = session.plate.clone().expect("hinge has a plate record");
+    let mut profile = original.profile.clone();
+    profile.measured.c_z_layers = Some(4);
+    assert!(session.set_profile(profile), "four layers change the active profile");
+    let failure = session.rebuild_eval().err().expect("four gap layers leave too little hinge eye");
+    assert!(failure.message.contains("eye of 0.20 mm"), "thin hinge under the new profile: {failure}");
+    session.open(&beta).expect("the box builds with four gap layers");
+    assert!(session.switch(&hinge_id).is_err(), "switch-back must refuse a hinge built for the old clearance");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -34,6 +34,31 @@ pub fn touched_by<'a>(mut event: &'a Event, lookup: impl Fn(&Id) -> Option<&'a E
 }
 
 #[derive(Debug, PartialEq)]
+pub(super) struct BoardImage {
+    pub blob: Option<(Id, u64)>,
+    pub poster: Option<(Id, u64)>,
+    pub media: String,
+    pub duration_ms: u64,
+    pub duration_label: String,
+}
+
+impl BoardImage {
+    fn read(e: &Entity) -> Self {
+        let file = |key| match e.value(key) {
+            Some(Value::Blob { size, root }) => Some((makepad_town_core::blob::id(*size, root), *size)),
+            _ => None,
+        };
+        let duration_ms = match e.value(field::DURATION) {
+            Some(Value::Int(n)) => u64::try_from(*n).unwrap_or(0),
+            _ => 0,
+        };
+        let secs = duration_ms / 1000;
+        Self { blob: file(field::BLOB), poster: file(field::POSTER), media: e.text(field::MEDIA).into(), duration_ms,
+            duration_label: if duration_ms > 0 { format!("{}:{:02}", secs / 60, secs % 60) } else { String::new() } }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct BoardItem {
     pub id: Id,
     pub kind: Key,
@@ -46,6 +71,7 @@ pub struct BoardItem {
     pub selectable: bool,
     pub parent_section: Option<Id>,
     pub colour: Option<u32>,
+    pub(super) image: Option<Box<BoardImage>>,
     pub z_key: Option<Box<[u8]>>,
     z_writer: Option<Id>,
 }
@@ -71,6 +97,7 @@ impl BoardItem {
         let z_key = entity.z_key().map(|(bytes, _)| Box::from(bytes));
         Self {
             id: entity.id,
+            image: (entity.kind == kind::IMAGE).then(|| Box::new(BoardImage::read(entity))),
             kind: entity.kind.clone(),
             rect: Rect::new(world(x), world(y), world(x + w), world(y + h)),
             x: x as i64,
@@ -295,6 +322,32 @@ impl BoardView {
         self.index.query_rect(rect, &mut hits);
         hits.sort_unstable_by_key(|&h| self.ranks[h as usize]);
         hits.into_iter().map(|h| self.item(h).id).collect()
+    }
+
+    /// Top-left in board ticks for a new card. Search beyond the viewport too when
+    /// placing beside a visible item, since its neighbour may be just off screen.
+    pub fn next_free_spot(&self, viewport: Option<Rect>, size: (f64, f64)) -> (i64, i64) {
+        let by_right = |a: &&BoardItem, b: &&BoardItem| a.rect.x1.total_cmp(&b.rect.x1).then(a.id.cmp(&b.id));
+        let ticks = |v: f64| (v * 64.).round() as i64;
+        let beside = |item: &BoardItem| (item.rect.x1 + 32., item.rect.y0);
+        let Some(vp) = viewport else {
+            return self.items.iter().flatten().max_by(by_right)
+                .map_or((0, 0), |item| { let (x, y) = beside(item); (ticks(x), ticks(y)) });
+        };
+        let overlaps = |x, y| {
+            let candidate = Rect::new(x, y, x + size.0, y + size.1);
+            self.visible(candidate).into_iter().filter_map(|id| self.get(&id))
+                .filter(|item| item.rect.overlaps(candidate)).max_by(by_right)
+        };
+        let (mut x, mut y) = ((vp.x0 + vp.x1) * 0.5, (vp.y0 + vp.y1) * 0.5);
+        x = ticks(x) as f64 / 64.;
+        y = ticks(y) as f64 / 64.;
+        if let Some(obstacle) = overlaps(x, y) {
+            let rightmost = self.visible(vp).into_iter().filter_map(|id| self.get(&id)).max_by(by_right);
+            (x, y) = beside(rightmost.unwrap_or(obstacle));
+            while let Some(item) = overlaps(x, y) { x = item.rect.x1 + 32.; }
+        }
+        (ticks(x), ticks(y))
     }
 
     /// Contiguous ranges of the supplied z-ordered visible set. Only the current layer can

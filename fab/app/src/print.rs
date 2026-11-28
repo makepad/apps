@@ -39,6 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use makepad_fab_slice::piece;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use fab_calibrate::apply::SlicerCalibration;
+use fab_calibrate::results::EffectiveResults;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -91,7 +93,7 @@ impl std::fmt::Debug for Catalog {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrintOutcome { Unchanged, Target, RestoredTarget, JobRows, JobPreview }
+pub enum PrintOutcome { Unchanged, Target, RestoredTarget, JobRows, JobPreview, Calibration { setup_changed: bool, slice_changed: bool } }
 
 impl PrintOutcome {
     fn completion(state: &mut PrintState, printer: &PrinterChoice) -> Self {
@@ -109,6 +111,8 @@ impl PrintOutcome {
 #[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub enum PrintEvent {
+    CalibrationResolved { seq: u64, effective: Arc<EffectiveCalibration> },
+    CalibrationWritten { outcome: CalWriteOutcome },
     Checked { id: u64, report: Arc<fab_printability::Report>, error: Option<String> },
     /// Configurations and original layouts for the printer and reset menus.
     PrinterConfigs { names: Vec<String>, presets: Vec<VirtualPrinter>, loadouts: LoadoutFiles },
@@ -350,7 +354,44 @@ pub struct Polled {
     pub others: bool,
 }
 
+const LOADING_CALIBRATION: &str = "Loading calibration";
+const UPDATING_CALIBRATION_PLATE: &str = "Updating the plate for calibration";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RebuildFailureKind {
+    Joint { parts: Vec<String>, kind: Option<&'static str>, id: String, reason: String },
+    Solid { parts: Vec<String>, id: String, op: String, reason: String },
+    Program { file: Option<String>, line: u32, col: u32, reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProfileRebuildFailure {
+    measured: makepad_csg_mech::Measured,
+    layer: f64,
+    source: fab_model::eval::Failure,
+    kind: RebuildFailureKind,
+    message: String,
+    redacted_message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PlateGate {
+    Wait(&'static str),
+    MachineInvalid(MachineError),
+    CalibrationFailed(String),
+}
+
+struct PendingSend {
+    ticket: PrintTicket,
+    preview: u64,
+}
+
 pub struct Printing {
+    pub dirs: Arc<crate::dirs::FabDirs>,
+    profile_rebuild_error: Option<ProfileRebuildFailure>,
+    pending_send: Option<PendingSend>,
+    print_setup_seq: u64,
+    setup_deferred: bool,
     /// With the test prints chosen, the ticked ones: what slices in place of the whole plate.
     tests: Option<Arc<[piece::TestPrint]>>,
     /// The slice the person switched away from, whole plate or test prints: it shows again without
@@ -373,12 +414,22 @@ pub struct Printing {
     factory: Vec<VirtualPrinter>,
     layout_revision: u64,
     catalog: Option<Arc<Catalog>>,
-    machine: Result<Arc<Machine>, String>,
+    calibration_key: CalibrationKey,
+    // Compare a report against the last inputs without rebuilding the unique-filament list
+    // or following the same twin provenance again.
+    calibration_target: Option<(PrinterChoice, Option<Arc<Saved>>)>,
+    calibration_slots: Vec<String>,
+    calibration_seq: u64,
+    calibration_resolved: u64,
+    calibration: Arc<EffectiveCalibration>,
+    machine: Result<Arc<Machine>, MachineError>,
     /// The colour mapping used to resolve the Print editor's current materials.
     pub(super) mapping: Option<Arc<Mapped>>,
     gen: u64,
     /// Only a requested settle can answer; an edit withdraws it without a new generation.
     slice_gen: Option<u64>,
+    /// The settled slice generation whose preview owns incoming `PrintEvent::Issues`.
+    issues_gen: Option<u64>,
     /// The live input kept verbatim until Print, Export or Slice asks for a settle.
     live: Option<LiveJob>,
     live_key: Option<(u64, u64)>,
@@ -387,6 +438,8 @@ pub struct Printing {
     last: Option<Arc<Sliced>>,
     /// Export the requested slice when it arrives.
     export_waits: bool,
+    /// The active file packaging attempt whose result still applies to the plate.
+    export_attempt: Option<u64>,
     /// A slice that Slice, Export or Print was waiting for went with its plate or settings (and
     /// whether an Export waited on it): [`Self::resume_asked`] asks for it again on what stands now.
     reask: Option<bool>,
@@ -471,6 +524,7 @@ pub(super) fn send_filament_control(
 impl Default for Printing {
     fn default() -> Self {
         Self {
+            dirs: Arc::default(),
             fleet: Vec::new(),
             pending_twins: Vec::new(),
             #[cfg(test)]
@@ -480,15 +534,26 @@ impl Default for Printing {
             published: 0,
             simulator: None,
             profiles_worker: None,
+            profile_rebuild_error: None,
+            pending_send: None,
+            print_setup_seq: 0,
+            setup_deferred: false,
             job_writer: None,
             virtuals: None,
             factory: Vec::new(),
             layout_revision: 0,
             catalog: None,
-            machine: CheckSetup::fab_defaults().machine().map(Arc::new),
+            calibration_key: CalibrationKey::default(),
+            calibration_target: None,
+            calibration_slots: Vec::new(),
+            calibration_seq: 0,
+            calibration_resolved: 0,
+            calibration: Arc::default(),
+            machine: CheckSetup::fab_defaults().machine_typed().map(Arc::new),
             mapping: None,
             gen: 0,
             slice_gen: None,
+            issues_gen: None,
             live: None,
             tests: None,
             kept: None,
@@ -496,6 +561,7 @@ impl Default for Printing {
             figures_of: None,
             last: None,
             export_waits: false,
+            export_attempt: None,
             reask: None,
             started: None,
             project_settings: Vec::new(),
@@ -580,9 +646,104 @@ impl Catalog {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CalResolveRequest {
+    seq: u64,
+    key: CalibrationKey,
+}
+
+#[derive(Clone, Debug)]
+pub enum CalWrite {
+    Save {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        coupon: Arc<fab_calibrate::Coupon>,
+        answer: fab_calibrate::Answer,
+        today: String,
+    },
+    Clear {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        step: fab_calibrate::Step,
+    },
+}
+
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
+pub enum CalWriteOutcome {
+    Saved {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        filament: String,
+        step: fab_calibrate::Step,
+        values: Vec<(&'static str, f64)>,
+    },
+    Cleared {
+        owner: Option<CalibrationOwner>,
+        preset: String,
+        step: fab_calibrate::Step,
+        has_preset_fallback: bool,
+    },
+    Failed(String),
+}
+
+/// Apply all writes in arrival order before publishing the most recent requested snapshot.
+fn run_calibration_work(dir: &Path, writes: Vec<CalWrite>, resolve: Option<CalResolveRequest>, mut post: impl FnMut(PrintEvent)) {
+    use fab_calibrate::Results;
+    for write in writes {
+        let (owner, preset, filament) = write.destination();
+        let mut r = match owner {
+            Some(owner) => Results::load_owner_in(dir, &owner.id, filament),
+            None => Results::load_in(dir, preset, filament),
+        };
+        let save = |r: &Results| if owner.is_some() { r.save_owner_in(dir) } else { r.save_in(dir) };
+        let result = match &write {
+            CalWrite::Save { coupon, answer, today, .. } => r.record(coupon, answer, today).and_then(|values| {
+                save(&r)?;
+                Ok(CalWriteOutcome::Saved { owner: owner.clone(), preset: preset.into(), filament: filament.into(), step: coupon.step, values })
+            }),
+            CalWrite::Clear { step, .. } => {
+                r.clear_step(*step);
+                save(&r).map(|_| {
+                    let has_preset_fallback = owner.is_some() && {
+                        let fallback = Results::load_in(dir, preset, filament);
+                        fab_calibrate::results::step_names(*step).iter().any(|name| fallback.get(name).is_some())
+                    };
+                    CalWriteOutcome::Cleared { owner: owner.clone(), preset: preset.into(), step: *step, has_preset_fallback }
+                })
+            }
+        };
+        post(PrintEvent::CalibrationWritten { outcome: result.unwrap_or_else(CalWriteOutcome::Failed) });
+    }
+    if let Some(request) = resolve {
+        let effective = Arc::new(EffectiveCalibration::resolve_in(dir, &request.key));
+        post(PrintEvent::CalibrationResolved { seq: request.seq, effective });
+    }
+}
+
+impl CalWrite {
+    fn destination(&self) -> (&Option<CalibrationOwner>, &str, &str) {
+        match self {
+            Self::Save { owner, preset, filament, .. } | Self::Clear { owner, preset, filament, .. } => (owner, preset, filament),
+        }
+    }
+}
+
+fn write_affects_key(write: &CalWrite, key: &CalibrationKey) -> bool {
+    let (owner, preset, filament) = write.destination();
+    key.filaments.iter().any(|f| f == filament) && match owner {
+        Some(owner) => key.owner.as_ref() == Some(owner),
+        None => key.preset == preset,
+    }
+}
+
 /// Settings snapshots replace earlier pending writes. Imports each need an answer.
 #[derive(Default)]
 struct ProfileWork {
+    cal_writes: Vec<CalWrite>,
+    cal_resolve: Option<CalResolveRequest>,
     saved: Option<Arc<Saved>>,
     rebuild: Option<u64>,
     loadouts: LoadoutFiles,
@@ -854,8 +1015,7 @@ fn loadout_file(id: &PrinterChoice) -> PathBuf {
     Path::new("trays").join(file)
 }
 
-fn read_loadouts() -> LoadoutFiles {
-    let dir = makepad_fab_settings::home::user_home().join(".makepad/fab");
+fn read_loadouts(dir: &Path) -> LoadoutFiles {
     let legacy = loadout_file(&PrinterChoice::None);
     let mut files = LoadoutFiles::new();
     if let Ok(text) = std::fs::read_to_string(dir.join(&legacy)) { files.insert(legacy, text); }
@@ -876,9 +1036,8 @@ fn read_loadouts() -> LoadoutFiles {
     files
 }
 
-fn write_loadouts(files: LoadoutFiles) {
+fn write_loadouts(dir: &Path, files: LoadoutFiles) {
     if files.is_empty() { return; }
-    let dir = makepad_fab_settings::home::user_home().join(".makepad/fab");
     for (file, text) in files {
         if let Err(e) = fab_model::project::write_atomic(&dir.join(file), text.as_bytes()) {
             log!("fab: could not keep the tray loadout: {e}");
@@ -989,6 +1148,7 @@ impl SliceJob {
         } else {
             None
         };
+        let head_envelope = self.setup.head_envelope().to_path_buf();
         let catalog = self.setup.catalog;
         let objects: Arc<[String]> = match &self.source {
             SliceSource::Model(ev, ..) => ev.plate.parts.iter().map(|p| p.object.clone()).collect(),
@@ -999,7 +1159,7 @@ impl SliceJob {
             SliceSource::Model(ev, ..) => melt_steps(&ev.plate),
             SliceSource::Tests(..) => Vec::new(),
         };
-        let job = crate::live_slice::PrintJob { gen: self.gen, settings: self.setup.settings, colours: palettes.material, model_colours: palettes.model, shared_tools: palettes.shared_tools, machine, name: self.name, objects, check: self.check, fallback, catalog, tests, melts };
+        let job = crate::live_slice::PrintJob { gen: self.gen, head_envelope, settings: self.setup.settings, colours: palettes.material, model_colours: palettes.model, shared_tools: palettes.shared_tools, machine, name: self.name, objects, check: self.check, fallback, catalog, tests, melts };
         (job, crate::live_slice::SliceInput { plate_id, settings_id, parts, make })
     }
 
@@ -1017,7 +1177,7 @@ impl SliceJob {
     fn mesh_report(&self) -> Arc<fab_printability::Report> {
         let ev = self.source.plate();
         let (plate, machine) = (&ev.plate, &ev.machine);
-        match resolve_setup(&self.setup.settings, self.setup.catalog.as_deref(), plate, machine) {
+        match resolve_tools(&self.setup.settings, self.setup.catalog.as_deref(), &self.setup.calibration, plate, machine, None) {
             Ok(setup) => {
                 let materials = fab_printability::Materials::from_job(&makepad_fab_settings::machine::Job::new(setup.build_config()));
                 Arc::new(ev.analyse(&materials))
@@ -1027,25 +1187,445 @@ impl SliceJob {
     }
 }
 
+/// Maximum characters of a raw `fab_material_slots` entry shown on the person's local UI.
+const MAX_LOCAL_SLOT_CHARS: usize = 64;
+
+/// Structured failure from resolving or validating a printer machine preset
+/// (`CheckSetup::machine_typed` / `machine_of`), built by construction — never parsed from text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachineError {
+    /// `self.catalog` is `None` while `use_installed` is true.
+    CatalogUnavailable,
+    /// Virtual printer layout is rebuilding on `ProfilesWorker`.
+    UpdatingVirtualLayout,
+    /// `Store::resolve(&preset)` failed: missing preset, deleted/unreadable
+    /// file, malformed JSON, missing include, or deep inheritance. `detail` may contain a full
+    /// local file path and OS error (local UI only).
+    ResolvePreset {
+        preset: String,
+        detail: String,
+    },
+    /// `fab_sla::printer::resin_machine` rejected a resin preset.
+    ResinSpec {
+        preset: String,
+        detail: String,
+    },
+    /// Required filament machine geometry key is missing or invalid:
+    /// `printable_area`, `printable_height`, `nozzle_diameter`, `extruder_printable_area`,
+    /// `extruder_printable_height`, `bed_exclude_area`, or `wrapping_exclude_area`.
+    InvalidKey {
+        preset: String,
+        key: &'static str,
+    },
+    /// `family::of(values)` did not recognize the preset's printer family.
+    UnsupportedFamily {
+        preset: String,
+    },
+    /// One-spool-per-head printer has more toolheads than `fab_plate::machine::UNITS`.
+    TooManyHeads {
+        preset: String,
+    },
+    /// `Machine::parse_slots(&named, count)` rejected an entry in `fab_material_slots`.
+    /// `raw_entry` and `detail` carry raw preset text (local UI only; never cross boundaries).
+    InvalidMaterialSlots {
+        preset: String,
+        /// 1-based index of the first failing entry in `fab_material_slots`, when located.
+        slot_index: Option<usize>,
+        /// Trimmed offending raw entry (local display only).
+        raw_entry: Option<String>,
+        /// Full parser error from `Machine::parse_slots` (local display only).
+        detail: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetRole {
+    Printer,
+    Process,
+    Filament,
+}
+
+impl PresetRole {
+    fn label(self) -> &'static str {
+        match self {
+            PresetRole::Printer => "printer",
+            PresetRole::Process => "process",
+            PresetRole::Filament => "filament",
+        }
+    }
+}
+
+/// Structured failure from `CheckSetup::job_setup_of_typed` / `resolve_tools_with`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupError {
+    Machine(MachineError),
+    /// `Catalog::store.resolve(preset)` failed for a filament, printer, or process preset.
+    ResolvePreset {
+        role: PresetRole,
+        preset: String,
+        detail: String,
+    },
+    /// Non-path validation error (bed plate, nozzle count, unsupported family, etc.).
+    Validation(String),
+}
+
+fn first_line_or(text: &str, empty: &str) -> String {
+    text.lines().next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(empty).to_owned()
+}
+
+fn trim_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let mut head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() { head.push('…'); }
+    head
+}
+
+impl MachineError {
+    pub fn local_message(&self) -> String {
+        match self {
+            Self::CatalogUnavailable => "The installed printer profiles are unavailable".into(),
+            Self::ResolvePreset { preset, detail } => format!("{}: {}", preset_label(preset), first_line_or(detail, "preset could not be loaded")),
+            Self::ResinSpec { detail, .. } => first_line_or(detail, "invalid resin printer preset"),
+            Self::InvalidMaterialSlots { preset, slot_index, raw_entry, detail } => {
+                let mut shown = first_line_or(detail, "invalid fab_material_slots");
+                if let Some(raw) = raw_entry.as_ref().filter(|s| s.chars().count() > MAX_LOCAL_SLOT_CHARS) {
+                    shown = if shown.contains(raw) {
+                        shown.replacen(raw, &trim_chars(raw, MAX_LOCAL_SLOT_CHARS), 1)
+                    } else {
+                        trim_chars(&shown, 2 * MAX_LOCAL_SLOT_CHARS)
+                    };
+                }
+                let preset = preset_label(preset);
+                match slot_index {
+                    Some(n) => format!("{preset}: fab_material_slots entry {n} — {shown}"),
+                    None => format!("{preset}: {shown}"),
+                }
+            }
+            _ => self.redacted_message(),
+        }
+    }
+}
+
+fn joint_kind_label(proto: &str) -> Option<&'static str> {
+    match proto {
+        "Hinge" => Some("hinge"),
+        "Slider" => Some("slider"),
+        "Bearing" => Some("bearing"),
+        "Ball" | "BallJoint" => Some("ball joint"),
+        "Bond" => Some("bond"),
+        "Anchor" => Some("anchor"),
+        "String" => Some("string"),
+        _ => None,
+    }
+}
+
+
+fn script_basename(file: &str) -> String {
+    Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or(file).to_owned()
+}
+
+fn format_measured_summary(m: &makepad_csg_mech::Measured, layer: f64) -> String {
+    let mut values = Vec::new();
+    if let Some(n) = m.c_z_layers { values.push(format!("Z gap {n} layers ({:.2} mm)", n as f64 * layer)); }
+    if let Some(c) = m.c_xy { values.push(format!("Clearance {c:.2} mm")); }
+    if let Some(u) = m.mu { values.push(format!("Friction {u:.2}")); }
+    if values.is_empty() { "default calibration".into() } else { values.join(", ") }
+}
+
+fn classify_rebuild_failure(
+    f: &fab_model::eval::Failure, ev: Option<&Evaluated>, program: Option<&fab_model::program::Compiled>,
+) -> RebuildFailureKind {
+    let reason = first_line_or(&f.message, "model failed to build");
+    if f.id.is_empty() {
+        return RebuildFailureKind::Program { file: (!f.file.is_empty()).then(|| script_basename(&f.file)), line: f.line, col: f.col, reason };
+    }
+    let instances = || program.into_iter().flat_map(|p| p.instances.iter()).filter(|i| i.script.file == f.file);
+    let name_of = |object: &str| {
+        let ev = ev?;
+        ev.plate.parts.iter().find(|p| p.object == object).map(|p| &p.name)
+            .or_else(|| ev.plate.excluded.iter().find(|p| p.part.object == object).map(|p| &p.part.name))
+    };
+    let mut parts = Vec::<String>::new();
+    let mut solids = Vec::new();
+    let mut joint = None;
+    let mut solid_op = None;
+    for inst in instances() {
+        let p = &inst.script.program;
+        let call = p.joints.iter().filter(|c| c.id == f.id).max_by_key(|c| c.loc == Some((f.line, f.col)));
+        let mut add = |index: usize| {
+            let id = &p.solids[index].id;
+            let object = fab_model::program::part_id(&inst.name, id);
+            if let Some(name) = name_of(&object) {
+                if !parts.contains(name) { parts.push(name.clone()); }
+            }
+            if !solids.contains(id) { solids.push(id.clone()); }
+        };
+        if let Some(c) = call.filter(|_| f.op == "joint") {
+            joint = Some(joint_kind_label(c.proto));
+            for index in [Some(c.a), c.b, c.shoe].into_iter().flatten() { add(index); }
+        } else if let Some(index) = p.solids.iter().position(|solid| solid.id == f.id) {
+            solid_op = Some(p.solids[index].proto);
+            add(index);
+        }
+    }
+    if parts.is_empty() && f.op == "joint" && joint.is_none() && solid_op.is_none() {
+        for m in ev.into_iter().flat_map(|e| e.mech.iter()).filter(|m| m.file == f.file && m.joint_ids.contains(&f.id)) {
+            for object in &m.names {
+                if let Some(name) = name_of(object) { if !parts.contains(name) { parts.push(name.clone()); } }
+            }
+        }
+    }
+    if parts.is_empty() {
+        for inst in instances() {
+            for placed in &inst.placed {
+                let object = fab_model::program::part_id(&inst.name, &inst.script.program.solids[placed.solid].id);
+                if let Some(name) = name_of(&object) { if !parts.contains(name) { parts.push(name.clone()); } }
+            }
+        }
+        if parts.is_empty() { parts = solids; }
+    }
+    if f.op == "joint" && (joint.is_some() || solid_op.is_none()) {
+        RebuildFailureKind::Joint { parts, kind: joint.flatten(), id: f.id.clone(), reason }
+    } else {
+        let op = if f.op == "joint" { solid_op.unwrap_or(&f.op) } else { &f.op };
+        RebuildFailureKind::Solid { parts, id: f.id.clone(), op: op.into(), reason }
+    }
+}
+
+fn format_rebuild_failure(
+    kind: &RebuildFailureKind,
+    measured: &makepad_csg_mech::Measured,
+    layer: f64,
+) -> String {
+    let cal = format_measured_summary(measured, layer);
+    match kind {
+        RebuildFailureKind::Joint { parts, kind, id, reason } => {
+            let joint = match kind {
+                Some(k) => format!("{k} `{id}`"),
+                None => format!("joint `{id}`"),
+            };
+            let head = if parts.is_empty() { joint } else { format!("{} · {joint}", parts.join(", ")) };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+        RebuildFailureKind::Solid { parts, id, op, reason } => {
+            let subject = if op.is_empty() { format!("solid `{id}`") } else { format!("`{id}` ({op})") };
+            let head = if parts.is_empty() { subject } else { format!("{} · {subject}", parts.join(", ")) };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+        RebuildFailureKind::Program { file, line, col, reason } => {
+            let head = match file {
+                Some(file) if *line > 0 => format!("script `{file}`:{line}:{col}"),
+                Some(file) => format!("script `{file}`"),
+                None if *line > 1 || *col > 1 => format!("project:{line}:{col}"),
+                None => "project build".to_string(),
+            };
+            format!("{head} ({cal}): {reason} — edit the model or adjust/clear calibration.")
+        }
+    }
+}
+
+fn scrub_known_paths(text: &str, failure: &fab_model::eval::Failure, program: Option<&fab_model::program::Compiled>) -> String {
+    let mut out = text.to_string();
+    let files = std::iter::once(failure.file.as_str())
+        .chain(program.into_iter().flat_map(|p| p.instances.iter().map(|i| i.script.file.as_str())));
+    for full in files {
+        if full.is_empty() { continue; }
+        let base = script_basename(full);
+        if base != full && out.contains(full) {
+            out = out.replace(full, &base);
+        }
+    }
+    out
+}
+
+pub(crate) fn redacted_eval_failure(f: &fab_model::eval::Failure) -> String {
+    let file = if f.file.is_empty() { String::new() } else { format!("{}:", script_basename(&f.file)) };
+    let msg = scrub_known_paths(&first_line_or(&f.message, "model failed to build"), f, None);
+    if f.id.is_empty() {
+        format!("{file}{}:{}: {msg}", f.line, f.col)
+    } else {
+        format!("{file}{}:{}: {} ({}): {msg}", f.line, f.col, f.id, f.op)
+    }
+}
+
+fn redact_rebuild_kind(kind: &RebuildFailureKind, failure: &fab_model::eval::Failure, program: Option<&fab_model::program::Compiled>) -> RebuildFailureKind {
+    let mut redacted = kind.clone();
+    let reason = match &mut redacted {
+        RebuildFailureKind::Joint { reason, .. } | RebuildFailureKind::Solid { reason, .. } | RebuildFailureKind::Program { reason, .. } => reason,
+    };
+    *reason = scrub_known_paths(reason, failure, program);
+    redacted
+}
+
+fn preset_label(preset: &str) -> String {
+    let name = first_line_or(preset, "");
+    if name.is_empty() {
+        "the selected printer preset".to_string()
+    } else {
+        format!("the printer preset `{name}`")
+    }
+}
+
+impl MachineError {
+    /// Safe for any outbound boundary (cloud AI, MCP agents, `Done::text`, `PrintEvent::Checked`):
+    /// names only the failing step and preset name — never a local path, OS error, or raw value.
+    pub fn redacted_message(&self) -> String {
+        match self {
+            MachineError::CatalogUnavailable => "the installed printer profiles are unavailable".into(),
+            MachineError::UpdatingVirtualLayout => "Updating the virtual printer layout".into(),
+            MachineError::ResolvePreset { preset, .. } => {
+                format!("could not read {}", preset_label(preset))
+            }
+            MachineError::ResinSpec { preset, .. } => {
+                format!("{} has invalid resin printer settings", preset_label(preset))
+            }
+            MachineError::InvalidKey { preset, key } => {
+                format!("{}: missing or invalid {key}", preset_label(preset))
+            }
+            MachineError::UnsupportedFamily { preset } => {
+                format!("{}: {}", preset_label(preset), makepad_fab_settings::family::UNSUPPORTED)
+            }
+            MachineError::TooManyHeads { preset } => {
+                format!("{}: this printer has more heads than its trays can be numbered", preset_label(preset))
+            }
+            MachineError::InvalidMaterialSlots { preset, .. } => {
+                format!("{} has an invalid `fab_material_slots` entry", preset_label(preset))
+            }
+        }
+    }
+}
+
+impl SetupError {
+    pub fn redacted_message(&self) -> String {
+        match self {
+            SetupError::Machine(m) => m.redacted_message(),
+            SetupError::ResolvePreset { role, preset, .. } => {
+                let name = first_line_or(preset, "");
+                if name.is_empty() {
+                    format!("could not read the selected {} preset", role.label())
+                } else {
+                    format!("could not read the {} preset `{name}`", role.label())
+                }
+            }
+            SetupError::Validation(msg) => msg.clone(),
+        }
+    }
+}
+
+/// The configured printer that owns measurements, including those used by its twins.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CalibrationOwner {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationKey {
+    pub owner: Option<CalibrationOwner>,
+    pub preset: String,
+    pub filaments: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectiveCalibration {
+    pub owner: Option<CalibrationOwner>,
+    pub preset: String,
+    pub by_filament: std::collections::BTreeMap<String, EffectiveResults>,
+}
+
+impl EffectiveCalibration {
+    pub fn resolve_in(dir: &Path, key: &CalibrationKey) -> Self {
+        let owner_id = key.owner.as_ref().map(|owner| owner.id.as_str());
+        let by_filament = key.filaments.iter().map(|filament| {
+            let results = fab_calibrate::Results::load_effective_in(dir, owner_id, &key.preset, filament);
+            (filament.clone(), results)
+        }).collect();
+        Self { owner: key.owner.clone(), preset: key.preset.clone(), by_filament }
+    }
+
+    pub fn for_filament(&self, filament: &str) -> Option<&EffectiveResults> {
+        self.by_filament.get(filament)
+    }
+
+    pub fn first_for(&self, settings: &PrintSettings) -> Option<&EffectiveResults> {
+        self.for_filament(settings.materials.first().map_or("", |f| f.preset.as_str()))
+    }
+
+    fn mech_measured(&self, settings: &PrintSettings) -> makepad_csg_mech::Measured {
+        let fit = self.first_for(settings).map(fab_calibrate::MechFit::from_effective).unwrap_or_default();
+        makepad_csg_mech::Measured { c_xy: fit.c_xy, c_z_layers: fit.c_z_layers, mu: fit.mu }
+    }
+
+    pub fn slicer_for(&self, filament: &str) -> SlicerCalibration {
+        self.for_filament(filament).map(SlicerCalibration::from_effective).unwrap_or_default()
+    }
+
+    pub fn hash_slicer_values(&self, settings: &PrintSettings, seed: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hash);
+        if settings.materials.is_empty() {
+            self.slicer_for("").hash(&mut hash);
+        }
+        for filament in &settings.materials {
+            self.slicer_for(&filament.preset).hash(&mut hash);
+        }
+        hash.finish()
+    }
+}
+
 /// Immutable settings snapshot for the model worker; preset resolution is I/O.
 #[derive(Clone)]
 pub struct CheckSetup {
+    dirs: Arc<crate::dirs::FabDirs>,
+    calibration: Arc<EffectiveCalibration>,
     mapping: Option<Arc<Mapped>>,
     settings: PrintSettings,
     catalog: Option<Arc<Catalog>>,
 }
 
+fn waits_mapping(mapping: Option<&Arc<Mapped>>, ev: &Evaluated) -> Option<&'static str> {
+    let mapping = mapping?;
+    (!Arc::ptr_eq(mapping, &ev.mapped) && mapping != &ev.mapped)
+        .then_some("Updating the plate for the printer's colours")
+}
+
 impl CheckSetup {
+    pub fn head_envelope(&self) -> &Path {
+        &self.dirs.head_envelope
+    }
+
     /// Fab's own defaults (no installed profiles read yet).
     pub fn fab_defaults() -> Self {
-        CheckSetup { settings: defaults_settings(), catalog: None, mapping: None }
+        CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings: defaults_settings(), catalog: None, mapping: None }
     }
 
     /// A rebuilt plate must carry the mapping that assigned these materials to nozzles.
+    pub fn plate_waits_mapping(&self, ev: &Evaluated) -> Option<&'static str> {
+        waits_mapping(self.mapping.as_ref(), ev)
+    }
+
+    /// Authoritative profile-mismatch predicate: true when `ev` has printable parts built
+    /// with different calibrated mechanism fits (`c_xy`, `c_z_layers`, `mu`) than this setup.
+    /// Pure in-memory O(log F) lookup, zero disk I/O.
+    pub fn plate_profile_mismatch(&self, ev: &Evaluated) -> bool {
+        !ev.plate.parts.is_empty() && ev.profile.measured != self.mech_measured()
+    }
+
+    /// Worker-side guard (`model_job`, `live_slice::send_live_plate`): never slice an `ev`
+    /// whose colour mapping or calibrated mechanics profile lags behind this setup.
     pub fn plate_waits(&self, ev: &Evaluated) -> Option<&'static str> {
-        let mapping = self.mapping.as_ref()?;
-        (!Arc::ptr_eq(mapping, &ev.mapped) && mapping != &ev.mapped)
-            .then_some("Updating the plate for the printer's colours")
+        self.plate_waits_mapping(ev).or_else(|| {
+            self.plate_profile_mismatch(ev).then_some(UPDATING_CALIBRATION_PLATE)
+        })
+    }
+
+    pub fn mech_measured(&self) -> makepad_csg_mech::Measured {
+        self.calibration.mech_measured(&self.settings)
+    }
+
+    pub fn calibration_owner(&self) -> Option<&CalibrationOwner> {
+        self.calibration.owner.as_ref()
     }
 
     /// The selected print profile's name.
@@ -1055,11 +1635,17 @@ impl CheckSetup {
 
     /// The selected printer's geometry (reads the inherited preset files).
     pub fn machine(&self) -> Result<Machine, String> {
+        self.machine_typed().map_err(|e| e.local_message())
+    }
+
+    pub fn machine_typed(&self) -> Result<Machine, MachineError> {
         if !self.settings.use_installed {
             return Ok(Machine::dual_nozzle_350());
         }
-        let catalog = self.catalog.as_ref().ok_or("The installed printer profiles are unavailable")?;
-        let preset = catalog.store.resolve(&self.settings.machine).map_err(|e| format!("the printer preset: {e}"))?;
+        let catalog = self.catalog.as_ref().ok_or(MachineError::CatalogUnavailable)?;
+        let preset = catalog.store.resolve(&self.settings.machine).map_err(|detail| MachineError::ResolvePreset {
+            preset: self.settings.machine.clone(), detail,
+        })?;
         machine_of(&preset.name, &preset.values)
     }
 
@@ -1070,28 +1656,26 @@ impl CheckSetup {
     }
 
     pub fn id(&self) -> u64 {
-        // Stored calibration results change what slices (flow, temperature, PA): their revision counts.
-        let text = format!("{:?}|{:?}|{}", self.settings, self.catalog.as_ref().map(|c| Arc::as_ptr(c) as usize), crate::calibrate::revision());
-        text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+        let text = format!("{:?}|{:?}", self.settings, self.catalog.as_ref().map(|c| Arc::as_ptr(c) as usize));
+        let base = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        self.calibration.hash_slicer_values(&self.settings, base)
     }
 
     /// What a calibration test part is made for (reads preset files: call off the UI thread).
     pub fn coupon_setup(&self) -> fab_calibrate::CouponSetup {
-        coupon_setup(&self.settings, self.catalog.as_deref())
+        coupon_setup(&self.settings, self.catalog.as_deref(), self.calibration.first_for(&self.settings))
     }
 
     /// The mechanisms' print profile: nozzle, layer and filament type of the job, with the clearances and
-    /// friction measured on this printer and filament when it is calibrated (reads preset files and the
-    /// calibration folder: call off the UI thread).
+    /// friction measured on this printer and filament. Preset files are resolved on the worker;
+    /// the measurements come from its immutable calibration snapshot.
     pub fn mech_profile(&self) -> makepad_csg_mech::Profile {
         let cs = self.coupon_setup();
-        let (printer, filament) = self.calibration_names();
-        let fit = fab_calibrate::MechFit::load(&printer, &filament);
         makepad_csg_mech::Profile {
             nozzle: cs.nozzle,
             layer: cs.layer,
             material: makepad_csg_mech::Material::named(&cs.material),
-            measured: makepad_csg_mech::Measured { c_xy: fit.c_xy, c_z_layers: fit.c_z_layers, mu: fit.mu },
+            measured: self.mech_measured(),
             ..Default::default()
         }
     }
@@ -1109,10 +1693,14 @@ impl CheckSetup {
     /// [`Self::job_setup`], with `kept` of only those of its tools (0-based, ascending): the ones
     /// a slice of it printed in.
     pub fn job_setup_of(&self, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, String> {
-        if !self.machine()?.same_volume(machine) {
-            return Err("Updating the plate for the selected printer".into());
+        self.job_setup_of_typed(plate, machine, kept).map_err(|e| e.redacted_message())
+    }
+
+    fn job_setup_of_typed(&self, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
+        if !self.machine_typed().map_err(SetupError::Machine)?.same_volume(machine) {
+            return Err(SetupError::Validation("Updating the plate for the selected printer".into()));
         }
-        resolve_tools(&self.settings, self.catalog.as_deref(), plate, machine, kept)
+        resolve_tools(&self.settings, self.catalog.as_deref(), &self.calibration, plate, machine, kept)
     }
 
     /// The job the app would slice a model with: setup, its paint streams (none: a model's
@@ -1179,7 +1767,11 @@ fn rim_of(job: &makepad_fab_settings::machine::Job, objects: usize) -> fab_model
 
 impl Printing {
     pub fn machine(&self) -> Result<&Machine, String> {
-        self.machine.as_deref().map_err(Clone::clone)
+        self.machine.as_deref().map_err(MachineError::local_message)
+    }
+
+    pub fn machine_error(&self) -> Option<&MachineError> {
+        self.machine.as_ref().err()
     }
 
     /// Keep `l` as the loadout, and on disk for the next run (a few hundred bytes, written only
@@ -1227,13 +1819,198 @@ impl Printing {
         }
     }
 
-    /// The Print editor already has the resolved machine, so a bed check here needs no I/O.
-    pub(super) fn plate_waits(&self, state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
-        self.check_setup(state).plate_waits(ev).or_else(|| {
+    /// True when `ev` has printable parts whose `ev.profile.measured` differs from the active
+    /// target's resolved calibration. O(log F) in-memory lookup, zero disk I/O.
+    pub fn plate_profile_mismatch(&self, state: &PrintState, ev: &Evaluated) -> bool {
+        !ev.plate.parts.is_empty() && ev.profile.measured != self.calibration.mech_measured(&state.settings)
+    }
+
+    /// Active failure message if the current target's calibrated `Measured` already failed to
+    /// rebuild on `ModelHost`.
+    fn active_calibration_failure(&self, state: &PrintState) -> Option<&ProfileRebuildFailure> {
+        self.profile_rebuild_error.as_ref().filter(|f| f.measured == self.calibration.mech_measured(&state.settings))
+    }
+
+    /// Non-calibration geometry waits (colour mapping or printer bed volume). Never marks a
+    /// settled fixed box stale during Stage 2.
+    pub(super) fn plate_waits_geometry(&self, _state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
+        waits_mapping(self.mapping.as_ref(), ev).or_else(|| {
             let machine = self.machine.as_ref().ok()?;
             (!machine.same_volume(&ev.machine)).then_some("Updating the plate for the selected printer")
         })
     }
+
+    /// Single authoritative readiness gate for any non-empty `Evaluated`.
+    /// Checks the profile mismatch directly — never solely the `calibration_plate_pending` flag.
+    pub(super) fn plate_gate(&self, state: &PrintState, ev: &Evaluated) -> Option<PlateGate> {
+        if self.calibration_pending() {
+            return Some(PlateGate::Wait(LOADING_CALIBRATION));
+        }
+        if let Err(error) = &self.machine { return Some(PlateGate::MachineInvalid(error.clone())); }
+        if self.plate_profile_mismatch(state, ev) {
+            if let Some(msg) = self.active_calibration_failure(state).map(|f| f.message.as_str()) {
+                return Some(PlateGate::CalibrationFailed(msg.to_owned()));
+            }
+            if state.calibration_plate_pending {
+                return Some(PlateGate::Wait(UPDATING_CALIBRATION_PLATE));
+            }
+            // Defensive invariant: ev.profile.measured != expected with no rebuild in flight.
+            // Never fall through to slicing or packaging old geometry.
+            return Some(PlateGate::CalibrationFailed(self.default_mismatch_error(state, Some(ev))));
+        }
+        self.plate_waits_geometry(state, ev).map(PlateGate::Wait)
+    }
+
+    /// Non-empty when `plate` cannot be sliced or packaged due to a calibration profile mismatch
+    /// failure (never true during Stage 1 `ProfilesWorker` resolve).
+    pub(super) fn calibration_failure(&self, state: &PrintState, plate: Option<&Arc<Evaluated>>) -> Option<String> {
+        if self.calibration_pending() {
+            return None;
+        }
+        if let Some(ev) = plate {
+            return match self.plate_gate(state, ev) {
+                Some(PlateGate::CalibrationFailed(err)) => Some(err),
+                _ => None,
+            };
+        }
+        state.calibration_error.clone()
+    }
+
+    /// Keep `plate_waits` strictly for `Wait` states (callers that need wait-vs-fail use `plate_gate`).
+    pub(super) fn plate_waits(&self, state: &PrintState, ev: &Evaluated) -> Option<&'static str> {
+        match self.plate_gate(state, ev) {
+            Some(PlateGate::Wait(why)) => Some(why),
+            _ => None,
+        }
+    }
+    /// Put the editor into the calibration-rebuild failure state without setting `reask` or
+    /// starting any slice or package.
+    pub(super) fn fail_for_calibration(&mut self, state: &mut PrintState, message: String, for_export: bool) {
+        let for_export = for_export || matches!(&state.export, ExportStatus::Failed(reason) if reason == &message);
+        self.stop_slice(state);
+        state.calibration_plate_pending = false;
+        state.calibration_error = Some(message.clone());
+        state.status = SliceStatus::Failed(message.clone());
+        if for_export {
+            state.export = ExportStatus::Failed(message);
+        }
+        state.bump();
+    }
+
+    /// Clear any active calibration rebuild failure (e.g. calibration corrected/cleared, model
+    /// rebuilt with matching `Measured`, printer retargeted, or plate emptied). Only clears
+    /// `status` / `export` / `print_blocked` entries that came from this calibration failure.
+    pub(super) fn clear_calibration_error(&mut self, state: &mut PrintState) -> bool {
+        let old = self.profile_rebuild_error.take().map(|f| f.message)
+            .or_else(|| state.calibration_error.clone());
+        let had_ui = state.calibration_error.take().is_some();
+        let Some(old) = old else { return had_ui };
+        if matches!(&state.status, SliceStatus::Failed(m) if *m == old) {
+            state.status = SliceStatus::Idle;
+        }
+        if matches!(&state.export, ExportStatus::Failed(m) if *m == old) {
+            state.export = ExportStatus::Idle;
+        }
+        if state.print_blocked.get(&state.links.picked).is_some_and(|m| m == old.as_str()) {
+            state.print_blocked.set(&state.links.picked, None);
+        }
+        state.bump();
+        true
+    }
+    pub fn sync_calibration_plate(&mut self, state: &mut PrintState, plate: Option<&Evaluated>, has_host: bool) -> bool {
+        let mismatch = plate.is_some_and(|ev| self.plate_profile_mismatch(state, ev));
+        let mut changed = false;
+        if !mismatch {
+            // Plate now matches the active target's calibration (or is empty): release any failure.
+            changed |= self.clear_calibration_error(state);
+        }
+        let failed_msg = if mismatch && !self.calibration_pending() {
+            self.active_calibration_failure(state).map(|f| f.message.as_str()).map(str::to_owned)
+        } else {
+            None
+        };
+        let pending = has_host && self.machine.is_ok() && !self.calibration_pending() && mismatch && failed_msg.is_none();
+        if state.calibration_plate_pending != pending {
+            state.calibration_plate_pending = pending;
+            changed = true;
+        }
+        if state.calibration_error != failed_msg {
+            state.calibration_error = failed_msg;
+            changed = true;
+        }
+        if !pending
+            && matches!(&state.status, SliceStatus::Running { stage, .. } if stage == UPDATING_CALIBRATION_PLATE)
+        {
+            state.status = SliceStatus::Idle;
+            changed = true;
+        }
+        if changed {
+            state.bump();
+        }
+        changed
+    }
+
+    pub fn calibration_waiting(&self, state: &PrintState) -> bool {
+        self.calibration_pending() || state.calibration_plate_pending
+    }
+
+    fn default_mismatch_error(&self, state: &PrintState, plate: Option<&Evaluated>) -> String {
+        let layer = if state.settings.layer_height > 0.0 { state.settings.layer_height } else { plate.map_or(0.2, |ev| ev.profile.layer) };
+        format!("plate does not match active calibration ({}) — edit the model or adjust/clear calibration.",
+            format_measured_summary(&self.check_setup(state).mech_measured(), layer))
+    }
+
+    pub fn external_slice_error(&self, state: &PrintState) -> Option<String> {
+        if let Err(e) = &self.machine { return Some(e.redacted_message()); }
+        if let Some(f) = self.active_calibration_failure(state) { return Some(f.redacted_message.clone()); }
+        match &state.status {
+            SliceStatus::Failed(error) => Some(first_line_or(error, "internal slicer error")),
+            _ => None,
+        }
+    }
+
+    pub fn profile_rebuild_failed(&mut self, state: &mut PrintState, plate: Option<&Evaluated>, program: Option<&fab_model::program::Compiled>, failure: &fab_model::eval::Failure) {
+        let measured = self.check_setup(state).mech_measured();
+        let layer = if state.settings.layer_height > 0.0 { state.settings.layer_height } else { plate.map_or(0.2, |e| e.profile.layer) };
+        let kind = classify_rebuild_failure(failure, plate, program);
+        let message = format_rebuild_failure(&kind, &measured, layer);
+        let redacted_message = format_rebuild_failure(&redact_rebuild_kind(&kind, failure, program), &measured, layer);
+        self.profile_rebuild_error = Some(ProfileRebuildFailure { measured, layer, source: failure.clone(), kind, message: message.clone(), redacted_message });
+        state.calibration_error = Some(message.clone());
+        self.reject_held_plate(state, message);
+    }
+
+    pub fn machine_preset_failed(&mut self, state: &mut PrintState, err: &MachineError) {
+        self.machine = Err(err.clone());
+        self.clear_calibration_error(state);
+        self.reject_held_plate(state, err.local_message());
+    }
+
+    fn reject_held_plate(&mut self, state: &mut PrintState, message: String) {
+        state.calibration_plate_pending = false;
+        let held = self.pending_send.take().is_some();
+        let exporting = self.reask.take() == Some(true) || self.export_waits;
+        self.stop_slice(state);
+        if held {
+            state.print_blocked.set(&state.links.picked, Some(message.clone()));
+            state.follow.closed = false;
+        }
+        if exporting { state.export = ExportStatus::Failed(message.clone()); }
+        state.status = SliceStatus::Failed(message);
+        state.bump();
+    }
+
+    pub fn print_setup_seq(&self) -> u64 { self.print_setup_seq }
+
+    pub fn next_print_setup(&mut self) -> Option<u64> {
+        self.setup_deferred = self.calibration_pending();
+        if self.setup_deferred { return None; }
+        self.print_setup_seq += 1;
+        Some(self.print_setup_seq)
+    }
+
+    pub fn setup_deferred(&self) -> bool { self.setup_deferred }
+
 
     /// Keep the previous slice visible while the plate rebuilds. Print must wait for its replacement.
     pub(super) fn mark_shown_slice_stale(state: &mut PrintState) {
@@ -1242,12 +2019,113 @@ impl Printing {
         }
     }
 
+    pub fn calibration_owner(&self, state: &PrintState) -> Option<CalibrationOwner> {
+        let configured = |name: &str| (!name.is_empty() && name != "No printer").then(|| CalibrationOwner { id: format!("printer:{name}"), title: name.into() });
+        let mut current = match &state.links.picked {
+            PrinterChoice::None => return None,
+            PrinterChoice::Real(name) => return configured(name),
+            PrinterChoice::Virtual(name) => name.as_str(),
+        };
+        let saved = self.virtuals.as_deref()?;
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(current) {
+            let printer = saved.printers.iter().find(|p| p.configured_for.is_none() && p.name == current)?;
+            let VirtualSource::Twin { source: Some(source), .. } = &printer.source else { return None };
+            if let Some(config) = source.strip_prefix("printer:") { return configured(config); }
+            current = source.strip_prefix("virtual:")?;
+        }
+        None
+    }
+
+    pub(super) fn requested_calibration_owner(&self) -> Option<&CalibrationOwner> { self.calibration_key.owner.as_ref() }
+
+    pub fn effective_calibration(&self) -> &Arc<EffectiveCalibration> { &self.calibration }
+
+    pub fn calibration_pending(&self) -> bool {
+        self.profiles_worker.is_some() && self.calibration_resolved < self.calibration_seq
+    }
+
+    fn sync_calibration_pending(&self, state: &mut PrintState) {
+        let pending = self.calibration_pending();
+        if state.calibration_pending != pending {
+            state.calibration_pending = pending;
+            state.bump();
+        }
+    }
+
+    pub fn sync_calibration(&mut self, state: &mut PrintState) -> bool {
+        let picked = &state.links.picked;
+        let records = match picked {
+            PrinterChoice::Virtual(_) => self.virtuals.as_ref(),
+            _ => None,
+        };
+        let same_target = self.calibration_target.as_ref().is_some_and(|(target, saved)| {
+            target == picked && saved.as_ref().map(Arc::as_ptr) == records.map(Arc::as_ptr)
+        });
+        let key = &self.calibration_key;
+        let materials = &state.settings.materials;
+        let already_requested = self.calibration_seq > 0 || self.profiles_worker.is_none();
+        if same_target && key.preset == state.settings.machine && already_requested
+            && self.calibration_slots.iter().eq(materials.iter().map(|m| &m.preset)) {
+            return false;
+        }
+        let owner = self.calibration_owner(state);
+        self.calibration_target = Some((picked.clone(), records.cloned()));
+        self.calibration_slots = materials.iter().map(|m| m.preset.clone()).collect();
+        let mut filaments = self.calibration_slots.clone();
+        if filaments.is_empty() { filaments.push(String::new()); }
+        filaments.sort();
+        filaments.dedup();
+        if already_requested && key.owner == owner && key.preset == state.settings.machine && key.filaments == filaments {
+            return false;
+        }
+        self.clear_calibration_error(state);
+        self.calibration_key = CalibrationKey { owner, preset: state.settings.machine.clone(), filaments };
+        let Some(worker) = &self.profiles_worker else { return false };
+        self.calibration_seq += 1;
+        worker.update(|work| work.cal_resolve = Some(CalResolveRequest { key: self.calibration_key.clone(), seq: self.calibration_seq }));
+        self.sync_calibration_pending(state);
+        true
+    }
+
+    fn queue_calibration_write(&mut self, state: &mut PrintState, write: CalWrite) {
+        let affects = write_affects_key(&write, &self.calibration_key);
+        if let Some(worker) = &self.profiles_worker {
+            if affects { self.calibration_seq += 1; }
+            worker.update(|work| {
+                work.cal_writes.push(write);
+                if affects {
+                    work.cal_resolve = Some(CalResolveRequest { key: self.calibration_key.clone(), seq: self.calibration_seq });
+                }
+            });
+            self.sync_calibration_pending(state);
+        }
+    }
+
+    pub fn save_calibration(&mut self, state: &mut PrintState, owner: Option<CalibrationOwner>, preset: String, filament: String,
+        coupon: Arc<fab_calibrate::Coupon>, answer: fab_calibrate::Answer, today: String) {
+        self.sync_calibration(state);
+        self.queue_calibration_write(state, CalWrite::Save { owner, preset, filament, coupon, answer, today })
+    }
+
+    pub fn clear_calibration(&mut self, state: &mut PrintState, step: fab_calibrate::Step) {
+        self.sync_calibration(state);
+        let (preset, filament) = self.check_setup(state).calibration_names();
+        self.queue_calibration_write(state, CalWrite::Clear { owner: self.calibration_key.owner.clone(), preset, filament, step })
+    }
+
     pub fn check_setup(&self, state: &PrintState) -> CheckSetup {
-        CheckSetup { settings: state.settings.clone(), catalog: if state.settings.use_installed { self.catalog.clone() } else { None }, mapping: self.mapping.clone() }
+        CheckSetup { dirs: self.dirs.clone(), calibration: self.calibration.clone(), settings: state.settings.clone(), catalog: if state.settings.use_installed { self.catalog.clone() } else { None }, mapping: self.mapping.clone() }
     }
 
     pub fn check_slice(&mut self, id: u64, state: &PrintState, ev: &Arc<Evaluated>) {
-        if let Some(error) = self.plate_waits(state, ev).map(str::to_owned).or_else(|| self.machine().err()) {
+        if let Some(gate) = self.plate_gate(state, ev) {
+            let error = match gate {
+                PlateGate::Wait(why) => why.into(),
+                PlateGate::MachineInvalid(err) => err.redacted_message(),
+                PlateGate::CalibrationFailed(_) => self.active_calibration_failure(state)
+                    .map(|f| f.redacted_message.clone()).unwrap_or_else(|| self.default_mismatch_error(state, Some(ev))),
+            };
             Cx::post_action(PrintEvent::Checked { id, report: ev.printability.clone(), error: Some(error) });
             return;
         }
@@ -1304,7 +2182,7 @@ impl Printing {
         }
         if self.job_writer.is_none() {
             let (writer, wakes) = JobWriter::channel();
-            let started = writer.spawn(jobs::jobs_dir(), wakes, |id, e| log!("fab jobs: {id} could not be saved: {e}"));
+            let started = writer.spawn(self.dirs.jobs.clone(), wakes, |id, e| log!("fab jobs: {id} could not be saved: {e}"));
             if let Err(e) = started { log!("fab jobs: could not start the job writer: {e}"); }
             self.job_writer = Some(writer);
         }
@@ -1312,17 +2190,17 @@ impl Printing {
         let pending = Arc::new(std::sync::Mutex::new(ProfileWork::default()));
         self.profiles_worker = Some(ProfilesWorker { wake, pending: pending.clone() });
         let path = virtual_path();
+        let dirs = self.dirs.clone();
         let started = std::thread::Builder::new().name("fab-profiles".into()).spawn(move || {
             let names = fab_printer_link::secrets::config_names();
             Cx::post_action(PrintEvent::PrinterConfigs {
                 names: names.clone(), presets: virtual_printer::presets(),
-                loadouts: read_loadouts(),
+                loadouts: read_loadouts(&dirs.app_data),
             });
-            let dirs = ProfileStore::default_data_dirs();
-            let imports = makepad_fab_settings::import::fab_profile_dir();
+            let data_dirs = ProfileStore::default_data_dirs();
             let mut saved = read_printer_profiles(path.as_deref(), &names, |printers| {
-                Cx::post_action(PrintEvent::JobsRead(jobs::read_all(&jobs::jobs_dir())));
-                catalog_in(&dirs, &imports, printers).map(Arc::new)
+                Cx::post_action(PrintEvent::JobsRead(jobs::read_all(&dirs.jobs)));
+                catalog_in(&data_dirs, &dirs.profiles, printers).map(Arc::new)
             }, Cx::post_action);
             let mut layout_revision = 0;
             while rx.recv().is_ok() {
@@ -1333,21 +2211,26 @@ impl Printing {
                         if let Err(e) = virtual_printer::save_to(path, &saved) { log!("fab: could not save virtual printers: {e}"); }
                     }
                 }
-                write_loadouts(work.loadouts);
+                write_loadouts(&dirs.app_data, work.loadouts);
                 if let Some(revision) = work.rebuild {
                     layout_revision = revision;
-                    let catalog = catalog_in(&dirs, &imports, &saved.printers).map(|mut cat| {
+                    let catalog = catalog_in(&data_dirs, &dirs.profiles, &saved.printers).map(|mut cat| {
                         cat.layout_revision = revision;
                         Arc::new(cat)
                     });
                     Cx::post_action(PrintEvent::Catalog(catalog));
                 }
                 for (path, select) in work.imports {
-                    import_profiles(&path, select, &dirs, &imports, &saved.printers, layout_revision);
+                    import_profiles(&path, select, &data_dirs, &dirs.profiles, &saved.printers, layout_revision);
                 }
+                run_calibration_work(&dirs.calibration, work.cal_writes, work.cal_resolve, Cx::post_action);
             }
         });
-        if let Err(e) = started { log!("fab: could not start the profiles worker: {e}"); }
+        if let Err(e) = started {
+            self.profiles_worker = None;
+            self.sync_calibration_pending(state);
+            log!("fab: could not start the profiles worker: {e}");
+        }
     }
 
     /// The plate changed: the slice (if any) is now stale (its colours map again in
@@ -1356,7 +2239,8 @@ impl Printing {
         // The slice shown (or in flight) was made from this very plate and these settings: an
         // evaluation that lands after it, as a setting's second commit does, changes nothing it
         // depends on, and it does not go stale (in Normal nothing would slice it again).
-        let (plate, settings) = crate::live_slice::slice_key(ev);
+        let plate = crate::live_slice::plate_id(ev);
+        let settings = self.check_setup(state).id_for(&ev.plate);
         let whole = (plate, settings);
         if self.figures_of != Some(whole) {
             state.whole_figures = None;
@@ -1371,7 +2255,9 @@ impl Printing {
         };
         let same = key.is_some() && self.live_key == key;
         if !same {
+            let waiting_card = state.calibration_plate_pending && state.confirm_print.is_some();
             self.invalidate(state);
+            if waiting_card { self.reask.get_or_insert(false); }
         }
         state.printability = ev.printability.clone();
         if self.project_settings != ev.plate.settings {
@@ -1398,13 +2284,35 @@ impl Printing {
             state.stale = true;
         }
         if let Err(e) = &self.machine {
-            state.status = SliceStatus::Failed(e.clone());
+            state.status = SliceStatus::Failed(e.local_message());
         }
     }
 
     /// A finished background step. Return which part of the app should handle the change.
     pub fn event(&mut self, state: &mut PrintState, ev: &PrintEvent) -> PrintOutcome {
         let changed = match ev {
+            PrintEvent::CalibrationWritten { .. } => return PrintOutcome::Unchanged,
+            PrintEvent::CalibrationResolved { seq, effective } => {
+                if *seq != self.calibration_seq { return PrintOutcome::Unchanged; }
+                let old = self.check_setup(state);
+                self.calibration = effective.clone();
+                self.calibration_resolved = *seq;
+                self.sync_calibration_pending(state);
+                let new = self.check_setup(state);
+                let slice_changed = old.id() != new.id();
+                let measured = new.mech_measured();
+                let setup_changed = slice_changed || old.mech_measured() != measured;
+                if self.profile_rebuild_error.as_ref().is_some_and(|f| f.measured != measured) {
+                    self.clear_calibration_error(state);
+                }
+                if slice_changed {
+                    if self.slice_gen.is_some() || self.live.is_some() { crate::live_slice::cancel(); }
+                    self.invalidate(state);
+                } else if matches!(&state.status, SliceStatus::Running { stage, .. } if stage == LOADING_CALIBRATION) {
+                    state.status = SliceStatus::Idle;
+                }
+                return PrintOutcome::Calibration { setup_changed, slice_changed };
+            }
             PrintEvent::Checked { .. } => false,
             PrintEvent::PrinterModesUnreadable(note) => {
                 state.links.note.clone_from(note);
@@ -1561,20 +2469,23 @@ impl Printing {
                 }
                 log!("fab slice: gen {gen} answered ({})", if result.is_ok() { "sliced" } else { "failed" });
                 self.started = None;
+                self.slice_gen = None;
+                self.issues_gen = None;
                 let job = self.slice_job.take();
+                self.clear_export(state);
                 match result {
                     Ok(s) => {
                         if let Some(job) = job {
                             job.done();
                         }
                         state.status = SliceStatus::Done { seconds: *seconds };
-                        state.exported = None;
                         // The colours on job tools the slice prints nothing in (paint covers them all).
                         let printed = |name: &str| state.colors.tool_of(name).is_none_or(|(t, _)| s.settled.tools.contains(&(t as usize - 1)));
                         state.unprinted = state.colors.rows.iter().filter(|r| r.used && !printed(&r.name)).map(|r| r.name.clone()).collect();
                         state.set_preview(s.preview.clone());
                         state.print_check = Some(s.checked.as_ref().map(|c| format!("passed: first layer {:.2} mm, {} moves checked", c.facts.first_layer_z, c.facts.moves)).map_err(Clone::clone));
                         self.last = Some(s.clone());
+                        self.issues_gen = Some(*gen);
                         if std::mem::take(&mut self.export_waits) {
                             self.export(state, None);
                         }
@@ -1603,7 +2514,7 @@ impl Printing {
                 true
             }
             PrintEvent::Issues { gen, report, done, total } => {
-                if self.slice_gen != Some(*gen) || state.preview.is_none() {
+                if self.issues_gen != Some(*gen) || state.preview.is_none() || state.stale {
                     return PrintOutcome::Unchanged;
                 }
                 state.streamed = Some(fab::print::StreamedIssues::new(report.clone(), *done, *total));
@@ -1661,10 +2572,14 @@ impl Printing {
                     return PrintOutcome::Unchanged;
                 }
                 let p = self.packaging.remove(at);
+                if matches!(p.to, PackageFor::File(_)) {
+                    if self.export_attempt != Some(*id) { return PrintOutcome::Unchanged; }
+                    self.export_attempt = None;
+                }
                 // Cancelled by the person: said when it was pressed.
                 if let PackageFor::Printer(send) = &p.to {
                     if p.stop.load(Ordering::Relaxed) || state.take_sending(&send.meta.id).is_none() {
-                        if matches!(result, Packaged::Checked(_)) { remove_job_files(send.meta.id.clone()); }
+                        if matches!(result, Packaged::Checked(_)) { remove_job_files(self.dirs.jobs.clone(), send.meta.id.clone()); }
                         return PrintOutcome::Unchanged;
                     }
                     if self.dispatch_entry(state, &send.ticket).is_err() {
@@ -1681,7 +2596,9 @@ impl Printing {
                     }
                 }
                 match (result, &p.to) {
-                    (Packaged::Written(path), _) => state.exported = Some(path.clone()),
+                    (Packaged::Written(path), PackageFor::File(_)) => state.export = ExportStatus::Written(path.clone()),
+                    (Packaged::Failed(why), PackageFor::File(_)) => state.export = ExportStatus::Failed(why.clone()),
+                    (Packaged::Stopped, PackageFor::File(_)) => state.export = ExportStatus::Idle,
                     (Packaged::Checked(_), PackageFor::Printer(send)) if send.queue => {
                         log!("fab print: {} queued", p.sliced.name);
                         if let Some(mut queued) = state.follow.job_of_mut(&send.meta.id) { queued.state = JobState::Queued; }
@@ -1696,7 +2613,7 @@ impl Printing {
                             log!("fab print: the package is made, the print is refused: {why}");
                             state.print_blocked.set(&send.ticket.printer, Some(why));
                             state.follow.jobs.remove(&send.meta.id);
-                            remove_job_files(send.meta.id.clone());
+                            remove_job_files(self.dirs.jobs.clone(), send.meta.id.clone());
                         }
                     },
                     (Packaged::Failed(why), PackageFor::Printer(send)) => {
@@ -1709,7 +2626,6 @@ impl Printing {
                         state.print_blocked.set(&send.ticket.printer, Some("Stopped while it was being prepared: nothing went to the printer.".into()));
                         state.follow.jobs.remove(&send.meta.id);
                     }
-                    (Packaged::Failed(why), PackageFor::File(_)) => state.status = SliceStatus::Failed(why.clone()),
                     _ => {}
                 }
                 if let PackageFor::Printer(send) = &p.to {
@@ -1797,7 +2713,7 @@ impl Printing {
             let mut job = f.jobs.at_mut(i);
             if job.preview.is_none() && !job.loading && job.unreadable.is_none() && job.state != JobState::Preparing {
                 job.loading = true;
-                let (id, meta, dir) = (job.meta.id.clone(), job.meta.clone(), jobs::jobs_dir());
+                let (id, meta, dir) = (job.meta.id.clone(), job.meta.clone(), self.dirs.jobs.clone());
                 crate::live_slice::run_shown("fab job preview", move || {
                     let began = std::time::Instant::now();
                     let result = jobs::read_package(&dir, &id).map_err(|e| e.to_string()).and_then(|package| preview_of_package(&package, &meta));
@@ -1871,9 +2787,10 @@ impl Printing {
             state.follow.on = true;
         }
         state.print_blocked.set(&ticket.printer, None);
-        let (id, dir) = (id.to_string(), jobs::jobs_dir());
+        let id = id.to_string();
+        let dirs = self.dirs.clone();
         crate::live_slice::run_shown("fab job check", move || {
-            let result = job_check(&catalog, &dir, &id, &meta);
+            let result = job_check(&catalog, &dirs.jobs, &id, &meta, &dirs.head_envelope);
             Cx::post_action(PrintEvent::JobChecked { id, attempt, ticket, options, result });
         });
         Ok(())
@@ -2164,6 +3081,7 @@ impl Printing {
         state.confirm_stop = None;
         state.follow.confirm_start = None;
         state.head_moves.clear();
+        self.pending_send = None;
         state.links.picked = choice.clone();
         if &previous != choice {
             state.shown = None;
@@ -2234,7 +3152,7 @@ impl Printing {
             self.layout_revision += 1;
             self.set_catalog(state, None);
             self.select_virtual(state);
-            self.machine = Err("Updating the virtual printer layout".into());
+            self.machine = Err(MachineError::UpdatingVirtualLayout);
         }
         self.save_virtual(rebuild);
     }
@@ -2242,6 +3160,12 @@ impl Printing {
     /// The settings half of the Print editor's actions (playback is
     /// `fab::print::apply`). Returns true when the view changed.
     pub fn action(&mut self, state: &mut PrintState, action: &PrintAction, plate: Option<&Arc<Evaluated>>) -> bool {
+        if matches!(action, PrintAction::AskPrint(false)) || matches!(action, PrintAction::AskStop(dest, true) if dest.matches(state)) {
+            self.pending_send = None;
+            if self.reask == Some(false) {
+                self.reask = None;
+            }
+        }
         match action {
             PrintAction::ShowPrinter(choice) => {
                 state.shown = choice.as_ref().filter(|p| *p != &state.links.picked).cloned();
@@ -2252,6 +3176,10 @@ impl Printing {
             PrintAction::Slice => return self.slice(state, plate),
             PrintAction::Export => return self.export(state, plate),
             // A press while the asked slice runs waits for it; anything else slices now.
+            PrintAction::AskPrint(true) if self.calibration_waiting(state) => {
+                self.reask.get_or_insert(false);
+                return true;
+            }
             PrintAction::AskPrint(true) if !state.can_send() => {
                 if self.slice_gen.is_some() && matches!(state.status, SliceStatus::Running { .. }) {
                     log!("fab print: Print pressed, the slice is on its way");
@@ -2276,7 +3204,7 @@ impl Printing {
                 if state.follow.job_of(id).is_some_and(|j| j.state == JobState::Queued) {
                     state.follow.jobs.remove(id);
                     if state.follow.picked.as_ref() == Some(id) { state.follow.picked = None; }
-                    remove_job_files(id.clone());
+                    remove_job_files(self.dirs.jobs.clone(), id.clone());
                 }
                 return false;
             }
@@ -2337,35 +3265,27 @@ impl Printing {
                     state.print_blocked.set(&state.links.picked, Some(STALE_TICKET.into()));
                     return false;
                 }
-                // Its package is made now; it goes to the printer when made and checked. A bond
-                // whose bends are known not to measure refuses it at once.
-                let mechs = plate.map_or(&[][..], |ev| &ev.mech[..]);
-                match self.send_checks(state, &state.print_options).and_then(|s| {
-                    if s.preview.id != *preview { return Err(STALE_PREVIEW.into()); }
-                    bends_refusal(mechs, false).map_or_else(|| Ok(s.clone()), Err)
-                }) {
-                    Ok(sliced) => {
-                        let queue = state.printer_busy();
-                        log!("fab print: Start print pressed, {} {}", if queue { "queueing" } else { "packaging" }, sliced.name);
-                        // Monitor shows this very slice from now on, and follows it.
-                        let meta = Arc::new(job_meta(&sliced, &ticket.printer, state.target_printer().map(Arc::as_ref), &state.print_options, state.accepted_errors()));
-                        state.sending.push(Sending { job: meta.id.clone(), printer: ticket.printer.clone() });
-                        if !meta.accepted.is_empty() {
-                            log!("fab print: printed anyway: {}", jobs::accepted_line(&meta.accepted));
-                        }
-                        state.follow.jobs.insert_newest(CommittedJob { meta: meta.clone(), preview: Some(sliced.preview.clone()), sent_at: Cx::time_now(), ..Default::default() });
-                        state.follow.picked = None;
+                if self.calibration_waiting(state) {
+                    if !self.settled_slice_reusable(state) || !state.preview.as_ref().is_some_and(|p| p.id == *preview) {
+                        self.pending_send = None;
+                        state.confirm_print = None;
+                        state.print_options.plate_clear = false;
+                        let why = if self.settled_slice_reusable(state) { STALE_PREVIEW } else { SLICE_NOT_READY };
+                        state.print_blocked.set(&state.links.picked, Some(why.into()));
                         state.follow.closed = false;
-                        state.follow.on = true;
-                        self.package(sliced, PackageFor::Printer(ToPrinter { ticket: ticket.clone(), options: state.print_options, meta, scripts: self.plate_scripts.clone(), queue }), mechs.to_vec());
+                    } else {
+                        self.pending_send = Some(PendingSend { ticket: ticket.clone(), preview: *preview });
                         state.print_blocked.set(&state.links.picked, None);
                     }
-                    Err(why) => {
-                        log!("fab print: Start print refused: {why}");
-                        state.print_blocked.set(&state.links.picked, Some(why));
-                        state.follow.closed = false;
-                    }
+                    return false;
                 }
+                self.pending_send = None;
+                if let Some(err) = self.calibration_failure(state, plate) {
+                    state.print_blocked.set(&state.links.picked, Some(err));
+                    state.follow.closed = false;
+                    return false;
+                }
+                self.admit_send_to_printer(state, ticket, *preview, state.print_options, plate);
                 return false;
             }
             PrintAction::SetMachine(owner, _) | PrintAction::EditTray(owner, ..) | PrintAction::VirtualLayout { owner, .. } |
@@ -2506,11 +3426,21 @@ impl Printing {
     }
 
     fn invalidate(&mut self, state: &mut PrintState) {
+        if let Some(held) = self.pending_send.take() {
+            if held.ticket.printer == state.links.picked && state.confirm_print.is_some() {
+                state.print_blocked.set(&state.links.picked, Some(STALE_PREVIEW.into()));
+                state.follow.closed = false;
+                self.reask.get_or_insert(false);
+            }
+        }
         // a settled slice still awaited (`started` is set from its start to its answer)
         if self.slice_gen.is_some() && self.started.is_some() {
-            self.reask = Some(self.export_waits);
+            self.reask = Some(self.export_waits || self.reask == Some(true));
         }
+        self.clear_export(state);
+        if self.reask == Some(true) { state.export = ExportStatus::Exporting; }
         self.slice_gen = None;
+        self.issues_gen = None;
         self.export_waits = false;
         self.live = None;
         self.live_key = None;
@@ -2580,10 +3510,49 @@ impl Printing {
     }
 
     /// Check the current plate for admission. Dispatch later checks this job's own report and trays.
+    fn settled_slice_reusable(&self, state: &PrintState) -> bool {
+        state.preview.is_some() && !state.stale && state.settled && !matches!(state.status, SliceStatus::Running { .. })
+            && self.last.as_ref().is_some_and(|s| state.preview.as_ref().is_some_and(|p| p.id == s.preview.id))
+    }
+
+    fn admit_send_to_printer(&mut self, state: &mut PrintState, ticket: &PrintTicket, preview: u64, options: fab_printer_link::PrintOptions, plate: Option<&Arc<Evaluated>>) {
+        // Its package is made now; it goes to the printer when made and checked. A bond
+        // whose bends are known not to measure refuses it at once.
+        let mechs = plate.map_or(&[][..], |ev| &ev.mech[..]);
+        match self.send_checks(state, &options).and_then(|s| {
+            if s.preview.id != preview { return Err(STALE_PREVIEW.into()); }
+            bends_refusal(mechs, false).map_or_else(|| Ok(s.clone()), Err)
+        }) {
+            Ok(sliced) => {
+                let queue = state.printer_busy();
+                log!("fab print: Start print pressed, {} {}", if queue { "queueing" } else { "packaging" }, sliced.name);
+                // Monitor shows this very slice from now on, and follows it.
+                let meta = Arc::new(job_meta(&sliced, &ticket.printer, state.target_printer().map(Arc::as_ref), &options, state.accepted_errors()));
+                state.sending.push(Sending { job: meta.id.clone(), printer: ticket.printer.clone() });
+                if !meta.accepted.is_empty() {
+                    log!("fab print: printed anyway: {}", jobs::accepted_line(&meta.accepted));
+                }
+                state.follow.jobs.insert_newest(CommittedJob { meta: meta.clone(), preview: Some(sliced.preview.clone()), sent_at: Cx::time_now(), ..Default::default() });
+                state.follow.picked = None;
+                state.follow.closed = false;
+                state.follow.on = true;
+                self.package(sliced, PackageFor::Printer(ToPrinter { ticket: ticket.clone(), options, meta, scripts: self.plate_scripts.clone(), queue }), mechs.to_vec());
+                state.print_blocked.set(&state.links.picked, None);
+            }
+            Err(why) => {
+                log!("fab print: Start print refused: {why}");
+                state.print_blocked.set(&state.links.picked, Some(why));
+                state.follow.closed = false;
+            }
+        }
+    }
+
     fn send_checks(&self, state: &PrintState, options: &fab_printer_link::PrintOptions) -> Result<&Arc<Sliced>, String> {
         if !fab_printer_link::printing_supported() { return Err(fab_printer_link::UNSUPPORTED_PRINTING.into()); }
-        if let Some(why) = state.print_blocker() { return Err(why); }
         if self.linked(&state.links.picked).is_none() { return Err("No printer is linked.".into()); }
+        if self.calibration_waiting(state) { return Err(SLICE_NOT_READY.into()); }
+        if let Some(err) = &state.calibration_error { return Err(err.clone()); }
+        if let Some(why) = state.print_blocker() { return Err(why); }
         if state.sending_for(&state.links.picked).is_some() { return Err("A job is being prepared for the printer.".into()); }
         let snapshot = state.target_printer().ok_or("The printer has not reported yet.")?;
         // A busy printer takes the job into the queue; what its start asks of the printer waits.
@@ -2621,7 +3590,7 @@ impl Printing {
     /// needs a settled one. A failed slice waits for the next press or change. True when asked.
     pub fn confirm_slice(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
         let coming = self.slice_gen.is_some() && matches!(state.status, SliceStatus::Running { .. });
-        if state.can_send() || coming || matches!(state.status, SliceStatus::Failed(_)) || plate.is_none_or(|ev| ev.plate.parts.is_empty()) {
+        if self.calibration_waiting(state) || state.calibration_error.is_some() || state.can_send() || coming || matches!(state.status, SliceStatus::Failed(_)) || plate.is_none_or(|ev| ev.plate.parts.is_empty()) {
             return false;
         }
         log!("fab print: the plate changed under the confirm card, slicing it");
@@ -2651,9 +3620,10 @@ impl Printing {
     /// `to`: checked for the printer (then sent, [`PrintEvent::Packaged`]) or written to a file.
     /// One at a time per destination and slice. For the printer it first waits for the bends of
     /// the plate's flexing pieces (`bends`) and refuses one that can't be measured.
-    fn package(&mut self, sliced: Arc<Sliced>, to: PackageFor, bends: Vec<Arc<fab_model::mech::Mech>>) {
-        if self.packaging.iter().any(|p| p.to == to && Arc::ptr_eq(&p.sliced, &sliced)) {
-            return;
+    fn package(&mut self, sliced: Arc<Sliced>, to: PackageFor, bends: Vec<Arc<fab_model::mech::Mech>>) -> u64 {
+        if let Some(p) = self.packaging.iter().find(|p| p.to == to && Arc::ptr_eq(&p.sliced, &sliced)
+            && !(matches!(to, PackageFor::File(_)) && p.stop.load(Ordering::Relaxed))) {
+            return p.id;
         }
         let id = self.next_attempt();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2663,6 +3633,7 @@ impl Printing {
         };
         let job = JobSpec::new(title).stage("the printer package").start();
         self.packaging.push(Packaging { id, sliced: sliced.clone(), to: to.clone(), stop: stop.clone() });
+        let jobs_dir = self.dirs.jobs.clone();
         crate::live_slice::run_shown("fab package", move || {
             let reporter = job.reporter();
             let stopped = || stop.load(Ordering::Relaxed) || reporter.is_cancelled();
@@ -2683,7 +3654,7 @@ impl Printing {
                                 // Committed before anything goes to the printer.
                                 Ok(job) => {
                                     let saved = SavedState { state: if send.queue { JobState::Queued } else { JobState::Sent }, started: (!send.queue).then_some(send.meta.created), ..Default::default() };
-                                    match jobs::commit(&jobs::jobs_dir(), &send.meta, &saved, job.bytes(), &send.scripts) {
+                                    match jobs::commit(&jobs_dir, &send.meta, &saved, job.bytes(), &send.scripts) {
                                         Ok(()) => {
                                             log!("fab jobs: {} committed: {} bytes, {} layers, planned {:.0} s, {}", send.meta.id, job.bytes().len(), send.meta.layers, send.meta.planned, if send.queue { "queued" } else { "goes to the printer now" });
                                             Packaged::Checked(job)
@@ -2696,6 +3667,7 @@ impl Printing {
                             Err(e) => Packaged::Failed(e.clone()),
                         }
                     }
+                    PackageFor::File(_) if stopped() => Packaged::Stopped,
                     PackageFor::File(path) => match std::fs::write(&path, &package) {
                         Ok(()) => Packaged::Written(path),
                         Err(e) => Packaged::Failed(format!("{}: {e}", path.display())),
@@ -2709,6 +3681,7 @@ impl Printing {
             }
             Cx::post_action(PrintEvent::Packaged { id, result });
         });
+        id
     }
 
     /// On a quiet event only the global publication counter is read. A new entry also has an unread slot.
@@ -2892,11 +3865,14 @@ impl Printing {
     /// project sets nothing), and the global layer height they resolve to.
     fn load_base_values(&mut self, state: &mut PrintState) {
         let was_invalid = self.machine.is_err();
-        let profile = self.catalog.as_ref().filter(|_| state.settings.use_installed)
-            .and_then(|c| c.twins.get(&state.settings.machine)).map(|p| p.machine.clone());
+        let profile = state.settings.use_installed.then(|| {
+            state.printers.binding(&state.links.picked).and_then(|b| b.machine())
+                .filter(|p| p.geometry.name == state.settings.machine).cloned()
+                .or_else(|| self.catalog.as_ref()?.twins.get(&state.settings.machine).map(|p| p.machine.clone()))
+        }).flatten();
         self.machine = match &profile {
             Some(p) => Ok(p.geometry.clone()),
-            None => self.check_setup(state).machine().map(Arc::new),
+            None => self.check_setup(state).machine_typed().map(Arc::new),
         };
         self.adopt_legacy_loadout(state);
         // Read again only for other toolheads: the kept text rounds a reported colour.
@@ -2945,7 +3921,7 @@ impl Printing {
                 state.base_values = values;
                 state.base_revision += 1;
             }
-        } else if let Ok(setup) = resolve_tools_with(&state.settings, catalog, &Plate::default(), machine, None, true) {
+        } else if let Ok(setup) = resolve_tools_with(&state.settings, catalog, None, &Plate::default(), machine, None) {
             let cfg = setup.build_config();
             state.base_values = fab_plate::PRINT_SETTINGS.iter().map(|s| s.key).chain(["nozzle_diameter"]).map(|k| (k.to_string(), cfg.raw(k, 0).to_string())).collect();
             state.base_revision += 1;
@@ -3001,7 +3977,7 @@ impl Printing {
 
     /// What would slice now, as it would.
     fn next_input(&self, state: &PrintState, plate: Option<&Arc<Evaluated>>) -> Option<(crate::live_slice::PrintJob, crate::live_slice::SliceInput)> {
-        if self.plate_waits(state, plate?).is_some() { return None; }
+        if self.plate_gate(state, plate?).is_some() { return None; }
         let (source, name) = self.source(plate, Arc::from([]), None).ok()?;
         Some(self.job(state, source, name).prepare())
     }
@@ -3030,6 +4006,12 @@ impl Printing {
 
     /// The plate and settings of a live edit, kept until Print, Export or Slice asks to settle.
     pub fn live_input(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>, swaps: Arc<[crate::live_slice::FieldSwap]>, moved: Option<(usize, crate::live_slice::PartTransform)>) {
+        if self.calibration_waiting(state) { return; }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, false);
+            return;
+        }
+        if self.machine.is_err() { return; }
         if self.wait_for_plate(state, plate) {
             return;
         }
@@ -3264,6 +4246,14 @@ impl Printing {
     }
 
     fn slice(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        if self.calibration_waiting(state) {
+            self.reask.get_or_insert(false);
+            return true;
+        }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, false);
+            return true;
+        }
         self.reask = None;
         if self.wait_for_plate(state, plate) {
             // The rebuilt or fully grown plate resumes this request.
@@ -3290,23 +4280,43 @@ impl Printing {
         self.start_slice(state, job, input)
     }
 
+    fn resume_pending_send(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        let Some(held) = self.pending_send.take() else { return false };
+        if matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if card == &held.ticket) && self.ticket_current(state, &held.ticket) {
+            let options = state.print_options;
+            state.confirm_print = None;
+            state.print_options.plate_clear = false;
+            self.admit_send_to_printer(state, &held.ticket, held.preview, options, plate);
+            return true;
+        }
+        if state.confirm_print.take().is_some() {
+            state.print_options.plate_clear = false;
+            state.print_blocked.set(&state.links.picked, Some(STALE_TICKET.into()));
+            return true;
+        }
+        false
+    }
+
     /// A slice Print, Export or Slice was waiting for went with an edit (the plate or the settings
     /// changed under it): it goes on with what stands now, and an Export waiting on it writes the
     /// newer slice. True when the view changed.
     pub fn resume_asked(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
-        let Some(export) = self.reask.take() else { return false };
-        if self.slice_gen.is_some() {
-            return false;
+        if self.calibration_waiting(state) || self.slice_gen.is_some() { return false; }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, self.reask == Some(true));
+            return true;
         }
+        let resumed = self.resume_pending_send(state, plate);
+        let Some(export) = self.reask.take() else { return resumed };
+        if state.can_send() { return (export && self.export(state, plate)) || resumed; }
         let changed = self.slice(state, plate);
-        self.export_waits = export && self.slice_gen.is_some();
-        if let Some(waiting) = &mut self.reask { *waiting |= export; }
+        if export { self.await_export(state); }
         changed
     }
 
     /// Print, Export or Slice awaits the slice in progress: it finishes whatever the view does.
     pub fn slice_asked(&self) -> bool {
-        self.slice_gen.is_some()
+        self.slice_gen.is_some() || self.reask.is_some() || self.pending_send.is_some()
     }
 
     /// Hold the editor's slice until the model worker has applied the printer settings and
@@ -3349,7 +4359,7 @@ impl Printing {
         // Only this editor's own slice stops: a headset's live slice (or nothing) runs on.
         let own = self.slice_gen.is_some() || self.live.is_some();
         self.invalidate(state);
-        self.reask = None;
+        if self.reask.take() == Some(true) { state.export = ExportStatus::Idle; }
         state.streamed = None;
         if own {
             crate::live_slice::cancel();
@@ -3358,12 +4368,14 @@ impl Printing {
 
     fn start_slice(&mut self, state: &mut PrintState, mut job: crate::live_slice::PrintJob, input: crate::live_slice::SliceInput) -> bool {
         mark_test_slice("fab.test_print.slice.start", &job, input.plate_id);
+        self.live_key = Some((input.plate_id, input.settings_id));
         if self.tests.is_none() {
             self.figures_of = Some((input.plate_id, input.settings_id));
         }
         self.export_waits = false;
         self.gen += 1;
         self.slice_gen = Some(self.gen);
+        self.issues_gen = None;
         job.gen = self.gen;
         // The settled slice has its own job (with a cancel) on the board.
         if let Some(job) = self.live_job.take() {
@@ -3381,24 +4393,59 @@ impl Printing {
         true
     }
 
+    fn clear_export(&mut self, state: &mut PrintState) {
+        for p in &self.packaging {
+            if matches!(p.to, PackageFor::File(_)) { p.stop.store(true, Ordering::Relaxed); }
+        }
+        self.export_attempt = None;
+        state.export = ExportStatus::Idle;
+    }
+
+    fn await_export(&mut self, state: &mut PrintState) {
+        self.export_waits = self.slice_gen.is_some();
+        if let Some(waiting) = &mut self.reask { *waiting = true; }
+        state.export = if self.export_waits || self.reask.is_some() {
+            ExportStatus::Exporting
+        } else if matches!(state.status, SliceStatus::Failed(_)) {
+            ExportStatus::Idle
+        } else {
+            ExportStatus::Failed("no printable parts on the plate".into())
+        };
+    }
+
     fn export(&mut self, state: &mut PrintState, plate: Option<&Arc<Evaluated>>) -> bool {
+        if self.calibration_waiting(state) {
+            self.reask = Some(true);
+            state.export = ExportStatus::Exporting;
+            return true;
+        }
+        if let Some(reason) = self.calibration_failure(state, plate) {
+            self.fail_for_calibration(state, reason, true);
+            return true;
+        }
+        if let Err(err) = &self.machine {
+            state.export = ExportStatus::Failed(err.local_message());
+            return true;
+        }
         if !state.can_send() {
+            self.clear_export(state);
             let changed = self.slice(state, plate);
-            self.export_waits = self.slice_gen.is_some();
-            // An export waiting for the plate writes the file once its slice is in.
-            if self.reask.is_some() {
-                self.reask = Some(true);
-            }
+            self.await_export(state);
             return changed;
         }
         let Some(last) = self.last.clone() else {
-            state.status = SliceStatus::Failed("slice the plate first: Export writes the sliced plate".into());
+            self.clear_export(state);
+            state.export = ExportStatus::Failed("slice the plate first: Export writes the sliced plate".into());
             return true;
         };
-        let path = export_path(&last.name, "gcode.3mf");
-        // Written when its package is made ([`PrintEvent::Packaged`]).
-        state.exported = None;
-        self.package(last, PackageFor::File(path), Vec::new());
+        let to = PackageFor::File(export_path_in(&self.dirs.documents, &last.name, "gcode.3mf"));
+        for p in &self.packaging {
+            if matches!(p.to, PackageFor::File(_)) && (p.to != to || !Arc::ptr_eq(&p.sliced, &last)) {
+                p.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        self.export_attempt = Some(self.package(last, to, Vec::new()));
+        state.export = ExportStatus::Exporting;
         true
     }
 }
@@ -3406,8 +4453,11 @@ impl Printing {
 /// Where Export writes the plate `name`'s `ext` (in `~/Documents/Fab`, made if need be): the name
 /// with anything but letters, digits, `-` and `_` turned into `-`.
 pub(crate) fn export_path(name: &str, ext: &str) -> std::path::PathBuf {
-    let dir = crate::model_host::documents_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    export_path_in(&crate::model_host::documents_dir(), name, ext)
+}
+
+fn export_path_in(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    let _ = std::fs::create_dir_all(dir);
     let stem: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
     dir.join(format!("{}.{ext}", if stem.trim_matches('-').is_empty() { "plate" } else { stem.trim_matches('-') }))
 }
@@ -3590,12 +4640,12 @@ fn default_plate(fits: &[String], printer_default: &str) -> String {
 
 /// The build volume and nozzle reaches described by a printer preset; a resin printer's
 /// screen and height.
-fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
+fn machine_of(name: &str, values: &Config) -> Result<Machine, MachineError> {
     if fab_sla::printer::is_resin(values) {
-        return fab_sla::printer::resin_machine(name, values);
+        return fab_sla::printer::resin_machine(name, values).map_err(|detail| MachineError::ResinSpec { preset: name.into(), detail });
     }
-    let invalid = |key: &str| format!("the printer preset {name}: missing or invalid {key}");
-    let bounds = |points: &[(f64, f64)], key: &str| -> Result<Rect, String> {
+    let invalid = |key| MachineError::InvalidKey { preset: name.into(), key };
+    let bounds = |points: &[(f64, f64)], key: &'static str| -> Result<Rect, MachineError> {
         if points.len() < 3 || points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
             return Err(invalid(key));
         }
@@ -3659,11 +4709,11 @@ fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
     };
     // The places filaments feed the nozzles from: the profile's, else the family's layout.
     use makepad_fab_settings::family::{self, Spools};
-    let spools = family::of(values).ok_or(family::UNSUPPORTED)?.spools;
+    let spools = family::of(values).ok_or_else(|| MachineError::UnsupportedFamily { preset: name.into() })?.spools;
     // A head's own spool is labelled by its unit's letters (A1, B1, … Z1, AA1): the trays'
     // numbering has letters for `UNITS` units.
     if spools == Spools::OnePerHead && count > fab_plate::machine::UNITS {
-        return Err(format!("the printer preset {name}: this printer has more heads than its trays can be numbered"));
+        return Err(MachineError::TooManyHeads { preset: name.into() });
     }
     let named = values.get("fab_material_slots").map(|v| v.as_vec()).unwrap_or_default();
     let slots = if named.iter().all(|s| s.trim().is_empty() || s.trim() == "nil") {
@@ -3679,7 +4729,15 @@ fn machine_of(name: &str, values: &Config) -> Result<Machine, String> {
             }
         }
     } else {
-        Machine::parse_slots(&named, count).map_err(|e| format!("the printer preset {name}: {e}"))?
+        Machine::parse_slots(&named, count).map_err(|detail| {
+            // A prefix fails from the first bad entry onward, including a duplicate tray.
+            let (mut lo, mut hi) = (1, named.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if Machine::parse_slots(&named[..mid], count).is_ok() { lo = mid + 1; } else { hi = mid; }
+            }
+            MachineError::InvalidMaterialSlots { preset: name.into(), slot_index: Some(lo), raw_entry: Some(named[lo - 1].trim().into()), detail }
+        })?
     };
     Ok(Machine { name: name.into(), technology: fab_plate::machine::Technology::Filament, bed, max_height, nozzles, keep_out, clearance, slots })
 }
@@ -3828,7 +4886,7 @@ fn tower_spot(plate: &Plate, machine: &Machine, size: f64) -> [f64; 2] {
 /// What a calibration test part is made for: the job's nozzle and layer height, and the first
 /// filament as it prints now (its preset with any stored calibration). Reads preset files:
 /// call off the UI thread.
-pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>) -> fab_calibrate::CouponSetup {
+pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>, effective: Option<&EffectiveResults>) -> fab_calibrate::CouponSetup {
     let mut cs = fab_calibrate::CouponSetup { layer: s.layer_height.max(0.05), ..Default::default() };
     let filament = s.materials.first().map(|f| f.preset.clone()).unwrap_or_default();
     if let Some(cat) = catalog {
@@ -3844,11 +4902,11 @@ pub fn coupon_setup(s: &PrintSettings, catalog: Option<&Catalog>) -> fab_calibra
             cs.nozzle_temp = parse_num(v.raw("nozzle_temperature", 0)).filter(|t| *t > 0.0).unwrap_or(cs.nozzle_temp);
         }
     }
-    let r = fab_calibrate::Results::load(&s.machine, &filament);
+    let measured = |name| effective.and_then(|r| r.get(name));
     use fab_calibrate::results::names;
-    cs.flow_ratio = r.get(names::FLOW_RATIO).unwrap_or(cs.flow_ratio);
-    cs.nozzle_temp = r.get(names::NOZZLE_TEMP).unwrap_or(cs.nozzle_temp);
-    cs.c_xy = r.get(names::C_XY).unwrap_or((0.875 * cs.nozzle).max(0.2));
+    cs.flow_ratio = measured(names::FLOW_RATIO).unwrap_or(cs.flow_ratio);
+    cs.nozzle_temp = measured(names::NOZZLE_TEMP).unwrap_or(cs.nozzle_temp);
+    cs.c_xy = measured(names::C_XY).unwrap_or((0.875 * cs.nozzle).max(0.2));
     cs
 }
 
@@ -3955,45 +5013,46 @@ fn swaps_on_a_nozzle(map: &[u32]) -> bool {
     map.iter().enumerate().any(|(i, n)| map[..i].contains(n))
 }
 
+#[cfg(test)]
 fn resolve_setup(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine) -> Result<JobSetup, String> {
-    resolve_tools(s, catalog, plate, machine, None)
+    resolve_tools_with(s, catalog, None, plate, machine, None).map_err(|e| e.redacted_message())
 }
 
 /// [`resolve_setup`], with `kept` of only those of the job's tools (0-based, ascending), each on
 /// its own nozzle: the ones a slice printed in.
-fn resolve_tools(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, String> {
-    resolve_tools_with(s, catalog, plate, machine, kept, false)
+fn resolve_tools(s: &PrintSettings, catalog: Option<&Catalog>, calibration: &EffectiveCalibration, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
+    resolve_tools_with(s, catalog, Some(calibration), plate, machine, kept)
 }
 
 /// A job takes the latest calibration measurements. The settings panel uses the preset values.
-fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>, panel: bool) -> Result<JobSetup, String> {
+fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, calibration: Option<&EffectiveCalibration>, plate: &Plate, machine: &Machine, kept: Option<&[usize]>) -> Result<JobSetup, SetupError> {
     if s.use_installed && catalog.is_none() {
-        return Err("The installed printer profiles are unavailable".into());
+        return Err(SetupError::Machine(MachineError::CatalogUnavailable));
     }
     if s.plate.is_empty() {
-        return Err(NO_PLATE_FITS.into());
+        return Err(SetupError::Validation(NO_PLATE_FITS.into()));
     }
-    let (_, bed_temp_key) = PLATES.iter().find(|(name, _)| *name == s.plate).ok_or_else(|| format!("Unknown bed plate {}", s.plate))?;
+    let (_, bed_temp_key) = PLATES.iter().find(|(name, _)| *name == s.plate).ok_or_else(|| SetupError::Validation(format!("Unknown bed plate {}", s.plate)))?;
     // The job's tools: its materials, and any a plate part or its paint asks for beyond them.
     let painted = plate.parts.iter().flat_map(|p| p.paint.iter().flat_map(|sp| sp.colors.iter().filter_map(|c| c.filament))).max().unwrap_or(0) as usize;
     let nf = plate.parts.iter().map(|p| p.filament as usize).max().unwrap_or(1).max(painted).max(s.materials.len()).max(1);
     let mut setup = match catalog {
         Some(cat) => {
-            let resolve = |n: &str, what: &str| cat.store.resolve(n).map_err(|e| format!("the {what} preset: {e}"));
+            let resolve = |n: &str, role| cat.store.resolve(n).map_err(|detail| SetupError::ResolvePreset { role, preset: n.into(), detail });
             let mut filaments = Vec::new();
             for i in 0..nf {
                 let f = s.materials.get(i).map(|f| f.preset.clone()).unwrap_or_default();
                 if f.is_empty() {
-                    return Err(format!("material {} has no filament preset: its tray reports none, and the installed profiles select none", i + 1));
+                    return Err(SetupError::Validation(format!("material {} has no filament preset: its tray reports none, and the installed profiles select none", i + 1)));
                 }
-                filaments.push(resolve(&f, "filament")?);
+                filaments.push(resolve(&f, PresetRole::Filament)?);
             }
-            let machine = resolve(&s.machine, "printer")?;
-            makepad_fab_settings::family::of_profile(&machine.values)?;
+            let machine = resolve(&s.machine, PresetRole::Printer)?;
+            makepad_fab_settings::family::of_profile(&machine.values).map_err(|msg| SetupError::Validation(msg.into()))?;
             let nozzle_volume_type = makepad_fab_settings::profiles::nozzle_flow_types(&machine, cat.selection.as_ref());
             JobSetup {
                 machine,
-                process: resolve(&s.process, "process")?,
+                process: resolve(&s.process, PresetRole::Process)?,
                 filaments,
                 filament_map: vec![1; nf],
                 nozzle_volume_type,
@@ -4012,7 +5071,7 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
             .or_else(|| plate.parts.iter().find(|p| p.filament as usize == i + 1).and_then(|p| p.nozzle))
             .unwrap_or(0);
         if nozzle >= nozzles {
-            return Err(format!("material {} prints on the {} nozzle, but the printer has {nozzles}", i + 1, if nozzle == 1 { "right" } else { "left" }));
+            return Err(SetupError::Validation(format!("material {} prints on the {} nozzle, but the printer has {nozzles}", i + 1, if nozzle == 1 { "right" } else { "left" })));
         }
         setup.filament_map[i] = nozzle as u32 + 1;
         setup.filament_colours[i] = s.materials.get(i).map(|f| colour_hex(f.color));
@@ -4023,10 +5082,12 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
     }
     // The panel takes only PRINT_SETTINGS and nozzle_diameter. The measured temperature,
     // flow and pressure advance belong to the slice, which still reads its current results.
-    if !panel {
+    if let Some(calibration) = calibration {
         for (i, f) in setup.filaments.iter_mut().enumerate() {
             let preset = s.materials.get(i).map(|f| f.preset.as_str()).unwrap_or("");
-            fab_calibrate::apply::apply_filament(&fab_calibrate::Results::load(&s.machine, preset), &mut f.values);
+            if let Some(results) = calibration.for_filament(preset) {
+                fab_calibrate::apply::apply_filament_effective(results, &mut f.values);
+            }
         }
     }
     // The project's global settings on top of the process. A filament's own value is
@@ -4043,7 +5104,7 @@ fn resolve_tools_with(s: &PrintSettings, catalog: Option<&Catalog>, plate: &Plat
     // Every material suits the plate: it sets a bed temperature for it (0: it does not).
     for (i, f) in setup.filaments.iter().enumerate() {
         if !makepad_fab_settings::machine::filament_suits_plate(f.values.bool("fab_bed_unheated"), f.values.f64(bed_temp_key)) {
-            return Err(format!("Material {} ({}) has no bed temperature for the {}: pick another plate", i + 1, f.name, s.plate));
+            return Err(SetupError::Validation(format!("Material {} ({}) has no bed temperature for the {}: pick another plate", i + 1, f.name, s.plate)));
         }
     }
     let p = &mut setup.process.values;
@@ -4093,7 +5154,7 @@ pub fn finish_sliced(job: &crate::live_slice::PrintJob, r: &Arc<makepad_fab_slic
     // The slice's tools are the job's that print.
     let trays = r.tools.iter().map(|&t| s.materials.get(t).and_then(|m| m.tray)).collect();
     let checked = match &job.catalog {
-        Some(cat) => gate_profile(cat, setup).and_then(|profile| match fab_printer_link::safety::check_gcode(&r.gcode.text()?, &profile) {
+        Some(cat) => gate_profile(cat, setup, &job.head_envelope).and_then(|profile| match fab_printer_link::safety::check_gcode(&r.gcode.text()?, &profile) {
             Ok(facts) => Ok(Checked { facts, profile }),
             Err(e) => Err(e.message()),
         }),
@@ -4115,8 +5176,8 @@ pub fn finish_sliced(job: &crate::live_slice::PrintJob, r: &Arc<makepad_fab_slic
 /// preset the job's machine preset descends from (never a user preset's edits or the
 /// project's overrides). Keys the machine does not have (filament_diameter, volumetric
 /// speeds, temperatures) come one per job filament, in filament order, from its presets.
-fn gate_profile(cat: &Catalog, setup: &JobSetup) -> Result<fab_printer_link::safety::MachineProfile, String> {
-    gate_profile_of(cat, system_machine(setup), &setup.filaments)
+fn gate_profile(cat: &Catalog, setup: &JobSetup, head_envelope: &Path) -> Result<fab_printer_link::safety::MachineProfile, String> {
+    gate_profile_of(cat, system_machine(setup), &setup.filaments, head_envelope)
 }
 
 /// The system preset a job's machine preset descends from.
@@ -4124,7 +5185,7 @@ fn system_machine(setup: &JobSetup) -> &str {
     if setup.machine.system_parent.is_empty() { &setup.machine.name } else { &setup.machine.system_parent }
 }
 
-fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset]) -> Result<fab_printer_link::safety::MachineProfile, String> {
+fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset], head_envelope: &Path) -> Result<fab_printer_link::safety::MachineProfile, String> {
     let system = cat.store.resolve(name).map_err(|e| format!("the printer's system profile {name}: {e}"))?;
     let get = |k: &str| {
         let m = system.values.get(k).map(|v| v.as_vec()).unwrap_or_default();
@@ -4134,7 +5195,7 @@ fn gate_profile_of(cat: &Catalog, name: &str, filaments: &[Preset]) -> Result<fa
     let templates = filaments.iter().flat_map(|f| ["filament_start_gcode", "filament_end_gcode"].into_iter().map(move |k| (k.to_string(), f.values.raw(k, 0).to_string()))).collect();
     let mut profile = fab_printer_link::safety::MachineProfile::from_settings(&get, templates).map_err(|e| e.message())?;
     // The user's measured head, if installed (the check decides whether it may allow non-planar moves).
-    profile.head = crate::head::installed();
+    profile.head = crate::head::installed_from(head_envelope);
     Ok(profile)
 }
 
@@ -4244,7 +5305,7 @@ fn mark_test_slice(what: &str, job: &crate::live_slice::PrintJob, at: u64) {
 fn run_slice(gen: u64, s: &PrintSettings, catalog: Option<&Arc<Catalog>>, plate: &Plate, machine: &Machine, name: &str) -> Result<Sliced, String> {
     let setup = resolve_setup(s, catalog.map(|c| &**c), plate, machine)?;
     let res = makepad_fab_slice::plate::slice_plate_painted_with(&setup, plate, &[], &|_, _| {})?;
-    let job = crate::live_slice::PrintJob { gen, settings: s.clone(), colours: s.materials.iter().map(|m| m.color).collect(), model_colours: Vec::new(), shared_tools: Vec::new(), machine: machine.clone(), name: name.to_string(), objects: plate.parts.iter().map(|p| p.object.clone()).collect(), check: None, fallback: None, catalog: catalog.filter(|_| s.use_installed).cloned(), tests: None, melts: melt_steps(plate) };
+    let job = crate::live_slice::PrintJob { gen, head_envelope: crate::dirs::FabDirs::system().head_envelope, settings: s.clone(), colours: s.materials.iter().map(|m| m.color).collect(), model_colours: Vec::new(), shared_tools: Vec::new(), machine: machine.clone(), name: name.to_string(), objects: plate.parts.iter().map(|p| p.object.clone()).collect(), check: None, fallback: None, catalog: catalog.filter(|_| s.use_installed).cloned(), tests: None, melts: melt_steps(plate) };
     Ok(finish_test_slice(job, setup, res, plate))
 }
 
@@ -4638,17 +5699,16 @@ fn preview_of_package(package: &[u8], meta: &JobMeta) -> Result<Arc<PrintPreview
 }
 
 /// A queued job's package from the disk, checked against the printer's installed profile.
-fn job_check(catalog: &Catalog, dir: &std::path::Path, id: &str, meta: &JobMeta) -> Result<fab_printer_link::safety::ValidatedJob, String> {
+fn job_check(catalog: &Catalog, dir: &Path, id: &str, meta: &JobMeta, head_envelope: &Path) -> Result<fab_printer_link::safety::ValidatedJob, String> {
     let package = jobs::read_package(dir, id).map_err(|e| format!("Fab's copy of this job can't be read: {e}"))?;
     let filaments = meta.filament_presets.iter().map(|name| catalog.store.resolve(name)).collect::<Result<Vec<_>, _>>()?;
-    let mut profile = gate_profile_of(catalog, &meta.machine_preset, &filaments)?;
-    profile.head = crate::head::installed();
+    let profile = gate_profile_of(catalog, &meta.machine_preset, &filaments, head_envelope)?;
     fab_printer_link::safety::validate_job(package, &profile, &meta.name).map_err(|e| e.message())
 }
 
-fn remove_job_files(id: String) {
+fn remove_job_files(dir: PathBuf, id: String) {
     crate::live_slice::run_shown("fab job remove", move || {
-        if let Err(e) = jobs::remove(&jobs::jobs_dir(), &id) { log!("fab jobs: {id} could not be removed: {e}"); }
+        if let Err(e) = jobs::remove(&dir, &id) { log!("fab jobs: {id} could not be removed: {e}"); }
         #[cfg(test)]
         Cx::post_action(PrintEvent::JobFilesRemoved(id));
     });
@@ -5722,6 +6782,79 @@ mod tests {
     use super::*;
     use fab_plate::{Part, PartMesh};
 
+    #[test]
+    fn export_attempts_preserve_the_settled_slice_and_ignore_stale_completions() {
+        let mut printing = Printing::default();
+        let plate = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &defaults_settings(), None, &plate.plate, &plate.machine, "cube").unwrap());
+        let mut state = PrintState::default();
+        let done = SliceStatus::Done { seconds: 0.1 };
+        state.set_preview(sliced.preview.clone());
+        state.status = done.clone();
+        assert_eq!(state.export, ExportStatus::Idle);
+        assert!(printing.export(&mut state, None));
+        assert!(matches!(state.export, ExportStatus::Failed(_)), "missing package source is an export failure");
+        assert_eq!(state.status, done);
+
+        // The matching file job is already in flight. Export adopts its id on a repeated press.
+        let path = crate::model_host::documents_dir().join("cube.gcode.3mf");
+        printing.last = Some(sliced.clone());
+        let pending = |id| Packaging { id, sliced: sliced.clone(), to: PackageFor::File(path.clone()), stop: Arc::default() };
+        for (id, result, expected) in [
+            (1, Packaged::Written(path.clone()), ExportStatus::Written(path.clone())),
+            (2, Packaged::Failed("write refused".into()), ExportStatus::Failed("write refused".into())),
+            (3, Packaged::Stopped, ExportStatus::Idle),
+        ] {
+            printing.packaging.push(pending(id));
+            assert!(printing.export(&mut state, None));
+            assert_eq!(state.export, ExportStatus::Exporting);
+            assert_eq!(printing.export_attempt, Some(id), "the same slice and path share an attempt");
+            assert_eq!(printing.event(&mut state, &PrintEvent::Packaged { id, result }), PrintOutcome::Target);
+            assert_eq!(state.export, expected);
+            assert_eq!(state.status, done);
+            assert_eq!(state.slice_state(), ("Sliced", 1.0));
+            assert!(state.can_send(), "the settled plate can be exported again");
+        }
+        for previous in [ExportStatus::Written(path.clone()), ExportStatus::Failed("write refused".into())] {
+            state.export = previous;
+            printing.invalidate(&mut state);
+            assert_eq!(state.export, ExportStatus::Idle, "edits clear the previous outcome");
+        }
+        let old = pending(4);
+        let stop = old.stop.clone();
+        printing.packaging.push(old);
+        printing.export_attempt = Some(4);
+        printing.reask = Some(true);
+        printing.invalidate(&mut state);
+        assert!(stop.load(Ordering::Relaxed), "a replaced file job gets a stop request");
+        assert_eq!(printing.export_attempt, None);
+        assert_eq!(state.export, ExportStatus::Exporting, "an export waiting for the rebuilt plate stays in progress");
+        let late = PrintEvent::Packaged { id: 4, result: Packaged::Written(path) };
+        assert_eq!(printing.event(&mut state, &late), PrintOutcome::Unchanged);
+        assert_eq!(state.export, ExportStatus::Exporting, "the superseded write cannot change the waiting export");
+    }
+
+    #[test]
+    fn export_of_an_all_excluded_plate_reports_the_refusal() {
+        let mut printing = Printing::default();
+        let mut state = PrintState::default();
+        let mut model = fab_model::FabModel::with_script("cube", "cube.cad.splash",
+            "use mod.fab.*\nobject(mod.model.box({size: [1mm 1mm 1mm]}))");
+        let mut evaluator = fab_model::eval::Evaluator::new(printing.machine().unwrap().clone());
+        let (compiled, plate) = model.evaluate(&mut evaluator, None).unwrap();
+        let action = fab::api::PartAction::SetPrint { objects: vec![plate.plate.parts[0].object.clone()], print: false };
+        let edits = crate::plate_edit::edits(&compiled, &plate, &action).unwrap();
+        let (_, update) = model.apply(&mut evaluator, "exclude", model.head(), &edits, None).unwrap();
+        let plate = Arc::new(update.unwrap().1);
+        assert!(plate.plate.parts.is_empty() && !plate.plate.excluded.is_empty());
+        assert!(printing.export(&mut state, Some(&plate)));
+        assert_eq!(state.export, ExportStatus::Failed("no printable parts on the plate".into()));
+        assert_eq!(state.status, SliceStatus::Idle);
+        printing.reask = Some(true);
+        assert!(printing.resume_asked(&mut state, Some(&plate)));
+        assert_eq!(state.export, ExportStatus::Failed("no printable parts on the plate".into()));
+    }
+
     /// A live slice's supports are a stage of its one bar: no job of their own on the board. The
     /// status follows the engine's progress of the live revision by the whole percent, and says
     /// supports while they plan; another revision's progress is not its.
@@ -5795,7 +6928,8 @@ mod tests {
             name: p.name, kind: p.kind, values: p.values, from: "system".into(), ..Default::default()
         }).collect();
         let cat = Catalog { twins: HashMap::new(), automatic: HashMap::new(), resin: Default::default(), layout_revision: 0, store: Arc::new(ProfileStore::open(&[], &[]).with_builtin(presets)), selection: None, entries: Vec::new(), installed: true };
-        let gate = gate_profile_of(&cat, &single.machine.name, std::slice::from_ref(&pla)).expect("the single-nozzle printer's gate profile");
+        let head_envelope = crate::dirs::FabDirs::system().head_envelope;
+        let gate = gate_profile_of(&cat, &single.machine.name, std::slice::from_ref(&pla), &head_envelope).expect("the single-nozzle printer's gate profile");
         assert_eq!(gate.extruder_areas, vec![gate.printable_area.clone()], "a single nozzle without an area of its own reaches the whole bed");
         settings.materials = vec![JobMaterial { preset: single.filaments[0].name.clone(), color: [0.9, 0.9, 0.9, 1.0], nozzle: 0, tray: None, dedicated: false }];
         let setup = resolve_setup(&settings, Some(&cat), &plate, &one).expect("the single-nozzle printer's job");
@@ -5803,7 +6937,7 @@ mod tests {
         // The check takes its machine: no refusal of its areas, nozzles or build volume. (The
         // fixture starts with Fab's own default sequence, not a printer's, so the check still
         // refuses its moves; an installed profile carries the printer's own sequence.)
-        if let Err(refusal) = fab_printer_link::safety::check_gcode(&sliced.gcode, &gate_profile(&cat, &setup).unwrap()) {
+        if let Err(refusal) = fab_printer_link::safety::check_gcode(&sliced.gcode, &gate_profile(&cat, &setup, &head_envelope).unwrap()) {
             let machine: Vec<_> = refusal.0.iter().filter(|v| matches!(v.rule, "machine" | "build volume" | "nozzle offset" | "nozzle diameter" | "nozzle map" | "filament")).collect();
             assert!(machine.is_empty(), "the safety check refuses a single-nozzle printer's machine: {machine:?}");
         }
@@ -5837,7 +6971,7 @@ mod tests {
             values.set_vec("extruder_printable_area", Vec::new());
             values.set_vec("extruder_printable_height", Vec::new());
             if let Some(slots) = slots { values.set_vec("fab_material_slots", vec![slots.into()]); }
-            machine_of("second", &values)
+            machine_of("second", &values).map_err(|e| e.local_message())
         };
         let own = |labels: &[&str]| labels.iter().enumerate().map(|(h, t)| Slot { nozzle: h, tray: t.to_string(), path: SlotPath::Own }).collect::<Vec<_>>();
         assert_eq!(heads(4, None).unwrap().slots, own(&["A1", "B1", "C1", "D1"]));
@@ -5971,16 +7105,16 @@ mod tests {
             return;
         }
 
+        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
+        let dir = home.join(".makepad/fab");
         // Hold the worker at its wake until all pending updates have arrived.
         let (wake, wakes) = std::sync::mpsc::sync_channel(1);
         let pending = Arc::new(std::sync::Mutex::new(ProfileWork::default()));
         let drain = || {
             wakes.recv().unwrap();
             let work = std::mem::take(&mut *pending.lock().unwrap());
-            write_loadouts(work.loadouts);
+            write_loadouts(&dir, work.loadouts);
         };
-        let home = PathBuf::from(std::env::var_os("MAKEPAD_TEST_HOME").unwrap());
-        let dir = home.join(".makepad/fab");
         let (a, b) = (PrinterChoice::Real("A".into()), PrinterChoice::Real("B".into()));
         let presets = virtual_printer::presets();
         let single = presets.iter().find(|p| p.name == "two-materials").unwrap();
@@ -5995,7 +7129,7 @@ mod tests {
             state.settings.process = virtual_printer::PROCESS.into();
             printing.load_base_values(&mut state);
             printing.event(&mut state, &PrintEvent::PrinterConfigs {
-                names: vec!["A".into(), "B".into()], presets: vec![single.clone()], loadouts: read_loadouts(),
+                names: vec!["A".into(), "B".into()], presets: vec![single.clone()], loadouts: read_loadouts(&dir),
             });
             (printing, state)
         };
@@ -6062,7 +7196,7 @@ mod tests {
         assert_eq!(state.settings.materials, materials, "B's report must leave A's material settings unchanged");
         let b_text = printing.loadouts[&loadout_file(&b)].clone();
         drain();
-        let saved = read_loadouts();
+        let saved = read_loadouts(&dir);
         assert!(saved.get(&loadout_file(&a)) == Some(&a_text) && saved.get(&loadout_file(&b)) == Some(&b_text),
             "one drain must write both printers' own latest trays");
         assert!(a_text.contains("\tPLA\t") && b_text.contains("tool_4\tD1\t") && b_text.contains("\tTPU\t"),
@@ -6096,9 +7230,1114 @@ mod tests {
         let owner = EditOwner::new(PrinterScope::Target, &state);
         printing.action(&mut state, &edit(owner, "PETG"), None);
         drain();
-        let saved = read_loadouts();
+        let saved = read_loadouts(&dir);
         assert!(saved[Path::new("trays.txt")].contains("\tPETG\t"), "hand editing with no printer must update trays.txt");
         assert_eq!((&saved[&loadout_file(&a)], &saved[&loadout_file(&b)]), (&a_text, &b_text), "no-printer edits must preserve both printers' trays");
+    }
+
+    fn owner(name: &str) -> CalibrationOwner {
+        CalibrationOwner { id: format!("printer:{name}"), title: name.into() }
+    }
+
+    fn test_calibration_setup() -> CheckSetup {
+        let mut setup = CheckSetup::fab_defaults();
+        setup.settings = settings(1);
+        setup.settings.materials[0].preset = "PLA".into();
+        setup
+    }
+
+    fn calibration_dir(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fab-cal-{case}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn calibration_owner_by_target_kind() {
+        let mut printing = Printing::default();
+        let mut state = PrintState::default();
+        let base = virtual_printer::presets().remove(0);
+        let twin = |name: &str, source: Option<&str>| VirtualPrinter {
+            name: name.into(), source: VirtualSource::Twin { preset: base.machine_preset_name(), model: base.model(), source: source.map(str::to_owned) },
+            ..base.clone()
+        };
+        let mut saved = Saved::default();
+        saved.printers = vec![base.clone(), twin("from-p", Some("printer:P")), twin("nested", Some("virtual:from-p")),
+            twin("catalogue", None), twin("from-generated", Some(&format!("virtual:{}", base.name))),
+            twin("a", Some("virtual:b")), twin("b", Some("virtual:a"))];
+        let mut configured = twin("paired", Some("printer:P"));
+        configured.configured_for = Some("P".into());
+        saved.printers.push(configured);
+        printing.virtuals = Some(Arc::new(saved));
+        state.links.picked = PrinterChoice::Real("P".into());
+        for disconnected in [false, true] {
+            state.links.disconnected = disconnected;
+            assert_eq!(printing.calibration_owner(&state), Some(owner("P")), "configured P owns both modes");
+        }
+        let saved = Arc::make_mut(printing.virtuals.as_mut().unwrap());
+        if let VirtualSource::Twin { source, .. } = &mut saved.printers.last_mut().unwrap().source { *source = None; }
+        assert_eq!(printing.calibration_owner(&state), Some(owner("P")), "legacy configured twin keeps its printer owner");
+        for (name, expected) in [("from-p", Some(owner("P"))), ("nested", Some(owner("P"))), ("catalogue", None),
+            (&base.name, None), ("from-generated", None), ("a", None)] {
+            state.links.picked = PrinterChoice::Virtual(name.into());
+            assert_eq!(printing.calibration_owner(&state), expected, "provenance of {name}");
+        }
+        state.links.picked = PrinterChoice::None;
+        assert_eq!(printing.calibration_owner(&state), None, "unlinked uses the preset store");
+    }
+
+    #[test]
+    fn check_setup_id_hashes_effective_slicer_values() {
+        use fab_calibrate::{results::names, Results};
+        let dir = calibration_dir("id");
+        let mut setup = test_calibration_setup();
+        let preset = setup.settings.machine.clone();
+        let key = |p| CalibrationKey { owner: Some(owner(p)), preset: preset.clone(), filaments: vec!["PLA".into()] };
+        let write = |name: &str, flow: f64, owned: bool| {
+            let mut r = Results { printer: name.into(), filament: "PLA".into(), ..Default::default() };
+            r.values.insert(names::FLOW_RATIO.into(), flow);
+            if owned { r.save_owner_in(&dir) } else { r.save_in(&dir) }.unwrap();
+        };
+        write("printer:P", 0.91, true);
+        write("printer:Q", 1.07, true);
+        write(&preset, 0.91, false);
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P")));
+        let id = setup.id();
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("Q")));
+        assert_ne!(id, setup.id(), "different effective flow gives different toolpaths");
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P2")));
+        assert_eq!(id, setup.id(), "equal flow hashes identically through preset fallback");
+        write("printer:Q", 0.85, true);
+        setup.calibration = Arc::new(EffectiveCalibration::resolve_in(&dir, &key("P")));
+        assert_eq!(id, setup.id(), "saving Q does not change P's slice key");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn check_setup_serves_job_mech_and_coupon_from_effective_arc() {
+        use fab_calibrate::results::{names, EffectiveValue, ValueSource};
+        let mut setup = test_calibration_setup();
+        let mut r = EffectiveResults::default();
+        for (name, value) in [(names::FLOW_RATIO, 0.91), (names::C_XY, 0.35), (names::NOZZLE_TEMP, 215.0)] {
+            r.values.insert(name.into(), EffectiveValue { value, source: ValueSource::Owner });
+        }
+        Arc::make_mut(&mut setup.calibration).by_filament.insert("PLA".into(), r);
+        let job = setup.job_setup(&Plate::default(), &Machine::dual_nozzle_350()).unwrap();
+        assert_eq!(job.filaments[0].values.raw("filament_flow_ratio", 0), "0.910", "the print job consumes effective flow");
+        assert_eq!(job.filaments[0].values.raw("nozzle_temperature", 0), "215", "the print job consumes effective temperature");
+        assert_eq!(setup.mech_profile().measured.c_xy, Some(0.35), "joint sizing consumes effective clearance");
+        let coupon = setup.coupon_setup();
+        assert_eq!((coupon.flow_ratio, coupon.nozzle_temp, coupon.c_xy), (0.91, 215.0, 0.35), "coupon generation consumes the same snapshot");
+    }
+
+    fn manual_profiles(printing: &mut Printing) -> std::sync::mpsc::Receiver<()> {
+        let (wake, rx) = std::sync::mpsc::sync_channel(1);
+        printing.profiles_worker = Some(ProfilesWorker { pending: Default::default(), wake });
+        rx
+    }
+
+    fn drain_cal(printing: &Printing, dir: &Path) -> Vec<PrintEvent> {
+        let work = std::mem::take(&mut *printing.profiles_worker.as_ref().unwrap().pending.lock().unwrap());
+        let mut events = Vec::new();
+        run_calibration_work(dir, work.cal_writes, work.cal_resolve, |e| events.push(e));
+        events
+    }
+
+    #[test]
+    fn calibration_writes_preserve_fifo_order_and_stale_resolves_drop() {
+        use fab_calibrate::{Answer, CouponSetup, Step, results::names};
+        let dir = calibration_dir("fifo");
+        let mut printing = Printing::default();
+        let wakes = manual_profiles(&mut printing);
+        let mut state = PrintState { settings: test_calibration_setup().settings, ..Default::default() };
+        state.links.picked = PrinterChoice::Real("P".into());
+        let preset = state.settings.machine.clone();
+        let mut steps = Vec::new();
+        for (step, n) in [(Step::Clearance, 5), (Step::Flow, 1)] {
+            let cs = CouponSetup { flow_ratio: 0.91 / 0.90, ..Default::default() };
+            let coupon = Arc::new(fab_calibrate::make(step, &cs).unwrap());
+            printing.save_calibration(&mut state, Some(owner("P")), preset.clone(), "PLA".into(), coupon, Answer::Number(n), "2026-01-01".into());
+            steps.push(step);
+        }
+        assert!(wakes.try_recv().is_ok(), "batched writes wake the worker");
+        let events = drain_cal(&printing, &dir);
+        let saved: Vec<_> = events.iter().filter_map(|e| match e {
+            PrintEvent::CalibrationWritten { outcome: CalWriteOutcome::Saved { step, .. } } => Some(*step), _ => None
+        }).collect();
+        assert_eq!(saved, steps, "every write is acknowledged once, in FIFO order");
+        let stale = events.last().unwrap();
+        printing.event(&mut state, stale);
+        let r = printing.effective_calibration().for_filament("PLA").unwrap();
+        assert_eq!(r.get(names::C_XY), Some(0.3), "clearance survives the subsequent flow save");
+        assert!((r.get(names::FLOW_RATIO).unwrap() - 0.91).abs() < 1e-9, "flow persisted with clearance");
+        state.links.picked = PrinterChoice::Real("Q".into());
+        printing.sync_calibration(&mut state);
+        for event in drain_cal(&printing, &dir) { printing.event(&mut state, &event); }
+        let q = printing.effective_calibration().clone();
+        assert_eq!(printing.event(&mut state, stale), PrintOutcome::Unchanged, "stale resolve is discarded");
+        assert!(Arc::ptr_eq(&q, printing.effective_calibration()), "Q keeps its resolved snapshot");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn late_answer_after_retarget_writes_captured_owner_and_leaves_active_target_alone() {
+        use crate::calibrate::{CalEvent, Calibrate};
+        use fab::print::calibrate::CalibrateAction;
+        use fab_calibrate::{Results, Step};
+        let dir = calibration_dir("late-answer");
+        let base = virtual_printer::presets().remove(0);
+        let cat = Arc::new(catalog_in(&[], &dir, std::slice::from_ref(&base)).unwrap());
+        let mut saved = Saved::default();
+        for name in ["P", "Q"] {
+            let mut vp = cat.twins[&base.machine_preset_name()].printer.clone();
+            vp.configured_for = Some(name.into());
+            vp.name = format!("coupon-{name}");
+            saved.printers.push(vp);
+            saved.disconnected.insert(name.into());
+        }
+        let mut printing = Printing { catalog: Some(cat), virtuals: Some(Arc::new(saved)), ..Default::default() };
+        let _wake = manual_profiles(&mut printing);
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        assert!(printing.link_printer(&mut state, &PrinterChoice::Real("P".into())));
+        printing.sync_calibration(&mut state);
+        for e in drain_cal(&printing, &dir) { printing.event(&mut state, &e); }
+        let mut panel = Calibrate::default();
+        let setup = printing.check_setup(&state);
+        let (preset, filament) = setup.calibration_names();
+        assert!(!filament.is_empty(), "the captured coupon needs a selected filament");
+        let CalEvent::Made(made) = CalEvent::make(Step::Clearance, &setup, [1.0; 4]);
+        panel.made(&mut state.calibrate, &made);
+        assert!(printing.link_printer(&mut state, &PrinterChoice::Real("Q".into())));
+        printing.sync_calibration(&mut state);
+        for e in drain_cal(&printing, &dir) { printing.event(&mut state, &e); }
+        let cube = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &state.settings, printing.catalog.as_ref(), &cube.plate, &cube.machine, "cube").unwrap());
+        state.set_preview(sliced.preview.clone());
+        state.status = SliceStatus::Done { seconds: 0.0 };
+        state.settled = true;
+        printing.last = Some(sliced);
+        let before = printing.check_setup(&state);
+        assert_eq!(before.calibration_names(), (preset.clone(), filament.clone()), "P and Q share a preset and filament");
+        let seq = printing.calibration_seq;
+        let a = CalibrateAction::Answer { a: 5, b: 0, angle: 0.0 };
+        assert!(panel.action(&mut state, &a, &mut printing, [1.0; 4], None));
+        for e in drain_cal(&printing, &dir) {
+            printing.event(&mut state, &e);
+            if let PrintEvent::CalibrationWritten { outcome, .. } = e {
+                panel.written(&mut state.calibrate, &outcome, printing.requested_calibration_owner(), &preset, &filament);
+            }
+        }
+        let after = printing.check_setup(&state);
+        assert_eq!(Results::load_owner_in(&dir, "printer:P", &filament).values.get("c_xy"), Some(&0.30), "P owns its coupon's answer");
+        assert!(!Results::owner_path_in(&dir, "printer:Q", &filament).exists(), "the active printer gets no write");
+        assert!(!Results::path_in(&dir, &preset, &filament).exists(), "a captured printer's result leaves the preset alone");
+        assert_eq!((after.id(), printing.calibration_seq), (before.id(), seq), "Q keeps its settled key and resolution");
+        assert!(state.can_send() && Arc::ptr_eq(&before.calibration, &after.calibration), "Q stays ready on the same calibration");
+        assert!(state.calibrate.status.contains("Saved to P"), "the completion identifies the saved coupon's printer: {}", state.calibrate.status);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rebuild_failure_formats_every_typed_kind_without_parsing() {
+        let path = std::env::temp_dir().join("fixture_home/project/hinge.cad.splash");
+        let full = path.to_str().unwrap();
+        let reason = format!("'{full}' is not open in the project");
+        let measured = makepad_csg_mech::Measured { c_z_layers: Some(4), ..Default::default() };
+        for (file, line, col, id, op, message, prefix) in [
+            (full, 6, 3, "", "", reason.as_str(), "script `hinge.cad.splash`:6:3 ("),
+            ("", 1, 1, "", "", "cancelled", "project build ("),
+            ("", 4, 2, "", "", "bad expression", "project:4:2 ("),
+            ("part.cad.splash", 2, 4, "pa", "BrepFillet", "radius is too large", "`pa` (BrepFillet)"),
+            ("part.cad.splash", 3, 5, "h", "joint", "eye too thin", "joint `h`"),
+        ] {
+            let failure = fab_model::eval::Failure { file: file.into(), line, col, id: id.into(), op: op.into(), lost: None, message: message.into() };
+            let kind = classify_rebuild_failure(&failure, None, None);
+            let expected = match (id, op) {
+                ("", _) => RebuildFailureKind::Program { file: (!file.is_empty()).then(|| "hinge.cad.splash".into()), line, col, reason: message.into() },
+                (_, "joint") => RebuildFailureKind::Joint { parts: vec![], kind: None, id: id.into(), reason: message.into() },
+                _ => RebuildFailureKind::Solid { parts: vec![], id: id.into(), op: op.into(), reason: message.into() },
+            };
+            assert_eq!(kind, expected, "structured diagnostic for {prefix}");
+            let shown = format_rebuild_failure(&redact_rebuild_kind(&kind, &failure, None), &measured, 0.2);
+            assert!(shown.starts_with(prefix), "{prefix} must identify the failed step: {shown}");
+            for error in [shown, redacted_eval_failure(&failure)] {
+                assert!(!error.contains("fixture_home") && !error.contains(full), "external diagnostic must scrub the script path: {error}");
+                if file == full { assert!(error.contains("'hinge.cad.splash' is not open in the project")); }
+            }
+        }
+    }
+
+    #[test]
+    fn sliced_printability_issues_block_confirm_card_after_slice_gen_clears() {
+        let vp = virtual_printer::presets().remove(0);
+        let choice = PrinterChoice::Virtual(vp.name.clone());
+        let mut printing = Printing::default();
+        let mut state = PrintState { settings: defaults_settings(), ..Default::default() };
+        state.links.picked = choice.clone();
+        printing.install(&mut state, &choice, fab_printer_link::PrinterLink::virtual_printer(setup_of(&vp, None).unwrap()), true);
+        state.printers.set(&choice, printing.installed_epoch, Arc::new(fab_printer_link::Snapshot {
+            name: vp.title.clone(),
+            model: vp.model(),
+            status: fab_printer_link::ConnectionStatus::Connected,
+            virtual_printer: true,
+            state: Arc::new(fab_printer_link::PrinterState {
+                storage: Some(true),
+                gcode_state: Some("IDLE".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        state.confirm_print = Some(PrintConfirm::Filament(PrintTicket {
+            printer: choice,
+            virtual_printer: true,
+            epoch: printing.installed_epoch,
+        }));
+
+        let plate = fleet_plate(&printing);
+        let sliced = Arc::new(run_slice(1, &state.settings, None, &plate.plate, &plate.machine, "cube").unwrap());
+        let island = Arc::new(fab_printability::Report {
+            sliced: true,
+            issues: vec![fab_printability::Issue {
+                kind: "mid_air",
+                severity: fab_printability::Severity::Error,
+                object: Some("cube".into()),
+                at_mm: [0.0; 3],
+                footprint: fab_printability::Footprint { min: [0.0; 2], max: [1.0; 2] },
+                layer: Some(11),
+                layer_to: None,
+                measure: 100.0,
+                message: "floating island (100.0 mm²)".into(),
+                hint: "Add supports or place it on the bed.".into(),
+                fix: None,
+                area_mm2: 100.0,
+                lowest_z: 2.2,
+                highest_z: 2.4,
+                flags: 0,
+            }],
+            ..Default::default()
+        });
+
+        // 1. Successful Sliced(1) clears slice_gen (so held Export resumes) and arms issues_gen.
+        printing.gen = 1;
+        printing.slice_gen = Some(1);
+        state.status = SliceStatus::Running { progress: 0.5, stage: "Slicing".into() };
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 1, result: Ok(sliced.clone()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None, "Sliced clears slice_gen so held Export can resume");
+        assert_eq!(printing.issues_gen, Some(1), "Sliced arms issues_gen for streaming printability");
+        assert!(state.can_send() && state.print_blocker().is_none());
+
+        // 2. In-progress Issues(1) holds the card while slice_gen is None.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: Arc::default(), done: 3, total: 12 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None);
+        assert_eq!(state.print_blocker().as_deref(), Some("Checking printability: layer 3 of 12"));
+        assert_eq!(printing.send_blocked(&state).as_deref(), Some("Checking printability: layer 3 of 12"));
+
+        // 3. Completed Issues(1) with mid_air blocks the confirm card while slice_gen is None.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Target
+        );
+        assert_eq!(printing.slice_gen, None);
+        let blocked = printing.send_blocked(&state).expect("floating island must block the confirm card");
+        assert!(blocked.starts_with("Not printable: floating island") && blocked.contains("on layer 12"), "{blocked}");
+        assert_eq!(printing.send_checks(&state, &state.print_options).err().as_deref(), Some(blocked.as_str()));
+
+        // 4. Another generation's Issues is ignored.
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 2, report: Arc::default(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert_eq!(printing.send_blocked(&state).as_deref(), Some(blocked.as_str()));
+
+        // 5. Plate change invalidates and drops late Issues(1).
+        printing.plate_changed(&mut state, &plate);
+        state.streamed = None;
+        assert_eq!(printing.issues_gen, None);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "late Issues after plate change must be discarded");
+
+        // 6. Replacement slice gen 2 ignores late Issues(1), and stop_slice clears issues_gen.
+        printing.gen = 2;
+        printing.slice_gen = Some(2);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 2, result: Ok(sliced.clone()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!((printing.slice_gen, printing.issues_gen), (None, Some(2)));
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 1, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none() && state.print_blocker().is_none(), "gen 1 report cannot poison gen 2");
+        printing.stop_slice(&mut state);
+        assert_eq!(printing.issues_gen, None);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 2, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "late Issues after stop_slice must be discarded");
+
+        // 7. Marking the preview stale or a failed Sliced(4) rejects subsequent Issues.
+        printing.gen = 3;
+        printing.slice_gen = Some(3);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 3, result: Ok(sliced), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        Printing::mark_shown_slice_stale(&mut state);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 3, report: island.clone(), done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none(), "stale preview ignores late Issues");
+
+        printing.gen = 4;
+        printing.slice_gen = Some(4);
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Sliced { gen: 4, result: Err("slice failed".into()), seconds: 0.1 }),
+            PrintOutcome::Target
+        );
+        assert_eq!((printing.slice_gen, printing.issues_gen), (None, None));
+        assert_eq!(
+            printing.event(&mut state, &PrintEvent::Issues { gen: 4, report: island, done: 12, total: 12 }),
+            PrintOutcome::Unchanged
+        );
+        assert!(state.streamed.is_none());
+    }
+
+    #[test]
+    fn confirm_card_precedence_prefers_calibration_error_over_stale_overlap_and_respects_hold() {
+        let vp = virtual_printer::presets().remove(0);
+        let choice = PrinterChoice::Virtual(vp.name.clone());
+        let snapshot = fab_printer_link::Snapshot { name: vp.title.clone(), virtual_printer: true, ..Default::default() };
+        let mut printing = Printing::default();
+        let mut p = PrintState::default();
+        p.links.picked = choice.clone();
+        printing.install(&mut p, &choice, fab_printer_link::PrinterLink::virtual_printer(setup_of(&vp, None).unwrap()), true);
+        p.confirm_print = Some(PrintConfirm::Filament(PrintTicket { printer: choice, virtual_printer: true, epoch: printing.installed_epoch }));
+        p.stale = true;
+        Arc::make_mut(&mut p.printability).issues.push(fab_printability::Issue {
+            kind: "overlap", severity: fab_printability::Severity::Error, object: None, at_mm: [0.0; 3],
+            footprint: fab_printability::Footprint { min: [0.0; 2], max: [1.0; 2] },
+            layer: Some(1), layer_to: None, measure: 1.0, message: "Two bodies overlap".into(),
+            hint: "Move them apart.".into(), fix: None, area_mm2: 1.0, lowest_z: 0.0, highest_z: 0.2, flags: 0,
+        });
+        assert!(p.print_blocker().unwrap().contains("overlap"), "the stale plate has its own refusal");
+        let failed = "The hinge cannot rebuild at the measured Z gap.";
+        p.calibration_error = Some(failed.into());
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some(failed), "admission gives the current rebuild failure");
+        assert_eq!(printing.send_blocked(&p).as_deref(), Some(failed), "the card shows the same failure");
+        assert!(panel::confirm_question(&p, &snapshot, false).0.contains("failed to rebuild"), "the question identifies calibration");
+        assert!(panel::slice_status(&p).0.contains(failed), "the status explains how the rebuild failed");
+        let _wake = manual_profiles(&mut printing);
+        printing.sync_calibration(&mut p);
+        p.calibration_error = Some(failed.into());
+        assert!(p.calibration_pending, "recovery waits on a real profiles request");
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some(SLICE_NOT_READY), "admission waits for recovery");
+        assert_eq!(printing.send_blocked(&p), None, "the card has no refusal during recovery");
+        for text in [panel::confirm_question(&p, &snapshot, false).0, panel::slice_status(&p).0] {
+            assert!(text.contains(LOADING_CALIBRATION) && !text.contains(failed) && !text.contains("overlap"), "the hold has one reason: {text}");
+        }
+        printing.action(&mut p, &PrintAction::AskPrint(true), None);
+        assert!(printing.reask == Some(false) && printing.slice_asked(), "held Print survives leaving Sliced view");
+        printing.action(&mut p, &PrintAction::AskPrint(false), None);
+        assert!(printing.reask.is_none() && !printing.slice_asked(), "closing the Print card releases a held Print wait");
+        printing.action(&mut p, &PrintAction::Export, None);
+        printing.action(&mut p, &PrintAction::AskPrint(false), None);
+        assert!(printing.reask == Some(true) && printing.slice_asked(), "closing the Print card keeps an independent held Export");
+        printing.fleet.clear();
+        assert_eq!(printing.send_blocked(&p).as_deref(), Some(STALE_TICKET), "a retired ticket is stale");
+        assert_eq!(printing.send_checks(&p, &p.print_options).err().as_deref(), Some("No printer is linked."), "a direct admission needs a linked printer");
+    }
+
+    const COMPACT_HINGE: &str = r#"use mod.model.*
+use mod.fab.*
+let m = mod.model
+let a = m.box({size: [6mm 2.6mm 6mm] at: [0 1.3mm 0]})
+let b = m.box({size: [6mm 2.6mm 6mm] at: [10mm 1.3mm 0]})
+let pa = m.union(a, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let pb = m.union(b, m.cylinder({radius: 3.4mm height: 2.6mm at: [5mm 1.3mm 0]}))
+let h = m.hinge(pa, pb, {at: [5mm 0 0] plate: 0.4mm})
+object(pa, name: "Probe")
+"#;
+
+    fn copy_done(d: &crate::model_host::Done) -> crate::model_host::Done {
+        crate::model_host::Done {
+            print_setup_seq: d.print_setup_seq, print_setup_failure: d.print_setup_failure.clone(),
+            person: d.person.clone(), id: d.id, ok: d.ok, text: d.text.clone(), images: d.images.clone(),
+            review: Default::default(), update: d.update.clone(), status: d.status.clone(), model_changed: d.model_changed,
+            check_slice: d.check_slice.clone(), source_files: d.source_files.clone(), source_problem: d.source_problem.clone(),
+            capped: d.capped.clone(),
+        }
+    }
+
+    struct CalibrationFleet {
+        app: crate::App,
+        fleet: FleetRuntime,
+        done: std::sync::mpsc::Receiver<crate::model_host::Done>,
+        _wake: std::sync::mpsc::Receiver<()>,
+        dir: PathBuf,
+        dirs: Arc<crate::dirs::FabDirs>,
+        last_setup_seq: Option<u64>,
+        coupons: Vec<(fab_calibrate::Step, fab_calibrate::CouponSetup, Arc<fab_calibrate::Coupon>)>,
+    }
+
+    impl CalibrationFleet {
+        fn new(dir: PathBuf) -> Self {
+            let (host_tx, done) = std::sync::mpsc::channel();
+            let (tx, events) = std::sync::mpsc::channel();
+            // Initialise the process-wide slice pool before the real Cx owns worker actions.
+            crate::live_slice::init_for_tests();
+            let mut runtime = super::slice_bench::SliceRuntime::with_events(move |event| {
+                if let Event::Actions(actions) = event {
+                    for a in actions {
+                        if let Some(crate::model_host::HostAction::Done(d)) = a.downcast_ref() {
+                            host_tx.send(copy_done(d)).unwrap();
+                        }
+                        if let Some(e) = a.downcast_ref::<PrintEvent>() { tx.send(e.clone()).unwrap(); }
+                    }
+                }
+            });
+            runtime.withhold_paint();
+            let dirs = Arc::new(crate::dirs::FabDirs::under(&dir));
+            let mut app = runtime.cx.with_vm(crate::App::script_new);
+            app.dirs = dirs.clone();
+            app.host = Some(crate::model_host::ModelHost::start_in(&runtime.cx, false, &dirs));
+            let base = virtual_printer::presets().remove(0);
+            let cat = Arc::new(catalog_in(&[], &dir, std::slice::from_ref(&base)).unwrap());
+            let mut saved = Saved::default();
+            for name in ["P", "Q"] {
+                let mut twin = cat.twins[&base.machine_preset_name()].printer.clone();
+                twin.name = format!("fixture-{name}");
+                twin.configured_for = Some(name.into());
+                saved.disconnected.insert(name.into());
+                saved.printers.push(twin);
+            }
+            app.printing = Printing { dirs: dirs.clone(), catalog: Some(cat), virtuals: Some(Arc::new(saved)), ..Default::default() };
+            app.state.print.settings = defaults_settings();
+            let _wake = manual_profiles(&mut app.printing);
+            let p = PrinterChoice::Real("P".into());
+            let q = PrinterChoice::Real("Q".into());
+            assert!(app.printing.link_printer(&mut app.state.print, &p));
+            app.printing.ensure_link(&mut app.state.print, &q).unwrap();
+            wait_for("both configured printers' stock", || {
+                app.printing.poll_printer(&mut app.state.print);
+                [&p, &q].into_iter().all(|id| app.state.print.printer_of(id)
+                    .is_some_and(|report| report.state.trays().next().is_some()))
+            });
+            app.printing.sync_calibration(&mut app.state.print);
+            for e in drain_cal(&app.printing, &dirs.calibration) { app.printing.event(&mut app.state.print, &e); }
+            let mut f = Self { app, fleet: FleetRuntime { runtime, events }, done, _wake, dir, dirs, last_setup_seq: None, coupons: Vec::new() };
+            f.app.push_print_setup();
+            f
+        }
+
+        #[track_caller]
+        fn deliver(&mut self, wanted: impl Fn(&crate::model_host::Done) -> bool) -> crate::model_host::Done {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                while let Ok(d) = self.done.try_recv() {
+                    if d.print_setup_seq.is_some() {
+                        self.last_setup_seq = d.print_setup_seq;
+                    }
+                    let hit = wanted(&d);
+                    self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(crate::model_host::HostAction::Done(Box::new(copy_done(&d))))]);
+                    if hit { return d; }
+                }
+                assert!(std::time::Instant::now() < deadline, "model worker did not deliver the requested completion (seq {}, waiting {}, gate {:?})", self.app.printing.print_setup_seq(), self.app.printing.calibration_pending(), self.app.plate.as_ref().and_then(|p|self.app.printing.plate_gate(&self.app.state.print, p)));
+                self.fleet.runtime.turn();
+            }
+        }
+
+        #[track_caller]
+        fn take_setup(&mut self) -> crate::model_host::Done {
+            let seq = self.app.printing.print_setup_seq();
+            self.deliver(|d| d.print_setup_seq == Some(seq))
+        }
+
+        fn open(&mut self, path: PathBuf) -> crate::model_host::Done {
+            let id = self.app.host.as_mut().unwrap().open(path, None);
+            self.deliver(|d| d.id == id)
+        }
+
+        fn resolve(&mut self) {
+            for e in drain_cal(&self.app.printing, &self.dirs.calibration) {
+                if let PrintEvent::CalibrationWritten { outcome, .. } = &e {
+                    match outcome {
+                        CalWriteOutcome::Saved { owner, preset, filament, step, values } => {
+                            assert!(!preset.is_empty() && !filament.is_empty() && !values.is_empty(), "saved {} under {:?} / {preset} / {filament}", step.title(), owner);
+                        }
+                        CalWriteOutcome::Cleared { owner, preset, step, has_preset_fallback } => {
+                            assert!(!preset.is_empty() && (owner.is_some() || !has_preset_fallback), "cleared {} from the captured target", step.title());
+                        }
+                        CalWriteOutcome::Failed(error) => panic!("calibration write failed: {error}"),
+                    }
+                }
+                self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(e)]);
+            }
+        }
+
+        fn save(&mut self, target: &str, step: fab_calibrate::Step, n: usize) {
+            let setup = self.app.printing.check_setup(&self.app.state.print);
+            let (preset, filament) = setup.calibration_names();
+            let cs = setup.coupon_setup();
+            let coupon = match self.coupons.iter().find(|(s, c, _)| *s == step && *c == cs) {
+                Some((_, _, coupon)) => coupon.clone(),
+                None => {
+                    let coupon = Arc::new(fab_calibrate::make(step, &cs).unwrap());
+                    self.coupons.push((step, cs, coupon.clone()));
+                    coupon
+                }
+            };
+            self.app.printing.save_calibration(&mut self.app.state.print, Some(owner(target)), preset, filament, coupon,
+                fab_calibrate::Answer::Number(n), "2026-01-01".into());
+        }
+
+        fn press(&mut self, action: PrintAction) {
+            self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(action)]);
+        }
+
+        fn card(&mut self) -> PrintAction {
+            self.press(PrintAction::AskPrint(true));
+            let p = &mut self.app.state.print;
+            p.print_options.plate_clear = true;
+            let Some(PrintConfirm::Filament(ticket)) = &p.confirm_print else { panic!("Print opens the target filament card") };
+            PrintAction::SendToPrinter { ticket: ticket.clone(), preview: p.preview.as_ref().unwrap().id }
+        }
+
+        fn check_hold(&mut self, start: &PrintAction, attempts: u64, gen: u64, stage: &str) {
+            self.press(PrintAction::AskPrint(true));
+            self.press(start.clone());
+            self.press(PrintAction::Export);
+            let app = &mut self.app;
+            let state = &mut app.state.print;
+            assert!(app.printing.last_attempt == attempts && app.printing.packaging.is_empty() && state.sending.is_empty() && app.printing.gen == gen,
+                "no old package started while {stage}");
+            assert!(!state.can_send(), "the settled plate cannot send while {stage}");
+            assert!(state.settled && !state.stale && state.confirm_print.is_some(), "waiting preserves the reviewed slice and card");
+            assert_eq!(state.calibration_pending, stage == LOADING_CALIBRATION, "profiles worker stage");
+            assert_eq!(state.calibration_plate_pending, stage == UPDATING_CALIBRATION_PLATE, "model worker stage");
+            assert!(!app.printing.confirm_slice(state, app.plate.as_ref()), "confirm waits without reslicing");
+            assert_eq!(app.printing.send_blocked(state), None, "waiting is not a refusal");
+            assert_eq!(state.export, ExportStatus::Exporting, "export stays held");
+            let snap = state.printer_of(&state.links.picked).unwrap();
+            assert!(panel::confirm_question(state, snap, false).0.contains(stage), "card names {stage}");
+            assert_eq!(panel::export_line(state), Some((format!("Exporting · {stage}…"), false)), "export names {stage}");
+        }
+        fn clear(&mut self, step: fab_calibrate::Step) {
+            self.app.printing.clear_calibration(&mut self.app.state.print, step);
+            self.resolve();
+        }
+
+        fn receive_slice(&mut self) -> Arc<Sliced> {
+            let gen = self.app.printing.slice_gen.expect("a fresh slice must have started");
+            let event = self.fleet.next(|e| matches!(e, PrintEvent::Sliced { gen: g, .. } if *g == gen));
+            self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(event)]);
+            assert!(self.app.state.print.can_send(), "the new slice must settle: {:?}", self.app.state.print.status);
+            self.app.printing.last.clone().unwrap()
+        }
+
+        fn finish_packages(&mut self) {
+            while !self.app.printing.packaging.is_empty() {
+                let event = self.fleet.next(|e| matches!(e, PrintEvent::Packaged { .. }));
+                self.app.handle_actions(&mut self.fleet.runtime.cx, &[Box::new(event)]);
+            }
+        }
+
+        fn exported(&mut self, slice: &Arc<Sliced>) -> PathBuf {
+            assert!(self.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::File(_)) && Arc::ptr_eq(&p.sliced, slice)),
+                "Export packages the expected settled geometry");
+            self.finish_packages();
+            let ExportStatus::Written(path) = &self.app.state.print.export else { panic!("Export did not finish: {:?}", self.app.state.print.export) };
+            assert!(path.metadata().unwrap().len() > 0, "Export wrote a nonempty package");
+            path.clone()
+        }
+
+        fn fresh_export(&mut self) -> Arc<Sliced> {
+            self.press(PrintAction::Export);
+            let slice = if self.app.printing.slice_gen.is_some() { self.receive_slice() } else { self.app.printing.last.clone().unwrap() };
+            self.exported(&slice);
+            slice
+        }
+
+        fn cancel_printer(&mut self) {
+            let id = self.app.state.print.sending.first().expect("Start print admitted a package").job.clone();
+            self.press(PrintAction::CancelSend(id));
+            self.finish_packages();
+        }
+
+        fn settle(&mut self) {
+            // Opening a plate discovers its colours, resolves its filament and submits its mapping.
+            // Dispatch those real worker completions before asking for the first print.
+            self.resolve();
+            while self.app.printing.plate_gate(&self.app.state.print, self.app.plate.as_deref().unwrap()).is_some() {
+                self.deliver(|d| d.update.is_some());
+                self.resolve();
+            }
+            // Wait for any in-flight PrintSetup on the same strand before recording a settled baseline.
+            if self.last_setup_seq != Some(self.app.printing.print_setup_seq()) {
+                let setup = self.take_setup();
+                assert!(setup.ok, "baseline model setup succeeds: {}", setup.text);
+            }
+            let ev = self.app.plate.clone().unwrap();
+            self.fleet.settle(&mut self.app.printing, &mut self.app.state.print, &ev);
+        }
+    }
+
+    #[test]
+    fn calibration_end_to_end_guards() {
+        let home = calibration_dir("calibration_end_to_end_guards");
+        {
+            let mut f = CalibrationFleet::new(home.clone());
+            phase_1_saved_plate(&mut f);
+            phase_2_hinge_clearance(&mut f);
+            phase_3_hinge_failure_and_recovery(&mut f);
+            phase_4_navigation_and_box(&mut f);
+            phase_5_machine_failures(&mut f);
+            f.finish_packages();
+            crate::live_slice::wait_idle();
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn assert_hinge_size(ev: &Evaluated, expected_layers: u32, expected_eye: f64, phase: &str) {
+        let makepad_csg_mech::JointGeom::Hinge { s0, s1, t_plate, c_z, .. } = &ev.mech[0].plan.joints[0] else {
+            panic!("{phase}: expected the calibrated hinge");
+        };
+        let thickness = s1 - s0;
+        let eye = thickness - 2.0 * (t_plate + c_z);
+        assert!((eye - expected_eye).abs() < 1e-6 && (thickness / ev.profile.layer - f64::from(expected_layers)).abs() < 1e-5,
+            "{phase}: thickness {thickness:.2} mm, plates {t_plate:.2} mm, axial gap {c_z:.2} mm, eye {eye:.2} mm, layer height {:.2} mm", ev.profile.layer);
+    }
+
+    fn phase_1_saved_plate(f: &mut CalibrationFleet) {
+        let model = fab_model::FabModel::with_script("hinge", "hinge.cad.splash", COMPACT_HINGE);
+        let path = f.dir.join("hinge.fab.splash");
+        fab_model::project::save(&model, &path).unwrap();
+        let open = f.open(path);
+        assert!(open.ok, "Phase 1: saved hinge opens: {}", open.text);
+        f.settle();
+        assert!(f.app.state.print.errors_text().is_none(), "Phase 1: compact hinge has no baseline printability error: {:?}", f.app.state.print.errors_text());
+        let app = &mut f.app;
+        let gen = app.printing.gen;
+        let before = app.plate.clone().unwrap();
+        assert_hinge_size(&before, 13, 1.00, "Phase 1 default geometry");
+        let slice = app.printing.last.clone().unwrap();
+        let revisions = crate::live_slice::revisions();
+        assert_eq!(gen, 1, "Phase 1: the first open creates one slice");
+        assert!(app.state.print.can_send(), "Phase 1: first open settles");
+        let original_parts: Vec<_> = before.plate.parts.iter().map(|p| (&p.object, &p.name)).collect();
+        let id = app.host.as_mut().unwrap().reload();
+        let reload = f.deliver(|d| d.id == id);
+        assert!(reload.ok, "Phase 1: saved hinge reloads: {}", reload.text);
+        let after = f.app.plate.as_ref().unwrap();
+        assert_eq!((after.content, crate::live_slice::plate_id(after)), (before.content, crate::live_slice::plate_id(&before)), "Phase 1: disk rebuild preserves printable geometry: profiles {:?} -> {:?}, parts {:?} -> {:?}, mapping equal {}", before.profile, after.profile, original_parts,
+            after.plate.parts.iter().map(|p| (&p.object, &p.name)).collect::<Vec<_>>(), before.mapped == after.mapped);
+        assert_eq!(f.app.printing.gen, gen, "Phase 1: identical disk rebuild starts zero slices");
+        assert!(f.app.state.print.can_send() && Arc::ptr_eq(f.app.printing.last.as_ref().unwrap(), &slice), "Phase 1: the settled package remains usable");
+        assert_eq!(crate::live_slice::revisions(), revisions, "Phase 1: no-op rebuild leaves the engine revisions unchanged");
+        f.app.push_print_setup();
+        assert!(f.take_setup().ok, "Phase 1: no-op setup completes");
+        assert_eq!(f.app.printing.gen, gen, "Phase 1: no-op setup starts zero slices");
+        assert!(f.app.state.print.can_send(), "Phase 1: no-op setup preserves the settled plate");
+    }
+
+    fn phase_2_hinge_clearance(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        let old = f.app.plate.clone().unwrap();
+        assert_eq!(old.profile.measured.c_xy, None, "Phase 2: hinge starts with default radial clearance");
+        let old_slice = f.app.printing.last.clone().unwrap();
+        let start = f.card();
+        let attempts = f.app.printing.last_attempt;
+        let gen = f.app.printing.gen;
+        f.save("P", Step::Clearance, 5);
+        f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+        f.resolve();
+        f.check_hold(&start, attempts, gen, UPDATING_CALIBRATION_PLATE);
+        assert!(f.take_setup().ok, "Phase 2: hinge rebuild completes");
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_eq!(ev.profile.measured.c_xy, Some(0.30), "Phase 2: rebuilt hinge uses the measured radial clearance");
+        assert_ne!(ev.content, old.content, "Phase 2: post-joint node keys distinguish the new hinge");
+        assert_ne!(crate::live_slice::plate_id(ev), crate::live_slice::plate_id(&old), "Phase 2: changed geometry changes the plate id");
+        assert_eq!(f.app.printing.last_attempt, attempts, "Phase 2: changed geometry drops the held start and export waits for the new slice");
+        assert!(f.app.state.print.sending.is_empty() && f.app.printing.gen > gen && f.app.printing.export_waits, "Phase 2: Export waits for the new generation and Start stays held back");
+        assert_eq!(f.app.state.print.print_blocked.get(&f.app.state.print.links.picked), Some(STALE_PREVIEW), "Phase 2: old preview is refused");
+        let new = f.receive_slice();
+        assert_ne!(new.preview.id, old_slice.preview.id, "Phase 2: replacement preview has a new id");
+        assert_ne!(new.settled.gcode.text().unwrap(), old_slice.settled.gcode.text().unwrap(), "Phase 2: joint clearance changes the sliced hinge");
+        f.exported(&new);
+        f.app.sync_confirm_card();
+        assert!(f.app.state.print.send_blocked.is_none(), "Phase 2: replacement slice enables Start print");
+        f.press(start);
+        assert!(f.app.state.print.sending.is_empty() && f.app.printing.packaging.is_empty(), "Phase 2: a press carrying the old hinge preview cannot package");
+        let start = f.card();
+        f.press(start);
+        assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &new)), "Phase 2: the fresh Start packages the new hinge");
+        f.cancel_printer();
+    }
+
+    fn phase_3_hinge_failure_and_recovery(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        assert!(f.app.state.print.can_send(), "Phase 3: Phase 2's settled hinge is ready");
+        let start = f.card();
+        let gen = f.app.printing.gen;
+        let attempt = f.app.printing.last_attempt;
+        let before = f.app.plate.clone().unwrap();
+        let old_slice = f.app.printing.last.clone().unwrap();
+        assert_eq!(before.profile.measured.c_z_layers, None, "Phase 3: baseline hinge uses the default Z gap");
+        f.save("P", Step::ZGap, 4);
+        f.check_hold(&start, attempt, gen, LOADING_CALIBRATION);
+        f.resolve();
+        assert!(f.app.state.print.calibration_plate_pending, "Phase 3: Z gap must reach the model worker before releasing held operations");
+        let d = f.take_setup();
+        f.app.sync_confirm_card();
+        assert!(!d.ok && d.update.is_none() && d.print_setup_seq == Some(f.app.printing.print_setup_seq()), "Phase 3: the active rebuild failed without replacing the plate");
+        let Some(crate::model_host::PrintSetupFailure::Eval(raw)) = &d.print_setup_failure else {
+            panic!("expected typed hinge failure, got {:?}: {}", d.print_setup_failure, d.text);
+        };
+        assert_eq!((&*raw.id, &*raw.op), ("h", "joint"), "Phase 3: the model worker identifies the failed joint");
+        assert!(raw.message.contains("2.60 mm along the pin leaves an eye of 0.20 mm (plates 0.40, gaps 0.80)"), "Phase 3: the four-layer gap leaves a 0.20 mm eye: {}", raw.message);
+        let recorded = f.app.printing.profile_rebuild_error.as_ref().expect("the app retains the typed failure");
+        assert_eq!(recorded.kind, RebuildFailureKind::Joint { parts: vec!["Probe pa".into(), "Probe pb".into()], kind: Some("hinge"), id: "h".into(),
+            reason: raw.message.lines().next().unwrap().trim().into() }, "Phase 3: typed failure identifies the affected printed part");
+        assert_eq!(recorded.source, raw.clone(), "Phase 3: typed failure retains the evaluator diagnostic");
+        assert_eq!(recorded.measured.c_z_layers, Some(4), "Phase 3: the typed failure retains the four-layer gap");
+        assert!((recorded.layer - 0.20).abs() < 1e-6, "Phase 3: the diagnostic uses the active layer height");
+        let state = &f.app.state.print;
+        let err = state.calibration_error.as_ref().expect("the person can see why the rebuild failed");
+        assert!(err.contains("Z gap 4 layers") && err.contains("0.80 mm") && !err.contains('\n'), "Phase 3: the diagnostic includes the axial gap on a single line");
+        assert_eq!(state.send_blocked.as_ref(), Some(err), "Phase 3: the confirm card explains the failed rebuild");
+        assert!(panel::confirm_question(state, state.target_printer().unwrap(), false).0.contains("failed to rebuild for this calibration"), "Phase 3: the question explains the failed rebuild");
+        let status = panel::slice_status(state).0;
+        assert!(status.starts_with("Export failed — calibration rebuild failed:") && status.contains("Probe pa") && status.contains("Z gap 4 layers"), "Phase 3: {status}");
+        assert!(panel::export_line(state).is_some_and(|(s, error)| error && s.starts_with("Export failed:") && s.contains("Probe pb") && s.contains("Z gap 4 layers")), "Phase 3: Export shows the affected part and gap");
+        let blocked = |app: &crate::App| {
+            assert_eq!(app.printing.gen, gen, "Phase 3: a failed profile may never slice the old hinge");
+            assert_eq!(app.printing.last_attempt, attempt, "Phase 3: a failed profile may never package the old hinge");
+            let p = &app.state.print;
+            assert!(p.sending.is_empty() && !p.can_send() && p.calibration_error.is_some() && !p.calibration_plate_pending, "Phase 3: failed geometry blocks admission with no work in flight");
+            assert!(matches!(p.status, SliceStatus::Failed(_)) && matches!(p.export, ExportStatus::Failed(_)), "Phase 3: slice and export retain the failure");
+        };
+        blocked(&f.app);
+        f.app.slice_view_follow(&mut f.fleet.runtime.cx);
+        blocked(&f.app);
+        for action in [PrintAction::Export, PrintAction::Slice, PrintAction::AskPrint(true), start] {
+            f.press(action);
+            blocked(&f.app);
+        }
+        f.app.request_reslice();
+        blocked(&f.app);
+        f.app.printing.live_input(&mut f.app.state.print, f.app.plate.as_ref(), Arc::from([]), None);
+        blocked(&f.app);
+        f.app.printing.confirm_slice(&mut f.app.state.print, f.app.plate.as_ref());
+        blocked(&f.app);
+        f.press(PrintAction::SetPlate("High Temp Plate".into()));
+        let retry = f.take_setup();
+        assert!(!retry.ok && retry.update.is_none(), "Phase 3: retry must rebuild even though its profile already matches");
+        assert!(matches!(&retry.print_setup_failure, Some(crate::model_host::PrintSetupFailure::Eval(e)) if e.id == "h" && e.op == "joint"), "Phase 3: the retry preserves the typed joint failure");
+        f.save("P", Step::Flow, 1);
+        f.resolve();
+        assert!(f.app.state.print.calibration_error.is_some() && !f.app.state.print.calibration_plate_pending, "Phase 3: Flow alone cannot repair hinge geometry");
+        assert_eq!(f.app.printing.gen, gen, "Phase 3: a Flow-only write starts no slice");
+
+        f.save("P", Step::ZGap, 1);
+        f.resolve();
+        f.app.handle_actions(&mut f.fleet.runtime.cx, &[Box::new(crate::model_host::HostAction::Done(Box::new(copy_done(&retry))))]);
+        assert!(f.app.state.print.calibration_error.is_none() && f.app.state.print.calibration_plate_pending, "Phase 3: an older failed completion cannot poison the corrected gap");
+        let corrected_setup = f.take_setup();
+        assert!(corrected_setup.ok, "Phase 3: one gap layer rebuilds the hinge: {}", corrected_setup.text);
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_hinge_size(ev, 13, 1.40, "Phase 3 corrected Z gap");
+        assert_eq!(ev.profile.measured.c_z_layers, Some(1), "Phase 3: the corrected profile uses one layer");
+        assert_ne!(ev.content, before.content, "Phase 3: the corrected gap changes the geometry");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: correcting the gap releases the typed failure");
+        let corrected = f.fresh_export();
+        assert_ne!(old_slice.settled.gcode.text().unwrap(), corrected.settled.gcode.text().unwrap(), "Phase 3: the corrected eye changes the exported G-code");
+        let assert_recovered = |f: &CalibrationFleet| {
+            let p = &f.app.state.print;
+            assert!(p.calibration_error.is_none() && !p.calibration_plate_pending && f.app.printing.profile_rebuild_error.is_none()
+                && f.app.printing.plate_gate(p, f.app.plate.as_ref().unwrap()).is_none(), "Phase 3: the rebuilt plate is ready");
+        };
+        let fail_again = |f: &mut CalibrationFleet| {
+            f.save("P", Step::ZGap, 4);
+            f.resolve();
+            assert!(!f.take_setup().ok && f.app.state.print.calibration_error.is_some(), "Phase 3: four gap layers fail on the thin hinge");
+        };
+        fail_again(f);
+        f.clear(Step::ZGap);
+        assert!(f.take_setup().ok && f.app.plate.as_ref().unwrap().profile.measured.c_z_layers.is_none(), "Phase 3: clearing the gap restores defaults");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: clearing the gap releases the typed failure");
+        assert_recovered(f);
+
+        // Recovery D: retarget to Q while P's four-layer gap fails on the 2.6 mm hinge.
+        fail_again(f);
+        let owner = EditOwner::new(PrinterScope::Target, &f.app.state.print);
+        f.press(PrintAction::LinkPrinter(owner, PrinterChoice::Real("Q".into())));
+        assert!(f.app.state.print.calibration_pending && f.app.state.print.calibration_error.is_none(), "Phase 3: Q starts with its own calibration");
+        f.resolve();
+        let q_setup = f.take_setup();
+        assert!(q_setup.ok && f.app.plate.as_ref().unwrap().profile.measured == Default::default(), "Phase 3: Q builds with its own default profile: {}", q_setup.text);
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: retarget releases P's failed calibration");
+        assert_recovered(f);
+        f.press(PrintAction::Export);
+        assert!(f.app.printing.slice_gen.is_some(), "Phase 3: Q can start exporting its recovered plate");
+        f.app.printing.stop_slice(&mut f.app.state.print);
+
+        // Returning to P reproduces P's persisted four-layer gap failure without rebuilding a throwaway baseline.
+        let owner = EditOwner::new(PrinterScope::Target, &f.app.state.print);
+        f.press(PrintAction::LinkPrinter(owner, PrinterChoice::Real("P".into())));
+        f.resolve();
+        assert!(!f.take_setup().ok && f.app.state.print.calibration_error.is_some(), "Phase 3: returning to P reproduces its four-layer failure");
+
+        // Recovery C: editing the model to 3.2 mm recovers under P's four-layer gap.
+        let id = f.app.host.as_mut().unwrap().set_source("hinge.cad.splash".into(), COMPACT_HINGE.replace("2.6mm", "3.2mm").replace("1.3mm", "1.6mm"));
+        let thick = f.deliver(|d| d.id == id);
+        assert!(thick.ok && f.app.plate.as_ref().unwrap().profile.measured.c_z_layers == Some(4), "Phase 3: a thicker part builds at four layers: {}", thick.text);
+        assert_hinge_size(f.app.plate.as_ref().unwrap(), 16, 0.80, "Phase 3 thicker edit");
+        assert!(f.app.printing.profile_rebuild_error.is_none(), "Phase 3: editing the model recovers without changing calibration");
+        assert_recovered(f);
+
+        // Plate switch under P's four-layer gap: beta builds cleanly and stays on the bed when reopening the 2.6 mm hinge fails.
+        let beta = f.dir.join("beta.cad.splash");
+        std::fs::write(&beta, "use mod.fab.*\nobject(mod.model.box({size: [1.2mm 0.2mm 1.2mm]}))").unwrap();
+        assert!(f.open(beta).ok && f.app.state.print.calibration_error.is_none(), "Phase 3: another plate builds under the failed hinge's calibration");
+        let path = f.dir.join("hinge.fab.splash");
+        assert!(!f.open(path).ok, "Phase 3: opening the thin hinge at four layers refuses its old geometry");
+    }
+
+    fn phase_4_navigation_and_box(f: &mut CalibrationFleet) {
+        use fab_calibrate::Step;
+        while f.fleet.events.try_recv().is_ok() {}
+        for step in [Step::Clearance, Step::ZGap, Step::Flow] {
+            f.app.printing.clear_calibration(&mut f.app.state.print, step);
+        }
+        f.resolve();
+        f.press(PrintAction::SetPlate("Textured PEI Plate".into()));
+        f.settle();
+        let seq = f.app.printing.calibration_seq;
+        let original = f.app.printing.check_setup(&f.app.state.print);
+        for shown in [Some(PrinterChoice::Real("Q".into())), None] {
+            f.press(PrintAction::ShowPrinter(shown));
+            let p = f.app.state.print.links.picked.clone();
+            fab::print::follow::reported(&mut f.app.state.print, &p, 5.0);
+            let app = &mut f.app;
+            assert!(!app.printing.sync_calibration(&mut app.state.print), "Phase 4: an unchanged target report requires no resolution");
+            assert_eq!(app.printing.calibration_seq, seq, "Phase 4: navigation and reports never queue a calibration read");
+            let current = app.printing.check_setup(&app.state.print);
+            assert_eq!(current.calibration_owner(), Some(&owner("P")), "Phase 4: the target owns the calibration");
+            assert_eq!(app.state.print.calibrate.owner_id.as_deref(), Some("printer:P"), "Phase 4: the calibration panel stays on the target");
+            assert_eq!(current.id(), original.id(), "Phase 4: showing another printer preserves the settled setup");
+            assert!(Arc::ptr_eq(&current.calibration, &original.calibration), "Phase 4: the immutable snapshot is retained");
+        }
+        let start = f.card();
+        let id = f.app.printing.check_setup(&f.app.state.print).id();
+        let seq = f.app.printing.calibration_seq;
+        let original_gen = f.app.printing.gen;
+        let original_slice = f.app.printing.last.clone().unwrap();
+        f.save("Q", fab_calibrate::Step::Flow, 1);
+        assert!(!f.app.state.print.calibration_pending && f.app.state.print.can_send(), "Phase 4: Q's save leaves P ready immediately");
+        f.press(PrintAction::AskPrint(true));
+        assert_eq!(f.app.printing.send_blocked(&f.app.state.print), None, "Phase 4: Q's queued write leaves P's card ready");
+        f.press(PrintAction::Export);
+        f.exported(&original_slice);
+        f.press(start);
+        assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &original_slice)),
+            "Phase 4: P starts the reviewed package while Q's write is queued");
+        f.cancel_printer();
+        f.resolve();
+        let (_, filament) = f.app.printing.check_setup(&f.app.state.print).calibration_names();
+        assert_eq!(fab_calibrate::Results::load_owner_in(&f.dirs.calibration, &owner("Q").id, &filament).get(fab_calibrate::results::names::FLOW_RATIO), Some(0.90), "Phase 4: Q owns its flow answer");
+        assert_eq!(f.app.printing.gen, original_gen, "Phase 4: P's slice stays settled through Q's write");
+        let start = f.card();
+        assert_eq!(f.app.printing.calibration_seq, seq, "Phase 4: Q's save never resolves P again");
+        assert_eq!(f.app.printing.check_setup(&f.app.state.print).id(), id, "Phase 4: Q's flow leaves P's slice key unchanged");
+        let attempts = f.app.printing.last_attempt;
+        let gen = f.app.printing.gen;
+        let sliced = f.app.printing.last.as_ref().unwrap().clone();
+        let plate_id = crate::live_slice::plate_id(f.app.plate.as_ref().unwrap());
+        f.save("P", fab_calibrate::Step::Clearance, 5);
+        f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+        f.resolve();
+        f.check_hold(&start, attempts, gen, UPDATING_CALIBRATION_PLATE);
+        let done = f.take_setup();
+        assert!(done.ok, "Phase 4: the box rebuilds: {}", done.text);
+        let ev = f.app.plate.as_ref().unwrap();
+        assert_eq!(ev.profile.measured.c_xy, Some(0.3), "Phase 4: box is rebuilt under P's clearance");
+        assert_eq!(crate::live_slice::plate_id(ev), plate_id, "Phase 4: fixed box geometry is unchanged");
+        assert_eq!(f.app.printing.gen, gen, "Phase 4: fixed box reuses the Normal mode slice");
+        assert!(f.app.state.print.can_send() && !f.app.state.print.calibration_plate_pending, "Phase 4: matching rebuild releases the card");
+        assert_eq!(f.app.state.print.sending.len(), 1, "Phase 4: the held start resumes exactly once");
+        let packages = &f.app.printing.packaging;
+        assert!(packages.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &sliced)), "Phase 4: Start uses the settled box");
+        assert!(packages.iter().any(|p| matches!(p.to, PackageFor::File(_)) && Arc::ptr_eq(&p.sliced, &sliced)), "Phase 4: Export uses the settled box");
+        use fab_calibrate::Answer;
+        f.cancel_printer();
+        for (step, target) in [(Step::Flow, Some(owner("P"))), (Step::PressureAdvance, None)] {
+            let setup = f.app.printing.check_setup(&f.app.state.print);
+            let before = setup.id();
+            let (preset, filament) = setup.calibration_names();
+            let coupon = Arc::new(fab_calibrate::make(step, &setup.coupon_setup()).unwrap());
+            let n = 2;
+            let start = f.card();
+            let attempts = f.app.printing.last_attempt;
+            let gen = f.app.printing.gen;
+            if target.is_none() {
+                f.app.printing.save_calibration(&mut f.app.state.print, None, "Unrelated preset".into(), filament.clone(),
+                    coupon.clone(), Answer::Number(n), "2026-01-01".into());
+                assert!(!f.app.state.print.calibration_pending && f.app.state.print.can_send(), "Phase 4: unrelated preset leaves P usable");
+                f.resolve();
+                assert_eq!(f.app.printing.check_setup(&f.app.state.print).id(), before, "Phase 4: the unrelated preset preserves the key");
+            }
+            f.app.printing.save_calibration(&mut f.app.state.print, target, preset, filament, coupon.clone(), Answer::Number(n), "2026-01-01".into());
+            f.check_hold(&start, attempts, gen, LOADING_CALIBRATION);
+            f.resolve();
+            assert_ne!(f.app.printing.check_setup(&f.app.state.print).id(), before, "Phase 4: a changed slicer value changes the input key for {step:?}");
+            assert_eq!(f.app.printing.last_attempt, attempts, "Phase 4: the old package is rejected before {step:?} reslices");
+            assert!(f.app.state.print.sending.is_empty() && f.app.state.print.confirm_print.is_some(), "Phase 4: the superseded Start leaves its confirm card open");
+            let p = &f.app.state.print.links.picked;
+            assert_eq!(f.app.state.print.print_blocked.get(p), Some(STALE_PREVIEW), "Phase 4: the changed settings require a fresh Start press");
+            assert!(f.app.printing.gen > gen && f.app.printing.export_waits, "Phase 4: Export waits for the new calibrated slice");
+            let new = f.receive_slice();
+            let path = f.exported(&new);
+            let mut file = std::fs::File::open(path).unwrap();
+            let zip = makepad_zip_file::zip_read_central_directory(&mut file).unwrap();
+            let entry = zip.file_headers.iter().find(|e| e.file_name == "Metadata/project_settings.config").unwrap().extract(&mut file).unwrap();
+            let config = makepad_strict_json::parse(&entry).unwrap();
+            let (key, expected) = match step {
+                Step::Flow => ("filament_flow_ratio", format!("{:.3}", coupon.variant(n).unwrap().value)),
+                _ => ("pressure_advance", format!("{:.4}", coupon.variant(n).unwrap().value)),
+            };
+            assert_eq!(config.get(key).and_then(|v| v.as_arr()).and_then(|a| a.first()).and_then(|v| v.as_str()), Some(expected.as_str()), "Phase 4: the exported package uses the resolved {key}");
+            if step == Step::Flow {
+                f.app.sync_confirm_card();
+                assert!(f.app.state.print.send_blocked.is_none(), "Phase 4: the new flow preview is ready to start");
+                let new_start = f.card();
+                f.press(new_start);
+                assert!(f.app.printing.packaging.iter().any(|p| matches!(p.to, PackageFor::Printer(_)) && Arc::ptr_eq(&p.sliced, &new)), "Phase 4: Start packages the new flow slice");
+                f.cancel_printer();
+            }
+        }
+    }
+
+    fn phase_5_machine_failures(f: &mut CalibrationFleet) {
+        use crate::model_host::{reason, PrintSetupFailure};
+        f.press(PrintAction::AskPrint(false));
+        f.clear(fab_calibrate::Step::Clearance);
+        assert!(f.take_setup().ok, "Phase 5: clear the box clearance before checking machine failures");
+        let ev = f.app.plate.clone().unwrap();
+        assert_eq!(ev.profile.measured, Default::default(), "Phase 5: the box uses default mechanics");
+        let imports = f.dir.join("fixture_home/presets");
+        let machines = imports.join("machine");
+        let filaments = imports.join("filament");
+        std::fs::create_dir_all(&machines).unwrap();
+        std::fs::create_dir_all(&filaments).unwrap();
+        let base = virtual_printer::presets().remove(0);
+        let long = format!("192.0.2.7-{}", "x".repeat(100));
+        let cases = [
+            ("Home Lab Printer", "home_lab.json", None),
+            ("Workshop Short", "workshop_short.json", Some("192.0.2.7")),
+            ("Workshop Long", "workshop_long.json", Some(long.as_str())),
+        ];
+        let write_machine = |name: &str, filename: &str, slot: Option<&str>| {
+            let slots = slot.map(|raw| format!(r#","fab_material_slots":["1:A1","{raw}"]"#)).unwrap_or_default();
+            std::fs::write(machines.join(filename), format!(r#"{{"type":"machine","name":"{name}","inherits":"{}"{slots}}}"#, base.machine_preset_name())).unwrap();
+        };
+        for (name, file, slot) in cases { write_machine(name, file, slot); }
+        write_machine("Live Preset", "live_preset.json", None);
+        std::fs::write(filaments.join("pla.json"), format!(r#"{{"type":"filament","name":"Fab PLA","inherits":"{}"}}"#, virtual_printer::filament_preset("PLA"))).unwrap();
+        f.app.printing.catalog = Some(Arc::new(catalog_in(&[], &imports, std::slice::from_ref(&base)).unwrap()));
+        std::fs::remove_file(machines.join("home_lab.json")).unwrap();
+        let snapshot = f.app.state.print.target_printer().unwrap().clone();
+        for (name, filename, slot) in cases {
+            let file = machines.join(filename);
+            f.app.state.print.settings.use_installed = true;
+            f.app.state.print.settings.machine = name.to_owned();
+            f.app.printing.sync_calibration(&mut f.app.state.print);
+            f.resolve();
+            let setup = f.app.printing.check_setup(&f.app.state.print);
+            let err = setup.machine_typed().expect_err("invalid installed machine must have a typed reason");
+            let expected = if let Some(raw) = slot {
+                assert!(matches!(&err, MachineError::InvalidMaterialSlots { preset, slot_index: Some(2), raw_entry: Some(value), .. } if preset == name && value == raw), "Phase 5: {err:?}");
+                format!("the printer preset `{name}` has an invalid `fab_material_slots` entry")
+            } else {
+                assert!(matches!(&err, MachineError::ResolvePreset { preset, detail } if preset == name && detail.contains(file.to_str().unwrap())), "Phase 5: {err:?}");
+                format!("could not read the printer preset `{name}`")
+            };
+            f.app.push_print_setup();
+            let d = f.take_setup();
+            assert!(matches!(&d.print_setup_failure, Some(PrintSetupFailure::Machine(e)) if e == &err), "Phase 5: worker preserves typed machine error");
+            let state = &f.app.state.print;
+            assert!(state.calibration_error.is_none() && !state.calibration_plate_pending && !state.can_send(), "Phase 5: machine failure appears on the printer's slice status");
+            for local in [err.local_message(), panel::slice_status(state).0, panel::confirm_question(state, &snapshot, false).0] {
+                assert!(local.contains(name) && !local.contains('\n'), "Phase 5: the local reason names its preset on one line: {local}");
+                if slot.is_none() { assert!(local.contains(file.to_str().unwrap()), "Phase 5: the local reason identifies the missing file: {local}"); }
+                else {
+                    assert!(local.contains("entry 2") && local.contains("192.0.2.7"), "Phase 5: the local reason identifies the failing slot: {local}");
+                    if slot == Some(&*long) { assert!(local.contains('…') && !local.contains(&"x".repeat(80)), "Phase 5: clip only the long slot: {local}"); }
+                }
+            }
+            f.app.printing.check_slice(31, state, &ev);
+            let PrintEvent::Checked { error: Some(checked), .. } = f.fleet.next(|e| matches!(e, PrintEvent::Checked { id: 31, .. })) else { panic!("checked error") };
+            let external = f.app.printing.external_slice_error(state).unwrap();
+            let read = makepad_strict_json::parse(br#"{"action":"read"}"#).unwrap();
+            let test_print = f.app.test_print_answer(&mut f.fleet.runtime.cx, &read);
+            let node = makepad_script::syntax::parse_value(&test_print.text).unwrap();
+            let read_error = node.field("error").unwrap().value.string().unwrap();
+            for (exit, result) in [
+                ("host completion", reason(&d.text)), ("check", checked), ("slice", external),
+                ("test_print read", read_error.into()), ("model job", setup.model_job(&ev).err().unwrap()),
+                ("job setup", setup.job_setup_of(&ev.plate, &ev.machine, None).err().unwrap()),
+            ] {
+                assert_eq!(result, expected, "Phase 5: {exit} carries the failing step and preset");
+            }
+            for text in std::iter::once(&*test_print.text).chain(f.app.state.ui.notices.iter().map(|n| n.text.as_str())) {
+                assert!(!["fixture_home", "home_lab.json", "192.0.2.7", "xxxx"].iter().any(|v| text.contains(v)), "Phase 5: private machine details in outbound context");
+            }
+        }
+        // The preset can disappear between the worker resolving calibration and rebuilding
+        // the plate. Exercise the failure with a settled preview already on the card.
+        let name = "Live Preset";
+        let file = machines.join("live_preset.json");
+        f.app.state.print.settings.machine = name.into();
+        f.app.state.print.settings.process = virtual_printer::PROCESS.into();
+        f.app.printing.load_base_values(&mut f.app.state.print);
+        // Apply the installed profile's tray mapping before capturing the coupon's filament.
+        f.app.remap();
+        f.app.printing.sync_calibration(&mut f.app.state.print);
+        f.settle();
+        let start = f.card();
+        let (gen, attempts) = (f.app.printing.gen, f.app.printing.last_attempt);
+        f.save("P", fab_calibrate::Step::Clearance, 5);
+        std::fs::remove_file(&file).unwrap();
+        f.resolve();
+        assert!(f.app.state.print.calibration_plate_pending, "Phase 5: the plate awaits its new clearance");
+        let failed = f.take_setup();
+        assert!(matches!(failed.print_setup_failure, Some(PrintSetupFailure::Machine(_))), "Phase 5: the worker reports a typed machine failure");
+        for action in [PrintAction::Slice, PrintAction::Export, PrintAction::AskPrint(true), start] {
+            f.press(action);
+            let state = &f.app.state.print;
+            assert!(!state.calibration_plate_pending && state.calibration_error.is_none() && !state.can_send(), "Phase 5: the invalid machine blocks the old plate");
+            assert_eq!((f.app.printing.gen, f.app.printing.last_attempt), (gen, attempts), "Phase 5: machine failure must never slice or package old geometry");
+        }
+        std::fs::write(&file, format!(r#"{{"type":"machine","name":"{name}","inherits":"{}"}}"#, base.machine_preset_name())).unwrap();
+        f.app.printing.load_base_values(&mut f.app.state.print);
+        f.app.remap();
+        f.resolve();
+        f.app.push_print_setup();
+        f.app.printing.sync_calibration_plate(&mut f.app.state.print, f.app.plate.as_deref(), true);
+        assert!(f.app.printing.machine_error().is_none() && f.app.state.print.calibration_plate_pending, "Phase 5: restored machine resumes the mismatched plate: error {:?}, phase one {}, plate {:?}, effective {:?}, settings {:?}", f.app.printing.machine_error(), f.app.state.print.calibration_pending, f.app.plate.as_ref().map(|p| &p.profile.measured), f.app.printing.check_setup(&f.app.state.print).mech_measured(), f.app.state.print.settings.machine);
+        assert!(f.take_setup().ok, "Phase 5: restored machine can rebuild the new clearance");
+        assert_eq!(f.app.plate.as_ref().unwrap().profile.measured.c_xy, Some(0.30), "Phase 5: restoring the machine applies the new clearance");
     }
 
     fn fleet_plate(printing: &Printing) -> Evaluated {
@@ -6136,7 +8375,7 @@ mod tests {
 
         fn settle(&mut self, printing: &mut Printing, state: &mut PrintState, plate: &Evaluated) {
             printing.slice(state, Some(&Arc::new(plate.clone())));
-            assert!(printing.slice_job.is_some(), "the mapped plate must reach the slicer");
+            assert!(printing.slice_job.is_some(), "the mapped plate must reach the slicer: {:?}, gate {:?}", state.status, printing.plate_gate(state, plate));
             while printing.slice_gen.is_some() && !state.settled {
                 while let Ok(event) = self.events.try_recv() {
                     if matches!(event, PrintEvent::Sliced { .. }) { printing.event(state, &event); }
@@ -9325,7 +11564,7 @@ pub(crate) mod slice_bench {
         let mut settings = defaults_settings();
         let colours = tool_colours(ev, None).model;
         settings.materials = colours.into_iter().enumerate().map(|(i, color)| JobMaterial { preset: String::new(), color, nozzle: i % 2, tray: None, dedicated: false }).collect();
-        CheckSetup { settings, catalog: None, mapping: Some(ev.mapped.clone()) }
+        CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings, catalog: None, mapping: Some(ev.mapped.clone()) }
     }
 
     /// What one Print editor slice showed: progress and the streamed layers over time.
@@ -9358,7 +11597,7 @@ pub(crate) mod slice_bench {
         let t0 = Instant::now();
         let (e2, s2) = (ev.clone(), setup.clone());
         let make: makepad_fab_slice::live::MakeInput = Arc::new(move || crate::live_slice::input_for(crate::live_slice::plate_id(&e2), &s2, Arc::new(e2.plate.printable()), e2.machine.clone(), Some(&e2.frames), Some(&e2.fields)));
-        let job = crate::live_slice::PrintJob { gen: 9, settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "bench".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+        let job = crate::live_slice::PrintJob { gen: 9, head_envelope: setup.head_envelope().to_path_buf(), settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "bench".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
         let mut last = String::new();
         let mut out = AppSlice { progress: Vec::new(), streamed: Vec::new(), shown: Vec::new(), stages: Vec::new(), bands: Vec::new(), seconds: 0.0, rebuilds: 0 };
         // The Print editor and its slice view, taking events as the app does.
@@ -9636,7 +11875,7 @@ pub(crate) mod slice_bench {
                 _ => {}
             }
         };
-        let job = crate::live_slice::PrintJob { gen: 0, settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(&ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "count".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+        let job = crate::live_slice::PrintJob { gen: 0, head_envelope: setup.head_envelope().to_path_buf(), settings: setup.settings.clone(), colours: setup.settings.materials.iter().map(|m| m.color).collect(), model_colours: tool_colours(&ev, None).model, shared_tools: Vec::new(), machine: ev.machine.clone(), name: "count".into(), objects: Arc::from([]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
         let sliced = finish_sliced(&job, &settled, Arc::from([]));
         (sliced, paths.expect("toolpaths"))
     }
@@ -9702,7 +11941,7 @@ pub(crate) mod slice_bench {
     fn sliced_and_changes(engine: &makepad_fab_slice::live::LiveEngine, rx: &std::sync::mpsc::Receiver<LiveEvent>, ev: &Arc<Evaluated>, state: &PrintState) -> (Arc<makepad_fab_slice::live::Settled>, Arc<makepad_fab_gcode::heads::Changes>) {
         let mut settings = defaults_settings();
         settings.materials = state.settings.materials.clone();
-        let setup = CheckSetup { settings, catalog: None, mapping: Some(ev.mapped.clone()) };
+        let setup = CheckSetup { dirs: Arc::default(), calibration: Arc::default(), settings, catalog: None, mapping: Some(ev.mapped.clone()) };
         engine.settle(1, crate::live_slice::input_for(crate::live_slice::plate_id(ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)));
         let (mut settled, mut changes) = (None, None);
         while settled.is_none() || changes.is_none() {
@@ -9760,19 +11999,23 @@ pub(crate) mod slice_bench {
             let event = runtime.recv(&slices);
             if matches!(event, PrintEvent::Sliced { gen, .. } if gen == generation) { break event; }
         };
+        let gen_before = printing.gen;
         assert!(printing.action(state, &PrintAction::AskPrint(true), Some(old)), "Print asks for a new slice");
         assert_eq!(state.status, waiting(colours), "an asked slice waits for the printer's colours");
         assert_eq!(printing.reask, Some(false));
-        assert!(!printing.slice_asked());
+        assert_eq!((printing.gen, printing.slice_gen), (gen_before, None), "no slice starts while the printer's colours are applied");
+        assert!(printing.slice_asked(), "a held Print press survives leaving Sliced view");
 
         let mut old_bed = (**rebuilt).clone();
         old_bed.machine.max_height += 1.0;
         printing.resume_asked(state, Some(&Arc::new(old_bed)));
         assert_eq!(state.status, waiting(bed), "the same ask also waits for the printer's bed");
         assert_eq!(printing.reask, Some(false));
+        assert_eq!((printing.gen, printing.slice_gen), (gen_before, None), "no slice starts while the printer's bed updates");
 
         assert_eq!(setup.plate_waits(rebuilt), None, "an equal mapping is ready even in a different Arc");
         assert!(printing.resume_asked(state, Some(rebuilt)));
+        assert_eq!(printing.slice_gen, Some(gen_before + 1), "resume_asked starts a fresh slice once the rebuilt plate lands");
         assert!(printing.slice_asked() && printing.reask.is_none());
         assert_eq!(printing.event(state, &slice_answer(printing.gen)), PrintOutcome::Target);
         assert!(matches!(state.status, SliceStatus::Done { .. }), "the resumed slice finished: {:?}", state.status);

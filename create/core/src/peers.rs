@@ -40,8 +40,6 @@ pub struct Device {
     /// Where this device was last reached, as this side saw it (see [`PathMemory`]). Old files
     /// have none, and such a device isn't reconnected.
     pub path: PathMemory,
-    /// The person disconnected: no reconnecting until they connect again. It survives a restart.
-    pub paused: bool,
     extra: Vec<String>,
 }
 
@@ -191,7 +189,7 @@ impl Peers {
             } else {
                 records.push_device(Device {
                     key, how, first: now, last: now, link_version: version, state: DeviceState::Active,
-                    checked: false, name: name.to_owned(), path: PathMemory::default(), paused: false, extra: Vec::new(),
+                    checked: false, name: name.to_owned(), path: PathMemory::default(), extra: Vec::new(),
                 });
             }
             Ok(())
@@ -219,22 +217,11 @@ impl Peers {
         })
     }
 
-    /// Pauses or resumes reconnecting to `key`.
-    pub fn set_paused(&mut self, key: &PublicKey, paused: bool) -> io::Result<()> {
-        if self.device(key).is_some_and(|d| d.paused == paused) {
-            return Ok(());
-        }
-        self.change(|records| {
-            records.device_mut(key)?.paused = paused;
-            Ok(())
-        })
-    }
-
     /// Resolve a key selected by the local fold or a local offer into a transport pin.
-    /// A member learned from the log can acquire a path later; pause and block always win.
+    /// A member learned from the log can acquire a path later; block always wins.
     pub fn carrier_pin(&self, key: PublicKey) -> Option<(Pin, PathMemory)> {
         match self.device(&key) {
-            Some(d) if d.paused || d.state != DeviceState::Active => None,
+            Some(d) if d.state != DeviceState::Active => None,
             Some(d) => Some((Pin { device: key, min_version: d.link_version }, d.path)),
             None => Some((Pin { device: key, min_version: crate::link::VERSION }, PathMemory::default())),
         }
@@ -341,10 +328,10 @@ impl Records {
                     _ => return Err("unknown checked value"),
                 };
                 let mut extra = extensions(extra)?;
-                let (path, paused) = take_path(&mut extra)?;
+                let path = take_path(&mut extra)?;
                 self.push_device(Device {
                     key, how, first, last, link_version: number(version, "invalid link version")?, state,
-                    checked, name: decode_name(name)?, path, paused, extra,
+                    checked, name: decode_name(name)?, path, extra,
                 });
             }
             ["v1", "device" | "town", ..] => return Err("too few record fields"),
@@ -377,7 +364,6 @@ impl Records {
                         crate::hex(&d.key), d.first, d.last, d.link_version).unwrap();
                     if let Some(addr) = d.path.addr { write!(text, " addr={addr}").unwrap(); }
                     if let Some(lan) = d.path.lan { write!(text, " lan={lan}").unwrap(); }
-                    if d.paused { text.push_str(" paused=1"); }
                     &d.extra
                 }
             };
@@ -449,21 +435,19 @@ fn decode_name(s: &str) -> Result<String, &'static str> {
 
 /// Takes the fields this version knows out of a device's extensions. A known field that doesn't
 /// parse is an error, like any other bad record.
-fn take_path(extra: &mut Vec<String>) -> Result<(PathMemory, bool), &'static str> {
-    let (mut path, mut paused) = (PathMemory::default(), false);
+fn take_path(extra: &mut Vec<String>) -> Result<PathMemory, &'static str> {
+    let mut path = PathMemory::default();
     let mut rest = Vec::new();
     for field in extra.drain(..) {
         let (key, value) = field.split_once('=').expect("extensions hold one '='");
         match key {
             "addr" => path.addr = Some(value.parse().map_err(|_| "invalid remembered address")?),
             "lan" => path.lan = Some(value.parse().map_err(|_| "invalid remembered LAN address")?),
-            "paused" if value == "1" => paused = true,
-            "paused" => return Err("invalid paused value"),
             _ => rest.push(field),
         }
     }
     *extra = rest;
-    Ok((path, paused))
+    Ok(path)
 }
 
 fn extensions(fields: &[&str]) -> Result<Vec<String>, &'static str> {
@@ -772,7 +756,7 @@ mod tests {
         remove_home(home);
     }
     #[test]
-    fn a_devices_remembered_path_and_pause_round_trip_and_old_files_still_load() {
+    fn a_devices_remembered_path_round_trips_and_old_files_still_load() {
         let home = test_home();
         let path = home.peers_path();
         let mut peers = Peers::create(&path).unwrap();
@@ -789,29 +773,26 @@ mod tests {
         assert_eq!(peers.device(&b).unwrap().path, PathMemory { lan: Some("192.0.2.12:6000".parse().unwrap()), ..seen },
             "an address that wasn't seen this time keeps its old value");
         assert!([a, b, c].into_iter().all(|k| peers.carrier_pin(k).is_some()));
-        peers.set_paused(&c, true).unwrap();
-        assert!(peers.carrier_pin(c).is_none());
         peers.set_state(&b, DeviceState::Blocked).unwrap();
         assert!(peers.carrier_pin(b).is_none());
         peers.set_state(&a, DeviceState::Removed).unwrap();
         assert_eq!(peers.carrier_pin(a), None, "nor a removed one");
-        assert!(peers.device(&c).unwrap().paused, "the pause is on the device");
         let reloaded = Peers::load(&path).unwrap();
-        assert_eq!(reloaded.devices(), peers.devices(), "the path and the pause survive a restart");
-        peers.set_paused(&c, false).unwrap();
-        assert_eq!(Peers::load(&path).unwrap().carrier_pin(c).map(|(p, _)| p.device), Some(c), "connecting again lifts the pause");
+        assert_eq!(reloaded.devices(), peers.devices(), "the path survives a restart");
+        assert_eq!(reloaded.carrier_pin(c).map(|(p, _)| p.device), Some(c), "an active peer stays pinned across reload");
 
         // A file from before these fields loads with none of them, and keeps fields it doesn't know.
         let public = crate::hex(&key(9));
-        let old = format!("v1 peers\nv1 device {public} words 10 20 7 active unchecked 61 port=70000 future=1\n");
+        let old = format!("v1 peers\nv1 device {public} words 10 20 7 active unchecked 61 paused=1 port=70000 future=1\n");
         let (stored, _) = protect_at_rest(PURPOSE, old.as_bytes()).unwrap();
         write_private(&path, &stored).unwrap();
         let mut peers = Peers::load(&path).unwrap();
         let device = peers.device(&key(9)).unwrap();
-        assert_eq!((device.path, device.paused), (PathMemory::default(), false), "an old record has no path and no pause");
-        peers.set_paused(&key(9), true).unwrap();
-        assert!(store_text(&path).ends_with(" paused=1 port=70000 future=1\n"), "an unknown field is kept after the known ones");
-        for bad in ["addr=nonsense", "lan=192.0.2.12", "paused=yes"] {
+        assert_eq!(device.path, PathMemory::default(), "an old record has no remembered path");
+        assert!(peers.carrier_pin(key(9)).is_some(), "a legacy pause does not suppress dialing");
+        peers.remember_path(&key(9), seen).unwrap();
+        assert!(store_text(&path).ends_with(" addr=192.0.2.7:4000 paused=1 port=70000 future=1\n"), "opaque legacy fields stay after the remembered address");
+        for bad in ["addr=nonsense", "lan=192.0.2.12"] {
             let text = format!("v1 peers\nv1 device {public} words 10 20 7 active unchecked 61 {bad}\n");
             let (stored, _) = protect_at_rest(PURPOSE, text.as_bytes()).unwrap();
             write_private(&path, &stored).unwrap();

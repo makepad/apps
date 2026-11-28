@@ -427,10 +427,16 @@ script_mod! {
                     draw_text.color: stage.glass_label
                     draw_text.text_style.font_size: 7
                 }
+                // Where the clip came from ("node 42 · model"), or a pending
+                // clip's progress. Fixed glass ink: it sits on the picture.
                 grid_sub := Label{
                     visible: false
                     width: Fill
+                    flow: Flow.Right{wrap: false}
+                    max_lines: 1
                     text: ""
+                    draw_text.color: stage.glass_ink_soft
+                    draw_text.text_style.font_size: 6
                 }
             }
             grid_busy := TileBusy{}
@@ -1286,6 +1292,18 @@ pub fn pad_entry_index(first_col: usize, pad: usize) -> usize {
     (first_col + slot) * PAD_ROWS + row
 }
 
+/// The entry pad `pad` paints from the bank at `first_col`: anything but a
+/// reserved placeholder (pending clips and prefabs included).
+fn pad_paints(entries: &[GridEntry], first_col: usize, pad: usize) -> Option<&GridEntry> {
+    entries.get(pad_entry_index(first_col, pad)).filter(|entry| !entry.placeholder)
+}
+
+/// The entry a click on pad `pad` acts on: a painted one that is not
+/// pending (see [`GridEntry::pending`]).
+fn pad_acts_on(entries: &[GridEntry], first_col: usize, pad: usize) -> Option<&GridEntry> {
+    pad_paints(entries, first_col, pad).filter(|entry| !entry.pending)
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct VjPadMatrix {
     #[deref]
@@ -1431,13 +1449,12 @@ impl VjPadMatrix {
     /// The entry a pad ACTS on: a prefab cell is drawn but not yet clickable
     /// (see [`GridEntry::pending`]), so it is not one.
     pub fn visible_at(&self, pad: usize) -> Option<&GridEntry> {
-        self.paint_at(pad).filter(|entry| !entry.pending)
+        pad_acts_on(&self.entries, self.bank, pad)
     }
 
     /// The entry a pad PAINTS — prefabs included.
     pub fn paint_at(&self, pad: usize) -> Option<&GridEntry> {
-        self.entry_at(pad_entry_index(self.bank, pad))
-            .filter(|entry| !entry.placeholder)
+        pad_paints(&self.entries, self.bank, pad)
     }
 
     pub fn len(&self) -> usize {
@@ -1472,6 +1489,9 @@ impl VjPadMatrix {
                 let mut cell = row_view.view(cx, *path);
                 let (selected, empty, has_thumb, fill, aspect) = if let Some(entry) = self.paint_at(pad) {
                     cell.label(cx, ids!(grid_title)).set_text(cx, &entry.title);
+                    let sub = cell.label(cx, ids!(grid_sub));
+                    sub.set_visible(cx, !entry.sub.is_empty());
+                    sub.set_text(cx, &entry.sub);
                     demand.note(entry, now);
                     let frame = entry_frame(entry, now, pad);
                     let aspect = thumb_aspect(cx, frame.as_ref());
@@ -1503,6 +1523,9 @@ impl VjPadMatrix {
                 } else {
                     // No content: a quiet, greyed placeholder, not a black pad.
                     cell.label(cx, ids!(grid_title)).set_text(cx, "");
+                    let sub = cell.label(cx, ids!(grid_sub));
+                    sub.set_visible(cx, false);
+                    sub.set_text(cx, "");
                     let image = cell.image(cx, ids!(grid_thumb));
                     image.set_visible(cx, false);
                     image.set_texture(cx, None);
@@ -1875,5 +1898,60 @@ mod pad_matrix_tests {
         // the 50 loaded entries (10 columns, which would fill most of the
         // track instead of floor at the minimum).
         assert_eq!(w, SCROLL_THUMB_MIN);
+    }
+
+    fn entry(byte: u8, pending: bool, loading: bool, failed: bool) -> GridEntry {
+        GridEntry {
+            asset: AssetId::from_bytes([byte; 16]),
+            title: format!("clip {byte}"),
+            sub: if pending { "queued".into() } else { "node 42 · fasth3-4step-q4-24g".into() },
+            state: String::new(),
+            texture: None,
+            frames: Vec::new(),
+            fps: 0.0,
+            cells: false,
+            loading,
+            failed,
+            active: false,
+            live: false,
+            placeholder: false,
+            pending,
+            fx: false,
+        }
+    }
+
+    #[test]
+    fn pending_pad_entries_prepend_and_stay_unclickable() {
+        // A generating clip and a failed one head the strip, then two
+        // published clips. Pads fill column by column: pad 0 is entry 0,
+        // pad PAD_COLS (the row below) is entry 1, and so on. The matrix's
+        // `paint_at` / `visible_at` are exactly these two functions.
+        let entries = vec![
+            entry(1, true, true, false),
+            entry(2, true, false, true),
+            entry(3, false, false, false),
+            entry(4, false, false, false),
+        ];
+        let paint_at = |pad| pad_paints(&entries, 0, pad);
+        let visible_at = |pad| pad_acts_on(&entries, 0, pad);
+        let pads: Vec<usize> = (0..4).map(|row| row * PAD_COLS).collect();
+        // The pending pads paint, flags intact…
+        let running = paint_at(pads[0]).expect("a running clip paints");
+        assert!(running.pending && running.loading && !running.failed);
+        assert_eq!(running.sub, "queued");
+        assert!(entry_spins(running), "a running clip's ring turns");
+        let failed = paint_at(pads[1]).expect("a failed clip paints");
+        assert!(failed.pending && failed.failed && !failed.loading);
+        assert!(!entry_spins(failed), "a failed ring is still");
+        // …but no click acts on them.
+        assert!(visible_at(pads[0]).is_none());
+        assert!(visible_at(pads[1]).is_none());
+        // The published clips below them are clickable, captions bound.
+        let published = visible_at(pads[2]).expect("a published clip acts");
+        assert_eq!(published.asset, AssetId::from_bytes([3; 16]));
+        assert_eq!(published.sub, "node 42 · fasth3-4step-q4-24g");
+        assert_eq!(visible_at(pads[3]).map(|e| e.asset), Some(AssetId::from_bytes([4; 16])));
+        // A pad past the end paints nothing.
+        assert!(paint_at(1).is_none());
     }
 }

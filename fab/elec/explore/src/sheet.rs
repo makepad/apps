@@ -1638,7 +1638,8 @@ fn blocks_layout(g: &LayoutGraph, o: &Opts) -> SheetLayout {
             top += 2;
             let mut previous = None;
             for (&c, terms) in &mut by_channel {
-                let x = channels[c as usize].x0 + 1;
+                // The bridge ends on the wall; the first vertical track is one step inside.
+                let x = channels[c as usize].x0;
                 let at = [x, top];
                 terms.push(Term { at, face: Face::East });
                 if let Some(last) = previous { root.wire(net, vec![last, at]); }
@@ -1652,25 +1653,46 @@ fn blocks_layout(g: &LayoutGraph, o: &Opts) -> SheetLayout {
     root.junctions = routed.junctions.into_iter().filter(|(n, _)| *n < BUS).collect();
     for piece in boxes { root.absorb(piece); }
 
-    let mut anchors = BTreeMap::new();
+    let mut anchors: BTreeMap<u32, (i32, Pt, Pt, f64)> = BTreeMap::new();
     let mut obstacles: Vec<_> = root.frames.iter().map(|(_, f)| Obstacle::Box { b: f.rect.map(f64::from), owner: u32::MAX }).collect();
-    for wire in &root.wires {
-        for seg in wire.pts.windows(2) {
+    let runs = root.wires.iter().map(|r| (r, r.net, 0.05))
+        .chain(root.buses.iter().map(|r| (r, BUS + r.net, 0.15)));
+    for (run, key, half) in runs {
+        for seg in run.pts.windows(2) {
             let [a, b] = [seg[0], seg[1]];
-            obstacles.push(Obstacle::Seg { a: a.map(f64::from), b: b.map(f64::from), half: 0.05, owner: wire.net });
-            if g.nets[wire.net as usize].kind != NetKind::Ground {
-                let length = (a[0]-b[0]).abs() + (a[1]-b[1]).abs();
-                let anchor = anchors.entry(wire.net).or_insert((0, a));
-                if length > anchor.0 { *anchor = (length, [(a[0]+b[0])/2, (a[1]+b[1])/2]); }
+            obstacles.push(Obstacle::Seg { a: a.map(f64::from), b: b.map(f64::from), half, owner: u32::MAX });
+            if key >= BUS || g.nets[key as usize].kind != NetKind::Ground {
+                let length = (a[0] - b[0]).abs() + (a[1] - b[1]).abs();
+                let entry = anchors.entry(key).or_insert((0, a, b, half));
+                if length > entry.0 { *entry = (length, a, b, half); }
             }
         }
     }
     let mut requests = Vec::new();
     let mut names = Vec::new();
-    for (net, (_, [x,y])) in anchors {
-        let text = rail_label(&g.nets[net as usize]);
-        requests.push(LabelReq { anchor: [x,y,x,y].map(f64::from), size: [text_w(&text, TEXT_NET), TEXT_NET],
-            spots: vec![Spot::Above, Spot::Below], priority: 0, owner: net, optional: false });
+    for (i, (key, (_, a, b, half))) in anchors.into_iter().enumerate() {
+        let (net, text) = if key >= BUS {
+            let bus = &g.buses[(key - BUS) as usize];
+            (bus.nets[0], bus.name.clone())
+        } else {
+            (key, rail_label(&g.nets[key as usize]))
+        };
+        let pad = half + 1e-6;
+        let horizontal = a[1] == b[1];
+        let anchor = if horizontal {
+            [a[0].min(b[0]) as f64, a[1] as f64 - pad, a[0].max(b[0]) as f64, a[1] as f64 + pad]
+        } else {
+            [a[0] as f64 - pad, a[1].min(b[1]) as f64, a[0] as f64 + pad, a[1].max(b[1]) as f64]
+        };
+        let spots = if horizontal {
+            vec![Spot::Above, Spot::Below, Spot::Right, Spot::Left]
+        } else {
+            vec![Spot::Right, Spot::Left, Spot::Above, Spot::Below]
+        };
+        requests.push(LabelReq {
+            anchor, size: [text_w(&text, TEXT_NET), TEXT_NET],
+            spots, priority: 0, owner: i as u32, optional: false,
+        });
         names.push((net, text));
     }
     let labels = labels::place_labels(&requests, &obstacles, &LabelOpts::default());
@@ -3466,22 +3488,29 @@ let gnd = e.net({name: "GND" kind: @ground})
 let reg = ldo({vin: input vout: output gnd: gnd})
 let ctl = load({v: output g: gnd})
 let data = e.bus("DATA", 2)
-let driver = e.block({name: "Sender" planned: true ports: {tx: e.port(@out, {width: 2})}})
-let sender = driver({tx: data})
+let ack = e.net({name: "ACK"})
+let ready = e.net({name: "READY"})
+let driver = e.block({name: "Sender" planned: true ports: {tx: e.port(@out, {width: 2}) ack: e.port(@bidi) ready: e.port(@bidi)}})
+let sender = driver({tx: data ack: ack ready: ready})
 "#.to_owned();
         if second {
             text.push_str(r#"let other = ldo({vin: input vout: output gnd: gnd})
-let receiver = e.block({name: "Receiver" planned: true ports: {a: e.port(@in) b: e.port(@in)}})
-let sink = receiver({a: data[0] b: data[1]})
+let receiver = e.block({name: "Receiver" planned: true ports: {a: e.port(@in) b: e.port(@in) ack: e.port(@bidi) ready: e.port(@bidi)}})
+let sink = receiver({a: data[0] b: data[1] ack: ack ready: ready})
 "#);
         } else {
-            text.push_str(r#"let receiver = e.block({name: "Receiver" planned: true ports: {rx: e.port(@in, {width: 2})}})
-let sink = receiver({rx: data})
+            text.push_str(r#"let receiver = e.block({name: "Receiver" planned: true ports: {rx: e.port(@in, {width: 2}) ack: e.port(@bidi) ready: e.port(@bidi)}})
+let sink = receiver({rx: data ack: ack ready: ready})
 "#);
         }
         src.add("device.ckt.splash", text).unwrap();
-        let ev = evaluate(&src, &std_libs()).expect("the realized regulator and planned load must evaluate");
-        crate::adapt::graph_of(&ev.design.units[0].circuit, &Default::default())
+        let mut ev = evaluate(&src, &std_libs()).expect("the realized regulator and planned load must evaluate");
+        let circuit = std::sync::Arc::make_mut(&mut ev.design.units[0].circuit);
+        if second {
+            let reg = circuit.tree.iter_mut().find(|b| b.path == "reg").expect("the realized LDO must exist");
+            reg.ports.reverse();
+        }
+        crate::adapt::graph_of(circuit, &Default::default())
     }
 
     #[test]
@@ -3491,6 +3520,14 @@ let sink = receiver({rx: data})
             let g = architecture(second);
             let sheet = layout_graph(&g, &opts);
             assert_eq!(sheet, layout_graph(&g, &opts), "identical architecture must lay out identically");
+            for label in &sheet.labels {
+                for run in sheet.wires.iter().chain(&sheet.buses) {
+                    for seg in run.pts.windows(2) {
+                        assert!(segment_box_distance(seg[0], seg[1], label.bx) > 0.0,
+                            "label {:?} must stay clear of the segment {:?}, including on its own net", label.lines, seg);
+                    }
+                }
+            }
             assert!(sheet.parts.iter().all(|p| !p.placed), "opaque blocks must hide their components");
             let frames: Vec<_> = sheet.frames.iter().skip(1).filter(|f| f.placed).collect();
             assert_eq!(frames.len(), if second { 5 } else { 4 }, "each direct child must have a frame");
@@ -3504,6 +3541,7 @@ let sink = receiver({rx: data})
                 for p in &f.ports {
                     assert!(match p.side { Side::Left => p.at[0] == l, Side::Right => p.at[0] == r, Side::Bottom => p.at[1] == b, Side::Top => p.at[1] == t },
                         "{} must lie on its frame edge", p.name);
+                    assert_eq!(p.ground, matches!(p.name.as_str(), "g" | "gnd"), "ground must follow the declared port name even after reordering bindings");
                     assert!(!p.ground || p.side == Side::Bottom, "ground must leave by the bottom");
                 }
             }
@@ -3514,6 +3552,24 @@ let sink = receiver({rx: data})
             let data = g.buses.iter().find(|bus| bus.name == "DATA").expect("the signal bus must survive adaptation");
             let terminal = |name: &str| frames.iter().flat_map(|f| &f.ports).find(|p| p.name == name).unwrap().at;
             if second {
+                // The split data bus orders the sender and receiver in separate columns.
+                // ACK and READY leave both boxes on the right, bridging two channels.
+                let roof = frames.iter().map(|f| f.rect[3]).max().unwrap();
+                for name in ["ACK", "READY"] {
+                    let net = g.nets.iter().find(|n| n.name == name).unwrap().key;
+                    let bridge = sheet.wires.iter().filter(|w| w.net == net && w.pts.len() == 2
+                        && w.pts[0][1] > roof && w.pts[0][1] == w.pts[1][1])
+                        .max_by_key(|w| (w.pts[1][0] - w.pts[0][0]).abs())
+                        .unwrap_or_else(|| panic!("{name} must bridge above the frames"));
+                    for &[x, y] in &bridge.pts {
+                        let crosses = |w: &Run| w.pts.windows(2).any(|s| s[0][0] == x && s[1][0] == x
+                            && (s[0][1].min(s[1][1])..=s[0][1].max(s[1][1])).contains(&y));
+                        assert!(!sheet.wires.iter().filter(|w| w.net != net).chain(&sheet.buses).any(crosses),
+                            "no other net's channel track may run through the {name} bridge terminal at ({x}, {y})");
+                        assert!(frames.iter().any(|f| f.rect[2] == x),
+                            "the {name} bridge terminal at ({x}, {y}) must lie on the right edge of its block column");
+                    }
+                }
                 for (i, name) in ["a", "b"].iter().enumerate() {
                     for at in [terminal(&format!("tx[{i}]")), terminal(name)] {
                         assert!(sheet.wires.iter().any(|w| w.net == data.nets[i] && w.pts.contains(&at)),
@@ -3521,6 +3577,14 @@ let sink = receiver({rx: data})
                     }
                 }
             } else {
+                let label = sheet.labels.iter().find(|l| l.owner == Owner::Net(data.nets[0])
+                    && l.lines.iter().any(|(name, _)| name == "DATA")).expect("the bundled bus must have its name on the sheet");
+                assert!(frames.iter().all(|f| item_box_distance(f.rect.map(f64::from), label.bx) > 0.0),
+                    "the bus name must stay clear of every block frame");
+                for other in sheet.labels.iter().filter(|l| matches!(l.owner, Owner::Net(n) if n != data.nets[0])) {
+                    assert!(sheet.buses.iter().flat_map(|w| w.pts.windows(2)).all(|s| segment_box_distance(s[0], s[1], other.bx) > 0.15),
+                        "rail and signal labels must stay clear of the bundled bus: {:?}", other.lines);
+                }
                 for at in [terminal("tx"), terminal("rx")] {
                     assert!(sheet.buses.iter().any(|w| w.pts.contains(&at)), "a whole bus must connect both frame ports");
                 }

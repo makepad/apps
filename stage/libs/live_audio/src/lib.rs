@@ -33,7 +33,7 @@ pub use paged::{
     AudioNote, AudioNoteKind, AudioNotes, DurableGap, LoopRefusal, LoopRejection, LoopRequest, PageOp, PageOpKind, PageOutcome, PageRefusal, PagedCommand, PagedCounts, PagedFrontier, PagedLoop,
     PagedReadiness, PagedSource, PagedSourceKey, PagedStart, PagedTerminal, PrepareRefusal, StemPolicy, stem_cushion_limit, MAX_STEM_CUSHION_SECS, MAX_PAGED_NOTES, PAGED_GROUP_PAGES, PAGE_OPS_PER_BUFFER, PAGE_ROUTES,
 };
-pub use engine::{AudioEngine, ClockTelemetry, DeckObservation, DeckStatus, SlotTelemetry, Telemetry};
+pub use engine::{AudioEngine, ClockTelemetry, DeckObservation, DeckStatus, RenderChunk, SlotTelemetry, Telemetry};
 pub use nodes::{register, OWNER};
 pub use runtime::{audio_owner, AudioDevice, AudioOwner, AudioDeckObservation, AudioRuntime, AudioTransportClock, DeckExchange, DeckExchangeCancel, PagedReceipt, EXCHANGED_CONTROLS};
 

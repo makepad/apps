@@ -100,7 +100,6 @@ pub enum CheckKind {
 impl Canon for CheckKind {
     fn canon(&self, w: &mut Writer) {
         match self {
-            CheckKind::OpenPort => w.tag(254),
             CheckKind::Custom(s) => {
                 w.tag(255);
                 s.canon(w)

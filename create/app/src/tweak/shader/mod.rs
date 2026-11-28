@@ -157,7 +157,7 @@ impl ShaderTab {
         let mut lines = Vec::new();
         if !layer.consts.is_empty() {
             lines.push(PropLine::Header { title: "Shader constants".into(),
-                count: layer.consts.len().to_string(), open: Some(self.consts_open) });
+                count: layer.consts.len().to_string(), open: Some((super::props::view::HeaderId::ShaderConstants, self.consts_open)) });
             if self.consts_open {
                 lines.extend(layer.consts.iter().map(|c| PropLine::Info {
                     name: c.name.clone(), value: c.value.clone(), loc: c.loc.clone(),

@@ -205,7 +205,8 @@ fn removable(app: &TestApp, name: &str) -> bool {
 fn lit(app: &TestApp) -> (Vec<String>, Vec<String>) {
     let list = override_rows(app).into_iter().filter(|r| r.2).map(|r| r.0).collect();
     let nodes = app.widget_snapshot().nodes();
-    let features = nodes.iter().find(|w| w.visible() && w.role == Role::List && w.name == "Features");
+    // Parts embeds the feature tree as an item in its list of rows.
+    let features = nodes.iter().find(|w| w.visible() && w.role == Role::ListItem && w.name == "Features");
     let tree = nodes.iter().filter(|w| w.visible() && w.states.contains(States::SELECTED)
         && (w.role == Role::TreeItem || features.is_some_and(|f| f.children.contains(&w.id))))
         .map(|w| w.name.clone()).collect();

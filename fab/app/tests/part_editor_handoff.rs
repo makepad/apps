@@ -99,6 +99,8 @@ fn the_picked_parts_editor_follows_the_plate_width() {
         app.press_key(KeyCode::Backtick);
         editor(&app, false);
         let view = viewport(&app, 581.0);
+        let workspaces = prefs.with_extension("workspaces.ron");
+        let before_drag = std::fs::read_to_string(&workspaces).expect("saved workspaces before the sash drag");
 
         // Keep the same pointer down across both thresholds and the return through the band.
         let mut sash = app.press_at(f64::from(view.x + view.w + 1.5), f64::from(view.center().1));
@@ -111,9 +113,18 @@ fn the_picked_parts_editor_follows_the_plate_width() {
             editor(&app, sidebar);
         }
         sash.release();
-        let saved = std::fs::read_to_string(prefs.with_extension("workspaces.ron")).expect("saved workspaces");
-        assert!(!saved.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Part"),
-            "the saved workspace contains the transient Part tab");
+        app.wait_until(|| {
+            let saved = match std::fs::read_to_string(&workspaces) {
+                Ok(text) => text,
+                Err(err) => return Some(format!("waiting to read the workspace after the sash drag: {err}")),
+            };
+            if saved == before_drag {
+                return Some("waiting for the sash drag to change the saved workspace".to_owned());
+            }
+            assert!(!saved.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Part"),
+                "the saved workspace contains the transient Part tab");
+            None
+        });
 
         app.press_key(KeyCode::Backtick);
         editor(&app, true);

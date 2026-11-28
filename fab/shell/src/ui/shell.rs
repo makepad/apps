@@ -14,7 +14,7 @@
 
 use crate::api::*;
 use crate::print::trays::DrawFabChip;
-use crate::ui::review_strip::ReviewStrip;
+use crate::ui::review_strip::{ReviewNext, ReviewStrip};
 use fab_elec_view::snapshot::{ElecLive, ProposalId, ProposalView};
 use std::sync::{Arc, Weak};
 use crate::ui::device3d::FabDevice3d;
@@ -75,22 +75,33 @@ script_mod! {
         draw_bg +: {
             border_size: 0.0
             border_radius: fab.radius
-            color: theme.prop_field
-            color_hover: theme.prop_field_hover
-            color_focus: theme.prop_field_hover
+            color: fab.color_input_field
+            color_hover: fab.color_input_field_hover
+            color_focus: fab.color_input_field_hover
             color_down: theme.prop_field_active
-            arrow_color: fab.color_text_dim
-            arrow_color_hover: fab.color_text_dim
+            arrow_color: fab.color_text_input_dim
+            arrow_color_hover: fab.color_text_input_dim
         }
         input +: {
             draw_text +: {
-                color: fab.color_text
-                color_hover: fab.color_text
-                color_focus: fab.color_text
-                color_down: fab.color_text
+                color: fab.color_text_input
+                color_hover: fab.color_text_input
+                color_focus: fab.color_text_input
+                color_down: fab.color_text_input
                 text_style: theme.font_code{font_size: fab.font_size_ui}
             }
         }
+    }
+
+    mod.widgets.BenchJackLoad = mod.widgets.BenchJackLoad{
+        draw_bg +: {
+            color: fab.color_input_field color_hover: fab.color_input_field_hover color_focus: fab.color_input_field
+            arrow_color: fab.color_text_input arrow_color_hover: fab.color_text_input_hover
+        }
+        input +: {draw_text +: {
+            color: fab.color_text_input color_hover: fab.color_text_input_hover
+            color_focus: fab.color_text_input color_down: fab.color_text_input_down
+        }}
     }
 
     // A dock tab: the panel's name, half-way between the dim and the body ink at rest (a name to
@@ -529,6 +540,9 @@ script_mod! {
                             a_arch_tip := FabTip{ place: TipPlace.Right text: "Draft architecture"
                                 a_arch := StripAct{ a11y: {label: "Draft architecture"} draw_icon +: {svg: crate_resource("self://resources/icons/spark.svg")} }
                             }
+                            a_schematic_tip := FabTip{ place: TipPlace.Right text: "Draft schematic"
+                                a_schematic := StripAct{ a11y: {label: "Draft schematic"} draw_icon +: {svg: crate_resource("self://resources/icons/split_pins.svg")} }
+                            }
                             FabTip{ place: TipPlace.Right text: "Place a part (A): opens the Library with the cursor in its search"
                                 a_place := StripAct{ a11y: {label: "Place part"} draw_icon +: { svg: crate_resource("self://resources/icons/add.svg") } }
                             }
@@ -603,6 +617,8 @@ script_mod! {
                 }
                 // Fab's corners, never the sheet's raw one (square on a square sheet)
                 Bench := BenchSetup{
+                    color_card: fab.color_field
+                    color_text: fab.color_text color_dim: fab.color_text_dim color_muted: fab.color_text_dim
                     radius: fab.radius radius_lg: fab.radius_lg
                     controls_panel +: {radius: fab.radius radius_lg: fab.radius_lg}
                 }
@@ -645,13 +661,38 @@ script_mod! {
                         // the steps start past the area's notch (38 wide) and its fillet (8)
                         padding: Inset{left: 46 right: 10 top: 6 bottom: 6}
                         // the steps' corners are the sheet's control radius
-                        steps +: { words +: {
-                            statement +: { draw_bg +: { border_radius: fab.radius } }
-                            entry +: { draw_bg +: { border_radius: fab.radius } }
-                            out +: { draw_bg +: { border_radius: fab.radius } }
-                        } }
-                        fold +: { draw_icon +: { svg: crate_resource("self://resources/icons/chevron_down.svg") } }
-                        unfold +: { draw_icon +: { svg: crate_resource("self://resources/icons/chevron_up.svg") } }
+                        steps +: {
+                            words +: {
+                                statement +: {
+                                    draw_bg +: { border_radius: fab.radius color: fab.color_field color_focus: fab.color_field color_hover: fab.color_field_hover }
+                                    draw_text +: {
+                                        color: fab.color_flat_ink color_hover: fab.color_flat_ink_hover
+                                        color_down: fab.color_flat_ink_down color_focus: fab.color_flat_ink_focus
+                                    }
+                                }
+                                entry +: {
+                                    draw_bg +: { border_radius: fab.radius color: fab.color_field color_focus: fab.color_field color_hover: fab.color_field_hover }
+                                    draw_text +: {
+                                        color: fab.color_flat_ink color_hover: fab.color_flat_ink_hover
+                                        color_down: fab.color_flat_ink_down color_focus: fab.color_flat_ink_focus
+                                    }
+                                }
+                                out +: {
+                                    draw_bg +: { border_radius: fab.radius color: fab.color_field color_focus: fab.color_field color_hover: fab.color_field_hover }
+                                    draw_text +: {
+                                        color: fab.color_flat_ink color_hover: fab.color_flat_ink_hover
+                                        color_down: fab.color_flat_ink_down color_focus: fab.color_flat_ink_focus
+                                    }
+                                }
+                            }
+                            icons +: {
+                                statement_tip +: { statement_icon +: { draw_icon +: {color: fab.color_flat_icon_or_raw} } }
+                                entry_tip +: { entry_icon +: { draw_icon +: {color: fab.color_flat_icon_or_raw} } }
+                                out_tip +: { out_icon +: { draw_icon +: {color: fab.color_flat_icon_or_raw} } }
+                            }
+                        }
+                        fold +: { draw_icon +: { color: fab.color_flat_icon_or_raw svg: crate_resource("self://resources/icons/chevron_down.svg") } }
+                        unfold +: { draw_icon +: { color: fab.color_flat_icon_or_raw svg: crate_resource("self://resources/icons/chevron_up.svg") } }
                     }
                 }
             }
@@ -739,12 +780,12 @@ struct PartPlacement {
 }
 
 fn part_placement(tree: &AreaTree, width: f64, narrow: bool, alone: Option<AreaId>,
-                  mode: Option<PlateMode>, test_mode: bool, page: Option<Editor>,
+                  mode: Option<PlateMode>, tests_take_side: bool, page: Option<Editor>,
                   was_offered: bool, was_side_shown: bool, was_part_front: bool) -> PartPlacement {
     let design = mode == Some(PlateMode::Design) && page.is_none()
         && !tree.any_instance(&|i| i.editor == Editor::Part);
     let threshold = if was_offered { PART_SIDE_MIN_VIEW - PART_SIDE_HYST } else { PART_SIDE_MIN_VIEW };
-    let offered = design && !test_mode && tree.lead_plate_area(alone).and_then(|area| {
+    let offered = design && !tests_take_side && tree.lead_plate_area(alone).and_then(|area| {
         tree.area_width(area, width, narrow, alone, DOCK_SPLITTER_W, (FIRST_PANE_WIDTH, SECOND_PANE_FLOOR))
     }).is_some_and(|w| w >= threshold);
     let want_tab = design && !offered;
@@ -958,6 +999,8 @@ pub struct FabShell {
     review_proposals: Option<Weak<Vec<Arc<ProposalView>>>>,
     #[rust]
     review_notice: Option<Arc<str>>,
+    #[rust]
+    review_next: Option<Arc<(String, fab_elec_view::flow::NextStep)>>,
     /// At a phone's width, an editor asked for that no area held yet: the area its Reveal puts
     /// it in becomes the one in use.
     #[rust]
@@ -1096,7 +1139,7 @@ impl FabShell {
                 LibraryAction::Place { left, folded } => cx.action(ShellAction::EditWorkspaces(ListOp::Region {
                     instance: Instance::first(Editor::Circuit), tools: Some(!*folded), left: Some(*left),
                 })),
-                LibraryAction::Arm(_) => {}
+                LibraryAction::Arm(_) | LibraryAction::ChooseParts => {}
             }
         }
     }
@@ -1418,7 +1461,8 @@ impl FabShell {
             return false;
         };
         let was_front = self.part_host.is_some_and(|a| self.extra_front.contains(&(a, Editor::Part)));
-        let next = part_placement(tree, self.width, self.narrow, alone, state.ui.mode(), state.print.test_mode,
+        let tests_take_side = state.print.test_mode || (state.ui.tests_sidebar && !state.test_prints.is_empty());
+        let next = part_placement(tree, self.width, self.narrow, alone, state.ui.mode(), tests_take_side,
             self.page, !fresh && self.part_side_offered, !fresh && state.ui.part_side_shown, !fresh && was_front);
         self.part_side_offered = next.offered;
         state.ui.part_side_offered = next.offered;
@@ -1438,21 +1482,24 @@ impl FabShell {
 
     /// Keep the existing tab bar and every sash alive, including the one under the pointer.
     fn sync_part_placement(&mut self, cx: &mut Cx, state: &mut AppState) {
+        let old_host = self.part_host;
         if !self.update_part_placement(state, None) { return; }
         let Some(tree) = &self.areas else { return };
         let dock = self.view.dock(cx, ids!(main.dock));
         let part = Editor::Part.tab();
         if let Some(set) = self.set_of_tab(part) {
-            let area = self.area_of_set(set);
+            let area = old_host.filter(|a| tree.stack_of(*a).is_some()).or_else(|| self.area_of_set(set));
             let underlying = area.and_then(|a| tree.instance(a));
             if let Some(DockItem::Tabs { tabs, selected, hide_tab_bar, .. }) = self.layout.get_mut(&set) {
-                let front = tabs[*selected];
+                let front = tabs.get(*selected).copied();
                 dock.close_tab_preserving_item(cx, part);
                 tabs.retain(|t| *t != part);
-                let restore = if front == part { underlying.map(Instance::tab) } else { Some(front) };
+                let restore = if front == Some(part) { underlying.map(Instance::tab) } else { front };
                 if let Some(k) = restore.and_then(|tab| tabs.iter().position(|t| *t == tab)) {
                     *selected = k;
-                    if front == part { dock.select_tab(cx, tabs[k]); }
+                    if front == Some(part) { dock.bring_tab_to_front(cx, tabs[k]); }
+                } else {
+                    *selected = (*selected).min(tabs.len().saturating_sub(1));
                 }
                 let hidden = tabs.len() == 1 && underlying.is_some_and(|i| i.editor.bare_alone());
                 if *hide_tab_bar != hidden {
@@ -1474,7 +1521,7 @@ impl FabShell {
                 tabs.insert(at, part);
                 if self.extra_front.contains(&(area, Editor::Part)) {
                     *selected = at;
-                    dock.select_tab(cx, part);
+                    dock.bring_tab_to_front(cx, part);
                 } else if at <= *selected {
                     *selected += 1;
                 }
@@ -1496,7 +1543,10 @@ impl FabShell {
         let live = cx.get_global_ref::<ElecLive>().filter(|_| self.review_elec);
         let proposals = live.filter(|l| !l.proposals_reloading && !l.snap.proposals.is_empty()).map(|l| &l.snap.proposals);
         let notice = live.and_then(|l| l.ended_proposals.as_ref());
-        if proposals.map(Arc::as_ptr) == self.review_proposals.as_ref().map(Weak::as_ptr)
+        let next = live.filter(|l| !l.proposals_reloading && l.snap.proposals.is_empty())
+            .and_then(|_| cx.get_global_ref::<ReviewNext>()).and_then(|n| n.0.as_ref());
+        if next.map(Arc::as_ptr) == self.review_next.as_ref().map(Arc::as_ptr)
+            && proposals.map(Arc::as_ptr) == self.review_proposals.as_ref().map(Weak::as_ptr)
             && notice.map(Arc::as_ptr) == self.review_notice.as_ref().map(Arc::as_ptr) {
             return;
         }
@@ -1504,18 +1554,20 @@ impl FabShell {
             self.view.area().redraw(cx);
             return;
         }
-        let was_visible = self.review_proposals.is_some() || self.review_notice.is_some();
+        let was_visible = self.review_proposals.is_some() || self.review_notice.is_some() || self.review_next.is_some();
+        self.review_next = next.cloned();
         let proposals = proposals.cloned();
         self.review_proposals = proposals.as_ref().map(Arc::downgrade);
         self.review_notice = notice.cloned();
         let area = self.view.view(cx, ids!(main.review_area));
-        let visible = proposals.is_some() || self.review_notice.is_some();
+        let visible = proposals.is_some() || self.review_notice.is_some() || self.review_next.is_some();
         if visible != was_visible {
             area.set_visible(cx, visible);
             self.view.area().redraw(cx);
         }
         let widget = area.widget(cx, ids!(review));
         if let Some(mut strip) = widget.borrow_mut::<ReviewStrip>() {
+            strip.sync_next(cx, self.review_next.as_deref());
             strip.sync(cx, proposals.as_ref().map_or(&[], |p| p.as_slice()), self.review_notice.clone());
         };
     }
@@ -2325,7 +2377,8 @@ impl FabShell {
     /// Bring a panel forward: its tab in front where the dock shows it, else the areas change
     /// to show it (a [`WorkspaceOp::Reveal`] through the state, as every area edit goes).
     /// At a phone's width the area holding it becomes the one in use, or, held by none, the area
-    /// its Reveal puts it in.
+    /// its Reveal puts it in. Part is the exception: only the placement sync puts it on screen
+    /// (its sidebar or its transient tab), so it is never revealed into the saved tree.
     pub fn show_panel(&mut self, cx: &mut Cx, panel: Editor) {
         if panel == Editor::Part && !self.part_tab_shown {
             if self.part_side_offered { cx.action(StageAction::PartSidebar(true)); }
@@ -2337,6 +2390,7 @@ impl FabShell {
             self.tab_pressed(cx, panel.tab());
             return;
         }
+        if panel == Editor::Part { return; }
         if self.compact {
             let held = self.areas.as_ref().and_then(|tree| tree.instances().into_iter().find(|(_, i)| i.editor == panel).map(|(area, i)| (area, i, tree.instance(area) == Some(i))));
             if let (Some((area, instance, front)), Some((ws, _))) = (held, self.shown) {
@@ -2355,17 +2409,21 @@ impl FabShell {
         cx.action(ShellAction::EditAreas(WorkspaceOp::Reveal { editor: panel, from }));
     }
 
+    fn press_area(&self, part: DropPart, id: LiveId) -> Option<AreaId> {
+        let tree = self.areas.as_ref()?;
+        match part {
+            DropPart::Tab => tree.area_of_tab(id).or_else(|| self.area_of_shown_tab(id)),
+            DropPart::Bar => None,
+            _ => self.area_of_set(id),
+        }
+    }
+
     /// Keeps the area a press lands in (a tab's, or the body's under it), for a Reveal the press
     /// leads to. Per press: the dock's drop query, O(tab sets + splits), and O(nodes) mapping.
     fn note_press(&mut self, cx: &Cx, abs: DVec2) {
-        let (Some((ws, _)), Some(tree)) = (self.shown, self.areas.as_ref()) else { return };
+        let (Some((ws, _)), Some(_)) = (self.shown, self.areas.as_ref()) else { return };
         let Some(pos) = self.view.dock(cx, ids!(main.dock)).drop_position(cx, abs) else { return };
-        let area = match pos.part() {
-            DropPart::Tab => tree.area_of_tab(pos.id()),
-            DropPart::Bar => None,
-            _ => self.area_of_set(pos.id()),
-        };
-        self.pressed_area = area.map(|area| (ws, area));
+        self.pressed_area = self.press_area(pos.part(), pos.id()).map(|area| (ws, area));
     }
 
     /// The dock's own actions: a tab's drag starts (the areas take its drop, `handle_event`), a
@@ -2899,25 +2957,29 @@ mod tests {
     use super::*;
     use crate::workspaces::{ListOp, Origin, ShownBy, Workspaces};
 
+    fn register_families(vm: &mut ScriptVm) {
+        // The families the app registers (the umbrella's order, fab first): the shell's
+        // widgets build on the fab family's controls (FabLabel, FabColorWheel).
+        makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[
+            makepad_widgets_fab::fab_mod,
+            makepad_widgets_pickers::pickers_mod,
+            makepad_widgets_data::dock_mod,
+            makepad_widgets_data::data_mod,
+            makepad_widgets_extras::glass_mod,
+            makepad_widgets_extras::color_mod,
+            makepad_widgets_extras::charts_mod,
+            // The Firmware pane's Monitor lines are a LogList.
+            makepad_widgets_rich_text::rich_text_mod,
+        ]);
+    }
+
     /// A shell on the first electronics workspace (Schematic), with its families and panels
     /// registered as the app does, the state it shows, and the script errors that registration and
     /// the workspace raised.
     fn electronics_shell() -> (Cx, FabShell, AppState, Vec<String>) {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let mut shell = cx.with_vm(|vm| {
-            // The families the app registers (the umbrella's order, fab first): the shell's
-            // widgets build on the fab family's controls (FabLabel, FabColorWheel).
-            makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[
-                makepad_widgets_fab::fab_mod,
-                makepad_widgets_pickers::pickers_mod,
-                makepad_widgets_data::dock_mod,
-                makepad_widgets_data::data_mod,
-                makepad_widgets_extras::glass_mod,
-                makepad_widgets_extras::color_mod,
-                makepad_widgets_extras::charts_mod,
-                // The Firmware pane's Monitor lines are a LogList.
-                makepad_widgets_rich_text::rich_text_mod,
-            ]);
+            register_families(vm);
             // What the shell's own registration and its panels raise from here on (a draw shader
             // that fails to compile is noted apart from the script errors).
             let _ = vm.take_errors();
@@ -2932,6 +2994,162 @@ mod tests {
         let mut errors = cx.with_vm(|vm| vm.take_errors());
         errors.extend(makepad_widgets_core::makepad_platform::shader_error::take());
         (cx, shell, state, errors)
+    }
+
+    #[test]
+    fn host_dark_widget_bindings_match_slice_3() {
+        use fab_controls::theme::{toned, Palette, HOST_FAMILIES};
+        use makepad_widgets_core::desktop_style::{self, StyleSheet};
+
+        fn child(vm: &mut ScriptVm, root: ScriptObject, key: LiveId) -> Option<ScriptObject> {
+            if let Some(obj) = vm.value(root, key).as_object() { return Some(obj); }
+            vm.vec_with(root, |vm, children| {
+                if let Some(kv) = children.iter().find(|kv| kv.key.as_id() == Some(key)) {
+                    return kv.value.as_object();
+                }
+                children.iter().filter(|kv| kv.key.is_nil()).find_map(|kv| {
+                    child(vm, kv.value.as_object()?, key)
+                })
+            })
+        }
+
+        fn walk(vm: &mut ScriptVm, root: ScriptObject, host: &str, path: &str) -> ScriptObject {
+            path.split('.').fold(root, |obj, key| child(vm, obj, LiveId::from_str(key))
+                .unwrap_or_else(|| panic!("{host}: missing {key} in {path}")))
+        }
+
+        fn unwrapped(vm: &ScriptVm, value: ScriptValue) -> ScriptValue {
+            value.as_object().filter(|&o| vm.heap().as_shader_io(o).is_some())
+                .map(|o| vm.heap().proto(o)).unwrap_or(value)
+        }
+
+        fn shader_vec4(vm: &mut ScriptVm, value: ScriptValue) -> Vec4f {
+            Vec4f::script_from_value(vm, unwrapped(vm, value))
+        }
+
+        for family in HOST_FAMILIES {
+            let entry = family.sheet(true);
+            let host = entry.id;
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            cx.init_cx_os();
+            cx.with_vm(|vm| {
+                desktop_style::install(vm, toned(StyleSheet::load(entry)));
+                register_families(vm);
+                vm.capture_errors();
+                crate::script_mod(vm);
+                let errors = vm.take_errors();
+                assert!(errors.is_empty(), "{host} shell registration: {errors:?}");
+
+                let theme = vm.module(id!(theme));
+                let palette = Palette::resolve(|key| vm.value(theme, LiveId::from_str(key)).as_color(), true);
+                let color = |vm: &mut ScriptVm, key| {
+                    let value = vm.value(theme, key);
+                    assert!(value.as_color().is_some(), "{host}: missing theme.{key}");
+                    Vec4f::script_from_value(vm, value)
+                };
+                let body = color(vm, id!(color_text));
+                let dim = color(vm, id!(color_on_surface_variant));
+                let on_accent = color(vm, id!(color_text_on_accent));
+                let inner_hover = color(vm, id!(color_label_inner_hover));
+                let inner_down = color(vm, id!(color_label_inner_down));
+                let outer_hover = color(vm, id!(color_label_outer_hover));
+                let outer_down = color(vm, id!(color_label_outer_down));
+                let action_ink = color(vm, id!(prop_ink_dim));
+                let field = color(vm, id!(prop_field));
+                let field_hover = color(vm, id!(prop_field_hover));
+                let field_active = color(vm, id!(prop_field_active));
+                let choice = color(vm, id!(prop_choice_on));
+                let hover = color(vm, id!(color_outset_hover));
+                let down = color(vm, id!(color_outset_down));
+                let accent = color(vm, id!(color_focus));
+                let selected = color(vm, id!(color_ctrl_selected));
+                let highlight = color(vm, id!(color_bg_highlight));
+                assert_eq!(body, Vec4f::from_u32(palette.inks.text), "{host}: palette body");
+                assert_eq!(dim, Vec4f::from_u32(palette.inks.dim), "{host}: palette dim");
+                let clear = Vec4f::all(0.0);
+                let raw = Vec4f::all(-1.0);
+                let white = Vec4f::from_u32(0xffffffff);
+                let cam_bg = Vec4f::from_u32(0x000000a0);
+                let cam_ink = Vec4f::from_u32(0xffffffd0);
+                let fab = vm.module(id!(fab));
+                let widgets = vm.module(id!(widgets));
+                assert_eq!(vm.value(fab, id!(flat_focus_tint)).as_f64(), Some(0.0), "{host}: fab.flat_focus_tint");
+                let icon = walk(vm, widgets, host, "FabIconButton.draw_icon");
+                let focus = vm.value(icon, id!(focus_tint));
+                assert_eq!(unwrapped(vm, focus).as_f64(), Some(0.0), "{host}: FabIconButton.draw_icon.focus_tint");
+                for wid in [id!(ButtonFlat), id!(ButtonFlatter), id!(RadioButtonTabFlat)] {
+                    let stock = desktop_style::widget_pixel_key(vm, id!(stock_widgets), wid)
+                        .unwrap_or_else(|| panic!("{host}: missing stock {wid}.draw_bg.pixel"));
+                    assert_eq!(desktop_style::widget_pixel_key(vm, id!(widgets), wid), Some(stock), "{host}: {wid}.draw_bg.pixel");
+                }
+                let mut check = |path: &str, fields: &[(&str, Vec4f)]| {
+                    let obj = walk(vm, widgets, host, path);
+                    for &(field, expected) in fields {
+                        let value = vm.value(obj, LiveId::from_str(field));
+                        assert!(!value.is_err() && !value.is_nil(), "{host}: missing {path}.{field}");
+                        assert_eq!(shader_vec4(vm, value), expected, "{host}: {path}.{field}");
+                    }
+                };
+                let body_ink = [("color", body), ("color_hover", body), ("color_down", body), ("color_focus", body)];
+                let accent_ink = [("color", on_accent), ("color_hover", on_accent), ("color_down", on_accent), ("color_focus", on_accent)];
+                let field_face = [("color", field), ("color_hover", field_hover), ("color_down", field_active), ("color_focus", field)];
+                let flat_face = [("color", clear), ("color_hover", hover), ("color_down", down), ("color_focus", clear)];
+                let toggle_icon = [("color", body), ("color_hover", body), ("color_down", body), ("color_active", on_accent)];
+                let toggle_label = [("color", body), ("color_hover", outer_hover), ("color_down", outer_down), ("color_focus", body), ("color_active", on_accent)];
+                let combo_text = [("color", body), ("color_hover", inner_hover), ("color_down", inner_down), ("color_focus", body)];
+                check("FabButton.draw_bg", &field_face);
+                check("FabButton.draw_text", &body_ink);
+                check("FabButtonAccent.draw_bg", &[("color", accent), ("color_hover", accent), ("color_down", highlight), ("color_focus", accent)]);
+                check("FabButtonAccent.draw_text", &accent_ink);
+                check("FabFlatButton.draw_bg", &flat_face);
+                check("FabFlatButton.draw_text", &body_ink);
+                check("FabIconButton.draw_bg", &flat_face);
+                check("FabIconButton.draw_icon", &body_ink);
+                check("FabActionButton.draw_bg", &[("color", clear), ("color_hover", field_hover), ("color_down", field_active), ("color_focus", clear)]);
+                check("FabActionButton.draw_icon", &[("color", action_ink), ("color_hover", body), ("color_down", body)]);
+                check("FabSegmentTab.draw_bg", &[("color", field), ("color_hover", field_hover), ("color_down", field_active), ("color_focus", field), ("color_active", choice)]);
+                check("FabSegmentTab.draw_text", &[("color", dim), ("color_hover", body), ("color_down", body), ("color_focus", dim), ("color_active", body)]);
+                check("FabSegmentTab.draw_icon", &[("color", dim), ("color_hover", body), ("color_down", body), ("color_active", body)]);
+                check("FabUnderlineTab.draw_text", &[("color_hover", body), ("color_down", body), ("color_focus", body), ("color_active", body)]);
+                check("FabIconToggle.draw_bg", &[("color", clear), ("color_hover", hover), ("color_down", down), ("color_focus", clear), ("color_active", selected)]);
+                check("FabIconToggle.draw_text", &[("color", body), ("color_hover", outer_hover), ("color_down", outer_down), ("color_focus", body), ("color_active", body)]);
+                check("FabIconToggle.draw_icon", &toggle_icon);
+                for path in ["FabStage.primary.view_flyout.options_card.grid.o_rails",
+                             "FabStage.primary.render_row.modes_row.tests_group.tests_toggle"] {
+                    check(&format!("{path}.draw_icon"), &toggle_icon);
+                    check(&format!("{path}.draw_text"), &toggle_label);
+                }
+                check("FabShell.main.dock.Board.status.bar.s_layer.draw_bg", &[("color", field), ("color_hover", field_hover), ("color_down", field_active), ("color_focus", field_hover), ("arrow_color", dim), ("arrow_color_hover", dim)]);
+                check("FabShell.main.dock.Board.status.bar.s_layer.input.draw_text", &body_ink);
+                check("BenchJackLoad.draw_bg", &[("color", field), ("color_hover", field_hover), ("color_focus", field), ("arrow_color", body), ("arrow_color_hover", inner_hover)]);
+                check("BenchJackLoad.input.draw_text", &combo_text);
+                check("ElecTransport.controls.length_well.length.draw_bg", &[("color", field), ("color_hover", field), ("color_focus", field), ("arrow_color", body), ("arrow_color_hover", inner_hover)]);
+                check("ElecTransport.controls.length_well.length.input.draw_text", &combo_text);
+                let head = "FabShell.main.dock.Firmware.head";
+                for key in ["statement", "entry", "out"] {
+                    check(&format!("{head}.steps.words.{key}.draw_bg"), &field_face);
+                    check(&format!("{head}.steps.words.{key}.draw_text"), &body_ink);
+                    check(&format!("{head}.steps.icons.{key}_tip.{key}_icon.draw_icon"), &[("color", raw)]);
+                }
+                for key in ["fold", "unfold"] {
+                    check(&format!("{head}.{key}.draw_icon"), &[("color", raw)]);
+                }
+                check("FabCameraFloat.card.head.close.draw_bg", &[("color", cam_bg), ("color_hover", hover), ("color_down", down), ("color_focus", clear)]);
+                check("FabCameraFloat.card.head.close.draw_icon", &[("color", cam_ink), ("color_hover", body), ("color_down", body), ("color_focus", cam_ink)]);
+                check("ElecTransport.controls.well.strip", &[("face_selected", choice), ("face_hover", hover)]);
+                check("ElecTransport.controls.mute.draw_bg", &[("color", clear), ("color_hover", hover), ("color_active", selected)]);
+                check("ElecTransport.controls.mute.draw_text", &[("color", dim), ("color_hover", body), ("color_down", body), ("color_focus", dim), ("color_active", white)]);
+                check("FabTopBar.ends.right.settings.draw_icon", &[("color", body), ("color_hover", body), ("color_down", body)]);
+                check("FabPartsPanel.list.Row.eye.draw_icon", &[("color", dim)]);
+                let dt = walk(vm, widgets, host, "FabUnderlineTab.draw_text");
+                let value = vm.value(dt, id!(color));
+                let ink = shader_vec4(vm, value);
+                let mid = (dim + body) * 0.5;
+                for (a, b) in [(ink.x, mid.x), (ink.y, mid.y), (ink.z, mid.z), (ink.w, mid.w)] {
+                    assert!((a - b).abs() <= 1.0 / 255.0, "{host}: FabUnderlineTab.draw_text.color {ink:?} vs {mid:?}");
+                }
+            });
+        }
     }
 
     /// What `f` asks for applied to the state as the app applies it, and the shell laid out again
@@ -2981,6 +3199,7 @@ mod tests {
         let (mut cx, mut shell, mut state, _) = electronics_shell();
         show(&mut cx, &mut shell, &mut state, Origin::Design);
         let saved = state.ui.workspaces.to_ron();
+        assert!(!saved.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Part"));
         for (width, offered, was_shown, front) in [
             (1594.0, false, false, Editor::Parts), (1654.0, true, false, Editor::Parts),
             (1644.0, true, false, Editor::Parts), (1634.0, false, false, Editor::Parts),
@@ -3000,7 +3219,6 @@ mod tests {
             }
             check_dock(&mut cx, &shell);
             assert_eq!(state.ui.workspaces.to_ron(), saved, "placement never edits the saved layout");
-            assert!(!saved.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Part"));
             assert!(!state.ui.workspaces.unsaved);
         }
     }
@@ -3016,6 +3234,14 @@ mod tests {
             assert_eq!(state.ui.part_side_offered, !tests);
             assert_eq!(shell.layout.contains_key(&Editor::Part.tab()), tests);
             if tests { assert_eq!(shell.part_host, shell.area_of_shown_tab(Editor::Parts.tab())); }
+            check_dock(&mut cx, &shell);
+        }
+        state.test_prints.push(TestPrintView { name: "Test 1".into(), ..Default::default() });
+        for open in [true, false] {
+            state.ui.tests_sidebar = open;
+            shell.sync_part_placement(&mut cx, &mut state);
+            assert_eq!(state.ui.part_side_offered, !open);
+            assert_eq!(shell.layout.contains_key(&Editor::Part.tab()), open);
             check_dock(&mut cx, &shell);
         }
         shell.width = 560.0;
@@ -3047,6 +3273,106 @@ mod tests {
             assert!(!state.ui.part_side_offered && !shell.layout.contains_key(&Editor::Part.tab()));
             check_dock(&mut cx, &shell);
         }
+    }
+
+    #[test]
+    fn part_tab_press_in_compact_keeps_its_area_and_selection() {
+        fn pick_here(cx: &mut Cx, shell: &mut FabShell, state: &AppState, from: LiveId, area: AreaId) {
+            shell.open_area_menu(cx, from, Rect::default(), Some(&state.ui.workspaces));
+            shell.area_menu_picked(cx, LiveId(area.0 as u64 ^ HERE_ROW), Some(&state.ui.workspaces));
+        }
+        fn select(cx: &mut Cx, shell: &mut FabShell, tab: LiveId) {
+            shell.view.dock(cx, ids!(main.dock)).select_tab(cx, tab);
+            shell.tab_pressed(cx, tab);
+        }
+        fn root_tabs(shell: &FabShell) -> (&[LiveId], usize) {
+            let DockItem::Tabs { tabs, selected, .. } = &shell.layout[&live_id!(root)] else {
+                panic!("compact root must hold a tab set");
+            };
+            (tabs, *selected)
+        }
+        fn check_selections(shell: &FabShell) {
+            for (set, item) in &shell.layout {
+                if let DockItem::Tabs { tabs, selected, .. } = item {
+                    assert!(*selected < tabs.len(), "tab set {set} must have a selection in range");
+                }
+            }
+        }
+
+        let (mut cx, mut shell, mut state, _) = electronics_shell();
+        show(&mut cx, &mut shell, &mut state, Origin::Design);
+        shell.compact = true;
+        shell.narrow = true;
+        shell.width = 480.0;
+        let def = state.ui.workspaces.current().clone();
+        let ws = def.id;
+        let plate = Editor::Viewport.tab();
+        let plates = Editor::Plates.tab();
+        let parts = Editor::Parts.tab();
+        let part = Editor::Part.tab();
+        let plate_area = def.tree.area_of_tab(plate).expect("Design has a Plate area");
+        let parts_area = def.tree.area_of_tab(parts).expect("Design has a Parts area");
+        shell.update_part_placement(&mut state, Some(&def));
+        shell.show_workspace(&mut cx, &def);
+
+        pick_here(&mut cx, &mut shell, &state, plate, parts_area);
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(root_tabs(&shell).0, &[plates, parts, part], "Areas here shows the Parts stack with Part after Parts");
+        check_dock(&mut cx, &shell);
+
+        let pressed = shell.press_area(DropPart::Tab, part);
+        assert_eq!(pressed, Some(parts_area), "pressing the transient Part tab keeps its Parts area");
+        shell.pressed_area = pressed.map(|area| (ws, area));
+        select(&mut cx, &mut shell, part);
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(front_of(&shell, Editor::Parts), part, "the pressed Part tab stays in front");
+        assert_eq!(shell.alone(shell.areas.as_ref().unwrap()), Some(parts_area), "the Parts area stays in use after the press");
+        check_dock(&mut cx, &shell);
+
+        assert!(state.apply_core(&ShellAction::SetPlateMode(PlateMode::Mechanics)), "Design switches to Mechanics");
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert!(!shell.layout.contains_key(&part), "Mechanics closes the transient Part tab");
+        check_selections(&shell);
+        check_dock(&mut cx, &shell);
+        assert!(state.apply_core(&ShellAction::SetPlateMode(PlateMode::Design)), "Mechanics switches back to Design");
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(root_tabs(&shell).0, &[plates, parts, part], "returning to Design puts Part after Parts");
+        assert_eq!(front_of(&shell, Editor::Parts), parts, "Parts stays in front of the returning Part tab");
+        check_dock(&mut cx, &shell);
+
+        select(&mut cx, &mut shell, part);
+        pick_here(&mut cx, &mut shell, &state, part, plate_area);
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(shell.part_host, Some(plate_area), "Part follows Areas here to the Plate area");
+        assert_eq!(root_tabs(&shell).0, &[plate, part], "the Plate stack holds Plate and Part");
+        assert_eq!(front_of(&shell, Editor::Viewport), part, "Part stays in front on the Plate stack");
+        check_selections(&shell);
+        check_dock(&mut cx, &shell);
+        pick_here(&mut cx, &mut shell, &state, part, parts_area);
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(root_tabs(&shell).0, &[plates, parts, part], "returning to the Parts area restores its stack");
+        check_dock(&mut cx, &shell);
+
+        select(&mut cx, &mut shell, plates);
+        select(&mut cx, &mut shell, part);
+        shell.pressed_area = None;
+        assert_eq!(shell.alone(shell.areas.as_ref().unwrap()), Some(plate_area), "clearing the press makes Plate the preferred compact area");
+        assert_eq!(shell.part_host, Some(parts_area), "before the sync Part still belongs to the Parts area");
+        assert!(state.apply_core(&ShellAction::SetPlateMode(PlateMode::Mechanics)), "Mechanics closes Part in the old host");
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(root_tabs(&shell), (&[plates, parts][..], 0), "closing Part restores Plates from the old host");
+        check_dock(&mut cx, &shell);
+
+        shell.pressed_area = Some((ws, parts_area));
+        assert!(state.apply_core(&ShellAction::SetPlateMode(PlateMode::Design)), "Design reopens Part in the Parts area");
+        shell.sync_part_placement(&mut cx, &mut state);
+        select(&mut cx, &mut shell, part);
+        shell.part_host = None;
+        shell.pressed_area = None;
+        assert!(state.apply_core(&ShellAction::SetPlateMode(PlateMode::Mechanics)), "Mechanics closes Part without a known host");
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert_eq!(root_tabs(&shell), (&[plates, parts][..], 1), "a missed restore clamps selection to Parts");
+        check_dock(&mut cx, &shell);
     }
 
     #[test]

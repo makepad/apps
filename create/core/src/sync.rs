@@ -214,6 +214,7 @@ impl SyncEngine {
     }
 
     pub fn shown_final(&self) -> &[Id] { &self.shown_final }
+    pub fn final_evidence(&self) -> &[Id] { &self.final_evidence }
 
     /// Queue this link's evidence when it first serves a final-bounded prefix. Its last
     /// event is a head. Tips alone carry the final evidence and keep this frame small.

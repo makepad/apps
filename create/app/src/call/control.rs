@@ -1,16 +1,16 @@
 //! The input topic on the authenticated peer link. Pointers use the shared window's layout points.
 use crate::app_link::{AppInput, Mods};
-use makepad_town_core::{event::SessionId, tlv::skip_tlv_tail};
+use makepad_town_core::{event::SessionId, key::PublicKey, tlv::skip_tlv_tail};
 use makepad_widgets::KeyCode;
 
 pub type GrantId = [u8; 16];
 
 #[derive(Clone, Default)]
 pub struct ControlShown {
-    pub peer_watching: bool,
     /// Requests in each direction are independent when both people are sharing.
     pub asking: Option<SessionId>,
-    pub requested: Option<SessionId>,
+    pub requests: Vec<(SessionId, PublicKey, String)>,
+    pub holder: Option<(PublicKey, String)>,
     /// The watched share on which this guest may take control.
     pub allowed: Option<SessionId>,
     /// Identifies this uninterrupted period of control to the panel that drew it.

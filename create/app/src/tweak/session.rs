@@ -1,8 +1,14 @@
 use super::wire::{self, Body, Packet};
 use super::*;
+use super::design::session::{validate_design_inputs, BakeInputs, Completed, DesignSession, Origin};
 use makepad_town_core::{event::Id, fold::{Agent, Profile, State}};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+
+pub use makepad_town_core::share::hello::DESIGN_LEVEL;
+const MAX_GATED_LEVEL: u16 = DESIGN_LEVEL;
+pub const OLDER_SHARER_DESIGN: &str = "The sharer's copy of Makepad Town is older and does not support structural design yet.";
+const OLDER_GUEST_DESIGN: &str = "This seat's copy of Makepad Town does not support structural design.";
 
 pub const THEME_LEVEL: u16 = 3;
 pub const OLDER_SHARER_THEME: &str = "The sharer's copy of Makepad Town is older and does not support live themes yet.";
@@ -17,6 +23,7 @@ pub struct Selection { pub path: String, pub rect: Option<Rect>, pub agent: Opti
 
 #[derive(Default)]
 pub struct SeatView {
+    pub(crate) design: design::DesignStateView,
     pub window: Option<(usize, [f64; 2])>,
     pub asked: BTreeSet<Seat>,
     pub allowed: BTreeSet<Seat>,
@@ -50,9 +57,21 @@ impl SeatView {
                 self.looking.remove(&ai);
                 if notice == Notice::Looked { done = Some(Request::Look); } else { self.finished.remove(&ai); }
             }
+            if done.is_none() {
+                if let Notice::Applied { path, prop, new, .. } = &notice {
+                    if path == "theme" {
+                        // Applied carries the resolved value or install label to every seat.
+                        done = Some(Request::Theme(if prop == "install" {
+                            ThemeOp::Install(super::ThemeInstall { label: new.clone(), base: String::new(), sheet: None, globals: vec![], overrides: vec![] })
+                        } else { ThemeOp::Set { name: prop.clone(), value: new.clone() } }));
+                    }
+                }
+            }
             if let Some(done) = done {
                 self.finished.insert(ai, (done, crate::model::wall_ms()));
-            } else if matches!(notice, Notice::Running(_) | Notice::Selected { .. }) {
+            } else if matches!(notice, Notice::Running(_))
+                || (matches!(notice, Notice::Selected { .. }) && who.req != 0)
+            {
                 self.finished.remove(&ai);
             }
         }
@@ -65,13 +84,16 @@ impl SeatView {
                 if let Some(agent) = who.agent { self.agents.insert((who.seat, agent), *stopped); }
             }
             Notice::Window { window, size } => self.window = Some((*window, *size)),
+            Notice::Design(DesignNotice::Status(text)) => {
+                if let Some(view) = design::DesignStateView::read(text) { self.design = view; }
+            }
             Notice::Asked => { self.asked.insert(who.seat); }
             Notice::Allowed(yes) => {
                 self.asked.remove(&who.seat);
                 if *yes { self.allowed.insert(who.seat); } else { self.allowed.remove(&who.seat); }
             }
             Notice::Picked { path, rect, .. } => {
-                for selection in self.selections.values_mut().filter(|s| s.path == *path && s.rect.is_none()) {
+                for selection in self.selections.values_mut().filter(|s| s.path == *path) {
                     selection.rect = Some(*rect);
                 }
                 self.selections.insert(who.seat, Selection { path: path.clone(), rect: Some(*rect), agent: who.agent });
@@ -82,7 +104,7 @@ impl SeatView {
             }
             _ => {}
         }
-        if matches!(notice, Notice::Picked { .. } | Notice::Selected { .. }) {
+        if matches!(notice, Notice::Picked { .. } | Notice::Selected { .. } | Notice::Design(DesignNotice::Status(_)) | Notice::Allowed(_)) {
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
         self.updates.push_back((who.seat, who.req, who.agent, notice));
@@ -90,13 +112,13 @@ impl SeatView {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Who { seat: Seat, req: RequestId, agent: Option<Id> }
+pub(super) struct Who { pub(super) seat: Seat, pub(super) req: RequestId, pub(super) agent: Option<Id> }
 
 fn older_sharer(min: u16) -> &'static str {
-    if min == THEME_LEVEL { OLDER_SHARER_THEME } else { OLDER_SHARER_TREE }
+    match min { DESIGN_LEVEL => OLDER_SHARER_DESIGN, THEME_LEVEL => OLDER_SHARER_THEME, _ => OLDER_SHARER_TREE }
 }
 fn older_guest(min: u16) -> &'static str {
-    if min == THEME_LEVEL { OLDER_GUEST_THEME } else { OLDER_GUEST_TREE }
+    match min { DESIGN_LEVEL => OLDER_GUEST_DESIGN, THEME_LEVEL => OLDER_GUEST_THEME, _ => OLDER_GUEST_TREE }
 }
 
 /// The app applies a scalar. Keep its validated theme reference for the source implementer.
@@ -106,7 +128,7 @@ fn single_theme_ref(value: &str) -> Option<&str> {
     rest.split('.').all(makepad_town_core::literal::is_identifier).then_some(trimmed)
 }
 
-enum WorkKind { Request(Request), ThemeRefresh }
+enum WorkKind { Request(Request), ThemeRefresh, DesignRetract }
 enum Answer { None, Notice(Notice), BroadcastTheme(String) }
 
 struct Work {
@@ -118,12 +140,14 @@ struct Work {
 
 impl Work {
     fn request(&self) -> Option<&Request> {
-        match &self.kind { WorkKind::Request(r) => Some(r), WorkKind::ThemeRefresh => None }
+        match &self.kind { WorkKind::Request(r) => Some(r), WorkKind::ThemeRefresh | WorkKind::DesignRetract => None }
     }
 }
 
 struct Write {
     theme_op: bool,
+    install: Option<ThemeInstall>,
+    rect: Option<Rect>,
     edit: AppEdit,
     answer: Option<(Who, Notice)>,
 }
@@ -131,6 +155,10 @@ struct Write {
 enum Still<T> { Queued, Capturing(T), Sent(u64) }
 
 struct Owner<L, T> {
+    design: DesignSession,
+    design_ticket: Option<T>,
+    unbaked_props: Arc<BTreeMap<(String, String), String>>,
+    last_theme_install: Option<Arc<ThemeInstall>>,
     link: L,
     window: Option<WindowId>,
     allowed: BTreeSet<Seat>,
@@ -143,7 +171,7 @@ struct Owner<L, T> {
     theme: Option<String>,
     theme_label: String,
     // Fold token deltas into the cached JSON only when a new member needs the snapshot.
-    theme_deltas: std::collections::HashMap<String, String>,
+    theme_deltas: BTreeMap<String, String>,
     running: Option<(T, Work)>,
     stills: Vec<(Who, Still<T>)>,
     writes: VecDeque<Write>,
@@ -195,11 +223,20 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
 
     pub fn owner(town: Id, share: SessionId, item: Id, me: Seat, link: L) -> Result<Self, String> {
         let mut session = Self::peer(town, share, item, me, me)?;
-        session.owner = Some(Owner { link, window: None, allowed: BTreeSet::new(), agents: BTreeMap::new(), seen: BTreeSet::new(), queue: VecDeque::new(),
+        session.owner = Some(Owner { design: Default::default(), design_ticket: None, unbaked_props: Default::default(), last_theme_install: None, link, window: None, allowed: BTreeSet::new(), agents: BTreeMap::new(), seen: BTreeSet::new(), queue: VecDeque::new(),
             profiles: BTreeMap::new(), stopped: BTreeMap::new(), peer_levels: BTreeMap::new(),
             theme: None, theme_label: String::new(), theme_deltas: Default::default(),
             running: None, stills: Vec::new(), writes: VecDeque::new(), seq: 0, rects: BTreeMap::new(), listed: BTreeMap::new(), shader_fns: BTreeMap::new(), out: BTreeMap::new(), delivery: 0 });
         Ok(session)
+    }
+
+    pub(super) fn commit_design_to_disk(&mut self) -> Result<(), String> {
+        if self.me != self.sharer || self.is_ended() { return Err("Only the active share owner can commit.".into()) }
+        let owner = self.owner.as_mut().ok_or("Only the share owner can commit.")?;
+        let result = owner.design.commit_to_disk();
+        let status = owner.design.state_view().json().to_json();
+        self.emit(Who { seat: self.me, req: 0, agent: None }, Notice::Design(DesignNotice::Status(status)));
+        result
     }
 
     pub fn supports_tree(&self) -> bool {
@@ -208,6 +245,10 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
 
     pub fn supports_theme(&self) -> bool {
         self.owner.is_some() || self.sharer_level.is_some_and(|level| level >= THEME_LEVEL)
+    }
+
+    pub fn supports_design(&self) -> bool {
+        self.owner.is_some() || self.sharer_level.is_some_and(|level| level >= DESIGN_LEVEL)
     }
 
     /// Mailboxes can outlive the board (e.g. a background town unloaded on disconnect).
@@ -227,11 +268,17 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     pub fn set_peer_level(&mut self, seat: Seat, level: Option<u16>) {
         if let Some(owner) = &mut self.owner {
             if seat == self.me || owner.peer_levels.get(&seat).copied() == level { return }
+            let was_design_peer = owner.peer_levels.get(&seat).is_some_and(|&l| l >= DESIGN_LEVEL);
             match level {
                 Some(l) => { owner.peer_levels.insert(seat, l); }
                 None => { owner.peer_levels.remove(&seat); }
             }
-            if let Some(level) = level.filter(|l| *l < THEME_LEVEL) {
+            if !was_design_peer && level.is_some_and(|l| l >= DESIGN_LEVEL) && owner.out.contains_key(&seat) {
+                let status = owner.design.state_view().json().to_json();
+                self.emit_to(seat, 0, None, Notice::Design(DesignNotice::Status(status)));
+            }
+            let owner = self.owner.as_mut().unwrap();
+            if let Some(level) = level.filter(|l| *l < MAX_GATED_LEVEL) {
                 if let Some(out) = owner.out.get_mut(&seat) {
                     out.pending.retain(|_, body| wire::min_level(body) <= level);
                 }
@@ -242,7 +289,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             }
         } else if seat == self.sharer && self.sharer_level != level {
             self.sharer_level = level;
-            if let Some(l) = level.filter(|l| *l < THEME_LEVEL) { self.drop_incompatible_requests(l); }
+            if let Some(l) = level.filter(|l| *l < MAX_GATED_LEVEL) { self.drop_incompatible_requests(l); }
         }
     }
 
@@ -266,6 +313,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         for seat in &departed { owner.peer_levels.remove(seat); }
         for seat in departed {
             self.refuse_looks(seat, "This seat left the share.");
+            self.refuse_matching(|who, r| (who.seat == seat && matches!(r, Request::Design(_))).then_some("This seat left the share."));
             if self.view.allowed.contains(&seat) { let _ = self.consent(seat, false); }
             self.view.asked.remove(&seat);
             let req = self.req();
@@ -302,6 +350,9 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                     }
                     snapshot(self.me, None, 0, Notice::Theme { theme: theme.clone() });
                 }
+            }
+            if owner.peer_levels.get(&peer).is_some_and(|&l| l >= DESIGN_LEVEL) {
+                snapshot(self.me, None, 0, Notice::Design(DesignNotice::Status(owner.design.state_view().json().to_json())));
             }
             owner.out.insert(peer, out);
         }
@@ -365,7 +416,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 }
             }
         }
-        if self.ended.is_none() || matches!(notice, Notice::Ended(_) | Notice::Allowed(false) | Notice::Applied { .. } | Notice::Refused(_)) {
+        if self.ended.is_none() || matches!(notice, Notice::Ended(_) | Notice::Allowed(false) | Notice::Applied { .. } | Notice::Refused(_)
+            | Notice::Design(DesignNotice::Status(_) | DesignNotice::Mutated { .. })) {
             self.view.receive(who, notice);
         }
     }
@@ -418,6 +470,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         } else if matches!(request, Request::AskEdit | Request::Select(_)) {
             return Ok(())
         }
+        if matches!(request, Request::Design(r) if r.is_read_only()) { return Ok(()); }
         let allowed = self.owner.as_ref().map_or(&self.view.allowed, |owner| &owner.allowed);
         if seat == &self.sharer || allowed.contains(seat) { Ok(()) } else { Err("Ask the owner to allow editing this share.") }
     }
@@ -455,7 +508,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             return
         }
         // A private read (including the owner's own AI) has no public activity to announce.
-        if let Some(agent) = who.agent.filter(|_| !matches!(request, Request::Tree(_) | Request::Theme(ThemeOp::Get))) {
+        if let Some(agent) = who.agent.filter(|_| !matches!(request, Request::Tree(_) | Request::Theme(ThemeOp::Get))
+            && !matches!(&request, Request::Design(r) if r.is_read_only())) {
             if !self.view.agents.contains_key(&(who.seat, agent)) {
                 // Announce a verified actor even when their first request is refused or only queued.
                 self.emit(Who { req: 0, ..who }, Notice::Stopped(false));
@@ -467,6 +521,15 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         }
         let owner = self.owner.as_ref().unwrap();
         match request {
+            Request::Design(ref r) => {
+                if let Err(why) = validate_design_inputs(r) {
+                    self.emit_to_seat(who, Notice::Refused(why));
+                } else if matches!(r, DesignRequest::DropTarget { window, .. } if owner.window != Some(WindowId(*window))) {
+                    self.emit_to_seat(who, Notice::Refused("That window is outside this share.".into()));
+                } else {
+                    self.owner.as_mut().unwrap().queue.push_back(Work { who, kind: WorkKind::Request(request), unnamed: None });
+                }
+            }
             Request::Look => {
                 let agent = who.agent.expect("only a guest AI may look");
                 let notice = if self.view.looking.contains_key(&(who.seat, agent)) {
@@ -488,7 +551,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             Request::Set { path, prop, value } if owner.shader_fns.get(&path).is_some_and(|fns| fns.contains(&prop)) => {
                 let notice = Notice::Refused("Shader code is not applied live. Saved a note for the implementer.".into());
                 let edit = AppEdit { seat: who.seat, agent: who.agent, path, prop, change: Change::Note(value) };
-                self.owner.as_mut().unwrap().writes.push_back(Write { theme_op: false, edit, answer: Some((who, notice)) });
+                self.owner.as_mut().unwrap().writes.push_back(Write { theme_op: false, install: None, rect: None, edit, answer: Some((who, notice)) });
             }
             Request::Set { path, prop, .. } if !owner.listed.get(&path).is_some_and(|rows| rows.contains(&prop)) =>
                 self.emit(who, Notice::Refused(format!("{prop} is not one of the properties this widget lists."))),
@@ -517,7 +580,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             owner.allowed.insert(seat);
         } else {
             owner.allowed.remove(&seat);
-            self.refuse_queued(seat, None, "Allow revoked. Ask the owner again.");
+            self.refuse_matching(|who, req| (who.seat == seat && !matches!(req, Request::Design(r) if r.is_read_only()))
+                .then_some("Allow revoked. Ask the owner again."));
         }
         let req = self.req();
         self.emit(Who { seat, req, agent: None }, Notice::Allowed(yes));
@@ -553,6 +617,14 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
 
     fn refuse_matching<'a>(&mut self, reason: impl Fn(Who, &Request) -> Option<&'a str>) {
         let owner = self.owner.as_mut().unwrap();
+        if let Some((who, req)) = owner.design.current() {
+            if let Some(why) = reason(who, &Request::Design(req.clone())) { owner.design.abort(why); }
+        }
+        if let Some(holder) = owner.design.holder() {
+            if reason(holder, &Request::Design(DesignRequest::GhostCancel)).is_some() {
+                Self::queue_retract(owner, holder);
+            }
+        }
         let mut removed = Vec::new();
         owner.queue.retain(|work| {
             if let Some((request, why)) = work.request().and_then(|r| reason(work.who, r).map(|why| (r, why))) {
@@ -562,6 +634,13 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         });
         for (who, min, notice) in removed {
             if min > 0 { self.emit_to_seat(who, notice); } else { self.emit(who, notice); }
+        }
+    }
+
+    fn queue_retract(owner: &mut Owner<L, T>, holder: Who) {
+        if !owner.queue.front().is_some_and(|w| matches!(w.kind, WorkKind::DesignRetract))
+            && !owner.design.cleaning() {
+            owner.queue.push_front(Work { who: holder, kind: WorkKind::DesignRetract, unnamed: None });
         }
     }
 
@@ -582,7 +661,10 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     /// Route the complete G11 event batch first. Captures run independently of the design FIFO.
     pub fn drive_app(&mut self, app: &mut impl AppLink<L, T>) {
         let Some(owner) = &mut self.owner else { return };
-        if self.ended.is_some() { return }
+        if self.ended.is_some() {
+            self.drive_design(|id, window, op| app.design(id, window, op));
+            return;
+        }
         if let Some(window) = owner.window {
             for (_, still) in &mut owner.stills {
                 if matches!(still, Still::Queued) { *still = Still::Capturing(app.png_still(owner.link, window)); }
@@ -598,9 +680,32 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     /// For a shared G11 hub whose poll also feeds picture, input and recording consumers.
     pub fn drive_design(&mut self, design: impl FnOnce(L, Option<WindowId>, DesignOp) -> T) {
         let Some(owner) = &mut self.owner else { return };
-        if self.ended.is_some() || owner.running.is_some() || !owner.writes.is_empty() { return }
-        while let Some(work) = self.owner.as_mut().unwrap().queue.pop_front() {
+        if owner.running.is_some() || owner.design_ticket.is_some() || !owner.writes.is_empty() { return }
+        loop {
+            let owner = self.owner.as_mut().unwrap();
+            if let Some((who, _)) = owner.design.current() {
+                let result = owner.design.poll();
+                self.structural_result(who, result);
+                let owner = self.owner.as_mut().unwrap();
+                if let Some((window, op)) = owner.design.next_app_op() {
+                    owner.design_ticket = Some(design(owner.link, window, op));
+                    return;
+                }
+                if owner.design.current().is_some() || !owner.writes.is_empty() { return }
+            }
+            if self.ended.is_some() && !self.owner.as_ref().unwrap().queue.front().is_some_and(|w| matches!(w.kind, WorkKind::DesignRetract)) {
+                self.finish_end(); return
+            }
+            let Some(work) = self.owner.as_mut().unwrap().queue.pop_front() else { return };
             let who = work.who;
+            if matches!(work.kind, WorkKind::DesignRetract) {
+                let owner = self.owner.as_mut().unwrap();
+                if owner.design.holder() == Some(who) {
+                    let result = owner.design.begin(who, DesignRequest::GhostCancel, owner.window, BakeInputs::default(), Origin::Cleanup);
+                    self.structural_result(who, result);
+                }
+                continue;
+            }
             let request = work.request();
             if let Some(request) = request {
                 if let Err(why) = self.may_act(&who.seat, who.agent, request) {
@@ -614,6 +719,19 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 }
             }
             let owner = self.owner.as_mut().unwrap();
+            if let Some(Request::Design(req)) = request {
+                let origin = if who.seat == self.me && who.agent.is_none() { Origin::Owner } else { Origin::Participant };
+                let announce = who.agent.is_some() && !req.is_read_only();
+                let inputs = if matches!(req, DesignRequest::Bake { .. }) {
+                    BakeInputs::snapshot(&owner.unbaked_props, owner.last_theme_install.as_ref(), owner.rects.keys().next())
+                } else { BakeInputs::default() };
+                let result = owner.design.begin(who, req.clone(), owner.window, inputs, origin);
+                if announce && result.is_ok() {
+                    self.emit(who, Notice::Design(DesignNotice::Running { summary: "Editing the shared app".into() }));
+                }
+                self.structural_result(who, result);
+                continue;
+            }
             let get = Request::Theme(ThemeOp::Get);
             let (window, op) = app::design(request.unwrap_or(&get), owner.window).expect("only app requests enter the FIFO");
             let running = request.filter(|r| r.min_level() == 0).map(|r| Notice::Running(r.clone()));
@@ -623,9 +741,67 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         }
     }
 
+    fn structural_result(&mut self, who: Who, result: Result<Option<Completed>, String>) {
+        match result {
+            Err(why) => self.emit_to_seat(who, Notice::Refused(why)),
+            Ok(Some(Completed::CleanupFailed(why))) => {
+                // Preserve the snapshot while the share is open so the next mutation retries
+                // settlement. The owner must see a failed cleanup even when the holder left.
+                self.emit_to_seat(Who { seat: self.me, agent: None, req: 0 },
+                    Notice::Refused(format!("Could not restore the drag preview: {why}")));
+            }
+            Ok(Some(Completed::GhostStatus { reply, .. })) => {
+                let status = self.owner.as_ref().unwrap().design.state_view().json().to_json();
+                self.emit(Who { seat: self.me, agent: None, req: 0 }, Notice::Design(DesignNotice::Status(status.clone())));
+                if reply {
+                    self.emit_to_seat(who, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, json: status }));
+                }
+            }
+            Ok(Some(Completed::Reply(kind, v))) =>
+                self.emit_to_seat(who, Notice::Design(DesignNotice::Reply { kind, json: v.to_json() })),
+            Ok(Some(Completed::Mutation { op, path, focus_path, old, new })) => {
+                let owner = self.owner.as_mut().unwrap();
+                owner.seq += 1;
+                let seq = owner.seq;
+                let edit = AppEdit { seat: who.seat, agent: who.agent, path: path.clone(), prop: format!("design:{op}"),
+                    change: Change::Applied { old, new, seq } };
+                let notice = Notice::Design(DesignNotice::Mutated { op: op.into(), path, focus_path, seq, summary: op.into() });
+                owner.writes.push_back(Write { edit, install: None, rect: None, theme_op: false, answer: Some((who, notice)) });
+            }
+            Ok(None) => {}
+        }
+    }
+
+    pub(super) fn set_run_dir(&mut self, dir: Option<&str>) {
+        if let Some(owner) = &mut self.owner {
+            if owner.design.set_run_dir(dir) {
+                let status = owner.design.state_view().json().to_json();
+                self.emit(Who { seat: self.me, agent: None, req: 0 }, Notice::Design(DesignNotice::Status(status)));
+            }
+        }
+    }
+
+    pub(super) fn configure_design_worker(&mut self, pool: &makepad_widgets::makepad_platform::thread::TaskPool) {
+        if let Some(owner) = &mut self.owner { owner.design.configure_worker(pool); }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_workspace_root(&mut self, root: std::path::PathBuf) {
+        self.owner.as_mut().unwrap().design = DesignSession::with_root(root);
+    }
+
     pub(super) fn link_ended(&mut self, link: L, why: &str) {
         let Some(owner) = self.owner.as_mut().filter(|o| o.link == link) else { return };
+        owner.design_ticket = None;
+        owner.queue.retain(|w| !matches!(w.kind, WorkKind::DesignRetract));
+        let had_ghost = owner.design.holder().is_some();
+        let interrupted = owner.design.link_lost();
         let outstanding = owner.running.take();
+        if had_ghost && owner.design.holder().is_none() {
+            let status = owner.design.state_view().json().to_json();
+            self.emit(Who { seat: self.me, req: 0, agent: None }, Notice::Design(DesignNotice::Status(status)));
+        }
+        if let Some(who) = interrupted { self.emit_to_seat(who, Notice::Refused(why.into())); }
         if let Some((_, work)) = outstanding {
             if let Some(request) = work.request() { self.emit_for(request, work.who, Notice::Refused(why.into())); }
         }
@@ -652,6 +828,14 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
 
     pub(super) fn design_reply(&mut self, link: L, ticket: T, ok: bool, json: &str) {
         let Some(owner) = &mut self.owner else { return };
+        if owner.link == link && owner.design_ticket == Some(ticket) {
+            owner.design_ticket = None;
+            let who = owner.design.current().expect("pending design ticket").0;
+            let result = owner.design.reply(owner.window, ok, json);
+            self.structural_result(who, result);
+            self.finish_end();
+            return;
+        }
         if owner.link != link || !owner.running.as_ref().is_some_and(|(t, _)| *t == ticket) { return }
         let (_, work) = owner.running.take().unwrap();
         let who = work.who;
@@ -676,7 +860,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                     let kind = if theme_op { "theme value" } else { "value" };
                     let notice = Notice::Refused(format!("The app did not apply this {kind}: {reason}. Saved a note for the implementer."));
                     let edit = AppEdit { seat: who.seat, agent: who.agent, path: path.into(), prop: prop.clone(), change: Change::Note(value.clone()) };
-                    owner.writes.push_back(Write { edit, theme_op, answer: Some((who, notice)) });
+                    owner.writes.push_back(Write { edit, theme_op, install: None, rect: None, answer: Some((who, notice)) });
                 } else if let Some(notice) = &work.unnamed {
                     if let Notice::Picked { path, rect, .. } = notice { owner.rects.insert(path.clone(), *rect); }
                     self.emit(who, notice.clone());
@@ -694,9 +878,20 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         if let Some(owner) = &mut self.owner {
             let writes = std::mem::take(&mut owner.writes);
             for write in writes {
-                if let Some((who, _)) = write.answer {
+                if let Some((who, answer)) = write.answer {
+                    let mut cleared_ghost = false;
+                    if matches!(answer, Notice::Design(DesignNotice::Mutated { .. })) {
+                        let design = &mut self.owner.as_mut().unwrap().design;
+                        let had_ghost = design.holder().is_some();
+                        if design.record_failed(why) { continue; }
+                        cleared_ghost = had_ghost && design.holder().is_none();
+                    }
                     let notice = Notice::Refused(why.into());
-                    if write.theme_op { self.emit_to_seat(who, notice); } else { self.emit(who, notice); }
+                    if write.theme_op || write.edit.prop.starts_with("design:") { self.emit_to_seat(who, notice); } else { self.emit(who, notice); }
+                    if cleared_ghost {
+                        let status = self.owner.as_ref().unwrap().design.state_view().json().to_json();
+                        self.emit(Who { seat: self.me, agent: None, req: 0 }, Notice::Design(DesignNotice::Status(status)));
+                    }
                 }
             }
         }
@@ -710,7 +905,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
             let label = app::theme_label_of(v);
             if label.is_empty() { return Err("invalid theme snapshot".into()) }
             owner.theme = Some(json.into());
-            owner.theme_label = label;
+            let custom = ["has_mix", "has_pins"].iter().any(|key| v.get(key).and_then(|v| v.as_bool()) == Some(true));
+            if !custom || owner.theme_label.is_empty() { owner.theme_label = label; }
             owner.theme_deltas.clear();
             return Ok(if request.is_none() { Answer::BroadcastTheme(json.into()) }
                 else { Answer::Notice(Notice::Theme { theme: json.into() }) })
@@ -739,21 +935,27 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 Notice::Rows { path: path.clone(), rows: json.to_owned() }
             }
             Request::Set { .. } | Request::Theme(_) => {
-                let (path, prop, old, new, refresh) = match request {
+                let (path, prop, old, new, refresh, rect) = match request {
                     Request::Set { path, prop, value } => {
                         let (old, reflected) = app::applied(v, prop)?;
-                        (path.as_str(), prop.as_str(), old, single_theme_ref(value).map_or(reflected, str::to_owned), false)
+                        let rect = app::applied_rect(v).filter(|r| owner.window.is_none_or(|w| w.0 == r.window));
+                        (path.as_str(), prop.as_str(), old, single_theme_ref(value).map_or(reflected, str::to_owned), false, rect)
                     }
                     Request::Theme(ThemeOp::Set { name, .. }) if v.get("name").and_then(|v| v.as_str()) == Some(name) => {
                         let (old, new, global) = app::theme_applied(v)?;
-                        if owner.theme.is_some() && old != new { owner.theme_deltas.insert(name.clone(), new.clone()); }
-                        ("theme", name.as_str(), old, new, global)
+                        if global {
+                            owner.theme = None;
+                            owner.theme_deltas.clear();
+                        } else if owner.theme.is_some() && old != new {
+                            owner.theme_deltas.insert(name.clone(), new.clone());
+                        }
+                        ("theme", name.as_str(), old, new, global, None)
                     }
                     Request::Theme(ThemeOp::Install(install)) if v.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
                         let old = std::mem::replace(&mut owner.theme_label, install.label.clone());
                         owner.theme = None;
                         owner.theme_deltas.clear();
-                        ("theme", "install", old, install.label.clone(), true)
+                        ("theme", "install", old, install.label.clone(), true, None)
                     }
                     _ => return Err("invalid theme reply".into()),
                 };
@@ -763,6 +965,8 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 owner.seq += 1;
                 let seq = owner.seq;
                 owner.writes.push_back(Write { theme_op: matches!(request, Request::Theme(_)),
+                    install: match request { Request::Theme(ThemeOp::Install(i)) => Some(i.clone()), _ => None },
+                    rect,
                     edit: AppEdit { seat: work.who.seat, agent: work.who.agent,
                         path: path.into(), prop: prop.into(), change: Change::Applied { old: old.clone(), new: new.clone(), seq } },
                     answer: Some((work.who, Notice::Applied { path: path.into(), prop: prop.into(), old, new, seq })) });
@@ -783,7 +987,46 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         if let Some(write) = self.owner.as_mut().and_then(|o| o.writes.pop_front()) {
             if let Some((who, notice)) = write.answer {
                 if write.theme_op && matches!(notice, Notice::Refused(_)) { self.emit_to_seat(who, notice); }
-                else { self.emit(who, notice); }
+                else {
+                    let structural = matches!(notice, Notice::Design(DesignNotice::Mutated { .. }));
+                    let owner = self.owner.as_mut().unwrap();
+                    let mut bake_report = None;
+                    let mut rect_update = None;
+                    if structural {
+                        let (keys, skipped) = owner.design.record_saved();
+                        for key in keys { Arc::make_mut(&mut owner.unbaked_props).remove(&key); }
+                        bake_report = skipped;
+                    } else if let Some(install) = write.install {
+                        owner.last_theme_install = Some(Arc::new(install));
+                    } else if !write.theme_op {
+                        if let Change::Applied { new, .. } = write.edit.change {
+                            if let Some(rect) = write.rect {
+                                owner.rects.insert(write.edit.path.clone(), rect);
+                                rect_update = Some((write.edit.path.clone(), rect));
+                            }
+                            Arc::make_mut(&mut owner.unbaked_props).insert((write.edit.path, write.edit.prop), new);
+                        }
+                    }
+                    if structural {
+                        let status = self.owner.as_ref().unwrap().design.state_view().json().to_json();
+                        self.emit(Who { seat: self.me, agent: None, req: 0 }, Notice::Design(DesignNotice::Status(status)));
+                    }
+                    if let Some(report) = bake_report {
+                        self.emit_to_seat(who, Notice::Design(DesignNotice::Reply { kind: DesignReplyKind::State, json: report.to_json() }));
+                    }
+                    self.emit(who, notice);
+                    if !self.is_ended() {
+                        if let Some((path, rect)) = rect_update {
+                            let seats: Vec<_> = self.view.selections.iter()
+                                .filter(|(_, s)| s.path == path && s.rect != Some(rect))
+                                .map(|(&seat, s)| (seat, s.agent)).collect();
+                            for (seat, agent) in seats {
+                                self.emit(Who { seat, req: 0, agent },
+                                    Notice::Selected { path: Some(path.clone()), rect: Some(rect) });
+                            }
+                        }
+                    }
+                }
             }
         }
         self.finish_end();
@@ -814,6 +1057,12 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     fn finish_end(&mut self) {
         if self.terminal || self.owner.is_none() || self.has_unsettled_edits() { return }
         if let Some(reason) = self.ended.clone() {
+            let owner = self.owner.as_mut().unwrap();
+            if owner.design.holder().is_some() {
+                owner.design.clear_ghost();
+                let status = owner.design.state_view().json().to_json();
+                self.emit(Who { seat: self.me, agent: None, req: 0 }, Notice::Design(DesignNotice::Status(status)));
+            }
             self.terminal = true;
             let req = self.req();
             self.emit(Who { seat: self.me, req, agent: None }, Notice::Ended(reason));
@@ -821,13 +1070,14 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     }
 
     pub fn has_unsettled_edits(&self) -> bool {
-        self.owner.as_ref().is_some_and(|o| o.running.is_some() || !o.writes.is_empty())
+        self.owner.as_ref().is_some_and(|o| o.running.is_some() || o.design.current().is_some() || !o.writes.is_empty()
+            || o.queue.front().is_some_and(|w| matches!(w.kind, WorkKind::DesignRetract)))
     }
 
     pub(super) fn unrecorded_edits(&self) -> usize {
         self.owner.as_ref().map_or(0, |owner| {
             let in_flight = owner.running.as_ref().is_some_and(|(_, work)| matches!(work.request(), Some(Request::Set { .. } | Request::Theme(ThemeOp::Set { .. } | ThemeOp::Install(_)))));
-            owner.writes.len() + usize::from(in_flight)
+            owner.writes.len() + usize::from(in_flight || owner.design.current().is_some_and(|(_, r)| !r.is_read_only()))
         })
     }
 
@@ -835,11 +1085,13 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         if self.ended.is_some() { return }
         self.ended = Some(why.into());
         if let Some(owner) = &mut self.owner {
+            owner.design.abort(why);
             owner.running.take_if(|(_, w)| matches!(w.kind, WorkKind::ThemeRefresh));
             let allowed = std::mem::take(&mut owner.allowed);
             // A local Leave can precede the final G11 Design event for a Set already applied.
             // Keep its ticket until Design or the terminal G11 Ended event.
             let queue = std::mem::take(&mut owner.queue);
+            if let Some(holder) = owner.design.holder() { Self::queue_retract(owner, holder); }
             for seat in allowed {
                 let req = self.req();
                 self.emit(Who { seat, req, agent: None }, Notice::Allowed(false));
@@ -887,7 +1139,10 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
     /// Call on a computer-link loss, including one with no queued outbound bodies.
     pub fn peer_unlinked(&mut self, peer: Seat) {
         self.retry_peer(peer);
-        if self.owner.is_some() { self.refuse_looks(peer, "The guest disconnected."); }
+        if self.owner.is_some() {
+            self.refuse_looks(peer, "The guest disconnected.");
+            self.refuse_matching(|who, r| (who.seat == peer && matches!(r, Request::Design(_))).then_some("The guest disconnected."));
+        }
         if self.owner.as_ref().is_some_and(|o| o.allowed.contains(&peer)) { let _ = self.consent(peer, false); }
         if self.owner.is_none() && peer == self.sharer {
             self.cancel_pending_looks("The sharer disconnected.");
@@ -917,6 +1172,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                     let valid = match &notice {
                         Notice::Tree { tree, .. } => wire::validate_tree(tree),
                         Notice::Theme { theme } => wire::validate_theme(theme),
+                        Notice::Design(DesignNotice::Status(json) | DesignNotice::Reply { json, .. }) => wire::validate_design_json(json),
                         _ => Ok(()),
                     };
                     if let Err(why) = valid {
@@ -928,14 +1184,16 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                         if let Some((_, Some(done))) = self.pending_looks.remove(&who.req) { self.requests.remove(&done); }
                     }
                     if seat == self.me && matches!(notice, Notice::Asked | Notice::Selected { .. } | Notice::Picked { .. }
-                        | Notice::Rows { .. } | Notice::Tree { .. } | Notice::Theme { .. } | Notice::Applied { .. } | Notice::Refused(_) | Notice::Looked) { self.requests.remove(&who.req); }
+                        | Notice::Rows { .. } | Notice::Tree { .. } | Notice::Theme { .. } | Notice::Applied { .. } | Notice::Refused(_) | Notice::Looked
+                        | Notice::Design(DesignNotice::Reply { .. } | DesignNotice::Mutated { .. })) { self.requests.remove(&who.req); }
                     if let Notice::Ended(why) = &notice {
                         self.end(why);
                         self.terminal = true;
                         let pending = std::mem::take(&mut self.requests);
                         self.refuse_requests(pending, why);
                     }
-                    if self.ended.is_none() || matches!(notice, Notice::Ended(_) | Notice::Applied { .. } | Notice::Refused(_)) {
+                    if self.ended.is_none() || matches!(notice, Notice::Ended(_) | Notice::Applied { .. } | Notice::Refused(_)
+                        | Notice::Design(DesignNotice::Status(_) | DesignNotice::Mutated { .. })) {
                         self.view.receive(Who { seat, ..who }, notice);
                     }
                 }
@@ -955,7 +1213,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
         if let Some(owner) = &mut self.owner {
             let level = owner.peer_levels.get(&peer).copied();
             let Some(out) = owner.out.get_mut(&peer) else { return Ok(()) };
-            if let Some(l) = level.filter(|l| *l < THEME_LEVEL) {
+            if let Some(l) = level.filter(|l| *l < MAX_GATED_LEVEL) {
                 out.pending.retain(|_, body| wire::min_level(body) <= l);
             }
             for (&id, body) in out.pending.range((std::ops::Bound::Excluded(out.sent), std::ops::Bound::Unbounded)) {
@@ -977,7 +1235,7 @@ impl<L: Copy + Eq, T: Copy + Eq> Session<L, T> {
                 self.ack = None;
             }
             if self.is_ended() { return Ok(()) }
-            if let Some(l) = self.sharer_level.filter(|l| *l < THEME_LEVEL) { self.drop_incompatible_requests(l); }
+            if let Some(l) = self.sharer_level.filter(|l| *l < MAX_GATED_LEVEL) { self.drop_incompatible_requests(l); }
             for (&req, bytes) in self.requests.range((std::ops::Bound::Excluded(self.sent), std::ops::Bound::Unbounded)) {
                 let min = wire::min_level(bytes);
                 if min > 0 && !self.sharer_level.is_some_and(|l| l >= min) { break }

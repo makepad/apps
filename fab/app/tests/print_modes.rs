@@ -251,7 +251,7 @@ fn global_and_override(app: &TestApp, name: &str) {
     set(app, density, "40%");
     wait_until(app, "global commit", || project(app).contains("settings({sparse_infill_density: \"40%\"})"));
     select_box(app, name);
-    wait_until(app, "the object's title", || app.widget_snapshot().nodes().iter().any(|n| n.name == "Follows the global settings." && n.visible()));
+    app.locator(Selector::path("head.note").name("No overrides: the global settings apply.")).wait_visible();
     // The object inherits it: 40, and a value equal to the global one is no override; a new
     // value is (edits land in order, so the first would have shown by the time the second has).
     set(app, density, "40%");

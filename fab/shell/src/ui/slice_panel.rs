@@ -5,7 +5,7 @@
 //! (the supports, travel, the parts under the toolpaths).
 
 use crate::api::*;
-use crate::print::{ColorBy, PrintAction};
+use crate::print::{panel::{export_failure, export_line, slice_status}, ColorBy, PrintAction, PrintState, SliceStatus};
 use crate::ui::popover::{dropdown_clicked, menu_picked, open_menu, MenuItem, MenuPlace};
 use makepad_widgets_core::*;
 
@@ -50,8 +50,14 @@ script_mod! {
         body := mod.widgets.FabScroll{
             padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
             a11y: {role: "group" label: "Print preview legend"}
-            // nothing sliced yet: what the slice is waiting for
-            none := mod.widgets.FabLabelDim{ width: Fill text: "" margin: Inset{left: 4 top: 4 bottom: 8} }
+            // The slice status before the preview, or the export's outcome beside it.
+            none := mod.widgets.FabLabelDim{
+                width: Fill text: "" margin: Inset{left: 4 top: 4 bottom: 8}
+                draw_text +: {
+                    error: instance(0.0)
+                    get_color: fn() { return fab.color_text_dim.mix(fab.color_error, self.error) }
+                }
+            }
             // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
             display_slot := View{width: Fill height: Fit
                 display := PropSection{
@@ -170,6 +176,28 @@ pub struct FabSlicePanel {
     view: View,
     #[rust]
     synced: Option<(Option<u64>, Option<u64>, bool, bool)>,
+    #[rust]
+    status_synced: Option<(u64, bool)>,
+}
+
+impl FabSlicePanel {
+    fn sync_status(&mut self, cx: &mut Cx, p: &PrintState, has: bool) {
+        let key = (p.revision, has);
+        if self.status_synced == Some(key) { return; }
+        self.status_synced = Some(key);
+        let line = if has {
+            export_line(p)
+        } else {
+            Some((slice_status(p).0, matches!(p.status, SliceStatus::Failed(_)) || export_failure(p).is_some()))
+        };
+        let none = self.view.label(cx, ids!(body.none));
+        none.set_visible(cx, line.is_some());
+        let (text, error) = line.unwrap_or_default();
+        none.set_text(cx, &text);
+        if let Some(mut label) = none.borrow_mut() {
+            label.draw_text.set_dyn_instance(cx, live_id!(error), &[if error { 1.0 } else { 0.0 }]);
+        };
+    }
 }
 
 impl Widget for FabSlicePanel {
@@ -290,16 +318,52 @@ impl Widget for FabSlicePanel {
             b.widget(cx, ids!(material_box)).set_visible(cx, has && crate::print::timeline::legend_has_materials(state));
             b.widget(cx, ids!(printability)).set_visible(cx, fixable || crate::print::timeline::issues_shown(p));
             b.widget(cx, ids!(overhang_list)).set_visible(cx, crate::print::support_list::has_lines(p));
-            let none = b.label(cx, ids!(none));
-            none.set_visible(cx, !has);
-            if !has {
-                none.set_text(cx, &crate::print::panel::slice_status(p).0);
-            }
+            self.sync_status(cx, p, has);
         }
         // the toolbar's search filters the sections' rows (`filter_sections`)
         let query = self.view.text_input(cx, ids!(editor_bar.search.row.input)).text();
         let sections = [ids!(display), ids!(compare), ids!(legend_box), ids!(printability), ids!(overhang_list)].map(|path| self.view.widget(cx, path));
         crate::ui::widgets::filter_sections(cx, live_id!(slice_sections), &query, &sections);
         self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::print::{panel::stage_failure, ExportStatus};
+
+    #[test]
+    fn preview_status_label_shows_the_export_and_keeps_the_slice() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut panel = cx.with_vm(|vm| {
+            makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[
+                makepad_widgets_fab::fab_mod, makepad_widgets_pickers::pickers_mod,
+                makepad_widgets_data::dock_mod, makepad_widgets_data::data_mod,
+                makepad_widgets_extras::glass_mod, makepad_widgets_extras::color_mod,
+                makepad_widgets_extras::charts_mod, makepad_widgets_rich_text::rich_text_mod,
+            ]);
+            crate::script_mod(vm);
+            FabSlicePanel::script_new_with_default(vm)
+        });
+        let done = SliceStatus::Done { seconds: 1.0 };
+        let mut p = PrintState { status: done.clone(), ..Default::default() };
+        let label = panel.view.label(&cx, ids!(body.none));
+        for (export, expected) in [
+            (ExportStatus::Idle, None),
+            (ExportStatus::Written("plate.gcode.3mf".into()), Some("Wrote plate.gcode.3mf")),
+            (ExportStatus::Failed("write refused".into()), Some("Export failed: write refused")),
+        ] {
+            p.export = export;
+            p.bump();
+            panel.sync_status(&mut cx, &p, true);
+            assert_eq!(label.visible(), expected.is_some(), "only an export shows a line beside a preview");
+            assert_eq!(label.text(), expected.unwrap_or_default(), "the Slice label carries the export's live text");
+            let failure = expected.filter(|_| matches!(p.export, ExportStatus::Failed(_)));
+            assert_eq!(export_failure(&p).as_deref(), failure);
+            assert_eq!(stage_failure(&p).as_deref(), failure);
+            assert_eq!(p.status, done);
+        }
     }
 }

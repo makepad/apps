@@ -2,7 +2,8 @@
 use super::{
     config::Config, sftp::{Progress, Published, Upload}, store::{Author, Entry, Store},
 };
-use makepad_strict_json::{obj, s, Value};
+use crate::ai_out::SafeToolError;
+use makepad_town_core::trust::{AiJson, AiOut, HomeGate};
 use makepad_widgets::makepad_platform::thread::{Class, TaskHandle, TaskPool};
 use std::{io, path::{Path, PathBuf}, sync::{Arc, mpsc::{self, Receiver, Sender}}};
 
@@ -65,12 +66,20 @@ impl LocalPublish {
         }
     }
 
-    pub fn catalog(&self) -> Result<String, String> {
+    pub fn catalog(&self, gate: &HomeGate) -> Result<AiOut, String> {
+        let withheld = |why| SafeToolError::withheld(why).as_str().to_owned();
+        gate.check_outside().map_err(withheld)?;
         if !self.enabled() { return Err("publish is unavailable".into()) }
         if self.inventory.is_some() || !self.imports.is_empty() { return Err("local media is loading; try again".into()) }
-        Ok(Value::Arr(self.entries.iter().map(|e| obj(vec![
-            ("id", s(&e.id)), ("file", s(&e.media.file)), ("bytes", Value::Int(e.media.bytes as i64)),
-        ])).collect()).to_json())
+        let mut entries = Vec::new();
+        for e in self.entries.iter().filter(|e| e.author == Author::Local) {
+            entries.push(AiJson::object(vec![
+                ("id", AiJson::text(gate.local_captured(e.id.clone()).map_err(withheld)?)),
+                ("file", AiJson::text(gate.local_captured(e.media.file.clone()).map_err(withheld)?)),
+                ("bytes", AiJson::int(e.media.bytes as i64)),
+            ]));
+        }
+        gate.finish_json(AiJson::array(entries)).map_err(withheld)
     }
 
     /// The local AI stops at this boundary. It cannot replace a draft under review.
@@ -78,7 +87,7 @@ impl LocalPublish {
         if !self.enabled() { return Err("publish is unavailable".into()) }
         if self.pending() || !self.draft.title.is_empty() || !self.draft.text.is_empty() { return Err("finish or discard the current draft first".into()) }
         if title.trim().is_empty() || ids.is_empty() { return Err("a draft needs a title and media".into()) }
-        if ids.iter().any(|id| !self.entries.iter().any(|e| &e.id == id)) { return Err("unknown local media entry".into()) }
+        if ids.iter().any(|id| !self.entries.iter().any(|e| e.author == Author::Local && &e.id == id)) { return Err("unknown local media entry".into()) }
         let target = self.draft.target;
         self.clear();
         self.draft = Draft { ids, title, text, target };

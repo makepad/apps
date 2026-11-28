@@ -3,18 +3,20 @@
 //!
 //! A bound agent can read the town's filtered timeline during its person's inbox turn.
 
-use crate::board::{design, page, BoardItem};
+use crate::board::{design, page, BoardItem, BoardView};
 use crate::link_worker::{PairWords, ToWorker};
 use crate::board::schema::{Vocabulary, STEP};
-use crate::store_worker::{FileResult, StoreWorker};
+use crate::store_worker::{BoardMediaTarget, FileResult, StoreWorker};
 use crate::board::tree::{add_home_changes, board_kind, descendants, live, parent, step_kind, steps, BoardTree, Placement};
 use makepad_ai_services::wire::MAX_RESULT_BYTES;
+use makepad_town_core::trust::{AiJson, AiOut, AiTextBuilder, ForAi, Gate, LocalPolicy, Withheld};
 use makepad_town_core::blob::{self, Hash, refs::References};
 use makepad_town_core::doc::{self, attr, Block, BreakRef, CharId};
 use makepad_town_core::entity::{field, kind, Entity};
 use makepad_town_core::event::{Actor, Change, Chat, ChatAgent, Content, Draft, Event, Id, Key, Member, TownId, Value as FieldValue, Via};
+use makepad_town_core::event::{normalize_copy_refs, CopyRef, CopySource};
 use makepad_town_core::event::{DeclineWhy, JobId, LeaveWhy, SaidLine, Service, SessionId, SessionMode, SessionOp};
-use makepad_town_core::fold::{self, Job, JobState, State};
+use makepad_town_core::fold::{self, FinalClosure, Job, JobState, State};
 pub use makepad_town_core::fold::ReinstatedDevice;
 
 /// One active person (seat) in the open town, in canonical DAG join order.
@@ -45,7 +47,7 @@ use makepad_widgets::makepad_platform::makepad_hal::sources as runner;
 use makepad_town_core::sync::SyncEngine;
 use makepad_town_core::{hex, order_key, parse_id};
 use makepad_strict_json::{self as json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -193,10 +195,10 @@ pub enum Action {
     AcceptProposed { tasks: Vec<Id> },
     /// Delete proposed tasks. UI only.
     DismissProposed { tasks: Vec<Id> },
-    SessionOpen { session: SessionId, mode: SessionMode, to: Vec<Id>, town: Option<TownId> },
-    SessionJoin { session: SessionId, town: Option<TownId> },
+    SessionOpen { session: SessionId, mode: SessionMode, to: Vec<Id>, town: Option<TownId>, town_wide: bool },
+    SessionJoin { session: SessionId, town: Option<TownId>, peer: Option<PublicKey> },
     SessionLeave { session: SessionId, secs: Option<u32>, why: LeaveWhy },
-    SessionDecline { session: SessionId, why: DeclineWhy, town: Option<TownId> },
+    SessionDecline { session: SessionId, why: DeclineWhy, town: Option<TownId>, peer: Option<PublicKey> },
     Said { session: SessionId, lines: Vec<SaidLine> },
     Shared { session: SessionId, agent: Id, line: Id },
     PostClip { project: Option<Id>, title: String, media: (u64, Hash), poster: Option<(u64, Hash)>,
@@ -220,6 +222,10 @@ pub enum Action {
     WriteDoc { doc: Id, markdown: String, based_on: String, range: Option<(BreakRef, BreakRef)> },
     LineToTask { doc: Id, at: BreakRef },
     AddBoard { title: String, project: Id },
+    PinMedia { board: Id, parent: Option<Id>, x: i64, y: i64, w: i64, h: i64, title: String,
+        blob: (u64, Hash), poster: Option<(u64, Hash)>, media: String, duration_ms: Option<u64>,
+        source: Option<Id>, session: Option<SessionId> },
+    PinFrom { board: Id, from: Id, parent: Option<Id>, x: Option<i64>, y: Option<i64>, w: Option<i64>, h: Option<i64> },
     /// Geometry in board actions uses integers in 1/64 canvas units, like the signed fields.
     AddItem { board: Id, kind: Key, x: i64, y: i64, w: i64, h: i64, style: ItemStyle, parent: Option<Id> },
     AddApp { town: TownId, board: Option<Id>, geometry: [i64; 4], session: crate::tweak::SessionId, name: String },
@@ -278,6 +284,16 @@ pub(crate) struct ProjectTasks {
 fn next_task_key_in(state: &State, project: Id) -> Vec<u8> {
     let last = state.visible_entities(|t| t.kind == kind::TASK && t.project == Some(project)).filter_map(task_key).max();
     order_key::try_between(last, None).expect("the fold accepts only valid order keys")
+}
+
+/// Label the fields this creation actually emits, including optional media and edit values.
+fn entity_copy_refs(fields: &[(Key, FieldValue)], targets: &[Key], sources: &[CopySource]) -> Vec<CopyRef> {
+    if sources.is_empty() { return vec![] }
+    let mut refs = fields.iter().filter(|(key, _)| targets.contains(key)).map(|(key, _)| CopyRef {
+        target_entity: None, target_field: key.clone(), sources: sources.to_vec(),
+    }).collect();
+    normalize_copy_refs(&mut refs);
+    refs
 }
 
 fn task_text_changes(task: Id, title: Option<String>, text: Option<String>) -> Result<Vec<Change>, String> {
@@ -523,6 +539,8 @@ pub enum AloneReason { SetAside, Ended, Never }
 pub enum NoticeAction {
     Answer { shown: OfferPrompt, yes: bool },
     Offer { town: TownId, peer: PublicKey, new: bool },
+    ReRemove { town: TownId, device: PublicKey, removal_event: Id },
+    DismissFork { town: TownId, removal_event: Id },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,6 +576,7 @@ struct StartupIssues {
 const CANNOT_REJOIN: &str = "This device can't rejoin this town.";
 /// The same fact seen from the device that stopped sharing: it names the other device.
 pub(crate) const THAT_CANNOT_REJOIN: &str = "That device can't rejoin this town.";
+pub(crate) const ALREADY_IN_TOWN: &str = "That computer is already in this town.";
 pub(crate) const DIFFERENT_INVITATION: &str = "This computer already has a different invitation\nto this town.";
 
 #[derive(Clone, Copy)]
@@ -584,6 +603,9 @@ pub struct Town {
     private: PrivateFiles,
     summaries: std::cell::OnceCell<SummaryIndex>,
     member_order: std::cell::OnceCell<JoinOrder>,
+    session_opens: std::cell::OnceCell<BTreeMap<SessionId, u32>>,
+    logged_conflicted_sessions: std::cell::RefCell<BTreeSet<SessionId>>,
+    membership_epoch: u64,
     log: Log,
     pub state: State,
     pub references: References,
@@ -609,6 +631,7 @@ struct SummaryIndex {
 struct JoinOrder {
     members: Vec<PublicKey>,
     agents: Vec<Id>,
+    seat_devices: BTreeMap<Id, Vec<PublicKey>>,
 }
 
 impl Town {
@@ -630,8 +653,50 @@ impl Town {
                 .collect();
             keyed.sort_unstable();
             let agents = keyed.into_iter().map(|(_, id)| id).collect();
-            JoinOrder { members, agents }
+            let mut seat_devices = BTreeMap::<Id, Vec<PublicKey>>::new();
+            for device in members.iter().copied().chain(self.state.admitted_devices().filter(|k| !seen.contains(k))) {
+                if let Some(seat) = self.state.seat_of(&device) {
+                    seat_devices.entry(seat).or_default().push(device);
+                }
+            }
+            // A departed seat keeps its historical name. A live seat is named by its active devices.
+            for devices in seat_devices.values_mut() {
+                if devices.iter().any(|key| self.state.active_member(key)) {
+                    devices.retain(|key| self.state.active_member(key));
+                }
+            }
+            JoinOrder { members, agents, seat_devices }
         })
+    }
+
+    fn counted_open(state: &State, event: &Event) -> Option<SessionId> {
+        if event.header.kind != makepad_town_core::event::kind::SESSION
+            || state.order_of(&event.id).is_none() || state.void_events.contains_key(&event.id) { return None }
+        match Content::decode(event.header.kind, event.header.kind_version, event.content()?)? {
+            Content::Session(SessionOp::Open { session, .. }) => Some(session),
+            _ => None,
+        }
+    }
+
+    fn session_opens(&self) -> &BTreeMap<SessionId, u32> {
+        self.session_opens.get_or_init(|| {
+            let mut counts = BTreeMap::<_, u32>::new();
+            if !self.state.sessions.is_empty() {
+                for session in self.log.events().iter().filter_map(|event| Self::counted_open(&self.state, event)) {
+                    let n = counts.entry(session).or_default();
+                    *n = n.saturating_add(1);
+                }
+            }
+            counts
+        })
+    }
+
+    fn has_unique_open(&self, session: &SessionId) -> bool {
+        let count = self.session_opens().get(session).copied().unwrap_or(0);
+        if count > 1 && self.logged_conflicted_sessions.borrow_mut().insert(*session) {
+            makepad_widgets::log!("Town call: refused join scope for session {} with {} open events.", hex(session), count);
+        }
+        count == 1
     }
 
     fn summary_index(&self) -> &SummaryIndex {
@@ -690,6 +755,7 @@ impl Town {
 pub(crate) struct JoinedOffers {
     pub binding: Credential,
     pub agent: Id,
+    pub name: String,
     pub lines: Vec<(Id, u64)>,
 }
 
@@ -717,7 +783,8 @@ impl Town {
         let agent_book = AgentBook::open_in(&agent_file, &PrivateFiles::default()).map_err(|e| format!("Reading the local agent record: {e}"));
         let agent_turns = AgentTurns::open_in(turns_path(home, &log.town_id()), private.clone());
         let references = References::from_log(&log);
-        Self { private, summaries: Default::default(), member_order: Default::default(), log, state, references, acks, agent_file, agent_book, agent_turns, agent_revision: 0, cached_events, board_report: None }
+        Self { private, summaries: Default::default(), member_order: Default::default(), session_opens: Default::default(),
+            logged_conflicted_sessions: Default::default(), membership_epoch: 0, log, state, references, acks, agent_file, agent_book, agent_turns, agent_revision: 0, cached_events, board_report: None }
     }
 
     fn checkpoint(&mut self, home: &Home) {
@@ -747,6 +814,7 @@ impl Town {
 
     fn sign(&self, key: &DeviceKey, content: Content, origin: Origin, mut parents: Vec<Id>) -> Result<Event, String> {
         if let Content::Member(Member::Invite { subject, .. } | Member::AddDevice { device: subject, .. }) = &content {
+            if self.state.active_member(subject) { return Err(ALREADY_IN_TOWN.into()) }
             if self.state.spent(subject) { return Err(THAT_CANNOT_REJOIN.into()) }
         }
         let me = key.public();
@@ -805,13 +873,27 @@ impl Town {
         let event = &self.log.events()[position];
         let author = event.header.author;
         let kind = event.header.kind;
+        let already_folded = kind == event_kind::SESSION && self.state.order_of(&event.id).is_some();
         let waiting_before = self.state.waiting.len();
         let fork_before = self.state.forked(&author);
         self.state.receive(event);
         let forked = fork_before != self.state.forked(&author);
         let released_waiting = self.state.waiting.len() < waiting_before;
+        if forked || released_waiting || kind == event_kind::MEMBER {
+            self.membership_epoch = self.membership_epoch.wrapping_add(1);
+        }
         if forked || released_waiting || matches!(kind, event_kind::TOWN | event_kind::MEMBER | event_kind::AGENT) {
             self.member_order.take();
+        }
+        if forked || released_waiting || matches!(kind, event_kind::TOWN | event_kind::MEMBER) {
+            self.session_opens.take();
+        } else if kind == event_kind::SESSION && !already_folded {
+            if let Some(counts) = self.session_opens.get_mut() {
+                if let Some(session) = Self::counted_open(&self.state, event) {
+                    let n = counts.entry(session).or_default();
+                    *n = n.saturating_add(1);
+                }
+            }
         }
         forked || released_waiting
     }
@@ -888,6 +970,7 @@ impl Town {
             active: self.state.active_members().collect(), admitted: self.state.admitted_devices().collect(),
             pending: self.state.pending_devices().collect(),
             forked_eligible: self.state.forked_eligible_devices().collect(),
+            final_boundaries: self.state.device_final_boundaries(&self.log),
             chat_tip: self.state.chat.last().map(|m| m.id),
         }
     }
@@ -903,11 +986,20 @@ struct TownInfo {
     admitted: Vec<PublicKey>,
     pending: Vec<PublicKey>,
     forked_eligible: Vec<PublicKey>,
+    final_boundaries: BTreeMap<PublicKey, (usize, FinalClosure)>,
     /// The newest live chat line when this summary was taken.
     chat_tip: Option<Id>,
 }
 
 impl TownInfo {
+    fn final_boundary(&self, a: &PublicKey, b: &PublicKey) -> Option<FinalClosure> {
+        let mut best = self.final_boundaries.get(a).copied();
+        if let Some(other) = self.final_boundaries.get(b).copied() {
+            if best.is_none_or(|(at, _)| other.0 < at) { best = Some(other); }
+        }
+        best.map(|(_, closure)| closure)
+    }
+
     fn had_standing(&self, key: &PublicKey) -> bool {
         self.admitted.contains(key) || self.forked_eligible.contains(key)
     }
@@ -930,7 +1022,7 @@ enum FinalEvidence<'a> {
 }
 
 #[derive(PartialEq, Eq)]
-enum ReceiveDecision { Silent, Receive, CloseFinal(TownId) }
+enum ReceiveDecision { Silent, Receive, CloseFinal(TownId, FinalClosure) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddComputer {
@@ -1054,6 +1146,9 @@ struct Files {
     holdings: BTreeMap<TownId, HashSet<Id>>,
     pending_adds: usize,
     pending_clips: usize,
+    /// Store results still to publish, by the town they go to. Such a town stays in memory
+    /// (`Model::keep_resident`): publishing reaches it without reading its log on the UI thread.
+    pending_towns: HashMap<TownId, usize>,
     to_publish: Vec<FileResult>,
     clip_problems: Vec<String>,
     retry_at: Option<Instant>,
@@ -1066,6 +1161,8 @@ struct Files {
 
 #[derive(Default)]
 pub struct StoreTick {
+    /// Newly published board image events, in store completion order.
+    pub board_events: Vec<(TownId, Id)>,
     pub issues: Vec<crate::store_worker::IssueReceipt>,
     pub changed: bool,
     pub retry_frame: bool,
@@ -1123,7 +1220,7 @@ pub struct Model {
     session_towns: BTreeMap<SessionId, SessionPin>,
     ringing_town: Option<(SessionId, Option<PublicKey>, Option<SessionPin>)>,
     ringing_wire_town: Option<TownId>,
-    share_offer_peers: BTreeMap<SessionId, (PublicKey, Option<TownId>)>,
+    share_offer_peers: BTreeMap<SessionId, (PublicKey, Option<TownId>, Option<SessionPin>)>,
     active_call: Option<(SessionId, Option<PublicKey>, Option<TownId>)>,
     selected_project: Option<Id>,
     doc_reads: BTreeMap<(TownId, Id), DocReads>,
@@ -1164,8 +1261,8 @@ pub struct Model {
     carrier_revision: u64,
     prompt_serial: u64,
     session_serial: u64,
-    closed_finals: Result<BTreeSet<(TownId, PublicKey)>, String>,
-    pending_final_writes: Vec<(TownId, PublicKey)>,
+    closed_finals: Result<BTreeMap<(TownId, PublicKey), BTreeSet<FinalClosure>>, String>,
+    pending_final_writes: Vec<(TownId, PublicKey, FinalClosure)>,
     town_notices: Vec<PathBuf>,
     startup: StartupIssues,
     logged_invalid_keys: BTreeSet<PublicKey>,
@@ -1192,18 +1289,80 @@ pub struct MentionedSeat {
     pub name: String,
 }
 
+/// Immutable identity bound to an `@` token in the composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComposerTarget {
+    Agent(Id),
+    Seat(Id),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundMention {
+    pub range: std::ops::Range<usize>,
+    /// Exact draft slice, including the opening `@` and excluding the separator.
+    pub token: String,
+    pub target: ComposerTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionCandidate {
+    pub target: ComposerTarget,
+    pub seat: crate::view::Seat,
+    pub tone: Option<crate::view::SeatTone>,
+    pub label: String,
+    pub insert_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionQuery {
+    pub range: std::ops::Range<usize>,
+    pub query: String,
+    pub leading: bool,
+}
+
+/// A query may contain spaces, since both people and AIs have multi-word labels.
+pub fn active_mention_query(draft: &str, cursor_byte: usize, bound: &[BoundMention]) -> Option<MentionQuery> {
+    let before = draft.get(..cursor_byte)?;
+    let at = before.rfind('@')?;
+    let query = &before[at + 1..];
+    if !is_mention_start(draft, at) || query.starts_with(char::is_whitespace) || query.contains(['\r', '\n'])
+        || bound.iter().any(|m| m.range.start < cursor_byte && at < m.range.end && draft.get(m.range.clone()) == Some(m.token.as_str())) {
+        return None
+    }
+    Some(MentionQuery { range: at..cursor_byte, query: query.into(), leading: before[..at].trim_start().is_empty() })
+}
+
+/// Retain only whole tokens on either side of the edited span, in UTF-8 byte coordinates.
+pub fn reconcile_mentions(bound: &mut Vec<BoundMention>, old_draft: &str, new_draft: &str) {
+    if bound.is_empty() || old_draft == new_draft { return }
+    let prefix = old_draft.chars().zip(new_draft.chars()).take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8()).sum::<usize>();
+    let suffix = old_draft[prefix..].chars().rev().zip(new_draft[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b).map(|(c, _)| c.len_utf8()).sum::<usize>();
+    let old_end = old_draft.len() - suffix;
+    let new_end = new_draft.len() - suffix;
+    bound.retain_mut(|m| {
+        if old_draft.get(m.range.clone()) != Some(m.token.as_str()) { return false }
+        if m.range.start >= old_end {
+            m.range = (new_end + (m.range.start - old_end))..(new_end + (m.range.end - old_end));
+        } else if m.range.end > prefix {
+            return false
+        }
+        new_draft.get(m.range.clone()) == Some(m.token.as_str())
+    });
+}
+
 /// How the composer routes a draft in the open town. The hint reads this, so it never differs
 /// from what `post_chat_draft` does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MentionTarget {
     /// Plain town chat: no person mentioned and no AI turn.
     None,
-    /// A leading `@`, `@ai` or the name of my own AI. Queued until an AI joins when `has_ai` is false.
-    YourAi { has_ai: bool, name: Option<String> },
-    /// A leading `@<name>` of an AI member owned by another seat. Its owner must approve.
-    PeerAi { agent: Id, agent_name: String, owner_name: String },
-    /// A leading `@<name>` matching AI members of 2 or more seats. It stays plain town chat.
-    AmbiguousAi { name: String, count: usize },
+    /// An explicit pick or the local seat's leading `@` / `@ai` shorthand.
+    YourAi { has_ai: bool, agent: Option<Id>, label: Option<String> },
+    PeerAi { agent: Id, label: String, owner_name: String },
+    /// A typed AI label has no recipient until the author picks one.
+    UnboundAi,
     /// Plain town chat mentioning other active people, in the order they first appear.
     People(Vec<MentionedSeat>),
 }
@@ -1212,6 +1371,7 @@ struct PersonCandidate {
     seat: Id,
     label: String,
     is_me: bool,
+    match_text: bool,
 }
 
 struct AgentCandidate {
@@ -1220,14 +1380,16 @@ struct AgentCandidate {
     owner_seat: Id,
     owner_name: String,
     name: String,
+    short_label: String,
+    custom_name: Option<String>,
     position: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DraftRoute {
     MyAi { agent: Option<Id>, text: String, above: Option<Id> },
-    PeerAi { agent: Id, agent_name: String, owner_name: String, text: String, above: Option<Id> },
-    Town { text: String, people: Vec<MentionedSeat>, ambiguous_ai: Option<(String, usize)> },
+    PeerAi { agent: Id, owner_name: String, text: String, above: Option<Id> },
+    Town { text: String, people: Vec<MentionedSeat>, unbound_ai: bool },
 }
 
 fn is_mention_start(draft: &str, at: usize) -> bool {
@@ -1279,28 +1441,30 @@ fn match_words(input: &str, label: &str) -> Option<usize> {
     Some(pos)
 }
 
-/// `,"mentions":[...]` for seat ids, within `budget` bytes with room for `,"mentions_truncated":true`
-/// when some do not fit. `person` gives the extra bytes' entry a seat brings; both go back together.
-fn mentions_json(mentions: &[Id], budget: usize, mut person: impl FnMut(&Id) -> Option<String>) -> (String, Vec<(Id, Option<String>)>) {
-    let mut json = String::from(r#","mentions":["#);
-    let mut taken: Vec<(Id, Option<String>)> = Vec::new();
-    let mut used = 14;
-    let mut truncated = false;
+// Mention ids travel with the page. Only timeline reads also resolve the people they name.
+fn add_mentions<'a>(fields: &mut Vec<(&'static str, AiJson)>, mentions: &'a [Id], budget: usize,
+    mut person: impl FnMut(&Id) -> Result<Option<AiJson>, String>) -> Result<(Vec<(Id, AiJson)>, usize, &'a [Id]), String> {
+    let mut ids = Vec::new();
+    let mut people = Vec::new();
+    let mut people_bytes = 0;
+    let mut used = r#","mentions":[]"#.len();
     for (i, seat) in mentions.iter().enumerate() {
-        let who = person(seat);
-        let cost = if taken.is_empty() { 66 } else { 67 } + who.as_ref().map_or(0, |p| p.len() + 1);
-        let reserve = if i + 1 < mentions.len() { 26 } else { 0 };
-        if used + cost + reserve > budget { truncated = true; break }
+        let who = person(seat)?;
+        // Every extra person follows the row's author in the final people map.
+        let name_cost = who.as_ref().map_or(0, |name| 68 + name.encoded_len());
+        let id = AiJson::id(seat);
+        let cost = usize::from(i != 0) + id.encoded_len() + name_cost;
+        let reserve = if i + 1 < mentions.len() { r#","mentions_truncated":true"#.len() } else { 0 };
+        if used + cost + reserve > budget { break }
         used += cost;
-        if !taken.is_empty() { json.push(','); }
-        json.push('"');
-        json.push_str(&hex(seat));
-        json.push('"');
-        taken.push((*seat, who));
+        ids.push(id);
+        if let Some(who) = who { people.push((*seat, who)); }
+        people_bytes += name_cost;
     }
-    json.push(']');
-    if truncated { json.push_str(r#","mentions_truncated":true"#); }
-    (json, taken)
+    let taken = ids.len();
+    fields.push(("mentions", AiJson::array(ids)));
+    if taken < mentions.len() { fields.push(("mentions_truncated", AiJson::bool(true))); }
+    Ok((people, people_bytes, &mentions[..taken]))
 }
 
 fn pick_agent(agents: &[AgentCandidate], seat: Id, preferred: Option<Id>, me: PublicKey) -> Option<Id> {
@@ -1308,63 +1472,69 @@ fn pick_agent(agents: &[AgentCandidate], seat: Id, preferred: Option<Id>, me: Pu
         .max_by_key(|a| (Some(a.agent) == preferred, a.owner == me, a.position, a.agent)).map(|a| a.agent)
 }
 
-/// Where a draft goes. Only a leading `@` starts an AI turn: `@`, `@ai` or the name of an AI member.
-/// Every other line is town chat, and the people it mentions are found by seat. The longest
-/// whole-word name wins; on a tie `@ai` beats a person and a person beats an AI.
-fn resolve_route(draft: &str, preferred: Option<Id>, shown: Option<Id>, me: PublicKey, my_seat: Option<Id>,
+/// Only a leading bound agent id or the local seat shorthand starts an AI turn.
+fn resolve_route(draft: &str, bound: &[BoundMention], preferred: Option<Id>, shown: Option<Id>, me: PublicKey, my_seat: Option<Id>,
     people: &[PersonCandidate], agents: &[AgentCandidate]) -> DraftRoute {
     let trimmed = draft.trim();
-    let mine = |agents: &[AgentCandidate]| my_seat.and_then(|seat| pick_agent(agents, seat, preferred, me));
-    let mut scan_from = 0;
-    let mut ambiguous_ai = None;
-    if let Some(after_at) = trimmed.strip_prefix('@') {
-        if after_at.is_empty() || after_at.starts_with(char::is_whitespace) {
-            let (text, above) = composer_context(after_at.trim_start(), shown);
-            return DraftRoute::MyAi { agent: mine(agents), text, above }
-        }
-        let ai_len = match_words(after_at, "ai").filter(|&n| ai_end_body(&after_at[n..]).is_some());
-        let person_len = people.iter().filter_map(|p| match_words(after_at, &p.label).filter(|&n| is_human_end(&after_at[n..]))).max();
-        let agent_len = agents.iter().filter_map(|a| match_words(after_at, &a.name).filter(|&n| ai_end_body(&after_at[n..]).is_some())).max();
-        if let Some(best) = ai_len.max(person_len).max(agent_len) {
-            if ai_len == Some(best) {
-                let (text, above) = composer_context(ai_end_body(&after_at[best..]).unwrap_or_default(), shown);
-                return DraftRoute::MyAi { agent: mine(agents), text, above }
-            } else if person_len != Some(best) {
-                let named: Vec<_> = agents.iter().filter(|a| match_words(after_at, &a.name) == Some(best)
-                    && ai_end_body(&after_at[best..]).is_some()).collect();
-                let mut owners: Vec<_> = named.iter().map(|a| a.owner_seat).collect();
-                owners.sort_unstable();
-                owners.dedup();
-                if owners.len() == 1 {
-                    let a = named.iter().max_by_key(|a| (Some(a.agent) == preferred, a.owner == me, a.position, a.agent)).expect("a named AI");
-                    let (text, above) = composer_context(ai_end_body(&after_at[best..]).unwrap_or_default(), shown);
-                    return if Some(a.owner_seat) == my_seat {
-                        DraftRoute::MyAi { agent: Some(a.agent), text, above }
-                    } else {
-                        DraftRoute::PeerAi { agent: a.agent, agent_name: a.name.clone(), owner_name: a.owner_name.clone(), text, above }
-                    }
+    let start = draft.len() - draft.trim_start().len();
+    let valid = |m: &&BoundMention| m.token.starts_with('@') && draft.get(m.range.clone()) == Some(m.token.as_str());
+    let bindings = || bound.iter().filter(valid);
+    let mut scan_from = start;
+    let mut unbound_ai = false;
+    if let Some(m) = bindings().find(|m| m.range.start == start) {
+        if let ComposerTarget::Agent(id) = m.target {
+            if let (Some(a), Some(body)) = (agents.iter().find(|a| a.agent == id), ai_end_body(draft[m.range.end..].trim_end())) {
+                let (text, above) = composer_context(body, shown);
+                return if Some(a.owner_seat) == my_seat {
+                    DraftRoute::MyAi { agent: Some(id), text, above }
+                } else {
+                    DraftRoute::PeerAi { agent: id, owner_name: a.owner_name.clone(), text, above }
                 }
-                ambiguous_ai = Some((named[0].name.clone(), owners.len()));
-                scan_from = 1 + best;
             }
+        }
+    } else if let Some(after_at) = trimmed.strip_prefix('@') {
+        let own = |body: &str| {
+            let (text, above) = composer_context(body, shown);
+            DraftRoute::MyAi { agent: my_seat.and_then(|seat| pick_agent(agents, seat, preferred, me)), text, above }
+        };
+        if after_at.is_empty() || after_at.starts_with(char::is_whitespace) { return own(after_at.trim_start()) }
+        let ai_match = |label: &str| match_words(after_at, label).filter(|&n| ai_end_body(&after_at[n..]).is_some());
+        if let Some(n) = ai_match("ai") { return own(ai_end_body(&after_at[n..]).unwrap()) }
+        let person_len = people.iter().filter(|p| p.match_text).filter_map(|p| match_words(after_at, &p.label).filter(|&n| is_human_end(&after_at[n..]))).max();
+        let ai_len = agents.iter().flat_map(|a| [Some(a.name.as_str()), Some(&a.short_label), a.custom_name.as_deref()])
+            .flatten().filter_map(ai_match).max();
+        if let Some(n) = ai_len.filter(|n| Some(*n) > person_len) {
+            unbound_ai = true;
+            scan_from += 1 + n;
         }
     }
     let mut mentioned: Vec<MentionedSeat> = Vec::new();
+    let mut mention = |p: &PersonCandidate| {
+        if !p.is_me && !mentioned.iter().any(|m| m.seat == p.seat) {
+            mentioned.push(MentionedSeat { seat: p.seat, name: p.label.clone() });
+        }
+    };
     let mut at = scan_from;
-    while let Some(found) = trimmed[at..].find('@') {
+    while let Some(found) = draft[at..].find('@') {
         let start = at + found;
         at = start + 1;
-        if !is_mention_start(trimmed, start) { continue }
-        let after = &trimmed[start + 1..];
-        let Some(len) = people.iter().filter_map(|p| match_words(after, &p.label).filter(|&n| is_human_end(&after[n..]))).max() else { continue };
-        let mut hit: Vec<_> = people.iter().filter(|p| !p.is_me && match_words(after, &p.label) == Some(len) && is_human_end(&after[len..])).collect();
-        hit.sort_by_key(|p| p.seat);
-        for p in hit {
-            if !mentioned.iter().any(|m| m.seat == p.seat) { mentioned.push(MentionedSeat { seat: p.seat, name: p.label.clone() }); }
+        if let Some(m) = bindings().find(|m| m.range.contains(&start)) {
+            if let ComposerTarget::Seat(id) = m.target {
+                if let Some(person) = people.iter().find(|p| p.seat == id) { mention(person); }
+            }
+            at = m.range.end;
+            continue
         }
-        at = start + 1 + len;
+        if !is_mention_start(draft, start) { continue }
+        let end = bindings().filter(|m| m.range.start > start).map(|m| m.range.start).min().unwrap_or(draft.len());
+        let after = &draft[at..end];
+        let Some(len) = people.iter().filter(|p| p.match_text).filter_map(|p| match_words(after, &p.label).filter(|&n| is_human_end(&after[n..]))).max() else { continue };
+        let mut hit: Vec<_> = people.iter().filter(|p| p.match_text && match_words(after, &p.label) == Some(len) && is_human_end(&after[len..])).collect();
+        hit.sort_by_key(|p| p.seat);
+        for p in hit { mention(p); }
+        at += len;
     }
-    DraftRoute::Town { text: trimmed.to_owned(), people: mentioned, ambiguous_ai }
+    DraftRoute::Town { text: trimmed.to_owned(), people: mentioned, unbound_ai }
 }
 
 fn composer_context(body: &str, shown: Option<Id>) -> (String, Option<Id>) {
@@ -1382,6 +1552,56 @@ fn device_name<'a>(profiles: &'a BTreeMap<PublicKey, fold::Profile>, peers: Opti
 pub(crate) fn peer_label(name: &str) -> &str {
     let name = name.trim();
     if name.is_empty() || name.eq_ignore_ascii_case("you") || name.eq_ignore_ascii_case("your ai") { "Peer" } else { name }
+}
+
+fn peer_name_for_devices(profiles: &BTreeMap<PublicKey, fold::Profile>, peers: Option<&Peers>, devices: &[PublicKey]) -> String {
+    devices.iter().filter_map(|key| profiles.get(key)).map(|p| p.name.trim()).find(|name| !name.is_empty())
+        .or_else(|| peers.and_then(|p| devices.iter().find_map(|key| p.device(key).map(|d| d.name.trim()).filter(|s| !s.is_empty()))))
+        .map(peer_label).unwrap_or("Peer").to_owned()
+}
+
+fn peer_seat_name_in(town: &Town, peers: Option<&Peers>, seat: Option<Id>, fallback_device: Option<&PublicKey>) -> String {
+    let devices = seat.and_then(|id| town.member_order().seat_devices.get(&id)).map(Vec::as_slice)
+        .unwrap_or_else(|| fallback_device.map(std::slice::from_ref).unwrap_or_default());
+    peer_name_for_devices(&town.state.profiles, peers, devices)
+}
+
+fn same_seat(state: &State, a: &PublicKey, b: &PublicKey) -> bool {
+    a == b || state.seat_of(a).is_some_and(|seat| state.seat_of(b) == Some(seat))
+}
+
+// Removed agents leave their signed addition in the log, so older replies keep their attribution.
+fn agent_identity_in(town: &Town, agent: Id) -> Option<(PublicKey, std::borrow::Cow<'_, str>)> {
+    if let Some(info) = town.state.agents.get(&agent) {
+        return Some((info.owner, info.name.as_str().into()))
+    }
+    let event = town.log.get(&agent)?;
+    let Content::AgentAdded { name, .. } = Content::decode(event.header.kind, event.header.kind_version, event.content()?)? else { return None };
+    Some((event.header.author, name.into()))
+}
+
+fn agent_short_label_in(town: &Town, me: &PublicKey, peers: Option<&Peers>, agent: Id) -> String {
+    let Some((owner, _)) = agent_identity_in(town, agent) else { return "Peer's AI".into() };
+    if let Some(custom) = agent_custom_name_in(town, agent) {
+        if same_seat(&town.state, me, &owner) { return custom }
+        let name = peer_seat_name_in(town, peers, town.state.seat_of(&owner), Some(&owner));
+        return format!("{name}'s {custom}")
+    }
+    owner_ai_label(town, me, peers, &owner)
+}
+
+fn agent_custom_name_in(town: &Town, agent: Id) -> Option<String> {
+    town.state.agents.get(&agent).and_then(|a| a.custom_name.as_deref()).map(clean_name).filter(|s| !s.is_empty())
+}
+
+fn owner_ai_label(town: &Town, me: &PublicKey, peers: Option<&Peers>, owner: &PublicKey) -> String {
+    if same_seat(&town.state, me, owner) { return "Your AI".into() }
+    format!("{}'s AI", peer_seat_name_in(town, peers, town.state.seat_of(owner), Some(owner)))
+}
+
+pub(crate) fn with_agent_backend(short: String, backend: &str) -> String {
+    let backend = backend.trim();
+    if backend.is_empty() || short.eq_ignore_ascii_case(backend) { short } else { format!("{short} · {backend}") }
 }
 
 /// Size the escaped UTF-8 directly so a long line costs at most one result page per call.
@@ -1411,6 +1631,7 @@ const LOCAL_TRANSCRIPT: &str = "That call's transcript stays on people's compute
 pub struct TranscriptConsent {
     pub town: Id,
     pub draft: String,
+    pub mentions: Vec<BoundMention>,
     pub prompt: String,
     agent: Id,
     above: Id,
@@ -1424,11 +1645,82 @@ struct TimelineReader<'a> {
     owner: Id,
     agent: Id,
     peers: Option<&'a Peers>,
+    gate: Gate<'a>,
+    me: PublicKey,
+    person_name: Option<&'a str>,
 }
 
 struct TimelinePage {
-    json: String,
+    json: AiJson,
     foreign: bool,
+}
+
+fn timeline_withheld(why: Withheld) -> String {
+    crate::ai_out::SafeToolError::withheld(why).as_str().to_owned()
+}
+
+// The field names here are static ASCII. Each contributes two quotes and a colon.
+fn timeline_fields_len(fields: &[(&'static str, AiJson)]) -> usize {
+    2 + fields.len().saturating_sub(1) + fields.iter().map(|(key, value)| key.len() + 3 + value.encoded_len()).sum::<usize>()
+}
+
+struct TimelineRows {
+    people: BTreeMap<Id, AiJson>,
+    items: Vec<AiJson>,
+    remaining: usize,
+}
+
+impl TimelineRows {
+    fn new(budget: usize) -> Self {
+        // The longest continuation is id@offset~through.stop (20 decimal and 16 hex digits).
+        let envelope = r#"{"people":{},"items":[],"next":"","note":""}"#.len() + TIMELINE_NOTE.len();
+        let next = 64 + 1 + 20 + 1 + 16 + 1 + 64;
+        Self { people: BTreeMap::new(), items: Vec::new(), remaining: budget.saturating_sub(envelope + next) }
+    }
+
+    fn person_cost(&self, name: Option<&AiJson>) -> usize {
+        name.map_or(0, |n| 67 + n.encoded_len() + usize::from(!self.people.is_empty()))
+    }
+
+    fn push(&mut self, fields: Vec<(&'static str, AiJson)>, people_bytes: usize) {
+        let item = AiJson::object(fields);
+        self.remaining -= usize::from(!self.items.is_empty()) + item.encoded_len() + people_bytes;
+        self.items.push(item);
+    }
+
+    fn finish(self, next: AiJson, foreign: bool) -> TimelinePage {
+        let json = AiJson::object(vec![("people", AiJson::id_object(self.people.into_iter().collect())),
+            ("items", AiJson::array(self.items)), ("next", next), ("note", AiJson::static_str(TIMELINE_NOTE))]);
+        TimelinePage { json, foreign }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TimelineCursor {
+    id: Id,
+    offset: Option<usize>,
+}
+
+impl TimelineCursor {
+    fn builder(self, range: Option<(usize, Option<Id>)>) -> AiTextBuilder {
+        let mut b = AiTextBuilder::new();
+        b.push_id(&self.id);
+        if let Some(offset) = self.offset { b.push_static("@"); b.push_usize(offset); }
+        if let Some((through, stop)) = range {
+            b.push_static("~"); b.push_u64_hex(through as u64); b.push_static(".");
+            if let Some(stop) = stop { b.push_id(&stop); }
+        }
+        b
+    }
+
+    fn register(self, gate: &Gate<'_>, turn: &mut Turn, range: (usize, Option<Id>)) -> Result<AiJson, String> {
+        let key = |scope| gate.finish_text(self.builder(scope)).map(AiOut::into_string).map_err(timeline_withheld);
+        let mut saved = key(None)?;
+        let scope = turn.pages.get(&saved).is_some_and(|prior| *prior != range).then_some(range);
+        if scope.is_some() { saved = key(scope)?; }
+        turn.pages.insert(saved, range);
+        Ok(AiJson::built_str(self.builder(scope)))
+    }
 }
 
 pub(crate) fn clean_name(name: &str) -> String {
@@ -1439,8 +1731,9 @@ pub(crate) fn clean_name(name: &str) -> String {
 }
 
 impl<'a> TimelineReader<'a> {
-    fn new(town: &'a Town, me: &PublicKey, agent: Id, peers: Option<&'a Peers>) -> Result<Self, String> {
-        Ok(Self { town, owner: town.state.seat_of(me).ok_or(NO_TURN)?, agent, peers })
+    fn new(town: &'a Town, me: &PublicKey, agent: Id, peers: Option<&'a Peers>, person_name: Option<&'a str>) -> Result<Self, String> {
+        Ok(Self { town, owner: town.state.seat_of(me).ok_or(NO_TURN)?, agent, peers,
+            gate: Gate::new(&town.state, LocalPolicy::Members), me: *me, person_name })
     }
 
     fn own(&self, line: &fold::ChatMsg) -> bool {
@@ -1456,12 +1749,12 @@ impl<'a> TimelineReader<'a> {
             && m.author_agent.is_none_or(|agent| agent == self.agent))
     }
 
-    fn person(&self, device: &PublicKey, seat: Id) -> String {
+    fn person(&self, device: &PublicKey, seat: Id) -> Result<AiJson, String> {
         let owner = seat == self.owner;
-        let name = device_name(&self.town.state.profiles, self.peers, device).map(clean_name);
-        let name = name.as_deref().map(peer_label).unwrap_or(if owner { "You" } else { "Peer" });
-        format!(r#""{}":{}"#, hex(&seat), json::obj(vec![("is", json::s(if owner { "owner" } else { "member" })),
-            ("name", json::s(name))]).to_json())
+        let pin = self.peers.and_then(|peers| peers.device(device)).map(|d| d.name.as_str());
+        let name = self.gate.profile_or_fallback_name(device, pin, &self.me, self.person_name)
+            .map_err(timeline_withheld)?.cleaned_person_label(owner);
+        Ok(AiJson::object(vec![("is", AiJson::static_str(if owner { "owner" } else { "member" })), ("name", AiJson::text(name))]))
     }
 
     // The lower bound belongs to the request even if a late event is folded while paging.
@@ -1482,12 +1775,13 @@ impl<'a> TimelineReader<'a> {
     }
 
     fn transcript(&self, turn: &mut Turn, entry: Id, after: Option<&str>) -> Result<TimelinePage, String> {
+        self.gate.town_readable().map_err(timeline_withheld)?;
         let state = &self.town.state;
         let session = state.timeline_index(entry).and_then(|i| match state.timeline[i] {
             fold::Entry::Session(session) => Some(session), _ => None,
         }).ok_or(LOCAL_TRANSCRIPT)?;
         if !state.transcript_shares(&session).any(|(share, _)| share.line == turn.line && share.agent == self.agent
-            && state.seat_of(&share.author) == Some(self.owner)) { return Err(LOCAL_TRANSCRIPT.into()) }
+            && state.active_member(&share.author) && !state.is_intake(&share.author) && state.seat_of(&share.author) == Some(self.owner)) { return Err(LOCAL_TRANSCRIPT.into()) }
         let lines = state.said_before(&session, Some(turn.line));
         let (start, mut offset) = if let Some(cursor) = after {
             let invalid = "Use the transcript continuation returned by read.";
@@ -1499,38 +1793,39 @@ impl<'a> TimelineReader<'a> {
             let start = lines.iter().position(|l| l.event == event && l.index == index).ok_or(invalid)?;
             (start, offset)
         } else { (0, 0) };
-        let mut people = BTreeMap::new();
-        let mut rows = Vec::new();
-        let mut remaining = MAX_RESULT_BYTES - TIMELINE_NOTE.len() - 192;
-        let mut next = Value::Null;
+        let mut rows = TimelineRows::new(MAX_RESULT_BYTES);
+        let mut next = AiJson::null();
         for line in &lines[start..] {
-            let Some(seat) = state.seat_of(&line.author) else { continue };
-            let person = (!people.contains_key(&seat)).then(|| self.person(&line.author, seat));
-            let name_size = person.as_ref().map_or(0, |p| p.len() + 1);
-            let cursor = |offset| json::s(format!("{}@{}@{offset}", hex(&line.event), line.index));
-            let rest = line.text.get(offset..).ok_or("Invalid transcript text offset.")?;
-            // from, at_ms, offset, complete, text delimiters and the item separator.
-            let budget = remaining.saturating_sub(name_size + 194);
-            if budget < 6 { next = cursor(offset); break }
-            let n = quoted_prefix(rest, budget);
-            let mut fields = vec![("from", json::s(hex(&seat))), ("at_ms", Value::Int(line.at_ms.into())),
-                ("text", json::s(&rest[..n]))];
-            if offset != 0 || n != rest.len() {
-                fields.extend([("offset", Value::Int(offset as i64)), ("complete", Value::Bool(n == rest.len()))]);
+            let Ok(text) = self.gate.said_line(&session, &line.event, line.text.to_owned()) else { offset = 0; continue };
+            let Some(seat) = state.seat_of(&line.author) else { offset = 0; continue };
+            let person = (!rows.people.contains_key(&seat)).then(|| self.person(&line.author, seat)).transpose()?;
+            let name_size = rows.person_cost(person.as_ref());
+            let cursor = |offset| {
+                let mut b = AiTextBuilder::new();
+                b.push_id(&line.event); b.push_static("@"); b.push_u64(line.index.into()); b.push_static("@"); b.push_usize(offset);
+                AiJson::built_str(b)
+            };
+            let mut fields = vec![("from", AiJson::id(&seat)), ("at_ms", AiJson::int(line.at_ms.into()))];
+            let fixed = timeline_fields_len(&fields) + name_size + usize::from(!rows.items.is_empty())
+                + r#","text":"","offset":18446744073709551615,"complete":false"#.len();
+            let room = rows.remaining.saturating_sub(fixed);
+            if room < 6 { next = cursor(offset); break }
+            let (chunk, len, complete) = text.json_chunk(offset, None, room).ok_or("Invalid transcript text offset.")?;
+            fields.push(("text", AiJson::text_str(chunk)));
+            if offset != 0 || !complete {
+                fields.extend([("offset", AiJson::int(offset as i64)), ("complete", AiJson::bool(complete))]);
             }
-            let row = json::obj(fields).to_json();
-            remaining -= row.len() + 1 + name_size;
-            rows.push(row);
-            if let Some(person) = person { people.insert(seat, person); }
-            if n < rest.len() { next = cursor(offset + n); break }
+            rows.push(fields, name_size);
+            if let Some(person) = person { rows.people.insert(seat, person); }
+            if !complete { next = cursor(offset + len); break }
             offset = 0;
         }
         turn.foreign = true;
-        Ok(TimelinePage { foreign: true, json: format!(r#"{{"people":{{{}}},"items":[{}],"next":{},"note":"{TIMELINE_NOTE}"}}"#,
-            people.into_values().collect::<Vec<_>>().join(","), rows.join(","), next.to_json()) })
+        Ok(rows.finish(next, true))
     }
 
     fn read(&self, turn: &mut Turn, before: Option<&str>) -> Result<TimelinePage, String> {
+        self.gate.town_readable().map_err(timeline_withheld)?;
         let state = &self.town.state;
         let mut end = state.timeline.len();
         let mut offset = 0;
@@ -1559,157 +1854,160 @@ impl<'a> TimelineReader<'a> {
         -> Result<TimelinePage, String> {
         let state = &self.town.state;
         let start = stop.and_then(|id| state.timeline_index(id)).map_or(0, |i| i + 1).min(end);
-        let mut people = BTreeMap::new();
-        let mut rows = Vec::new();
+        let mut rows = TimelineRows::new(budget);
         let mut foreign = false;
         let mut last = None;
         let mut next = None;
-        // Fixed JSON envelope, note and the longest anchor plus byte offset.
-        let mut remaining = budget.saturating_sub(TIMELINE_NOTE.len() + 256);
         for &entry in state.timeline[start..end].iter().rev() {
-            let Some(id) = state.anchor(entry) else { continue };
-            if self.town.log.position(&id).is_none_or(|p| p >= through) { continue }
-            let Some(event) = self.town.log.get(&id) else { continue };
+            let Some(id) = state.anchor(entry) else { offset = 0; continue };
+            if self.town.log.position(&id).is_none_or(|p| p >= through) { offset = 0; continue }
+            let Some(event) = self.town.log.get(&id) else { offset = 0; continue };
             let h = &event.header;
-            let Some(seat) = state.seat_of(&h.author) else { continue };
+            let Some(seat) = state.seat_of(&h.author) else { offset = 0; continue };
             let mine = seat == self.owner;
-            if !mine && h.actor == Actor::Ai { continue }
-            let mut fields = vec![("id", json::s(hex(&id))), ("from", json::s(hex(&seat))), ("by", json::s(if h.actor == Actor::Ai { "ai" } else { "person" }))];
+            if !mine && h.actor == Actor::Ai { offset = 0; continue }
+            let mut fields = vec![("id", AiJson::id(&id)), ("from", AiJson::id(&seat)),
+                ("by", AiJson::static_str(if h.actor == Actor::Ai { "ai" } else { "person" }))];
             let mut body = None;
+            let mut literal_body = None;
             let mut rung = None;
             let mut foreign_item = !mine;
             let mut mentions: &[Id] = &[];
             let kind = match entry {
                 fold::Entry::Chat(_) => {
-                    if !mine && (event.redacted() || state.addressed_chat(&id)) { continue }
+                    if !mine && (event.redacted() || state.addressed_chat(&id)) { offset = 0; continue }
                     if let Some(m) = state.message(&id) {
-                        body = Some(("text", m.chat.text.as_str()));
+                        let Ok(text) = self.gate.chat_text(&id) else { offset = 0; continue };
+                        body = Some(("text", text));
                         if offset == 0 { mentions = &m.chat.mentions; }
-                        if let Some(q) = m.chat.quote { fields.push(("quotes", json::s(hex(&q)))); }
-                    } else if mine && event.redacted() {
-                        body = Some(("text", "(removed)"));
-                    } else { continue }
+                        if let Some(q) = m.chat.quote.filter(|q| self.gate.chat_text(q).is_ok()) {
+                            fields.push(("quotes", AiJson::id(&q)));
+                        }
+                    } else if mine && event.redacted() && self.gate.redacted_header_visible(&id).is_ok() {
+                        literal_body = Some(("text", "(removed)"));
+                    } else { offset = 0; continue }
                     "chat"
                 }
                 fold::Entry::Clip(_) => {
-                    let Some(clip) = state.entities.get(&id).filter(|e| live(e)) else { continue };
-                    // The clip's creator and the person who last edited its title can differ.
-                    if let Some(writer) = clip.fields.get(&field::TITLE).and_then(|f| self.town.log.get(&f.writer)) {
-                        foreign_item |= state.seat_of(&writer.header.author) != Some(self.owner);
+                    if self.gate.entity_visible(&id).is_err() { offset = 0; continue }
+                    let Some(clip) = state.entities.get(&id).filter(|e| live(e)) else { offset = 0; continue };
+                    match self.gate.entity_field_text(&id, &field::TITLE) {
+                        Ok(title) => body = Some(("title", title)),
+                        Err(Withheld::MissingSource) => literal_body = Some(("title", "")),
+                        Err(_) => { offset = 0; continue }
                     }
-                    body = Some(("title", clip.text(field::TITLE)));
-                    fields.push(("length_ms", Value::Int(coordinate(clip, field::DURATION))));
+                    let duration = match self.gate.entity_field_value(&id, &field::DURATION) {
+                        Ok(v) => v.as_i64().unwrap_or(0),
+                        Err(Withheld::MissingSource) => 0,
+                        Err(_) => { offset = 0; continue }
+                    };
+                    for field in [field::TITLE, field::DURATION].iter().filter_map(|key| clip.fields.get(key)) {
+                        foreign_item |= [field.writer, field.origin].iter().any(|id| {
+                            self.town.log.get(id).and_then(|e| state.seat_of(&e.header.author)) != Some(self.owner)
+                        });
+                    }
+                    fields.push(("length_ms", AiJson::int(duration)));
                     "clip"
                 }
-                fold::Entry::Member(_) => { fields.push(("seat", json::s(hex(&seat)))); "member" }
+                fold::Entry::Member(_) => {
+                    if self.gate.record_visible(&id).is_err() { offset = 0; continue }
+                    fields.push(("seat", AiJson::id(&seat)));
+                    "member"
+                }
                 fold::Entry::Session(session) => {
-                    let Some(summary) = state.session_summary(&session, Some(self.owner)) else { continue };
-                    let (outcome, secs) = match summary.outcome {
-                        fold::Outcome::Answered { secs, .. } => ("answered", secs),
-                        fold::Outcome::Declined { busy, .. } => (if busy { "busy" } else { "declined" }, None),
-                        fold::Outcome::Unanswered => ("no answer", None), fold::Outcome::Pending => ("pending", None),
-                    };
-                    fields.push(("outcome", json::s(outcome)));
-                    fields.push(("secs", secs.map_or(Value::Null, |n| Value::Int(n.into()))));
-                    if summary.lines > 0 { fields.push(("transcript", json::s("local"))); }
+                    let Ok(summary) = self.gate.session_summary(&session).map(ForAi::into_summary) else { offset = 0; continue };
+                    fields.push(("outcome", AiJson::static_str(summary.outcome)));
+                    fields.push(("secs", summary.secs.map_or_else(AiJson::null, |n| AiJson::int(n.into()))));
+                    if summary.has_transcript { fields.push(("transcript", AiJson::static_str("local"))); }
                     rung = Some(summary.rung);
-                    match summary.mode { makepad_town_core::event::SessionMode::Share { .. } => "share", _ => "call" }
+                    if summary.is_share { "share" } else { "call" }
                 }
             };
-            fields.push(("kind", json::s(kind)));
-            let person = (!people.contains_key(&seat)).then(|| self.person(&h.author, seat));
-            let mut row = json::obj(fields).to_json();
-            row.pop();
-            row.push_str(&format!(r#","at":{}"#, h.wall_ms));
-            let fixed = row.len() + person.as_ref().map_or(0, |s| s.len() + 1) + 2;
-            // Leave room for field names, the offset, and the complete flag.
-            if remaining < fixed + 80 {
-                next = last.or_else(|| Some(format!("{}@{offset}", hex(&id))));
-                break
-            }
-            // A mention names its seat by id, and its person joins `people` so names stay in one place.
-            let mut extra_people = BTreeMap::new();
-            let mut extra_bytes = 0;
+            fields.push(("kind", AiJson::static_str(kind)));
+            fields.push(("at", AiJson::int(i64::try_from(h.wall_ms).unwrap_or(i64::MAX))));
+            let person = (!rows.people.contains_key(&seat)).then(|| self.person(&h.author, seat)).transpose()?;
+            let mut name_size = rows.person_cost(person.as_ref());
+            // Reserve the longest fragment fields and payload delimiters before choosing any mentions.
+            let fixed = timeline_fields_len(&fields) + name_size + usize::from(!rows.items.is_empty())
+                + r#","title":"","offset":18446744073709551615,"complete":false"#.len();
+            let available = rows.remaining.saturating_sub(fixed);
+            let resume = || last.unwrap_or(TimelineCursor { id, offset: Some(offset) });
+            if available < 67 { next = Some(resume()); break }
+            let mut extra_people = Vec::new();
+            let mut mention_size = 0;
             if !mentions.is_empty() {
-                let mention_budget = (remaining - fixed - 80) / 2;
-                if mention_budget < 40 && !rows.is_empty() {
-                    next = last.or_else(|| Some(format!("{}@{offset}", hex(&id))));
-                    break
-                }
+                let mention_budget = available / 2;
+                if mention_budget < 40 && !rows.items.is_empty() { next = Some(resume()); break }
                 if mention_budget >= 40 {
-                    let (json, taken) = mentions_json(mentions, mention_budget, |target| {
-                        (*target != seat && !people.contains_key(target)).then(|| state.seat_device(target)).flatten()
-                            .map(|device| self.person(&device, *target))
-                    });
-                    row.push_str(&json);
-                    for (target, who) in taken {
-                        foreign_item |= target != self.owner;
-                        if let Some(who) = who { extra_bytes += who.len() + 1; extra_people.insert(target, who); }
-                    }
+                    let field_start = fields.len();
+                    let (extra, bytes, taken) = add_mentions(&mut fields, mentions, mention_budget, |target| {
+                        if *target == seat || rows.people.contains_key(target) { return Ok(None) }
+                        state.seat_device(target).map(|device| self.person(&device, *target)).transpose()
+                    })?;
+                    foreign_item |= taken.iter().any(|target| *target != self.owner);
+                    extra_people = extra;
+                    name_size += bytes;
+                    mention_size = bytes + fields[field_start..].iter().map(|(k, v)| k.len() + 4 + v.encoded_len()).sum::<usize>();
                 }
             }
-            let fixed = row.len() + person.as_ref().map_or(0, |s| s.len() + 1) + extra_bytes + 2;
-            let available = remaining.saturating_sub(fixed + 80);
+            let room = available - mention_size;
+            let changed = "the text changed; read again from the start";
             let continuation = if let Some((field, text)) = body {
-                let rest = text.get(offset..).ok_or("the text changed; read again from the start")?;
-                let n = quoted_prefix(rest, available);
-                row.push_str(&format!(r#","{field}":"#));
-                json::s(&rest[..n]).write_into(&mut row);
-                (n < rest.len()).then_some(offset + n)
+                let (chunk, len, complete) = text.json_chunk(offset, None, room).ok_or(changed)?;
+                fields.push((field, AiJson::text_str(chunk)));
+                (!complete).then_some(offset + len)
+            } else if let Some((field, text)) = literal_body {
+                let rest = text.get(offset..).ok_or(changed)?;
+                let len = quoted_prefix(rest, room);
+                fields.push((field, AiJson::static_str(&rest[..len])));
+                (len != rest.len()).then_some(offset + len)
             } else if let Some(seats) = rung {
                 let rest = seats.get(offset..).ok_or("the call changed; read again from the start")?;
-                let n = rest.len().min(available / 67);
-                row.push_str(r#","rung":"#);
-                Value::Arr(rest[..n].iter().map(|s| json::s(hex(s))).collect()).write_into(&mut row);
-                (n < rest.len()).then_some(offset + n)
+                let n = rest.len().min(room / 67);
+                fields.push(("rung", AiJson::array(rest[..n].iter().map(AiJson::id).collect())));
+                (n != rest.len()).then_some(offset + n)
             } else { None };
             if continuation.is_some() || offset != 0 {
-                row.push_str(&format!(r#","offset":{offset},"complete":{}"#, continuation.is_none()));
+                fields.extend([("offset", AiJson::int(offset as i64)), ("complete", AiJson::bool(continuation.is_none()))]);
             }
-            row.push('}');
-            remaining -= row.len() + 1 + person.as_ref().map_or(0, |s| s.len() + 1) + extra_bytes;
-            if let Some(p) = person { people.insert(seat, p); }
-            people.extend(extra_people);
-            rows.push(row);
+            rows.push(fields, name_size);
+            if let Some(p) = person { rows.people.insert(seat, p); }
+            rows.people.extend(extra_people);
             foreign |= foreign_item;
-            if let Some(at) = continuation { next = Some(format!("{}@{at}", hex(&id))); break }
-            last = Some(hex(&id));
+            if let Some(at) = continuation { next = Some(TimelineCursor { id, offset: Some(at) }); break }
+            last = Some(TimelineCursor { id, offset: None });
             offset = 0;
         }
-        if let Some(cursor) = &mut next {
-            // Two traversals can meet at the same anchor with different lower bounds or snapshots.
-            if turn.pages.get(cursor).is_some_and(|range| *range != (through, stop)) {
-                *cursor = format!("{cursor}~{through:x}.{}", stop.map_or_else(String::new, |id| hex(&id)));
-            }
-            turn.pages.insert(cursor.clone(), (through, stop));
-        }
-        let next_json = next.as_ref().map_or(Value::Null, json::s).to_json();
-        let json = format!(r#"{{"people":{{{}}},"items":[{}],"next":{next_json},"note":"{TIMELINE_NOTE}"}}"#,
-            people.into_values().collect::<Vec<_>>().join(","), rows.join(","));
-        Ok(TimelinePage { json, foreign })
+        let next = match next {
+            Some(cursor) => cursor.register(&self.gate, turn, (through, stop))?,
+            None => AiJson::null(),
+        };
+        Ok(rows.finish(next, foreign))
     }
 }
 
 struct Delivery {
-    json: String,
+    json: AiOut,
     end: Position,
     turn: Option<Turn>,
 }
 
 fn agent_page(reader: &TimelineReader<'_>, inbox: &Inbox, previous: Option<&Turn>, delivered: &mut Vec<Id>) -> Result<Option<Delivery>, String> {
+    reader.gate.town_readable().map_err(timeline_withheld)?;
     let state = &reader.town.state;
     let agent = reader.agent;
     let mut turn = previous.cloned();
     let new_turn = |line| Turn { line, through: reader.town.log.events().len(), foreign: false, pages: BTreeMap::new() };
     let mut foreign_row = false;
     let mut pos = inbox.ack;
-    let mut page = String::from(r#"{"items":["#);
-    let mut count = 0;
+    let mut items = Vec::new();
+    let overhead = r#"{"items":[],"last":"","more":false,"note":"Quoted data from people."}"#.len() + 64;
+    let mut remaining = MAX_RESULT_BYTES - overhead;
     // Keep the last delivered boundary stable if a retry arrives before its acknowledgement.
     let mut replay = inbox.offered;
     while let Some(id) = inbox.ready.get(pos.row) {
         if replay.is_some_and(|end| pos >= end) {
-            if count != 0 { break }
+            if !items.is_empty() { break }
             // Previously offered text can have become void in the meantime.
             replay = None;
         }
@@ -1719,33 +2017,43 @@ fn agent_page(reader: &TimelineReader<'_>, inbox: &Inbox, previous: Option<&Turn
             pos = Position { row: pos.row + 1, ..Position::default() };
             continue
         };
+        let Ok(line_text) = reader.gate.chat_text(id) else {
+            pos = Position { row: pos.row + 1, ..Position::default() };
+            continue
+        };
         let own = reader.request(line);
         // Approved foreign requests are delivered alone, without their quote or context.
-        if count > 0 && (!own || foreign_row || pos.part == 0 && line.chat.above.is_some()) { break }
+        if !items.is_empty() && (!own || foreign_row || pos.part == 0 && line.chat.above.is_some()) { break }
         foreign_row = !own;
-        let quote = line.chat.quote.as_ref().and_then(|q| state.message(q)).filter(|q| own &&
-            (reader.own(q) || inbox.approved.contains(&q.id)));
         if own && pos.part == 2 {
             let through = turn.as_ref().map_or_else(|| reader.town.log.events().len(), |t| t.through);
             if let Some((end, stop)) = reader.above(line, through) {
-                let budget = MAX_RESULT_BYTES.saturating_sub(page.len() + 320);
-                if budget < 640 && count > 0 { break }
+                let mut fields = vec![("id", AiJson::id(id)), ("from", AiJson::static_str("the owner")), ("part", AiJson::int(2))];
+                let budget = remaining.saturating_sub(usize::from(!items.is_empty()) + timeline_fields_len(&fields) + r#","above":"#.len());
+                if budget < 640 && !items.is_empty() { break }
                 let t = turn.get_or_insert_with(|| new_turn(*id));
-                let range = (through, stop);
-                let block = reader.page(end, 0, range, budget, t)?;
+                let block = reader.page(end, 0, (through, stop), budget, t)?;
                 t.foreign |= block.foreign;
                 if delivered.last() != Some(id) { delivered.push(*id); }
-                if count != 0 { page.push(','); }
-                page.push_str(&format!(r#"{{"id":"{}","from":"the owner","part":2,"above":{}}}"#, hex(id), block.json));
-                count += 1;
+                fields.push(("above", block.json));
+                items.push(AiJson::object(fields));
             }
             pos = Position { row: pos.row + 1, ..Position::default() };
-            if count == 0 { continue }
+            if items.is_empty() { continue }
             break
         }
-        let Some(msg) = (match pos.part { 0 => Some(line), 1 => quote, _ => None }) else {
-            pos = Position { row: pos.row + 1, ..Position::default() };
-            continue
+        let quote = line.chat.quote.as_ref().and_then(|q| state.message(q)).filter(|q| own &&
+            (reader.own(q) || inbox.approved.contains(&q.id)))
+            .and_then(|q| reader.gate.chat_text(&q.id).ok().map(|text| (q, text)));
+        let has_quote = quote.is_some();
+        let (msg, text) = match (pos.part, quote) {
+            (0, _) => (line, line_text),
+            (1, Some(quoted)) => quoted,
+            _ => {
+                pos = if pos.part == 1 && own && line.chat.above.is_some() { Position { part: 2, offset: 0, ..pos } }
+                    else { Position { row: pos.row + 1, ..Position::default() } };
+                continue
+            }
         };
         let from = match (reader.own(msg), msg.actor) {
             (true, Actor::Human) => "the owner",
@@ -1753,45 +2061,43 @@ fn agent_page(reader: &TimelineReader<'_>, inbox: &Inbox, previous: Option<&Turn
             (false, Actor::Human) => "the other person",
             (false, Actor::Ai) => "the other person's AI",
         };
-        let mut fields = vec![("id", json::s(hex(&msg.id))), ("from", json::s(from)), ("offset", Value::Int(pos.offset as i64))];
-        if pos.part == 1 { fields.push(("quoted_by", json::s(hex(id)))); }
-        let remaining = msg.chat.text.get(pos.offset..).ok_or("Unreadable delivery position.")?;
-        let part = if let Some(end) = replay.filter(|end| end.row == pos.row && end.part == pos.part) {
-            remaining.get(..end.offset.saturating_sub(pos.offset)).ok_or("Unreadable delivery boundary.")?
-        } else { remaining };
-        let mut item = json::obj(fields).to_json();
-        item.pop(); // Replace the object's closing brace with the last two fields.
-        // A quoted town line may mention people: their seat ids only, never names.
+        let mut fields = vec![("id", AiJson::id(&msg.id)), ("from", AiJson::static_str(from)), ("offset", AiJson::int(pos.offset as i64))];
+        if pos.part == 1 { fields.push(("quoted_by", AiJson::id(id))); }
+        let comma = usize::from(!items.is_empty());
+        let fixed = comma + timeline_fields_len(&fields) + r#","text":"","complete":false"#.len();
+        if remaining < fixed { break }
+        let mut room = remaining - fixed;
         if pos.part == 1 && pos.offset == 0 && !msg.chat.mentions.is_empty() {
-            let budget = MAX_RESULT_BYTES.saturating_sub(page.len() + item.len() + 168) / 2;
-            if budget < 40 && count > 0 { break }
-            if budget >= 40 { item.push_str(&mentions_json(&msg.chat.mentions, budget, |_| None).0); }
+            let budget = room / 2;
+            if budget < 40 && !items.is_empty() { break }
+            if budget >= 40 {
+                let start = fields.len();
+                add_mentions(&mut fields, &msg.chat.mentions, budget, |_| Ok(None))?;
+                room -= fields[start..].iter().map(|(k, v)| k.len() + 4 + v.encoded_len()).sum::<usize>();
+            }
         }
-        item.push_str(r#","text":"#);
-        // The envelope tail (including the 64 hex cursor), separator, quotes and "complete" field.
-        let budget = MAX_RESULT_BYTES.saturating_sub(page.len() + item.len() + 160);
-        let n = quoted_prefix(part, budget);
-        if n == 0 && !part.is_empty() { break }
+        let end = replay.filter(|end| end.row == pos.row && end.part == pos.part).map(|end| end.offset);
+        let (chunk, n, complete) = text.json_chunk(pos.offset, end, room).ok_or("Unreadable delivery boundary.")?;
+        if n == 0 && !complete { break }
         if own && pos.part == 0 { turn.get_or_insert_with(|| new_turn(*id)); }
-        let chunk = part.get(..n).ok_or("Unreadable delivery boundary.")?;
-        let complete = n == remaining.len();
-        json::s(chunk).write_into(&mut item);
-        item.push_str(if complete { r#","complete":true}"# } else { r#","complete":false}"# });
-        if count != 0 { page.push(','); }
-        page.push_str(&item);
+        fields.extend([("text", AiJson::text_str(chunk)), ("complete", AiJson::bool(complete))]);
+        let item = AiJson::object(fields);
+        remaining -= comma + item.encoded_len();
+        items.push(item);
         // A quoted part belongs to its addressed line, even across a page boundary.
         if delivered.last() != Some(id) { delivered.push(*id); }
-        count += 1;
         if !complete { pos.offset += n; break }
-        if pos.part == 0 && quote.is_some() {
+        if pos.part == 0 && has_quote {
             pos = Position { part: 1, offset: 0, ..pos };
         } else if own && line.chat.above.is_some() {
             pos = Position { part: 2, offset: 0, ..pos };
         } else { pos = Position { row: pos.row + 1, ..Position::default() }; }
     }
-    if count == 0 { return Ok(None) }
-    page.push_str(&format!(r#"],"last":"{}","more":{},"note":"Quoted data from people."}}"#, hex(&pos.cursor(&agent)), pos.row < inbox.ready.len()));
-    Ok(Some(Delivery { json: page, end: pos, turn: if foreign_row { None } else { turn } }))
+    if items.is_empty() { return Ok(None) }
+    let page = AiJson::object(vec![("items", AiJson::array(items)), ("last", AiJson::id(&pos.cursor(&agent))),
+        ("more", AiJson::bool(pos.row < inbox.ready.len())), ("note", AiJson::static_str("Quoted data from people."))]);
+    let json = reader.gate.finish_json(page).map_err(timeline_withheld)?;
+    Ok(Some(Delivery { json, end: pos, turn: if foreign_row { None } else { turn } }))
 }
 
 impl Model {
@@ -1879,7 +2185,7 @@ impl Model {
             // older unnamed town keeps its automatic label.
             if model.log.events().len() == 1 && model.open.town_name_entity().is_none() {
                 let fields = vec![(field::TITLE, FieldValue::Text("Center".into()))];
-                let center = model.open.sign(&model.key, Content::Entity { derive: None, kind: Key::Number(kind::TOWN), project: None, fields },
+                let center = model.open.sign(&model.key, Content::Entity { copied_from: vec![], derive: None, kind: Key::Number(kind::TOWN), project: None, fields },
                     Origin::Ui, parents)?;
                 parents = vec![center.id];
                 projects.push(center);
@@ -1889,7 +2195,7 @@ impl Model {
                 if !goal.is_empty() {
                     fields.push((field::TEXT, FieldValue::Text(goal.into())));
                 }
-                let project = model.open.sign(&model.key, Content::Entity { derive: None, kind: Key::Number(kind::PROJECT), project: None, fields },
+                let project = model.open.sign(&model.key, Content::Entity { copied_from: vec![], derive: None, kind: Key::Number(kind::PROJECT), project: None, fields },
                     Origin::Ui, parents)?;
                 parents = vec![project.id];
                 projects.push(project);
@@ -1942,16 +2248,8 @@ impl Model {
             }
             if !town.state.sessions.is_empty() && town.state.active_member(&key.public()) {
                 let me = key.public();
-                let mut unfinished: BTreeSet<_> = town.state.sessions.keys().copied()
-                    .filter(|id| town.state.participants(id).contains(&me)).collect();
-                // Membership cutoffs also apply to departures. Only a valid signed Leave closes mine.
-                for event in town.log.events().iter().filter(|e| e.header.author == me
-                    && e.header.kind == makepad_town_core::event::kind::SESSION && !town.state.void_events.contains_key(&e.id)) {
-                    if let Some(Content::Session(SessionOp::Leave { session, .. })) = event.content()
-                        .and_then(|b| Content::decode(event.header.kind, event.header.kind_version, b)) {
-                        unfinished.remove(&session);
-                    }
-                }
+                let unfinished: BTreeSet<_> = town.state.sessions.keys().copied()
+                    .filter(|id| town.state.active_participants(id).contains(&me)).collect();
                 for session in unfinished {
                     if let Err(e) = town.append(key, Content::Session(SessionOp::Leave { session, secs: None,
                         why: LeaveWhy::Dropped }), Origin::Ui) { notes.push(format!("Closing interrupted call: {e}")); }
@@ -2080,6 +2378,32 @@ impl Model {
         if *owner == self.me() { "Your AI".into() } else { format!("{}'s AI", self.name(owner, "Peer")) }
     }
 
+    pub(crate) fn peer_seat_name(&self, seat: Id, fallback_device: Option<&PublicKey>) -> String {
+        peer_seat_name_in(&self.open, self.peers.as_ref().ok(), Some(seat), fallback_device)
+    }
+
+    pub(crate) fn peer_seat_name_for_devices(&self, devices: &[PublicKey]) -> String {
+        peer_name_for_devices(&self.state.profiles, self.peers.as_ref().ok(), devices)
+    }
+
+    /// Immutable provider label from the signed addition, including after removal.
+    pub fn agent_backend(&self, agent: Id) -> Option<String> {
+        agent_identity_in(&self.open, agent).map(|(_, backend)| backend.into_owned())
+    }
+
+    pub fn agent_short_label(&self, agent: Id) -> String {
+        agent_short_label_in(&self.open, &self.me(), self.peers.as_ref().ok(), agent)
+    }
+
+    pub fn agent_custom_name(&self, agent: Id) -> Option<String> {
+        agent_custom_name_in(&self.open, agent)
+    }
+
+    pub fn agent_display_label(&self, agent: Id) -> String {
+        let Some((_, backend)) = agent_identity_in(&self.open, agent) else { return "Peer's AI".into() };
+        with_agent_backend(self.agent_short_label(agent), &backend)
+    }
+
     pub fn author_label(&self, author: &PublicKey, actor: Actor) -> String {
         match actor {
             Actor::Ai => self.agent_label(author),
@@ -2089,9 +2413,15 @@ impl Model {
     }
 
     pub fn ai_request_label(&self, author: &PublicKey, owner: &PublicKey) -> String {
-        let target = if *owner == self.me() { "your AI".into() }
-            else if owner == author { "their AI".into() }
-            else { self.agent_label(owner) };
+        self.ai_request_label_for(author, None, owner)
+    }
+
+    pub fn ai_request_label_for(&self, author: &PublicKey, to_agent: Option<Id>, owner: &PublicKey) -> String {
+        let target = if let Some(agent) = to_agent.filter(|id| self.agent_custom_name(*id).is_some()) { self.agent_short_label(agent) }
+            else if same_seat(&self.state, owner, &self.me()) { "your AI".into() }
+            else if same_seat(&self.state, owner, author) { "their AI".into() }
+            else if let Some(agent) = to_agent { self.agent_short_label(agent) }
+            else { owner_ai_label(&self.open, &self.me(), self.peers.as_ref().ok(), owner) };
         format!("{} asked {target}", self.author_label(author, Actor::Human))
     }
 
@@ -2204,25 +2534,28 @@ impl Model {
         std::iter::from_fn(|| s.control_frame(&self.hello, &self.hello_bytes)).collect()
     }
 
-    /// Bound the last batch by the actual folded cut. A pause or a closed town with
+    /// Bound the last batch by the actual folded cut. A refused device or a closed town with
     /// no removal has no final history to send.
     pub fn finish_carrier_town(&mut self, peer: PublicKey, id: TownId) -> Result<Vec<Vec<u8>>, String> {
-        if self.peer_paused(&peer) || !self.sync_compatible(peer) { return Ok(Vec::new()) }
+        if self.peer_refused(&peer) || !self.sync_compatible(peer) { return Ok(Vec::new()) }
         let mut bytes = Vec::new();
         if !self.final_closed(id, &peer) {
             let mut engine = self.detach_engine(peer, id).unwrap_or_default();
-            self.in_town(id, |r, key| {
+            let closure = self.in_town(id, |r, key| {
                 engine.serve(&r.log, &r.state, &key.public(), &peer);
                 if engine.finish_prefix(&r.log) {
                     bytes.extend(std::iter::from_fn(|| engine.poll_send(&r.log)));
+                    return Ok(FinalClosure::from_evidence(engine.final_evidence()))
                 }
-                Ok(())
+                Ok(None)
             })?;
             if !bytes.is_empty() {
                 if let Some(hello) = self.sessions.get_mut(&peer).and_then(|s| s.greeting(&self.hello_bytes)) {
                     bytes.insert(0, hello);
                 }
-                if let Err(why) = self.close_final(id, peer) { self.last_share_note = Some(why); }
+                if let Some(closure) = closure {
+                    if let Err(why) = self.close_final(id, peer, closure) { self.last_share_note = Some(why); }
+                }
             } else if let Some(s) = self.sessions.get_mut(&peer) { s.drop_town(id); }
         }
         self.release_towns();
@@ -2243,18 +2576,6 @@ impl Model {
     pub fn remember_path(&mut self, device: &PublicKey, path: PathMemory) -> Result<(), String> {
         self.carrier_revision = self.carrier_revision.wrapping_add(1);
         self.peers.as_mut().map_err(|reason| reason.clone())?.remember_path(device, path).map_err(|e| e.to_string())
-    }
-
-    /// Disconnect pauses reconnecting to `device` until the person connects again. The pause is on
-    /// the device's record, so a restart keeps it.
-    pub fn set_paused(&mut self, device: &PublicKey, paused: bool) -> Result<(), String> {
-        self.carrier_revision = self.carrier_revision.wrapping_add(1);
-        self.peers.as_mut().map_err(|reason| reason.clone())?.set_paused(device, paused).map_err(|e| e.to_string())?;
-        if paused {
-            self.interrupted.remove(device);
-            self.end_carrier(*device, false);
-        }
-        Ok(())
     }
 
     pub(crate) fn service_provider(&self, service: Service) -> Option<PublicKey> {
@@ -2359,14 +2680,16 @@ impl Model {
 
     /// A service job's proposal: a task in `project` that the AI flag marks as written by a tool and
     /// that stays hidden from AI members until a person accepts it. False when the project is gone.
-    pub(crate) fn propose_task(&mut self, town: TownId, project: Id, title: String, text: String) -> Result<bool, String> {
+    pub(crate) fn propose_task(&mut self, town: TownId, project: Id, request: Id, title: String, text: String) -> Result<bool, String> {
         self.in_town(town, |r, key| {
             if !r.state.active_member(&key.public()) { return Err("This town is read-only now.".into()) }
             if !r.state.entities.get(&project).is_some_and(|e| e.kind == kind::PROJECT && live(e)) { return Ok(false) }
             let order = next_task_key_in(&r.state, project);
-            r.append(key, Content::Entity { kind: Key::Number(kind::TASK), project: Some(project), derive: None,
-                fields: vec![(field::TITLE, FieldValue::Text(title)), (field::TEXT, FieldValue::Text(text)),
-                    (field::ORDER, FieldValue::Key(order)), (field::PROPOSED, FieldValue::Bool(true))] }, Origin::Tool)?;
+            let fields = vec![(field::TITLE, FieldValue::Text(title)), (field::TEXT, FieldValue::Text(text)),
+                (field::ORDER, FieldValue::Key(order)), (field::PROPOSED, FieldValue::Bool(true))];
+            let copied_from = entity_copy_refs(&fields, &[field::TITLE, field::TEXT], &[CopySource::Record(request)]);
+            r.append(key, Content::Entity { copied_from, kind: Key::Number(kind::TASK), project: Some(project), derive: None,
+                fields }, Origin::Tool)?;
             Ok(true)
         })
     }
@@ -2474,6 +2797,8 @@ impl Model {
             .flatten()
     }
 
+    pub fn peers(&self) -> Option<&Peers> { self.peers.as_ref().ok() }
+
     pub fn active_town_peers(&self, town: TownId) -> Vec<PublicKey> {
         let me = self.me();
         let Some(state) = self.loaded_town(town).map(|t| &t.state) else { return Vec::new() };
@@ -2485,14 +2810,45 @@ impl Model {
         self.active_town_peers(town).into_iter().filter(|peer| self.peer_multiparty(peer)).collect()
     }
 
+    pub fn linked_town_share_peers(&self, town: TownId) -> Vec<PublicKey> {
+        self.active_town_peers(town).into_iter().filter(|peer| self.peer_multiparty_share(peer)).collect()
+    }
+
+    fn join_scope_from_summary(state: &State, summary: &fold::SessionSummary) -> Option<crate::call::CallScope> {
+        use crate::call::CallScope;
+        if summary.ended || !matches!(summary.mode, SessionMode::Call { .. })
+            || !state.active_member(&summary.opener) { return None }
+        if summary.town_wide { return Some(CallScope::Town) }
+        if summary.viewer == fold::Seen::Other { return None }
+        let caller = summary.opener_seat?;
+        let mut callees: Vec<_> = summary.rung.iter().copied().filter(|&seat| seat != caller).collect();
+        callees.sort_unstable();
+        callees.dedup();
+        match callees.as_slice() {
+            [callee] => Some(CallScope::Seats { caller, callee: *callee }),
+            _ => None,
+        }
+    }
+
+    pub fn call_join_scope(&self, town: TownId, session: SessionId) -> Option<crate::call::CallScope> {
+        let town = self.loaded_town(town)?;
+        let me = self.me();
+        if !town.state.active_member(&me) || !town.has_unique_open(&session) { return None }
+        let summary = town.state.session_summary(&session, town.state.seat_of(&me))?;
+        Self::join_scope_from_summary(&town.state, &summary)
+    }
+
     pub fn active_town_call(&self, town: TownId) -> Option<(SessionId, Vec<String>)> {
-        let state = &self.loaded_town(town)?.state;
+        let town = self.loaded_town(town)?;
+        let state = &town.state;
         let me = self.me();
         if !state.active_member(&me) { return None }
+        let my_seat = state.seat_of(&me);
         state.timeline.iter().rev().find_map(|entry| {
             let fold::Entry::Session(id) = entry else { return None };
-            let summary = state.session_summary(id, None)?;
-            if summary.ended || !matches!(summary.mode, SessionMode::Call { .. }) { return None }
+            let summary = state.session_summary(id, my_seat)?;
+            if summary.ended || !matches!(summary.mode, SessionMode::Call { .. }) || !town.has_unique_open(id) { return None }
+            Self::join_scope_from_summary(state, &summary)?;
             let names = state.active_participants(id).iter().map(|peer| {
                 if *peer == me { "You" }
                 else { device_name(&state.profiles, self.peers.as_ref().ok(), peer).map(peer_label).unwrap_or("Peer") }.to_owned()
@@ -2608,18 +2964,17 @@ impl Model {
     }
 
     pub fn observe_share_offer(&mut self, session: SessionId, sharer: PublicKey, wire_town: Option<TownId>) {
-        self.share_offer_peers.insert(session, (sharer, wire_town));
         let peer = Some(sharer);
         let pin = match wire_town {
             Some(town) => self.wire_pin(town, peer),
             None => self.unique_peer_town(&sharer).filter(|_| self.sync_compatible(sharer))
                 .map(|town| SessionPin { town, confident: true, peer, from_wire: false }),
         };
-        if let Some(pin) = pin {
-            self.session_towns.insert(session, pin);
-        } else if wire_town.is_some() {
-            self.session_towns.remove(&session);
-        }
+        self.share_offer_peers.insert(session, (sharer, wire_town, pin));
+    }
+
+    pub fn end_share_offer(&mut self, session: SessionId) {
+        self.share_offer_peers.remove(&session);
     }
 
     fn resolve_session_pin(&self, session: SessionId, pin: SessionPin) -> Option<SessionPin> {
@@ -2636,6 +2991,9 @@ impl Model {
         let pin = *self.session_towns.get(&session)?;
         if let Some((_, _, ring_pin)) = self.ringing_town.filter(|(id, _, _)| *id == session && self.ringing_wire_town.is_some()) {
             if ring_pin?.town != pin.town { return None }
+        }
+        if let Some(&(_, Some(_), offer_pin)) = self.share_offer_peers.get(&session) {
+            if offer_pin?.town != pin.town { return None }
         }
         self.resolve_session_pin(session, pin).map(|p| p.town)
     }
@@ -2665,42 +3023,51 @@ impl Model {
         }
     }
 
-    fn ring_destination(&self, session: SessionId, wire_town: Option<TownId>) -> Option<SessionPin> {
+    fn ring_destination(&self, session: SessionId, action_peer: Option<PublicKey>, wire_town: Option<TownId>) -> Option<SessionPin> {
         let ring = self.ringing_town.filter(|(id, _, _)| *id == session);
         let offer = self.share_offer_peers.get(&session).copied();
         let pin = self.session_towns.get(&session).copied();
-        let observed = ring.and(self.ringing_wire_town).or_else(|| offer.and_then(|(_, town)| town));
-        let peer = ring.and_then(|(_, peer, _)| peer).or_else(|| offer.map(|(peer, _)| peer));
+        let observed = ring.and(self.ringing_wire_town).or_else(|| offer.and_then(|(_, town, _)| town));
+        let observed_peer = ring.and_then(|(_, peer, _)| peer).or_else(|| offer.map(|(peer, ..)| peer));
         if let Some(town) = wire_town.or(observed) {
-            if observed.is_some_and(|id| id != town) || (ring.is_some() && offer.is_some()) { return None }
-            let peer = peer.or_else(|| pin.and_then(|p| p.peer));
-            let want_share = ring.map(|_| false).or_else(|| offer.map(|_| true));
-            return match self.opened_session(session, want_share, peer, Some(town)) {
-                OpenedTown::Ambiguous => None,
-                _ => Some(SessionPin { town, confident: true, peer, from_wire: true }),
+            if observed.is_some_and(|id| id != town) || pin.is_some_and(|p| p.confident && p.town != town)
+                || (ring.is_some() && offer.is_some()) || offer.is_some_and(|(sharer, ..)| action_peer.is_some_and(|p| p != sharer)) {
+                return None
             }
+            let peer = action_peer.or(observed_peer).or_else(|| pin.and_then(|p| p.peer));
+            let want_share = ring.map(|_| false).or_else(|| offer.map(|_| true));
+            let town = match self.opened_session(session, want_share, peer, Some(town)) {
+                OpenedTown::One(town) => town,
+                OpenedTown::None if peer.is_some() => town,
+                OpenedTown::None | OpenedTown::Ambiguous => return None,
+            };
+            return Some(SessionPin { town, confident: true, peer, from_wire: true })
         }
+        let peer = observed_peer;
         if let Some(pin) = pin { return self.resolve_session_pin(session, pin) }
         match self.opened_session(session, None, peer, None) {
             OpenedTown::One(town) => Some(SessionPin { town, confident: true, peer, from_wire: false }),
             OpenedTown::Ambiguous => None,
             OpenedTown::None => match self.ringing_town {
                 Some((id, _, pin)) if id == session => pin,
-                _ => self.shared_call_pin(peer),
+                _ => offer.and_then(|(_, _, pin)| pin).or_else(|| self.shared_call_pin(peer)),
             },
         }
     }
 
-    pub fn observe_voice_call(&mut self, session: Option<SessionId>) {
+    pub fn observe_voice_call(&mut self, session: Option<SessionId>, peer: Option<PublicKey>, wire_town: Option<TownId>) {
         self.active_call = session.map(|id| {
             let ring = self.ringing_town.filter(|(cur, _, _)| *cur == id);
-            if let Some((_, peer, _)) = ring.filter(|_| self.ringing_wire_town.is_some()) {
-                return (id, peer, self.ringing_wire_town)
-            }
             let current = self.active_call.filter(|(cur, _, _)| *cur == id);
             let pin = self.session_towns.get(&id).copied();
-            let peer = current.and_then(|(_, peer, _)| peer)
-                .or_else(|| pin.and_then(|p| p.peer)).or_else(|| ring.and_then(|(_, peer, _)| peer));
+            let ring_peer = ring.and_then(|(_, peer, _)| peer);
+            let current_peer = current.and_then(|(_, peer, _)| peer);
+            let pin_peer = pin.and_then(|p| p.peer);
+            if let Some(town) = wire_town {
+                return (id, peer.or(ring_peer).or(current_peer).or(pin_peer), Some(town))
+            }
+            if let Some(town) = ring.and(self.ringing_wire_town) { return (id, peer.or(ring_peer), Some(town)) }
+            let peer = peer.or(current_peer).or(pin_peer).or(ring_peer);
             let wire_town = current.and_then(|(_, _, town)| town).or_else(|| pin.and_then(SessionPin::wire_town));
             (id, peer, wire_town)
         });
@@ -2715,6 +3082,7 @@ impl Model {
             None => {
                 let (id, peer, wire_town) = self.active_call?;
                 let pin = self.session_towns.get(&id).copied();
+                let peer = if pin.is_some_and(|p| p.confident && p.from_wire && wire_town == Some(p.town)) { None } else { peer };
                 (id, peer, wire_town, pin)
             }
         };
@@ -2727,28 +3095,44 @@ impl Model {
 
     pub fn share_offer_town(&self, session: SessionId) -> Option<TownId> {
         if self.active_call.is_some_and(|(id, _, _)| id == session) { return None }
-        let pin = self.session_towns.get(&session).copied();
-        let (peer, wire_town) = match self.share_offer_peers.get(&session) {
-            Some(&(peer, town)) => (Some(peer), town),
-            None => (pin.and_then(|p| p.peer), pin.and_then(SessionPin::wire_town)),
+        let (peer, wire_town, pin) = match self.share_offer_peers.get(&session) {
+            Some(&(peer, town, pin)) => (Some(peer), town, pin),
+            None => {
+                let pin = self.session_towns.get(&session).copied();
+                (pin.and_then(|p| p.peer), pin.and_then(SessionPin::wire_town), pin)
+            }
         };
         match self.opened_session(session, Some(true), peer, wire_town) {
             OpenedTown::One(town) => Some(town),
             OpenedTown::Ambiguous => None,
-            OpenedTown::None => pin.filter(|p| p.confident && wire_town.is_none_or(|t| p.town == t)).map(|p| p.town),
+            OpenedTown::None => pin.filter(|p| p.confident && wire_town.is_none_or(|t| p.town == t)
+                && peer.is_none_or(|who| p.peer.is_none_or(|pp| pp == who))).map(|p| p.town),
         }
     }
 
     pub fn transcript_town(&self, session: SessionId, peer: Option<PublicKey>, wire_town: Option<TownId>) -> Option<TownId> {
-        if let Some(town) = wire_town { return self.verify_wire_town(town, peer) }
+        let ring = self.ringing_town.filter(|(id, _, _)| *id == session);
+        let active = self.active_call.filter(|(id, _, _)| *id == session);
+        let ring_town = ring.and(self.ringing_wire_town);
+        let active_town = active.and_then(|(_, _, town)| town);
+        if ring_town.zip(active_town).is_some_and(|(r, a)| r != a) { return None }
+        let observed = ring_town.or(active_town);
+        if wire_town.zip(observed).is_some_and(|(w, o)| w != o) { return None }
+        if let Some(town) = wire_town.or(observed) {
+            let joined = wire_town.is_none() && ring_town.is_none()
+                && self.session_towns.get(&session).is_some_and(|p| p.confident && p.from_wire && p.town == town);
+            let peer = if joined { peer } else {
+                peer.or_else(|| ring.and_then(|(_, p, _)| p)).or_else(|| active.and_then(|(_, p, _)| p))
+            };
+            return self.verify_wire_town(town, peer)
+        }
         if let Some(town) = self.session_write_town(session) {
             return Some(town);
         }
         match self.opened_session(session, Some(false), peer, None) {
             OpenedTown::One(town) => Some(town),
             OpenedTown::Ambiguous => None,
-            OpenedTown::None => self.ringing_town
-                .filter(|(id, _, _)| *id == session)
+            OpenedTown::None => ring
                 .and_then(|(_, _, pin)| pin.map(|p| p.town))
                 .or_else(|| peer.and_then(|p| self.shared_town_with(&p)))
                 .or_else(|| self.shared_call_town()),
@@ -2770,7 +3154,7 @@ impl Model {
 
     /// The human share flow can start before its signed Open syncs.
     pub(crate) fn tweak_town(&self, session: SessionId) -> Option<TownId> {
-        self.ring_destination(session, None).map(|pin| pin.town)
+        self.ring_destination(session, None, None).map(|pin| pin.town)
     }
 
     /// In-memory lookup for a shared board, its membership and its signed App item.
@@ -2785,7 +3169,7 @@ impl Model {
         self.in_town(id, |town, _| read(town))
     }
 
-    fn session_action(&mut self, op: SessionOp, wire_town: Option<TownId>, origin: Origin) -> Result<Id, String> {
+    fn session_action(&mut self, op: SessionOp, peer: Option<PublicKey>, wire_town: Option<TownId>, origin: Origin) -> Result<Id, String> {
         let session = match &op {
             SessionOp::Open { session, .. } | SessionOp::Join { session } | SessionOp::Leave { session, .. }
                 | SessionOp::Decline { session, .. } => *session,
@@ -2806,10 +3190,10 @@ impl Model {
             }),
             (SessionOp::Open { to, .. }, None) if !to.is_empty() => self.open_destination(to)
                 .map(|town| SessionPin { town, confident: true, peer: None, from_wire: false }),
-            _ => self.ring_destination(session, wire_town),
+            _ => self.ring_destination(session, peer, wire_town),
         }.ok_or("No shared town for this call.")?;
         let id = self.in_town(dest.town, |r, key| r.append(key, Content::Session(op), origin))?;
-        if open || join || dest.from_wire {
+        if open || join {
             self.session_towns.insert(session, SessionPin {
                 confident: open || dest.confident,
                 peer: if open { None } else { dest.peer },
@@ -2824,6 +3208,22 @@ impl Model {
         self.act_in(self.open_id(), self.selected_project, action, origin)
     }
 
+    fn append_held_image(&mut self, town: TownId, item: Content, origin: Origin) -> Result<Id, String> {
+        let Content::Entity { fields, .. } = &item else { unreachable!() };
+        let held = self.complete_blobs(&town);
+        for (_, value) in fields {
+            if let FieldValue::Blob { size, root } = value {
+                if !held.is_some_and(|ids| ids.contains(&blob::id(*size, root))) {
+                    return Err("The picture or its poster is missing from local storage.".into())
+                }
+            }
+        }
+        self.in_town(town, |r, key| {
+            if !r.state.active_member(&key.public()) { return Err("This town is read-only now.".into()) }
+            r.append(key, item, origin)
+        })
+    }
+
     pub fn act_in(&mut self, town_id: TownId, project_override: Option<Id>, action: Action, origin: Origin) -> Result<Id, String> {
         self.act_at(town_id, project_override, action, origin, None)
     }
@@ -2831,10 +3231,35 @@ impl Model {
     fn act_at(&mut self, town_id: TownId, project_override: Option<Id>, action: Action, origin: Origin,
         clip_town: Option<TownId>) -> Result<Id, String> {
         match action {
-            Action::SessionOpen { session, mode, to, town } => self.session_action(SessionOp::Open { session, mode, to }, town, origin),
-            Action::SessionJoin { session, town } => self.session_action(SessionOp::Join { session }, town, origin),
-            Action::SessionLeave { session, secs, why } => self.session_action(SessionOp::Leave { session, secs, why }, None, origin),
-            Action::SessionDecline { session, why, town } => self.session_action(SessionOp::Decline { session, why }, town, origin),
+            Action::PinFrom { board, from, parent, x, y, w, h } => {
+                self.in_tool_town(town_id, |r, key| {
+                    let item = r.pin_image(board, parent, [x, y, w, h], Some(from), None)?;
+                    let Content::Entity { fields, .. } = &item else { unreachable!() };
+                    for (_, value) in fields {
+                        if let FieldValue::Blob { size, root } = value {
+                            if !r.references.visible(&blob::id(*size, root), &r.state, None) {
+                                return Err("The picture or its poster is unavailable in this town.".into())
+                            }
+                        }
+                    }
+                    if !r.state.active_member(&key.public()) { return Err("This town is read-only now.".into()) }
+                    r.append(key, item, origin)
+                })
+            }
+            Action::PinMedia { board, parent, x, y, w, h, title, blob, poster, media, duration_ms, source, session } => {
+                if origin != Origin::Ui { return Err("Only a local media flow can supply board picture data.".into()) }
+                let value = |(size, root)| FieldValue::Blob { size, root };
+                let mut fields = vec![(field::TITLE, FieldValue::Text(title)), (field::BLOB, value(blob)), (field::MEDIA, FieldValue::Text(media))];
+                if let Some(poster) = poster { fields.push((field::POSTER, value(poster))); }
+                if let Some(ms) = duration_ms { fields.push((field::DURATION, FieldValue::Int(i64::try_from(ms).map_err(|_| "Clip duration is too large.")?))); }
+                if let Some(session) = session { fields.push((field::SESSION, FieldValue::Key(session.to_vec()))); }
+                let item = self.in_tool_town(town_id, |r, _| r.pin_image(board, parent, [x, y, w, h].map(Some), source, Some(fields)))?;
+                self.append_held_image(town_id, item, origin)
+            }
+            Action::SessionOpen { session, mode, to, town, town_wide } => self.session_action(SessionOp::Open { session, mode, to, town_wide }, None, town, origin),
+            Action::SessionJoin { session, town, peer } => self.session_action(SessionOp::Join { session }, peer, town, origin),
+            Action::SessionLeave { session, secs, why } => self.session_action(SessionOp::Leave { session, secs, why }, None, None, origin),
+            Action::SessionDecline { session, why, town, peer } => self.session_action(SessionOp::Decline { session, why }, peer, town, origin),
             Action::Said { session, lines } => {
                 if origin == Origin::Tool { return Err("an AI can't state what a person said".into()) }
                 if lines.is_empty() { return Err("An empty transcript batch.".into()) }
@@ -2869,7 +3294,17 @@ impl Model {
                     if project.is_some_and(|id| !r.state.entities.get(&id).is_some_and(|e| e.kind == kind::PROJECT && live(e))) {
                         return Err("The destination project is no longer active.".into())
                     }
-                    r.append(key, Content::Entity { kind: Key::Number(kind::CLIP), project, derive: None, fields }, origin)
+                    let mut sources = Vec::new();
+                    if let Some(s) = session {
+                        if let Some(open) = r.state.session(&s).and_then(|sess| sess.open.as_ref()) {
+                            sources.push(CopySource::Record(open.anchor));
+                            let me = key.public();
+                            sources.extend(r.state.participants(&s).into_iter().filter(|peer| *peer != me)
+                                .map(|peer| CopySource::SharePeer { peer }));
+                        }
+                    }
+                    let copied_from = entity_copy_refs(&fields, &[field::TITLE, field::BLOB, field::POSTER], &sources);
+                    r.append(key, Content::Entity { copied_from, kind: Key::Number(kind::CLIP), project, derive: None, fields }, origin)
                 })
             }
             action => {
@@ -2898,10 +3333,10 @@ impl Model {
                     Action::WriteDoc { doc, .. } => self.doc_reads.remove(&(town_id, doc)).map(|reads| (doc, reads)),
                     _ => None,
                 };
-                let result = self.in_town_with_peers(town_id, origin == Origin::Tool, |town, device, peers| {
+                let result = self.in_town_with_peers(town_id, origin == Origin::Tool, |town, device, peers, person_name| {
                     let provider = providers.and_then(|(service, connected)|
                         town.choose_provider(service, device.public(), local, connected.into_iter()));
-                    town.act(device, peers, selected, provider, coverage.as_ref().map(|(_, reads)| reads), action, origin)
+                    town.act(device, peers, person_name, selected, provider, coverage.as_ref().map(|(_, reads)| reads), action, origin)
                 });
                 if let Some((doc, reads)) = coverage { self.doc_reads.insert((town_id, doc), reads); }
                 if let Ok(id) = result {
@@ -2914,9 +3349,13 @@ impl Model {
 }
 
 impl Town {
-    fn act(&mut self, device: &DeviceKey, peers: Option<&Peers>, selected: Option<Id>, provider: Option<PublicKey>,
+    fn act(&mut self, device: &DeviceKey, peers: Option<&Peers>, person_name: Option<&str>, selected: Option<Id>, provider: Option<PublicKey>,
         reads: Option<&DocReads>, action: Action, origin: Origin) -> Result<Id, String> {
-        if origin == Origin::Tool { self.refuse_proposed(&action)?; }
+        let tool_gate = (origin == Origin::Tool).then(|| Gate::new(&self.state, LocalPolicy::Members));
+        if let Some(gate) = &tool_gate {
+            gate.town_readable().map_err(timeline_withheld)?;
+            self.refuse_proposed(&action)?;
+        }
         match action {
             Action::Provide { .. } if origin != Origin::Ui => Err("Only a person can offer this computer's AI Hub.".into()),
             Action::RequestSummary { session } => {
@@ -2940,13 +3379,14 @@ impl Town {
             }
             Action::Shared { session, agent, line } => {
                 if origin == Origin::Tool { return Err("Only your person can send a transcript.".into()) }
-                let reader = TimelineReader::new(self, &device.public(), agent, peers)?;
+                let reader = TimelineReader::new(self, &device.public(), agent, peers, person_name)?;
                 if !self.state.message(&line).is_some_and(|m| reader.request(m))
                     || !self.state.agents.get(&agent).is_some_and(|a| self.state.seat_of(&a.owner) == Some(reader.owner)) { return Err("Unknown transcript request.".into()) }
                 self.append(device, Content::Shared { session, agent, line }, origin)
             }
             Action::SessionOpen { .. } | Action::SessionJoin { .. } | Action::SessionLeave { .. } |
-            Action::SessionDecline { .. } | Action::Said { .. } | Action::PostClip { .. } => {
+            Action::SessionDecline { .. } | Action::Said { .. } | Action::PostClip { .. } |
+            Action::PinFrom { .. } | Action::PinMedia { .. } => {
                 return Err("Session actions require their pinned destination.".into())
             }
             _ if !self.state.active_member(&device.public()) => Err("This town is read-only now.".into()),
@@ -2965,6 +3405,7 @@ impl Town {
                     if !self.state.chat.iter().any(|m| m.id == quote) {
                         return Err(format!("no message {}", hex(&quote)));
                     }
+                    if let Some(gate) = &tool_gate { gate.chat_text(&quote).map_err(timeline_withheld)?; }
                 }
                 let to_ai = to_ai && origin == Origin::Ui;
                 self.append(device, Content::Chat(Chat { text, to_ai, quote: reply_to, ..Chat::default() }), origin)
@@ -2977,6 +3418,7 @@ impl Town {
                 let project = self.resolve_project(selected).ok_or("choose a project first")?.id;
                 let order = self.next_task_key(Some(project));
                 self.append(device, Content::Entity {
+                    copied_from: vec![],
                     derive: None, kind: Key::Number(kind::TASK), project: Some(project),
                     fields: vec![(field::TITLE, FieldValue::Text(title)), (field::TEXT, FieldValue::Text(text.trim().into())),
                         (field::ORDER, FieldValue::Key(order))],
@@ -2986,31 +3428,31 @@ impl Town {
                 let task = self.current_task(selected, task)?.id;
                 let changes = task_text_changes(task, title, text)?;
                 if changes.is_empty() { return Err("give a title or text to edit".into()) }
-                self.append(device, Content::Set { changes, label: Some("edit task".into()) }, origin)
+                self.append(device, Content::Set { copied_from: vec![], changes, label: Some("edit task".into()) }, origin)
             }
             Action::SetTaskStatus { task, status } => {
                 let task = self.current_task(selected, task)?.id;
                 if !TASK_STATUSES.contains(&status.as_str()) { return Err(INVALID_TASK_STATUS.into()) }
                 let changes = vec![Change { entity: task, field: field::STATUS, value: FieldValue::Text(status) }];
-                self.append(device, Content::Set { changes, label: Some("set task status".into()) }, origin)
+                self.append(device, Content::Set { copied_from: vec![], changes, label: Some("set task status".into()) }, origin)
             }
             Action::MoveTask { task, before, after } => {
                 let changes = self.move_task(selected, task, before, after)?;
-                self.append(device, Content::Set { changes, label: Some("move task".into()) }, origin)
+                self.append(device, Content::Set { copied_from: vec![], changes, label: Some("move task".into()) }, origin)
             }
             Action::MergeTasks { into, from, title, text } => {
-                let changes = self.merge_tasks(selected, into, from, title, text)?;
-                self.append(device, Content::Set { changes, label: Some("merge tasks".into()) }, origin)
+                let (changes, copied_from) = self.merge_tasks(selected, into, from, title, text)?;
+                self.append(device, Content::Set { copied_from, changes, label: Some("merge tasks".into()) }, origin)
             }
             Action::AddProject { title } => {
                 let title = title.trim();
                 if title.is_empty() { return Err("a project needs a name".into()) }
-                self.append(device, Content::Entity { kind: Key::Number(kind::PROJECT), derive: None, project: None,
+                self.append(device, Content::Entity { copied_from: vec![], kind: Key::Number(kind::PROJECT), derive: None, project: None,
                     fields: vec![(field::TITLE, FieldValue::Text(title.into()))] }, origin)
             }
             Action::RemoveProject { project } => {
                 if !self.project_removable(project) { return Err("only an empty, active project can be removed".into()) }
-                self.append(device, Content::Set { changes: vec![Change { entity: project, field: field::ARCHIVED, value: FieldValue::Bool(true) }],
+                self.append(device, Content::Set { copied_from: vec![], changes: vec![Change { entity: project, field: field::ARCHIVED, value: FieldValue::Bool(true) }],
                     label: Some("remove project".into()) }, origin)
             }
             Action::AddDoc { title, project } => {
@@ -3019,7 +3461,7 @@ impl Town {
                 }
                 let title = title.trim();
                 if title.is_empty() { return Err("a document needs a title".into()) }
-                self.append(device, Content::Entity { kind: Key::Number(kind::DOC), project: Some(project), derive: None,
+                self.append(device, Content::Entity { copied_from: vec![], kind: Key::Number(kind::DOC), project: Some(project), derive: None,
                     fields: vec![(field::TITLE, FieldValue::Text(title.into()))] }, origin)
             }
             Action::AddBoard { title, project } => {
@@ -3028,7 +3470,7 @@ impl Town {
                 }
                 let title = title.trim();
                 if title.is_empty() { return Err("a board needs a title".into()) }
-                self.append(device, Content::Entity { kind: Key::Number(kind::BOARD), project: Some(project), derive: None,
+                self.append(device, Content::Entity { copied_from: vec![], kind: Key::Number(kind::BOARD), project: Some(project), derive: None,
                     fields: vec![(field::TITLE, FieldValue::Text(title.into()))] }, origin)
             }
             Action::AddItem { board, kind, x, y, w, h, style, parent } => {
@@ -3037,7 +3479,7 @@ impl Town {
                     return Err("item_add supports sticky, text, shape and section".into())
                 }
                 if w < 0 || h < 0 { return Err("item sizes must be nonnegative".into()) }
-                let item = self.add_board_item(self.board(board)?, parent, kind, [x, y, w, h], style.fields())?;
+                let item = self.add_board_item(self.board(board)?, parent, kind, [x, y, w, h], style.fields(), vec![])?;
                 self.append(device, item, origin)
             }
             Action::AddApp { board, geometry, session, name, .. } => {
@@ -3055,15 +3497,21 @@ impl Town {
                     Some(id) => id,
                     None => {
                         let project = oldest(kind::PROJECT).ok_or("The share's town has no active project.")?;
-                        self.append(device, Content::Entity { kind: Key::Number(kind::BOARD), project: Some(project), derive: None,
+                        self.append(device, Content::Entity { copied_from: vec![], kind: Key::Number(kind::BOARD), project: Some(project), derive: None,
                             fields: vec![(field::TITLE, FieldValue::Text("Board".into()))] }, origin)?
                     }
                 };
                 let board = self.board(board).map_err(|_| "The board is unavailable in the share's town.")?;
-                let item = self.add_board_item(board, None, Key::Number(kind::APP), geometry, vec![
+                let fields = vec![
                     (field::TITLE, FieldValue::Text(name)), (field::SESSION, FieldValue::Key(session.to_vec())),
                     (field::SHARER, FieldValue::Key(sharer.to_vec())),
-                ])?;
+                ];
+                let mut sources = vec![CopySource::SharePeer { peer: sharer }];
+                if let Some(open) = self.state.session(&session).and_then(|s| s.open.as_ref()) {
+                    sources.push(CopySource::Record(open.anchor));
+                }
+                let copied_from = entity_copy_refs(&fields, &[field::TITLE], &sources);
+                let item = self.add_board_item(board, None, Key::Number(kind::APP), geometry, fields, copied_from)?;
                 self.append(device, item, origin)
             }
             Action::RecordAppEdit { item, edit, .. } => {
@@ -3084,13 +3532,15 @@ impl Town {
                     Change::Sidebar(line) => { fields.push((field::TEXT, FieldValue::Text(line))); "sidebar" }
                 };
                 fields.push((field::LABEL, FieldValue::Text(label.into())));
-                self.append(device, Content::Entity { kind: Key::Number(kind::APP_EDIT), project: app.project, derive: None, fields }, origin)
+                let copied_from = entity_copy_refs(&fields, &[field::WIDGET_PATH, field::PROPERTY, field::OLD_VALUE,
+                    field::NEW_VALUE, field::TEXT], &[CopySource::SharePeer { peer: edit.seat }]);
+                self.append(device, Content::Entity { copied_from, kind: Key::Number(kind::APP_EDIT), project: app.project, derive: None, fields }, origin)
             }
             Action::AddDesign { board, x, y, preset, src, title } => {
                 let (w, h) = design::initial_size(&preset)?;
                 let item = self.add_board_item(self.board(board)?, None, Key::Number(kind::DESIGN), [x, y, w, h], vec![
                     (field::SRC, FieldValue::Text(src)), (field::TITLE, FieldValue::Text(title)),
-                ])?;
+                ], vec![])?;
                 self.append(device, item, origin)
             }
             Action::WriteDesign { item, src, revision } => {
@@ -3098,7 +3548,7 @@ impl Town {
                 if revision != writer {
                     return Err(format!("design source changed; read it again with design_read (current revision @{})", hex(&writer)))
                 }
-                self.append(device, Content::Set { changes: vec![Change { entity: item, field: field::SRC, value: FieldValue::Text(src) }],
+                self.append(device, Content::Set { copied_from: vec![], changes: vec![Change { entity: item, field: field::SRC, value: FieldValue::Text(src) }],
                     label: Some("write design".into()) }, origin)
             }
             Action::EditItem { item, style, w, h, locked } => {
@@ -3174,7 +3624,7 @@ impl Town {
                 if let Some(title) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
                     fields.push((field::TITLE, FieldValue::Text(title.into())));
                 }
-                self.append(device, Content::Entity { kind: Key::Name(STEP.into()), project, derive: None, fields }, origin)
+                self.append(device, Content::Entity { copied_from: vec![], kind: Key::Name(STEP.into()), project, derive: None, fields }, origin)
             }
             Action::MoveStep { step, at } => {
                 let board = self.step_board(step)?;
@@ -3217,6 +3667,9 @@ impl Town {
             Action::LineToTask { doc, at } => {
                 let state = self.state.docs.get(&doc).ok_or("unknown document")?;
                 let line = state.blocks().into_iter().find(|b| b.at == at).ok_or("unknown or deleted line")?;
+                if let Some(gate) = &tool_gate {
+                    gate.doc_block_text(&doc, at, line.text.clone()).map_err(timeline_withheld)?;
+                }
                 let project = self.state.entities[&doc].project;
                 if let Some(FieldValue::Id(id)) = line.attrs.get(&attr::TASK) {
                     let task = Self::resolve_task(&self.state, project, *id)?;
@@ -3236,16 +3689,45 @@ impl Town {
                     if entity.flag(field::DELETED) {
                         let removed = entity.fields[&field::DELETED].writer;
                         if state.attribute_writer(at, attr::TASK) == Some(removed) {
+                            if let Some(gate) = &tool_gate {
+                                gate.record_visible(&removed).map_err(timeline_withheld)?;
+                                let meta = self.state.derived_task_meta(&task).ok_or_else(|| timeline_withheld(Withheld::MissingSource))?;
+                                gate.record_visible(&meta.creator).map_err(timeline_withheld)?;
+                            }
                             return self.append(device, Content::Undo { of: removed }, origin);
                         }
                     }
                     let task = Self::resolve_task(&self.state, project, task)?.id;
+                    if let Some(gate) = &tool_gate { gate.entity_visible(&task).map_err(timeline_withheld)?; }
                     let ops = vec![doc::TextOp::Attr { at, attr: attr::TASK, value: FieldValue::Id(task) }];
                     return self.append(device, Content::Text { doc, ops }, origin);
                 }
                 let status = line.attrs.get(&attr::CHECKBOX).cloned().unwrap_or_else(|| FieldValue::Text("open".into()));
                 let order = self.next_task_key(project);
-                self.append(device, Content::Entity { kind: Key::Number(kind::TASK), project, derive: Some((doc, id)),
+                let line_source = |target_field, events| CopyRef { target_entity: None, target_field,
+                    sources: vec![CopySource::DocLine { doc, events }] };
+                let mut title_events = state.block_run_events(at).unwrap_or_default();
+                if let BreakRef::Char(ch) = at { title_events.push(ch.event); }
+                let mut copied_from = vec![line_source(field::TITLE, title_events)];
+                let mut status_events = Vec::new();
+                let mut add_writers = |at, attr, mut writer: Option<Id>| {
+                    while let Some(cur) = writer {
+                        status_events.push(cur);
+                        writer = self.state.doc_attr_undo_prev(&doc, &cur, at, attr);
+                    }
+                };
+                add_writers(at, attr::CHECKBOX, state.attribute_writer(at, attr::CHECKBOX));
+                if let Some(src) = state.block_checkbox_source(at) {
+                    add_writers(at, attr::TASK, Some(src.link_writer));
+                    if let Some(doc::CopiedStatus::SameEventTick { at: tick_at, link_writer }) = src.status {
+                        add_writers(tick_at, attr::TASK, Some(link_writer));
+                    }
+                }
+                if !status_events.is_empty() {
+                    copied_from.push(line_source(field::STATUS, status_events));
+                }
+                normalize_copy_refs(&mut copied_from);
+                self.append(device, Content::Entity { copied_from, kind: Key::Number(kind::TASK), project, derive: Some((doc, id)),
                     fields: vec![(field::TITLE, FieldValue::Text(line.text)), (field::STATUS, status),
                         (field::ORDER, FieldValue::Key(order))] }, origin)
             }
@@ -3339,7 +3821,7 @@ impl Town {
         }
         if changes.is_empty() { return Err("Choose proposed tasks first.".into()) }
         let label = if accept { "accept proposed tasks" } else { "dismiss proposed tasks" };
-        self.append(device, Content::Set { changes, label: Some(label.into()) }, origin)
+        self.append(device, Content::Set { copied_from: vec![], changes, label: Some(label.into()) }, origin)
     }
 
     fn write_doc_ops(&mut self, device: &DeviceKey, doc: Id, ops: Vec<doc::TextOp>, origin: Origin) -> Result<Id, String> {
@@ -3432,28 +3914,51 @@ impl Town {
         Ok(changes)
     }
 
-    fn merge_tasks(&self, selected: Option<Id>, into: Id, from: Vec<Id>, title: Option<String>, text: Option<String>) -> Result<Vec<Change>, String> {
+    fn merge_tasks(&self, selected: Option<Id>, into: Id, from: Vec<Id>, title: Option<String>, text: Option<String>)
+        -> Result<(Vec<Change>, Vec<CopyRef>), String> {
+        fn copied_text<'a>(entity: &'a Entity, field: Key, sources: &mut Vec<CopySource>) -> &'a str {
+            let Some(state) = entity.fields.get(&field) else { return "" };
+            let FieldValue::Text(text) = &state.value else { return "" };
+            if !text.is_empty() { sources.push(CopySource::EntityField { entity: entity.id, field, writer: state.writer }); }
+            text
+        }
         let into = self.current_task(selected, into)?;
         if from.is_empty() { return Err("choose at least one task to merge".into()) }
         let mut seen = HashSet::new();
         let mut changes = Vec::new();
-        let mut combined = text.is_none().then(|| into.text(field::TEXT).to_owned());
+        let mut sources = Vec::new();
+        let mut combined = text.is_none().then(|| copied_text(into, field::TEXT, &mut sources).to_owned());
         for id in from {
             let source = Self::resolve_task(&self.state, into.project, id)?;
             if source.id == into.id { return Err("cannot merge a task into itself".into()) }
             if !seen.insert(source.id) { return Err("the same task was supplied twice".into()) }
             if let Some(body) = &mut combined {
                 if !body.is_empty() { body.push_str("\n\n"); }
-                body.push_str(source.text(field::TITLE));
-                let detail = source.text(field::TEXT);
+                body.push_str(copied_text(source, field::TITLE, &mut sources));
+                let detail = copied_text(source, field::TEXT, &mut sources);
                 if !detail.is_empty() { body.push('\n'); body.push_str(detail); }
             }
             changes.push(Change { entity: source.id, field: field::DELETED, value: FieldValue::Bool(true) });
             changes.push(Change { entity: source.id, field: field::MERGED_INTO, value: FieldValue::Id(into.id) });
         }
         changes.extend(task_text_changes(into.id, title, text.or(combined))?);
-        Ok(changes)
+        let mut copied_from = Vec::new();
+        if !sources.is_empty() {
+            copied_from.push(CopyRef { target_entity: Some(into.id), target_field: field::TEXT, sources });
+            normalize_copy_refs(&mut copied_from);
+        }
+        Ok((changes, copied_from))
     }
+}
+
+const DEFAULT_MEDIA_SIZE: (i64, i64) = (320 * 64, 240 * 64);
+
+/// Initial card dimensions in board ticks, preserving aspect ratio to the nearest tick.
+pub fn fit_media_size(pw: u64, ph: u64) -> Option<(i64, i64)> {
+    if pw == 0 || ph == 0 { return Some(DEFAULT_MEDIA_SIZE) }
+    let w = pw.min(480) * 64;
+    let h = (u128::from(w) * u128::from(ph) + u128::from(pw / 2)) / u128::from(pw);
+    Some((w as i64, i64::try_from(h.max(1)).ok()?))
 }
 
 impl Town {
@@ -3462,8 +3967,111 @@ impl Town {
             .ok_or_else(|| format!("unknown, deleted or archived board {}", hex(&id)))
     }
 
+    fn pin_image(&self, board: Id, parent: Option<Id>, [x, y, w, h]: [Option<i64>; 4],
+        source: Option<Id>, supplied: Option<Vec<(Key, FieldValue)>>) -> Result<Content, String> {
+        let board = self.board(board)?;
+        let gate = Gate::new(&self.state, LocalPolicy::Members);
+        let withheld = |why| crate::ai_out::SafeToolError::withheld(why).as_str().to_owned();
+        let copying = supplied.is_none();
+        let mut fields = supplied.unwrap_or_default();
+        let mut refs = Vec::new();
+        let (mut fit_w, mut fit_h) = DEFAULT_MEDIA_SIZE;
+
+        if let Some(from) = source {
+            gate.entity_visible(&from).map_err(withheld)?;
+            let src = self.state.entities.get(&from).ok_or("The source is unavailable in this town.")?;
+            if !matches!(src.kind, Key::Number(kind::CLIP | kind::ISSUE)) { return Err("Choose a chat clip or an issue picture.".into()) }
+            let issue = src.kind == kind::ISSUE;
+            let read = |key: &Key| {
+                let state = src.fields.get(key).filter(|v| v.value != FieldValue::Null);
+                if state.is_some() { gate.entity_field_value(&from, key).map_err(withheld)?; }
+                Ok::<_, String>(state)
+            };
+            let mut title = field::TITLE;
+            if issue {
+                title = if read(&field::LABEL)?.is_some_and(|s| matches!(&s.value, FieldValue::Text(t) if !t.trim().is_empty())) {
+                    field::LABEL
+                } else { field::TEXT };
+            }
+            for (target, key) in [(field::BLOB, field::BLOB), (field::POSTER, field::POSTER), (field::TITLE, title),
+                (field::MEDIA, if issue { field::BLOB } else { field::MEDIA }), (field::DURATION, field::DURATION),
+                (field::SESSION, field::SESSION)] {
+                if issue && target == field::DURATION { continue }
+                if !copying && !fields.iter().any(|(f, _)| *f == target) { continue }
+                let Some(state) = read(&key)? else { continue };
+                if copying {
+                    let value = match (&target, &state.value) {
+                        (k, FieldValue::Blob { .. }) if *k == field::BLOB || *k == field::POSTER => state.value.clone(),
+                        (k, FieldValue::Text(text)) if *k == field::TITLE => FieldValue::Text(
+                            if key == field::TEXT { text.lines().next().unwrap_or("") } else { text }.to_owned()),
+                        (k, _) if *k == field::MEDIA && issue => FieldValue::Text("image/png".into()),
+                        (k, FieldValue::Text(_)) if *k == field::MEDIA => state.value.clone(),
+                        (k, FieldValue::Int(n)) if *k == field::DURATION && *n >= 0 => state.value.clone(),
+                        (k, FieldValue::Key(bytes)) if *k == field::SESSION && bytes.len() == 16 => state.value.clone(),
+                        _ => return Err("The source has invalid media metadata.".into()),
+                    };
+                    fields.push((target.clone(), value));
+                }
+                refs.push(CopyRef { target_entity: None, target_field: target,
+                    sources: vec![CopySource::EntityField { entity: from, field: key, writer: state.origin }] });
+            }
+            fields.push((field::FROM, FieldValue::Id(from)));
+            for (target, _) in &fields {
+                refs.push(CopyRef { target_entity: None, target_field: target.clone(), sources: vec![CopySource::Record(from)] });
+            }
+            if w.is_none() || h.is_none() {
+                if let (Some(sw), Some(sh)) = (read(&field::W)?, read(&field::H)?) {
+                    if let (FieldValue::Int(pw), FieldValue::Int(ph)) = (&sw.value, &sh.value) {
+                        if *pw > 0 && *ph > 0 {
+                            (fit_w, fit_h) = fit_media_size(*pw as u64, *ph as u64).ok_or("The source is too tall for the board.")?;
+                            for (target, explicit) in [(field::W, w), (field::H, h)] {
+                                if explicit.is_none() {
+                                    refs.push(CopyRef { target_entity: None, target_field: target, sources: vec![
+                                        CopySource::EntityField { entity: from, field: field::W, writer: sw.origin },
+                                        CopySource::EntityField { entity: from, field: field::H, writer: sh.origin }] });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !fields.iter().any(|(k, v)| *k == field::BLOB && matches!(v, FieldValue::Blob { .. })) {
+            return Err("This source has no picture or recording.".into())
+        }
+        let (w, h) = (w.unwrap_or(fit_w), h.unwrap_or(fit_h));
+        if w < 0 || h < 0 { return Err("item sizes must be nonnegative".into()) }
+        let mut position = (0, 0);
+        if x.is_none() || y.is_none() {
+            let readable = |item: &Entity, key: &Key| {
+                if item.fields.contains_key(key) { gate.entity_field_value(&item.id, key).ok()?.as_i64() } else { Some(0) }
+            };
+            let rightmost = self.board_items().filter(|(_, p)| p.board == board.id).filter_map(|(e, _)| {
+                gate.entity_visible(&e.id).ok()?;
+                let right = i128::from(readable(e, &field::X)?) + i128::from(readable(e, &field::W)?);
+                Some((right, e.id, readable(e, &field::Y)?, e))
+            }).max_by_key(|&(right, id, _, _)| (right, id));
+            if let Some((right, id, top, item)) = rightmost {
+                if x.is_none() { position.0 = (right + 32 * 64).try_into().map_err(|_| "No room to the right of this board item.")?; }
+                position.1 = top;
+                for (target, explicit, keys) in [(field::X, x, &[field::X, field::W][..]), (field::Y, y, &[field::Y][..])] {
+                    if explicit.is_some() { continue }
+                    let mut sources = vec![CopySource::Record(id)];
+                    for key in keys {
+                        if let Some(s) = item.fields.get(key) {
+                            sources.push(CopySource::EntityField { entity: id, field: key.clone(), writer: s.origin });
+                        }
+                    }
+                    refs.push(CopyRef { target_entity: None, target_field: target, sources });
+                }
+            }
+        }
+        normalize_copy_refs(&mut refs);
+        self.add_board_item(board, parent, Key::Number(kind::IMAGE), [x.unwrap_or(position.0), y.unwrap_or(position.1), w, h], fields, refs)
+    }
+
     fn add_board_item(&self, board: &Entity, parent: Option<Id>, kind: Key, [x, y, w, h]: [i64; 4],
-        mut fields: Vec<(Key, FieldValue)>) -> Result<Content, String> {
+        mut fields: Vec<(Key, FieldValue)>, copied_from: Vec<CopyRef>) -> Result<Content, String> {
         let project = board.project;
         let board = board.id;
         let parent = parent.unwrap_or(board);
@@ -3476,7 +4084,7 @@ impl Town {
         fields.extend([(field::BOARD, FieldValue::Id(board)), (field::PARENT, FieldValue::Id(parent)), (field::Z, FieldValue::Key(z)),
             (field::X, FieldValue::Int(x)), (field::Y, FieldValue::Int(y)),
             (field::W, FieldValue::Int(w)), (field::H, FieldValue::Int(h))]);
-        Ok(Content::Entity { kind, project, derive: None, fields })
+        Ok(Content::Entity { copied_from, kind, project, derive: None, fields })
     }
 
     fn board_item(&self, id: Id) -> Result<(&Entity, Id), String> {
@@ -3675,7 +4283,7 @@ impl Town {
             if change.field == field::DELETED { *deleted = enabled; }
         }
         add_home_changes(&self.state, &mut changes);
-        self.append(device, Content::Set { changes, label }, origin)
+        self.append(device, Content::Set { copied_from: vec![], changes, label }, origin)
     }
 }
 
@@ -3726,6 +4334,20 @@ impl Model {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn start_store_with_poster_decoder(
+        &mut self,
+        pool: makepad_widgets::makepad_platform::thread::TaskPool,
+        wake_ui: impl Fn() + Send + Sync + 'static,
+        poster_decoder: crate::store_worker::PosterDecoder,
+    ) -> std::io::Result<()> {
+        if self.files.worker.is_none() {
+            let worker = StoreWorker::start_with_poster_decoder(self.home.clone(), pool, wake_ui, poster_decoder)?;
+            self.install_store(worker);
+        }
+        Ok(())
+    }
+
     fn install_store(&mut self, mut worker: StoreWorker) {
         for &id in self.towns.keys() { worker.open(id); }
         worker.dispatch();
@@ -3762,6 +4384,7 @@ impl Model {
         worker.add(town, project, path, title);
         worker.dispatch();
         self.files.pending_adds += 1;
+        self.hold_for_store(town);
         self.files.error = None;
         Ok(())
     }
@@ -3780,14 +4403,26 @@ impl Model {
     /// here: the store worker sniffs, stores and measures the file, and any refusal or failure
     /// comes back through `take_recording_problems`. The file is the person's and is never removed.
     pub fn post_dropped(&mut self, town: TownId, path: PathBuf) -> Result<(), String> {
+        self.queue_drop(town, path, None)
+    }
+
+    pub fn drop_on_board(&mut self, town: TownId, target: BoardMediaTarget, path: PathBuf) -> Result<(), String> {
+        self.queue_drop(town, path, Some(target))
+    }
+
+    fn queue_drop(&mut self, town: TownId, path: PathBuf, target: Option<BoardMediaTarget>) -> Result<(), String> {
         if self.files.closing { return Err("Town is closing.".into()) }
         if !self.state.active_member(&self.me()) { return Err("This town is read-only now.".into()) }
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a file.")?;
         let worker = self.files.worker.as_mut().ok_or("File storage is unavailable.")?;
-        worker.add_own(town, path, title);
+        match target {
+            Some(target) => worker.add_board_file(town, target, path, title),
+            None => worker.add_own(town, path, title),
+        }
         worker.dispatch();
         self.files.pending_adds += 1;
         self.files.pending_clips += 1;
+        self.hold_for_store(town);
         Ok(())
     }
 
@@ -3813,6 +4448,7 @@ impl Model {
         worker.dispatch();
         self.files.pending_adds += 1;
         self.files.pending_clips += 1;
+        self.hold_for_store(town);
         Ok(())
     }
 
@@ -3832,32 +4468,69 @@ impl Model {
 
     /// Publish imported recordings on the owner of the town log. Removal is queued only
     /// after publication succeeds, so a rejected post leaves the original movie recoverable.
-    fn publish_stored_clips(&mut self, clips: &[crate::store_worker::ClipResult]) {
+    fn publish_stored_clips(&mut self, clips: &[crate::store_worker::ClipResult], tick: &mut StoreTick) {
         for clip in clips {
-            if let Err(why) = self.publish_clip(clip) {
-                self.files.clip_problems.push(format!("{}: {why}", clip.file.title));
+            match self.publish_clip(clip) {
+                Ok(id) if clip.board.is_some() => tick.board_events.push((clip.file.town, id)),
+                Ok(_) => {}
+                Err(why) => self.files.clip_problems.push(format!("{}: {why}", clip.file.title)),
             }
             self.files.pending_adds -= 1;
             self.files.pending_clips -= 1;
+            self.release_for_store(clip.file.town);
         }
     }
 
-    fn publish_clip(&mut self, clip: &crate::store_worker::ClipResult) -> Result<(), String> {
+    fn hold_for_store(&mut self, town: TownId) {
+        *self.files.pending_towns.entry(town).or_default() += 1;
+    }
+
+    fn release_for_store(&mut self, town: TownId) {
+        if let std::collections::hash_map::Entry::Occupied(mut held) = self.files.pending_towns.entry(town) {
+            *held.get_mut() -= 1;
+            if *held.get() == 0 {
+                held.remove();
+                if town != self.open_id() && self.background.contains_key(&town) { self.release_towns(); }
+            }
+        }
+    }
+
+    /// Whether a town that is not open must stay in memory: something still writes to it (a
+    /// tool, a sync engine, a pending offer or join, or a store result still to publish).
+    fn keep_resident(&self, id: &TownId) -> bool {
+        self.tool_towns.contains(id) || self.engines.keys().any(|(_, r)| r == id)
+            || self.sessions.values().any(|s| s.offer_town == Some(*id) || s.joining_town == Some(*id))
+            || self.files.pending_towns.contains_key(id)
+    }
+
+    fn publish_clip(&mut self, clip: &crate::store_worker::ClipResult) -> Result<Id, String> {
         let add = &clip.file;
         let file = add.result.map_err(str::to_owned)?;
         let poster = clip.stored_poster.map(|p| (p.size, p.root));
+        if let Some(target) = clip.board {
+            let (w, h) = fit_media_size(clip.info.width.into(), clip.info.height.into())
+                .ok_or("The source is too tall for the board.")?;
+            let (x, y) = match target.pos {
+                Some(pos) => pos,
+                None => self.in_tool_town(add.town, |town, _| Ok(BoardView::build(&town.state, target.board)
+                    .next_free_spot(None, (w as f64 / 64., h as f64 / 64.))))?,
+            };
+            return self.act_in(add.town, None, Action::PinMedia { board: target.board, parent: None, x, y, w, h,
+                title: add.title.clone(), blob: (file.size, file.root), poster, media: clip.info.format.media_kind().into(),
+                duration_ms: (clip.info.duration_ms > 0).then_some(clip.info.duration_ms), source: None, session: clip.info.session }, Origin::Ui)
+        }
         let action = Action::PostClip { project: add.project, title: add.title.clone(),
             media: (file.size, file.root), poster, duration_ms: clip.info.duration_ms,
             width: clip.info.width, height: clip.info.height, media_kind: clip.info.format.media_kind().into(), session: clip.info.session };
-        self.act_at(add.town, None, action, Origin::Ui, Some(add.town))?;
+        let id = self.act_at(add.town, None, action, Origin::Ui, Some(add.town))?;
         // A person's own file stays where it is.
-        if clip.info.source == crate::store_worker::ClipSource::Own { return Ok(()) }
+        if clip.info.source == crate::store_worker::ClipSource::Own { return Ok(id) }
         let worker = self.files.worker.as_mut().expect("the store returned this recording");
         worker.remove_recording(clip.path.clone(), add.title.clone(), clip.info.format.extension());
         if let (Some(path), Some(_)) = (&clip.info.poster, clip.stored_poster) {
             worker.remove_recording(path.clone(), add.title.clone(), "jpg");
         }
-        Ok(())
+        Ok(id)
     }
 
     pub fn file_problem<'a>(&'a self) -> Option<&'a str> { self.files.error.as_deref() }
@@ -3912,7 +4585,7 @@ impl Model {
                         if !town.state.entities.get(&project).is_some_and(|e| e.kind == kind::PROJECT && live(e)) {
                             return Ok(Err("The destination project is no longer active."));
                         }
-                        town.append(key, Content::Entity { kind: Key::Number(kind::FILE), project: Some(project),
+                        town.append(key, Content::Entity { copied_from: vec![], kind: Key::Number(kind::FILE), project: Some(project),
                             derive: None, fields: vec![(field::TITLE, FieldValue::Text(add.title.clone())),
                                 (field::BLOB, FieldValue::Blob { size: file.size, root: file.root })] }, Origin::Ui)?;
                         Ok(Ok(()))
@@ -3925,6 +4598,7 @@ impl Model {
                             self.files.error = Some(message.to_string());
                         }
                         self.files.pending_adds -= 1;
+                        self.release_for_store(add.town);
                         tick.changed = true;
                     }
                     Err(err) => {
@@ -3938,7 +4612,7 @@ impl Model {
                 tick.retry_later = true;
             }
         }
-        if let Some(snapshot) = snapshot { self.publish_stored_clips(&snapshot.clips); }
+        if let Some(snapshot) = snapshot { self.publish_stored_clips(&snapshot.clips, &mut tick); }
         tick.retry_frame = self.send_store_stop();
         tick
     }
@@ -4073,6 +4747,10 @@ impl Model {
 
     /// Build one notice for the town on screen. Only its Offer action can send history.
     pub fn chat_notice(&self) -> Option<TownNotice> {
+        self.chat_notice_inner(None)
+    }
+
+    fn chat_notice_inner(&self, omit_split_for: Option<&PublicKey>) -> Option<TownNotice> {
         if let Some(shown) = self.offer_prompt() {
             return Some(TownNotice {
                 line: self.sessions[&shown.peer].prompt_line.clone(),
@@ -4090,6 +4768,7 @@ impl Model {
         let peer = alone.map(|alone| alone.peer);
         let why = alone.map(|alone| alone.why);
         let mut notice = TownNotice::default();
+        let mut omitted_split = false;
         if let Some(Alone { peer, why }) = alone {
             let name = self.device_label(&peer);
             notice.line = match why {
@@ -4109,7 +4788,12 @@ impl Model {
                         if by == me { "You left this town. It's read-only here.".into() }
                         else { format!("{} stopped sharing this town. It's read-only here.", self.device_label(&by)) }
                     } else if self.state.forked(&peer).is_some() {
-                        format!("{name}'s history split.")
+                        if omit_split_for == Some(&peer) {
+                            omitted_split = true;
+                            String::new()
+                        } else {
+                            format!("{name}'s history split.")
+                        }
                     } else {
                         match self.removed_by(&peer) {
                             Some(by) if by == peer => format!("{name} left this town."),
@@ -4138,7 +4822,7 @@ impl Model {
             notice.replaces_read_only = false;
             return Some(notice)
         }
-        if alone.is_some() && why != Some(AloneReason::SetAside) { return Some(notice) }
+        if alone.is_some() && why != Some(AloneReason::SetAside) { return (!omitted_split).then_some(notice) }
         if let Some(problem) = self.town_problem().filter(|_| alone.is_none()) {
             notice.line = "Your earlier town couldn't be set aside.".into();
             notice.details = Some(NoticeDetails { town, peer, label: "Show the reason", text: problem.into() });
@@ -4267,6 +4951,7 @@ impl Model {
     fn offer_problem(&self, town: &Town, peer: PublicKey) -> Option<String> {
         let me = self.me();
         if !town.state.active_member(&me) { return Some("This town is read-only now.".into()) }
+        if town.state.active_member(&peer) { return Some(ALREADY_IN_TOWN.into()) }
         if town.state.spent(&peer) { return Some(THAT_CANNOT_REJOIN.into()) }
         if self.final_closed(town.log.town_id(), &peer) { return Some("No offer is available.".into()) }
         None
@@ -4292,9 +4977,9 @@ impl Model {
         let active = |id: &TownId| self.towns.get(id).is_some_and(|t| t.active.contains(&me));
         self.tool_towns.retain(|id| *id != open && active(id));
         self.doc_reads.retain(|(id, _), _| *id == open || active(id));
+        let keep: HashSet<TownId> = self.background.keys().filter(|id| self.keep_resident(id)).copied().collect();
         self.background.retain(|id, town| {
-            if self.tool_towns.contains(id) || self.engines.keys().any(|(_, r)| r == id)
-                || self.sessions.values().any(|s| s.offer_town == Some(*id) || s.joining_town == Some(*id)) { return true }
+            if keep.contains(id) { return true }
             self.background_revision = self.background_revision.wrapping_add(1);
             self.towns.insert(*id, town.summary());
             town.checkpoint(&self.home);
@@ -4309,8 +4994,7 @@ impl Model {
         let mut old = std::mem::replace(&mut self.open, town);
         self.carrier_revision = self.carrier_revision.wrapping_add(1);
         self.towns.insert(old.log.town_id(), old.summary());
-        if self.engines.keys().any(|(_, id)| *id == old.log.town_id())
-            || self.sessions.values().any(|s| s.offer_town == Some(old.log.town_id()) || s.joining_town == Some(old.log.town_id())) {
+        if self.keep_resident(&old.log.town_id()) {
             self.background.insert(old.log.town_id(), old);
             self.background_revision = self.background_revision.wrapping_add(1);
         } else { old.checkpoint(&self.home); }
@@ -4430,6 +5114,25 @@ impl Model {
 
     fn refresh_engines(&mut self, id: Id) {
         let me = self.me();
+        let town_left = self.peers.as_ref().map_or(true, |peers| {
+            peers.towns().iter().any(|t| t.id == id && t.state == makepad_town_core::peers::TownState::Left)
+        });
+        if !town_left {
+            let reopen: Vec<_> = self.sessions.iter().filter_map(|(&peer, s)| {
+                if peer == me || self.engines.contains_key(&(peer, id)) { return None }
+                if s.offer_town == Some(id) || s.joining_town == Some(id) { return None }
+                self.peers.as_ref().ok()?.carrier_pin(peer)?;
+                if self.final_closed(id, &peer) { return None }
+                let town = self.loaded_town(id)?;
+                let active = town.state.active_member(&me) && town.state.active_member(&peer);
+                let final_pair = town.state.has_standing(&me) && town.state.has_standing(&peer)
+                    && (town.state.seat_of(&me).is_some() || town.state.forked(&me).is_some())
+                    && (town.state.seat_of(&peer).is_some() || town.state.forked(&peer).is_some())
+                    && town.state.final_boundary(&town.log, &me, &peer).is_some();
+                (active || final_pair).then_some(peer)
+            }).collect();
+            for peer in reopen { let _ = self.start_serving(peer, id); }
+        }
         let peers: Vec<_> = self.engines.keys().filter(|(_, r)| *r == id).map(|&(p, _)| p).collect();
         for peer in peers {
             let town = if self.open_id() == id { &self.open } else { &self.background[&id] };
@@ -4578,6 +5281,10 @@ impl Model {
         self.sync_compatible(*peer) && self.peer_media_caps(peer).supports(MediaCaps::MULTIPARTY_V1)
     }
 
+    pub fn peer_multiparty_share(&self, peer: &PublicKey) -> bool {
+        self.sync_compatible(*peer) && self.peer_media_caps(peer).supports(MediaCaps::MULTIPARTY_SHARE_V1)
+    }
+
     pub fn sync_compatible(&self, peer: PublicKey) -> bool {
         self.sessions.get(&peer).and_then(|s| s.peer_hello.as_ref()).is_some_and(|p| self.hello.compatible(p))
     }
@@ -4631,8 +5338,13 @@ impl Model {
 
     /// The incoming offer already has its own controls on the town page.
     pub fn home_notice(&self) -> Option<TownNotice> {
+        self.home_notice_without_split(None)
+    }
+
+    /// Omit the bare split sentence when Home already explains that peer's fork.
+    pub fn home_notice_without_split(&self, omit_split_for: Option<&PublicKey>) -> Option<TownNotice> {
         use runner::SourceUpdate::*;
-        let mut notice = self.chat_notice()
+        let mut notice = self.chat_notice_inner(omit_split_for)
             .filter(|n| !matches!(n.offer, Some((_, NoticeAction::Answer { .. }))));
         let mut add = |line: &str| {
             let text = &mut notice.get_or_insert_with(TownNotice::default).line;
@@ -4721,7 +5433,6 @@ impl Model {
         self.carrier_revision = self.carrier_revision.wrapping_add(1);
         self.peers.as_mut().map_err(|e| e.clone())?
             .linked(*peer, how, version, name, wall_ms() / 1000).map_err(|e| e.to_string())?;
-        if words && self.peer_paused(peer) { self.set_paused(peer, false)?; }
         Ok(())
     }
 
@@ -4748,22 +5459,62 @@ impl Model {
         Ok(())
     }
 
+    fn active_shared_town(&self, peer: PublicKey) -> Result<Option<TownId>, String> {
+        let me = self.me();
+        if peer == me { return Ok(None) }
+        let active: Vec<_> = self.towns.iter().filter_map(|(&id, s)| {
+            (!self.final_closed(id, &peer) && s.active.contains(&me) && s.active.contains(&peer))
+                .then_some((id, s.founded))
+        }).collect();
+        if active.is_empty() { return Ok(None) }
+        if active.len() == 1 { return Ok(Some(active[0].0)) }
+        let open = self.open_id();
+        let towns = self.home.share_order().map_err(|e| format!("Reading shared towns: {e}"))?;
+        let order: BTreeMap<_, _> = towns.into_iter().enumerate().map(|(i, town)| (town, i)).collect();
+        Ok(active.into_iter().max_by_key(|&(id, founded)| (id == open, order.get(&id), founded, id)).map(|(id, _)| id))
+    }
+
     fn start_link(&mut self, peer: PublicKey, intent: Option<PairIntent>) -> Result<(), String> {
-        if self.peer_paused(&peer) { return Ok(()) }
-        if self.closed_finals.is_err() { self.closed_finals = self.home.closed_finals().map_err(|e| format!("Reading final exchanges: {e}")); }
+        if self.peer_refused(&peer) { return Ok(()) }
+        if self.closed_finals.is_err() {
+            self.closed_finals = self.home.closed_finals().map_err(|e| format!("Reading final exchanges: {e}"));
+            if self.closed_finals.is_ok() { self.carrier_revision = self.carrier_revision.wrapping_add(1); }
+        }
         self.flush_final_writes()?;
         self.closed_finals.as_ref().map_err(Clone::clone)?;
         self.remember_open();
+        let me = self.me();
         if let Some(intent) = intent {
-            if let PairSide::Add(id, choice) = intent.side {
-                if let Some(reason) = self.pair_problem(id) { return Err(reason) }
-                self.grant_computer(id, peer, Some(choice))?;
-                self.send_offer(peer, id, self.town_for_link(id).offer());
+            match intent.side {
+                PairSide::Add(id, choice) => {
+                    if let Some(reason) = self.pair_problem(id) { return Err(reason) }
+                    self.load_for_link(id)?;
+                    let town = self.town_for_link(id);
+                    if !town.state.active_member(&me) { return Err("This town is read-only now.".into()) }
+                    if town.state.active_member(&peer) {
+                        if peer == me || (choice == AddComputer::Mine && town.state.seat_of(&peer) != town.state.seat_of(&me)) {
+                            return Err(ALREADY_IN_TOWN.into())
+                        }
+                        self.start_serving(peer, id)?;
+                        self.session_mut(peer).phase = ShareState::Shared(id);
+                        if self.open_id() != id { self.open_town(id)?; }
+                        return Ok(())
+                    }
+                    self.grant_computer(id, peer, Some(choice))?;
+                    self.send_offer(peer, id, self.town_for_link(id).offer());
+                    self.session_mut(peer).intent = Some(intent);
+                }
+                PairSide::Join => {
+                    if let Some(id) = self.active_shared_town(peer)? {
+                        self.start_serving(peer, id)?;
+                        self.session_mut(peer).phase = ShareState::Shared(id);
+                        if self.open_id() != id { self.open_town(id)?; }
+                    }
+                    self.session_mut(peer).intent = Some(intent);
+                }
             }
-            self.session_mut(peer).intent = Some(intent);
             return Ok(())
         }
-        let me = self.me();
         let towns = self.home.share_order().map_err(|e| format!("Reading shared towns: {e}"))?;
         let order: BTreeMap<_, _> = towns.into_iter().enumerate().map(|(i, town)| (town, i)).collect();
         let selected = self.towns.iter().filter_map(|(&id, s)| {
@@ -4802,6 +5553,7 @@ impl Model {
         self.clear_newer_peer(Some(peer));
         if !self.sessions.contains_key(&peer) { return }
         self.upgrade_session_pins();
+        self.share_offer_peers.retain(|_, (p, ..)| *p != peer);
         let mut session = self.sessions.remove(&peer).unwrap();
         if interrupted && session.pending() {
             let pending = match (session.phase, session.offer_town) {
@@ -4949,7 +5701,7 @@ impl Model {
         if offer == Offer::New {
             let genesis = self.session_mut(peer).new_genesis.take().ok_or("The offered town is missing.")?;
             let mut town = Self::found_town(&self.home, (id, genesis))?;
-            town.append(&self.key, Content::Entity { derive: None, kind: Key::Number(kind::PROJECT), project: None,
+            town.append(&self.key, Content::Entity { copied_from: vec![], derive: None, kind: Key::Number(kind::PROJECT), project: None,
                 fields: vec![(field::TITLE, FieldValue::Text("First project".into()))] }, Origin::Ui)?;
             self.home.set_open_town(&id).map_err(|e| e.to_string())?;
             self.install_open(town);
@@ -5045,27 +5797,31 @@ impl Model {
         Ok(())
     }
 
-    fn peer_paused(&self, peer: &PublicKey) -> bool {
-        self.peers.as_ref().map_or(true, |peers| peers.device(peer).is_some_and(|d| d.paused))
+    fn peer_refused(&self, peer: &PublicKey) -> bool {
+        self.peers.as_ref().map_or(true, |peers| peers.device(peer).is_some_and(|d| d.state != DeviceState::Active))
     }
 
     fn final_closed(&self, town: TownId, peer: &PublicKey) -> bool {
-        self.closed_finals.as_ref().map_or(true, |closed| closed.contains(&(town, *peer)))
+        let Ok(closed) = &self.closed_finals else { return true };
+        let Some(recorded) = closed.get(&(town, *peer)) else { return false };
+        let Some(info) = self.towns.get(&town) else { return false };
+        let Some(current) = info.final_boundary(&self.me(), peer) else { return false };
+        recorded.contains(&current)
     }
 
-    fn final_closes(&self, peer: PublicKey, town: TownId, evidence: FinalEvidence<'_>) -> bool {
-        let Some(engine) = self.engines.get(&(peer, town)) else { return false };
+    fn final_closes(&self, peer: PublicKey, town: TownId, evidence: FinalEvidence<'_>) -> Option<FinalClosure> {
+        let engine = self.engines.get(&(peer, town))?;
         let shown = engine.shown_final();
-        if shown.is_empty() { return false }
+        let closure = FinalClosure::from_evidence(shown)?;
         // Close after queuing so the peer cannot keep probing. Another member can supply a removal lost on this link.
         let heads = match evidence {
-            FinalEvidence::Delivered(ids) => return shown.iter().all(|req| ids.contains(req)),
+            FinalEvidence::Delivered(ids) => return shown.iter().all(|req| ids.contains(req)).then_some(closure),
             FinalEvidence::Heads(heads) => heads,
         };
         let log = &self.town_for_link(town).log;
         let mut min_at = usize::MAX;
         for id in shown {
-            let Some(pos) = log.position(id) else { return false };
+            let pos = log.position(id)?;
             min_at = min_at.min(pos);
         }
         let mut remaining: HashSet<Id> = shown.iter().copied().collect();
@@ -5075,27 +5831,28 @@ impl Model {
             stack.push(*head);
             while let Some(id) = stack.pop() {
                 remaining.remove(&id);
-                if remaining.is_empty() { return true }
+                if remaining.is_empty() { return Some(closure) }
                 if log.position(&id).is_some_and(|pos| pos > min_at) && visited.insert(id) {
                     if let Some(event) = log.get(&id) { stack.extend_from_slice(&event.header.parents); }
                 }
             }
         }
-        false
+        None
     }
 
     fn flush_final_writes(&mut self) -> Result<(), String> {
-        while let Some((town, peer)) = self.pending_final_writes.last() {
-            self.home.close_final(town, peer).map_err(|e| format!("Recording a final exchange: {e}"))?;
+        while let Some(&(town, peer, closure)) = self.pending_final_writes.last() {
+            self.home.close_final(&town, &peer, closure).map_err(|e| format!("Recording a final exchange: {e}"))?;
             self.pending_final_writes.pop();
         }
         Ok(())
     }
 
-    fn close_final(&mut self, town: TownId, peer: PublicKey) -> Result<(), String> {
+    fn close_final(&mut self, town: TownId, peer: PublicKey, closure: FinalClosure) -> Result<(), String> {
+        let closure = closure.normalized().ok_or_else(|| "Invalid final exchange closure.".to_owned())?;
         self.carrier_revision = self.carrier_revision.wrapping_add(1);
         let closed = self.closed_finals.as_mut().map_err(|e| e.clone())?;
-        if closed.insert((town, peer)) { self.pending_final_writes.push((town, peer)); }
+        if closed.entry((town, peer)).or_default().insert(closure) { self.pending_final_writes.push((town, peer, closure)); }
         self.detach_engine(peer, town);
         if let Some(s) = self.sessions.get_mut(&peer) {
             s.drop_town(town);
@@ -5109,7 +5866,7 @@ impl Model {
     // so an offline peer can learn the Remove or Leave before both devices stop serving.
     fn expects_message(&self, peer: PublicKey, message: &Message<'_>) -> ReceiveDecision {
         let Some(link) = self.sessions.get(&peer) else { return ReceiveDecision::Silent };
-        if self.peer_paused(&peer) { return ReceiveDecision::Silent }
+        if self.peer_refused(&peer) { return ReceiveDecision::Silent }
         let expected = match *message {
             Message::Hello(_) => true,
             Message::Offer { town, .. } => !self.final_closed(town, &peer),
@@ -5129,7 +5886,9 @@ impl Model {
                 }
                 if !link.can_exchange(self.town_for_link(town), &self.me(), &peer) { return ReceiveDecision::Silent }
                 if let Message::Heads { heads, .. } = message {
-                    if self.final_closes(peer, town, FinalEvidence::Heads(heads)) { return ReceiveDecision::CloseFinal(town) }
+                    if let Some(closure) = self.final_closes(peer, town, FinalEvidence::Heads(heads)) {
+                        return ReceiveDecision::CloseFinal(town, closure)
+                    }
                 }
                 true
             }
@@ -5179,8 +5938,8 @@ impl Model {
         };
         match self.expects_message(peer, &message) {
             ReceiveDecision::Silent => return Ok(false),
-            ReceiveDecision::CloseFinal(town) => {
-                self.close_final(town, peer)?;
+            ReceiveDecision::CloseFinal(town, closure) => {
+                self.close_final(town, peer, closure)?;
                 return Ok(false)
             }
             ReceiveDecision::Receive => {}
@@ -5234,7 +5993,11 @@ impl Model {
             }
             message => {
                 let id = match &message { Message::Heads { town, .. } | Message::HeadsDone { town, .. } | Message::Events { town, .. } => *town, _ => unreachable!() };
-                let Some(engine) = self.engines.get_mut(&(peer, id)) else { return Ok(false) };
+                if !self.engines.contains_key(&(peer, id)) { return Ok(false) }
+                if self.sessions[&peer].intent.as_ref().is_some_and(|i| i.side == PairSide::Join) {
+                    self.session_mut(peer).intent = None;
+                }
+                let engine = self.engines.get_mut(&(peer, id)).unwrap();
                 let background = id != self.open.log.town_id();
                 let town = if background { self.background.get_mut(&id).unwrap() } else { &mut self.open };
                 let from = town.log.events().len();
@@ -5280,8 +6043,10 @@ impl Model {
                     }
                     self.log_invalid_keys();
                 }
-                if !received.delivered_membership.is_empty() && self.final_closes(peer, id, FinalEvidence::Delivered(&received.delivered_membership)) {
-                    self.close_final(id, peer)?;
+                if !received.delivered_membership.is_empty() {
+                    if let Some(closure) = self.final_closes(peer, id, FinalEvidence::Delivered(&received.delivered_membership)) {
+                        self.close_final(id, peer, closure)?;
+                    }
                 }
                 return Ok(membership || profile || (appended && id == self.open_id()))
             }
@@ -5330,7 +6095,9 @@ impl Model {
                 } else {
                     engine.poll_reply(&town.log)
                 };
-                if !engine.shown_final().is_empty() && engine.peer_heads_answered() { closing.push(id); }
+                if let Some(closure) = FinalClosure::from_evidence(engine.shown_final()).filter(|_| engine.peer_heads_answered()) {
+                    closing.push((id, closure));
+                }
                 if frame.is_some() {
                     session.last_town = Some(id);
                     batch = frame;
@@ -5338,8 +6105,8 @@ impl Model {
                 }
             }
         }
-        for id in closing {
-            if let Err(why) = self.close_final(id, peer) { self.session_mut(peer).note = Some(why); }
+        for (id, closure) in closing {
+            if let Err(why) = self.close_final(id, peer, closure) { self.session_mut(peer).note = Some(why); }
         }
         batch
     }
@@ -5674,14 +6441,14 @@ impl Model {
     }
 
     pub fn verify_binding(&mut self, binding: Credential) -> Result<ToolCaller, String> {
-        self.in_agent_town(binding.town, |town, key, _| {
+        self.in_agent_town(binding.town, |town, key, _, _| {
             let agent = town.bound_agent(&key.public(), binding)?;
             Ok(ToolCaller { binding, town: binding.town, agent })
         })
     }
 
     /// Run against the town in the credential, without changing the window or the link's town.
-    fn in_agent_town<T>(&mut self, id: Id, f: impl FnOnce(&mut Town, &DeviceKey, Option<&Peers>) -> Result<T, String>) -> Result<T, String> {
+    fn in_agent_town<T>(&mut self, id: Id, f: impl FnOnce(&mut Town, &DeviceKey, Option<&Peers>, Option<&str>) -> Result<T, String>) -> Result<T, String> {
         if !self.towns.get(&id).is_some_and(|s| s.active.contains(&self.me())) {
             return Err("This code or binding is no longer active.".into())
         }
@@ -5689,14 +6456,14 @@ impl Model {
     }
 
     fn in_town<T>(&mut self, id: Id, f: impl FnOnce(&mut Town, &DeviceKey) -> Result<T, String>) -> Result<T, String> {
-        self.in_town_with_peers(id, false, |town, key, _| f(town, key))
+        self.in_town_with_peers(id, false, |town, key, _, _| f(town, key))
     }
 
     fn in_tool_town<T>(&mut self, id: Id, f: impl FnOnce(&mut Town, &DeviceKey) -> Result<T, String>) -> Result<T, String> {
-        self.in_town_with_peers(id, true, |town, key, _| f(town, key))
+        self.in_town_with_peers(id, true, |town, key, _, _| f(town, key))
     }
 
-    fn in_town_with_peers<T>(&mut self, id: Id, cache_on_ok: bool, f: impl FnOnce(&mut Town, &DeviceKey, Option<&Peers>) -> Result<T, String>) -> Result<T, String> {
+    fn in_town_with_peers<T>(&mut self, id: Id, cache_on_ok: bool, f: impl FnOnce(&mut Town, &DeviceKey, Option<&Peers>, Option<&str>) -> Result<T, String>) -> Result<T, String> {
         let mut loaded = None;
         let background = self.background.contains_key(&id);
         let is_open = self.open.log.town_id() == id;
@@ -5706,7 +6473,8 @@ impl Model {
                 loaded.insert(Self::read_town(&self.home, id, &mut self.update_checks)?.ok_or("This town cannot be read.")?.0)
             };
         let from = town.log.events().len();
-        let result = f(town, &self.key, self.peers.as_ref().ok());
+        let epoch_before = town.membership_epoch;
+        let result = f(town, &self.key, self.peers.as_ref().ok(), self.person_name.as_deref());
         let foreign = town.foreign_turn();
         let appended = town.log.events().len() != from;
         if appended { Self::log_town_invalid_keys(&mut self.logged_invalid_keys, town); }
@@ -5715,7 +6483,7 @@ impl Model {
         for ((_, served), engine) in &mut self.engines {
             if *served == id { for event in &town.log.events()[from..] { engine.on_append(event); } }
         }
-        let membership = town.log.events()[from..].iter().any(|e| e.header.kind == makepad_town_core::event::kind::MEMBER);
+        let membership = town.membership_epoch != epoch_before;
         if membership {
             self.carrier_revision = self.carrier_revision.wrapping_add(1);
             self.towns.insert(id, town.summary());
@@ -5763,7 +6531,7 @@ impl Model {
     }
 
     pub fn agent_join_with_id(&mut self, code: Credential, waiting: bool) -> Result<(String, Id), String> {
-        let (bearer, offers) = self.in_agent_town(code.town, |town, key, _| {
+        let (bearer, offers) = self.in_agent_town(code.town, |town, key, peers, _| {
             let mut book = town.book()?.clone();
             let entry = book.codes.get(&code.check).cloned().ok_or("Unknown or spent join code.")?;
             if !waiting && entry.creating.is_none() {
@@ -5792,7 +6560,8 @@ impl Model {
             let lines = inbox.ready.iter().skip(inbox.ack.row).filter_map(|id| town.state.message(id))
                 .filter(|m| m.to_agent.is_none() && fold::addresses_my_ai(m, &me)).map(|m| (m.id, m.wall_ms)).collect();
             town.save_book(book)?;
-            Ok((bearer, JoinedOffers { binding, agent, lines }))
+            let name = agent_short_label_in(town, &me, peers, agent);
+            Ok((bearer, JoinedOffers { binding, agent, name, lines }))
         })?;
         let agent = offers.agent;
         self.joined_offers = Some(offers);
@@ -5809,6 +6578,19 @@ impl Model {
             last_heard: reply.map_or(inbox.last_heard, |m| m.wall_ms.max(inbox.last_heard)),
             answering: inbox.delivered_at.is_some_and(|start| position.is_none_or(|at| at < start)),
         })
+    }
+
+    pub fn can_rename_agent(&self, agent: Id) -> bool {
+        let me = self.me();
+        self.state.active_member(&me) && self.state.agents.get(&agent).is_some_and(|a| same_seat(&self.state, &a.owner, &me))
+    }
+
+    pub fn rename_agent(&mut self, agent: Id, name: &str) -> Result<(), String> {
+        if !self.can_rename_agent(agent) { return Err("Only an active computer on the owner's seat can rename this AI.".into()) }
+        let name = name.trim();
+        if self.state.agents[&agent].custom_name.as_deref().unwrap_or("") == name { return Ok(()) }
+        self.append(Content::AgentRenamed { agent, name: name.to_owned() }, Origin::Ui)?;
+        Ok(())
     }
 
     pub fn remove_agent(&mut self, agent: Id) -> Result<(), String> {
@@ -5837,8 +6619,41 @@ impl Model {
             .map(|(id, _)| id).max_by_key(|id| self.log.position(id)).copied()
     }
 
+    /// Own AI first, then peer AIs in join order, then the active seats.
+    pub fn mention_candidates(&self, query: &str, leading: bool, tones: &BTreeMap<Id, crate::view::SeatTone>) -> Vec<MentionCandidate> {
+        use crate::view::Seat;
+        let mut rows = Vec::new();
+        let me = self.state.seat_of(&self.me());
+        let order = self.open.member_order();
+        let folded = query.to_lowercase();
+        let matches = |label: &str| folded.is_empty() || label.to_lowercase().contains(&folded);
+        if leading {
+            for &id in &order.agents {
+                let Some(info) = self.state.agents.get(&id) else { continue };
+                if !self.state.active_member(&info.owner) { continue }
+                let Some(seat) = self.state.seat_of(&info.owner) else { continue };
+                let insert_text = self.agent_short_label(id);
+                let label = with_agent_backend(insert_text.clone(), &info.name);
+                if matches(&label) {
+                    rows.push(MentionCandidate { target: ComposerTarget::Agent(id), insert_text, label,
+                        seat: if Some(seat) == me { Seat::YourAi } else { Seat::PeerAi }, tone: tones.get(&seat).copied() });
+                }
+            }
+            rows.sort_by_key(|row| row.seat != Seat::YourAi);
+        }
+        // Your own seat is never a mention target, so the picker doesn't offer it.
+        for SeatSummary { seat, devices, is_mine } in self.seats_in_order() {
+            if is_mine { continue }
+            let label = self.peer_seat_name_for_devices(&devices);
+            if matches(&label) {
+                rows.push(MentionCandidate { target: ComposerTarget::Seat(seat), seat: Seat::Peer, tone: tones.get(&seat).copied(), insert_text: label.clone(), label });
+            }
+        }
+        rows
+    }
+
     /// Route a draft by the open town's current active people and AI members.
-    fn resolve_draft(&self, draft: &str, preferred: Option<Id>, shown: Option<Id>) -> DraftRoute {
+    fn resolve_draft(&self, draft: &str, bound: &[BoundMention], preferred: Option<Id>, shown: Option<Id>) -> DraftRoute {
         let me = self.me();
         let my_seat = self.state.seat_of(&me);
         let mut people: Vec<PersonCandidate> = Vec::new();
@@ -5850,36 +6665,55 @@ impl Model {
             let folded = label.to_lowercase();
             if label.is_empty() || matches!(folded.as_str(), "you" | "your ai" | "the other device" | "peer") { continue }
             if people.iter().any(|p| p.seat == seat && p.label.to_lowercase() == folded) { continue }
-            people.push(PersonCandidate { seat, label, is_me: Some(seat) == my_seat });
+            people.push(PersonCandidate { seat, label, match_text: true, is_me: Some(seat) == my_seat });
+        }
+        // Picked seats may have only a fallback label, which pasted text cannot address.
+        for m in bound {
+            let ComposerTarget::Seat(seat) = m.target else { continue };
+            if !people.iter().any(|p| p.seat == seat) {
+                if let Some(devices) = self.open.member_order().seat_devices.get(&seat) {
+                    if devices.iter().any(|k| self.state.active_member(k)) {
+                        people.push(PersonCandidate { seat, label: self.peer_seat_name_for_devices(devices), match_text: false, is_me: Some(seat) == my_seat });
+                    }
+                }
+            }
         }
         let mut agents = Vec::new();
         for (&agent, info) in &self.state.agents {
             if !self.state.active_member(&info.owner) { continue }
             let Some(owner_seat) = self.state.seat_of(&info.owner) else { continue };
-            let owner_name = if info.owner == me { self.device_label(&me).to_owned() } else { self.name(&info.owner, "Peer").to_owned() };
-            agents.push(AgentCandidate { agent, owner: info.owner, owner_seat, owner_name, name: clean_name(&info.name), position: self.log.position(&agent) });
+            let owner_name = if Some(owner_seat) == my_seat { self.device_label(&me).to_owned() } else { self.peer_seat_name(owner_seat, Some(&info.owner)) };
+            agents.push(AgentCandidate { agent, owner: info.owner, owner_seat, owner_name, name: clean_name(&info.name), short_label: self.agent_short_label(agent), custom_name: self.agent_custom_name(agent), position: self.log.position(&agent) });
         }
-        resolve_route(draft, preferred, shown, me, my_seat, &people, &agents)
+        resolve_route(draft, bound, preferred, shown, me, my_seat, &people, &agents)
     }
 
     /// What the composer will do with `draft`: the same routing `post_chat_draft` uses.
     pub fn mention_target(&self, draft: &str) -> MentionTarget {
-        match self.resolve_draft(draft, None, None) {
+        self.mention_target_bound(draft, &[])
+    }
+
+    pub fn mention_target_bound(&self, draft: &str, bound: &[BoundMention]) -> MentionTarget {
+        match self.resolve_draft(draft, bound, None, None) {
             DraftRoute::MyAi { agent, .. } => MentionTarget::YourAi {
-                has_ai: agent.is_some(), name: agent.and_then(|id| self.state.agents.get(&id).map(|a| a.name.clone())),
+                has_ai: agent.is_some(), agent, label: agent.map(|id| self.agent_display_label(id)),
             },
-            DraftRoute::PeerAi { agent, agent_name, owner_name, .. } => MentionTarget::PeerAi { agent, agent_name, owner_name },
-            DraftRoute::Town { ambiguous_ai: Some((name, count)), .. } => MentionTarget::AmbiguousAi { name, count },
+            DraftRoute::PeerAi { agent, owner_name, .. } => MentionTarget::PeerAi { agent, label: self.agent_display_label(agent), owner_name },
+            DraftRoute::Town { unbound_ai: true, .. } => MentionTarget::UnboundAi,
             DraftRoute::Town { people, .. } if !people.is_empty() => MentionTarget::People(people),
             DraftRoute::Town { .. } => MentionTarget::None,
         }
     }
 
     pub fn transcript_consent(&self, draft: &str, preferred: Option<Id>, shown: Option<Id>) -> Option<TranscriptConsent> {
-        let DraftRoute::MyAi { agent: Some(agent), text, above: Some(above) } = self.resolve_draft(draft, preferred, shown) else { return None };
+        self.transcript_consent_bound(draft, &[], preferred, shown)
+    }
+
+    pub fn transcript_consent_bound(&self, draft: &str, bound: &[BoundMention], preferred: Option<Id>, shown: Option<Id>) -> Option<TranscriptConsent> {
+        let DraftRoute::MyAi { agent: Some(agent), text, above: Some(above) } = self.resolve_draft(draft, bound, preferred, shown) else { return None };
         let target = self.state.agents.get(&agent)?;
         if self.state.seat_of(&target.owner) != self.state.seat_of(&self.me()) || !self.state.active_member(&target.owner) { return None }
-        let reader = TimelineReader::new(&self.open, &self.me(), agent, self.peers.as_ref().ok()).ok()?;
+        let reader = TimelineReader::new(&self.open, &self.me(), agent, self.peers(), self.person_name.as_deref()).ok()?;
         let end = self.state.timeline_index(above)? + 1;
         let stop = reader.previous_exchange(self.state.timeline.len(), self.log.events().len());
         let start = stop.and_then(|id| self.state.timeline_index(id)).map_or(0, |i| i + 1).min(end);
@@ -5902,17 +6736,17 @@ impl Model {
         names.sort();
         let last = names.pop()?;
         let who = if names.is_empty() { last } else { format!("{} and {last}", names.join(", ")) };
-        let ai = clean_name(&target.name);
+        let ai = clean_name(&self.agent_backend(agent)?);
         let ai = if ai.is_empty() { "Claude" } else { &ai };
         let question = if calls.len() == 1 { "this transcript" } else { "these transcripts" };
         let pronoun = if calls.len() == 1 { "It includes" } else { "They include" };
-        Some(TranscriptConsent { town: self.open_id(), agent, text, above, calls, draft: draft.into(),
+        Some(TranscriptConsent { town: self.open_id(), agent, text, above, calls, draft: draft.into(), mentions: bound.to_vec(),
             prompt: format!("Send {question} to {ai} (cloud)? {pronoun} {who} words.") })
     }
 
     /// Sends the confirmed request, quoting `reply_to` when the draft was a reply.
     pub fn send_transcripts(&mut self, consent: &TranscriptConsent, reply_to: Option<Id>) -> Result<Id, String> {
-        if self.open_id() != consent.town || self.transcript_consent(&consent.draft, Some(consent.agent), Some(consent.above)).as_ref() != Some(consent) {
+        if self.open_id() != consent.town || self.transcript_consent_bound(&consent.draft, &consent.mentions, Some(consent.agent), Some(consent.above)).as_ref() != Some(consent) {
             return Err("The transcript or its recipient changed. Review it again.".into())
         }
         self.in_town(consent.town, |town, key| {
@@ -5954,7 +6788,11 @@ impl Model {
 
     /// Resolve the composer's leading mention against members of the open town at send time.
     pub fn post_chat_draft(&mut self, draft: &str, preferred: Option<Id>, shown: Option<Id>, reply_to: Option<Id>) -> Result<Id, String> {
-        match self.resolve_draft(draft, preferred, shown) {
+        self.post_chat_draft_bound(draft, &[], preferred, shown, reply_to)
+    }
+
+    pub fn post_chat_draft_bound(&mut self, draft: &str, bound: &[BoundMention], preferred: Option<Id>, shown: Option<Id>, reply_to: Option<Id>) -> Result<Id, String> {
+        match self.resolve_draft(draft, bound, preferred, shown) {
             DraftRoute::MyAi { agent: Some(agent), text, above } | DraftRoute::PeerAi { agent, text, above, .. } => {
                 self.mention_with_context(agent, text, reply_to, above)
             }
@@ -5989,9 +6827,12 @@ impl Model {
     }
 
     pub fn agent_say(&mut self, binding: Credential, text: String, reply_to: Option<Id>) -> Result<Id, String> {
-        self.in_agent_town(binding.town, |town, key, _| {
+        self.in_agent_town(binding.town, |town, key, _, _| {
             let agent = town.bound_agent(&key.public(), binding)?;
             let content = town.named_chat(ChatAgent::Author(agent), text, reply_to, None)?;
+            let gate = Gate::new(&town.state, LocalPolicy::Members);
+            gate.town_readable().map_err(timeline_withheld)?;
+            if let Some(quote) = reply_to { gate.chat_text(&quote).map_err(timeline_withheld)?; }
             town.append(key, content, Origin::Tool)
         })
     }
@@ -6048,36 +6889,38 @@ impl Model {
         Ok(())
     }
 
-    pub fn agent_read(&mut self, binding: Credential, before: Option<&str>) -> Result<String, String> {
+    pub fn agent_read(&mut self, binding: Credential, before: Option<&str>) -> Result<AiOut, String> {
         self.read_page(binding, None, before)
     }
 
     /// Resolve the binding and its offered owner request without reading the timeline.
     pub(crate) fn owner_turn(&mut self, binding: Credential) -> Result<(Id, Id), String> {
-        self.in_agent_town(binding.town, |town, key, peers| {
+        self.in_agent_town(binding.town, |town, key, peers, person_name| {
             let me = key.public();
             let agent = town.bound_agent(&me, binding)?;
             let offered = town.book()?.inboxes.get(&agent).and_then(|inbox| inbox.offered).ok_or(NO_TURN)?;
             let turn = town.agent_turns.get(&agent, Some(offered)).ok_or(NO_TURN)?;
-            let reader = TimelineReader::new(town, &me, agent, peers)?;
+            let reader = TimelineReader::new(town, &me, agent, peers, person_name)?;
             if !town.state.message(&turn.line).is_some_and(|line| reader.request(line)) { return Err(NO_TURN.into()) }
             Ok((agent, turn.line))
         })
     }
 
-    pub fn read_page(&mut self, binding: Credential, entry: Option<Id>, cursor: Option<&str>) -> Result<String, String> {
-        self.in_agent_town(binding.town, |town, key, peers| {
+    pub fn read_page(&mut self, binding: Credential, entry: Option<Id>, cursor: Option<&str>) -> Result<AiOut, String> {
+        self.in_agent_town(binding.town, |town, key, peers, person_name| {
             let agent = town.bound_agent(&key.public(), binding)?;
             let offered = town.book()?.inboxes.get(&agent).and_then(|inbox| inbox.offered).ok_or(NO_TURN)?;
             let mut turn = town.agent_turns.get(&agent, Some(offered)).ok_or(NO_TURN)?.clone();
-            let reader = TimelineReader::new(town, &key.public(), agent, peers)?;
+            let reader = TimelineReader::new(town, &key.public(), agent, peers, person_name)?;
             if !town.state.message(&turn.line).is_some_and(|line| reader.request(line)) { return Err(NO_TURN.into()) }
+            if reader.gate.chat_text(&turn.line).is_err() { return Err(NO_TURN.into()) }
             let page = match entry {
                 Some(id) => reader.transcript(&mut turn, id, cursor)?,
                 None => reader.read(&mut turn, cursor)?,
             };
+            let out = reader.gate.finish_json(page.json).map_err(timeline_withheld)?;
             town.agent_turns.set(agent, Some((offered, turn))).map_err(|e| e.to_string())?;
-            Ok(page.json)
+            Ok(out)
         })
     }
 
@@ -6090,13 +6933,13 @@ impl Model {
             book.inboxes.get(&agent).is_none_or(|inbox| inbox.binding != binding.check)))
     }
 
-    pub fn agent_wait(&mut self, binding: Credential, after: Option<Id>, new_wait: bool) -> Result<Option<String>, String> {
-        self.agent_wait_with_receipt(binding, after, new_wait, |_, _, _| {})
+    pub fn agent_wait(&mut self, binding: Credential, after: Option<Id>, new_wait: bool) -> Result<Option<AiOut>, String> {
+        self.agent_wait_with_receipt(binding, after, new_wait, |_, _, _, _| {})
     }
 
     pub(crate) fn agent_wait_with_receipt(&mut self, binding: Credential, after: Option<Id>, new_wait: bool,
-        receipt: impl FnOnce(Id, bool, &[Id])) -> Result<Option<String>, String> {
-        self.in_agent_town(binding.town, |town, key, peers| {
+        receipt: impl FnOnce(Id, &str, bool, &[Id])) -> Result<Option<AiOut>, String> {
+        self.in_agent_town(binding.town, |town, key, peers, person_name| {
             let me = key.public();
             let agent = town.bound_agent(&me, binding)?;
             let mut book = town.book()?.clone();
@@ -6112,7 +6955,7 @@ impl Model {
                 inbox.delivered_at = None;
             }
             inbox.collect(&town.state, &agent, &me);
-            let reader = TimelineReader::new(town, &me, agent, peers)?;
+            let reader = TimelineReader::new(town, &me, agent, peers, person_name)?;
             let mut delivered = Vec::new();
             let page = agent_page(&reader, inbox, town.agent_turns.get(&agent, inbox.offered), &mut delivered)?;
             let (reply, turn) = if let Some(page) = page {
@@ -6126,12 +6969,14 @@ impl Model {
             };
             // If interrupted between writes, the old turn cannot match the newly offered page.
             town.save_book(book)?;
-            if let Err(err) = town.agent_turns.set(agent, turn) {
+            let saved = town.agent_turns.set(agent, turn);
+            let receipt = |ids: &[Id]| receipt(agent, &agent_short_label_in(town, &me, peers, agent), acknowledged, ids);
+            if let Err(err) = saved {
                 // The inbox already committed the ack, but this wait returns no page.
-                if acknowledged { receipt(agent, true, &[]); }
+                if acknowledged { receipt(&[]); }
                 return Err(err.to_string())
             }
-            if acknowledged || reply.is_some() { receipt(agent, acknowledged, &delivered); }
+            if acknowledged || reply.is_some() { receipt(&delivered); }
             Ok(reply)
         })
     }
@@ -6260,13 +7105,13 @@ impl Model {
         project.or_else(|| if town == self.open_id() { self.selected_project } else { None })
     }
 
-    pub fn boards_json(&self) -> String {
+    pub fn boards_json(&self) -> Result<AiOut, String> {
         self.open.boards_json(self.selected_project)
     }
 
-    pub fn boards_json_in(&mut self, town: TownId, project: Option<Id>) -> Result<String, String> {
+    pub fn boards_json_in(&mut self, town: TownId, project: Option<Id>) -> Result<AiOut, String> {
         let selected = self.project_selection(town, project);
-        self.in_tool_town(town, |town, _| Ok(town.boards_json(selected)))
+        self.in_tool_town(town, |town, _| town.boards_json(selected))
     }
 
     pub fn tasks_json(&self) -> String {
@@ -6278,41 +7123,72 @@ impl Model {
         self.in_tool_town(town, |town, key| Ok(town.tasks_json(selected, &key.public())))
     }
 
-    pub fn board_read_json_in(&mut self, town: TownId, board: Id, rect: Option<[f64; 4]>, after: Option<page::Cursor>) -> Result<String, String> {
+    pub fn board_read_json_in(&mut self, town: TownId, board: Id, rect: Option<[f64; 4]>, after: Option<page::Cursor>) -> Result<AiOut, String> {
         self.in_tool_town(town, |town, _| town.board_read_json(board, rect, after))
     }
 
-    pub fn read_json_in(&mut self, town: TownId, read: &crate::tools::Read) -> Result<String, String> {
+    pub fn read_json_in(&mut self, town: TownId, read: &crate::tools::Read) -> Result<AiOut, String> {
         self.in_tool_town(town, |town, _| town.read_json(read))
     }
 }
 
 impl Town {
-    fn boards_json(&self, selected: Option<Id>) -> String {
-        let Some(project) = self.resolve_project(selected).map(|e| e.id) else { return r#"{"project_id":null,"boards":[]}"#.into() };
-        let boards = fold::project_entities(&self.state, Some(project), Some(kind::BOARD));
+    fn boards_json(&self, selected: Option<Id>) -> Result<AiOut, String> {
+        let gate = Gate::new(&self.state, LocalPolicy::Members);
+        let Some(project) = self.resolve_project(selected).map(|e| e.id) else {
+            return gate.ack(r#"{"project_id":null,"boards":[]}"#).map_err(timeline_withheld)
+        };
+        gate.entity_visible(&project).map_err(timeline_withheld)?;
         let mut counts = BTreeMap::new();
-        for (_, p) in self.board_items() { *counts.entry(p.board).or_insert(0i64) += 1 }
-        let boards = boards.into_iter().map(|b| json::obj(vec![
-            ("id", json::s(hex(&b.id))), ("title", json::s(b.text(field::TITLE))),
-            ("item_count", Value::Int(counts.get(&b.id).copied().unwrap_or(0))),
-        ])).collect();
-        json::obj(vec![("project_id", json::s(hex(&project))), ("boards", Value::Arr(boards))]).to_json()
+        for (item, placement) in self.board_items() {
+            if gate.board_item_placement(&item.id, &placement.board).is_ok() {
+                *counts.entry(placement.board).or_insert(0i64) += 1;
+            }
+        }
+        let mut boards = Vec::new();
+        for board in fold::project_entities(&self.state, Some(project), Some(kind::BOARD)) {
+            if gate.entity_visible(&board.id).is_err() { continue }
+            let title = match gate.entity_field_text(&board.id, &field::TITLE) {
+                Ok(text) => AiJson::text(text),
+                Err(Withheld::MissingSource) => AiJson::static_str(""),
+                Err(_) => continue,
+            };
+            boards.push(AiJson::object(vec![
+                ("id", AiJson::id(&board.id)), ("title", title),
+                ("item_count", AiJson::int(counts.get(&board.id).copied().unwrap_or(0))),
+            ]));
+        }
+        gate.finish_json(AiJson::object(vec![
+            ("project_id", AiJson::id(&project)), ("boards", AiJson::array(boards)),
+        ])).map_err(timeline_withheld)
     }
 
-    pub fn board_read_json(&self, board: Id, rect: Option<[f64; 4]>, after: Option<page::Cursor>) -> Result<String, String> {
-        page::read(&self.state, board, rect, after)
+    pub fn board_read_json(&self, board: Id, rect: Option<[f64; 4]>, after: Option<page::Cursor>) -> Result<AiOut, String> {
+        let gate = Gate::new(&self.state, LocalPolicy::Members);
+        page::read(&self.state, &gate, board, rect, after)
     }
 
-    pub fn read_json(&self, read: &crate::tools::Read) -> Result<String, String> {
+    pub fn read_json(&self, read: &crate::tools::Read) -> Result<AiOut, String> {
+        let gate = Gate::new(&self.state, LocalPolicy::Members);
         match *read {
-            crate::tools::Read::Design { item } => {
-                let (item, src, writer) = self.design_source(item)?;
-                let (w, h) = design::size(item);
-                let units = |n: i64| if n % 64 == 0 { Value::Int(n / 64) } else { Value::F64(n as f64 / 64.) };
+            crate::tools::Read::Design { item: id } => {
+                let (item, board) = self.board_item(id)?;
+                gate.board_item_placement(&id, &board).map_err(timeline_withheld)?;
+                if item.kind != kind::DESIGN { return Err(format!("item {} is not a design", hex(&id))) }
+                let src = gate.entity_field_text(&id, &field::SRC).map_err(timeline_withheld)?;
+                let writer = gate.entity_field_writer(&id, &field::SRC).map_err(timeline_withheld)?;
+                let dimension = |key| match gate.entity_field_value(&id, key) {
+                    Ok(value) => Ok(value.as_i64().unwrap_or(0)),
+                    Err(Withheld::MissingSource) => Ok(0),
+                    Err(why) => Err(timeline_withheld(why)),
+                };
+                let (w, h) = (dimension(&field::W)?, dimension(&field::H)?);
+                let units = |n: i64| if n % 64 == 0 { AiJson::int(n / 64) } else { AiJson::f64(n as f64 / 64.) };
                 // The rendering slice will supply the isolate's actual load state here.
-                Ok(json::obj(vec![("src", json::s(src)), ("preset", json::s(design::preset(item))),
-                    ("w", units(w)), ("h", units(h)), ("revision", json::s(format!("@{}", hex(&writer))))]).to_json())
+                gate.finish_json(AiJson::object(vec![
+                    ("src", AiJson::text(src)), ("preset", AiJson::static_str(design::preset_for((w, h)))),
+                    ("w", units(w)), ("h", units(h)), ("revision", AiJson::revision(&writer)),
+                ])).map_err(timeline_withheld)
             }
         }
     }
@@ -6430,7 +7306,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn file_reference(model: &mut Model, file: crate::store_worker::StoredFile) -> Id {
-        model.append(Content::Entity { kind: Key::Number(kind::FILE), project: Some(model.project().id),
+        model.append(Content::Entity { copied_from: vec![], kind: Key::Number(kind::FILE), project: Some(model.project().id),
             derive: None, fields: vec![(field::BLOB, FieldValue::Blob { size: file.size, root: file.root })] },
             Origin::Ui).unwrap()
     }
@@ -6443,6 +7319,54 @@ pub(crate) mod tests {
             if done(model) { return; }
             wake.recv().expect("the store worker stopped before waking its client");
         }
+    }
+
+    #[test]
+    fn dropped_png_on_board_creates_image_at_world_coords_without_touching_chat() {
+        use makepad_ai_services::pictures::{encode_png, RgbaPicture};
+        let home = ShareHomes::new("board-drop");
+        let mut model = Model::open(&home.0).unwrap().0;
+        let town = model.open_id();
+        let board = model.act(Action::AddBoard { title: "Review".into(), project: model.project().id }, Origin::Ui).unwrap();
+        let png = encode_png(&RgbaPicture { width: 600, height: 5, rgba: [16, 32, 48, 255].repeat(600 * 5) }).unwrap();
+        let path = home.0.join("layers.png");
+        std::fs::write(&path, &png).unwrap();
+        let (signal, wake) = std::sync::mpsc::channel();
+        model.start_store(crate::store_worker::test_pool(), move || { let _ = signal.send(()); }).unwrap();
+        let timeline = model.state.timeline.len();
+        model.drop_on_board(town, BoardMediaTarget { board, pos: Some((6400, 12800)) }, path.clone()).unwrap();
+        // The person switches towns while the import runs: the drop's town stays in memory, so
+        // its publication reads no town log on the UI thread.
+        let other = Model::found_town(&model.home, Model::new_genesis(&model.key).unwrap()).unwrap().log.town_id();
+        model.towns.insert(other, Model::read_town(&model.home, other, &mut model.update_checks).unwrap().unwrap().0.summary());
+        model.open_town(other).unwrap();
+        assert!(model.background.contains_key(&town), "a town with an import still to publish stays in memory");
+        let mut published = Vec::new();
+        while model.clips_pending() {
+            published.extend(model.drain_store().board_events);
+            if model.clips_pending() { wake.recv().unwrap(); }
+        }
+        let [(at, id)] = published[..] else { panic!("expected one published board image, got {published:?}") };
+        assert_eq!(at, town);
+        assert_eq!(model.open_id(), other, "the person's town switch stands");
+        assert!(model.background.get(&town).is_some_and(|t| t.state.entities.contains_key(&id)), "the image went to the drop's town");
+        model.open_town(town).unwrap();
+        let image = &model.state.entities[&id];
+        assert_eq!(image.kind, kind::IMAGE);
+        assert_eq!(image.value(field::BOARD), Some(&FieldValue::Id(board)));
+        assert_eq!(image.text(field::MEDIA), "image/png");
+        assert_eq!(image.text(field::TITLE), "layers.png");
+        for (key, ticks) in [(field::X, 6400), (field::Y, 12800), (field::W, 480 * 64), (field::H, 4 * 64)] {
+            assert_eq!(image.value(key), Some(&FieldValue::Int(ticks)));
+        }
+        let stored = FieldValue::Blob { size: png.len() as u64, root: blob::Tree::new(&png, blob::CHUNK).unwrap().root() };
+        assert_eq!(image.value(field::BLOB), Some(&stored));
+        assert_eq!(image.value(field::POSTER), Some(&stored));
+        assert_eq!(image.value(field::DURATION), None);
+        assert_eq!(model.state.timeline.len(), timeline);
+        model.stop_store();
+        drive_store(&mut model, &wake, Model::store_stopped);
+        assert_eq!(std::fs::read(path).unwrap(), png, "the person's file survives the import");
     }
 
     #[test]
@@ -6590,14 +7514,14 @@ pub(crate) mod tests {
                 assert_eq!(town.references.servable(&town.state, Some(end)), rebuilt.servable(&town.state, Some(end)));
             }
         };
-        let entity = a.append(Content::Entity { kind: Key::Number(kind::FILE), project: Some(a.project().id),
+        let entity = a.append(Content::Entity { copied_from: vec![], kind: Key::Number(kind::FILE), project: Some(a.project().id),
             derive: None, fields: vec![(field::BLOB, value(1))] }, Origin::Ui).unwrap();
         a.act(Action::AddTask { title: "unrelated".into(), text: String::new() }, Origin::Ui).unwrap();
-        a.append(Content::Set { changes: vec![Change { entity, field: field::BLOB, value: value(2) }], label: None }, Origin::Ui).unwrap();
+        a.append(Content::Set { copied_from: vec![], changes: vec![Change { entity, field: field::BLOB, value: value(2) }], label: None }, Origin::Ui).unwrap();
         check(&a);
         exchange(&mut a, &mut b);
         check(&b);
-        b.append(Content::Set { changes: vec![Change { entity, field: field::BLOB, value: value(3) }], label: None }, Origin::Ui).unwrap();
+        b.append(Content::Set { copied_from: vec![], changes: vec![Change { entity, field: field::BLOB, value: value(3) }], label: None }, Origin::Ui).unwrap();
         check(&b);
         exchange(&mut b, &mut a);
         check(&a);
@@ -6657,6 +7581,210 @@ pub(crate) mod tests {
             peer.install_open(Town::load(&peer.home, log));
         }
         (homes, nodes)
+    }
+
+    // The final computer shares an existing member's seat. Every model reads the same signed log.
+    pub(crate) fn call_history_models(label: &str, seats: usize, sibling_owner: usize) -> (ShareHomes, Vec<Model>) {
+        let (homes, mut models) = group_town(label, seats);
+        let mut sibling = Model::open(&homes.0.join("sibling")).unwrap().0;
+        let keys: Vec<_> = models.iter().map(Model::device_key).collect();
+        let owner = &keys[sibling_owner];
+        let a = &mut models[0];
+        let from = a.log.events().len();
+        let seat = a.state.seat_of(&owner.public()).unwrap();
+        let entry = a.open.append(owner, Content::Member(Member::AddDevice { seat, device: sibling.me() }), Origin::Ui).unwrap();
+        a.open.append(&sibling.key, Content::Member(Member::Accept { entry }), Origin::Ui).unwrap();
+        let names = ["Ana", "Ada", "Ben", "Kit"];
+        a.open.append(&sibling.key, Content::Profile { name: names[sibling_owner].into(), colour: 0 }, Origin::Ui).unwrap();
+        for (key, name) in keys.iter().zip(names) {
+            a.open.append(key, Content::Profile { name: name.into(), colour: 0 }, Origin::Ui).unwrap();
+        }
+        a.remember_open();
+        let mut log = Log::found(&sibling.home.town_log_path(&a.open_id()), a.log.genesis().clone()).unwrap();
+        log.append_all(a.log.events()[1..].to_vec()).unwrap();
+        sibling.install_open(Town::load(&sibling.home, log));
+        let tail = a.log.events()[from..].to_vec();
+        for peer in &mut models[1..] {
+            for event in &tail { peer.open.append_signed(event.clone()).unwrap(); }
+            peer.remember_open();
+        }
+        models.push(sibling);
+        (homes, models)
+    }
+
+    pub(crate) fn record_call_event(models: &mut [Model], author: usize, content: Content) -> Id {
+        let model = &models[author];
+        let event = model.open.sign(&model.key, content, Origin::Ui, model.log.parents_for(&model.me())).unwrap();
+        let id = event.id;
+        for model in models { model.open.append_signed(event.clone()).unwrap(); }
+        id
+    }
+
+    #[test]
+    fn active_town_call_hides_targeted_call_from_non_callees() {
+        use crate::call::CallScope;
+        let (_homes, mut models) = call_history_models("call-join-scope", 3, 1);
+        let town = models[0].open_id();
+        let seat = |i: usize| models[0].state.seat_of(&models[i].me()).unwrap();
+        let (ana, ada, ben) = (seat(0), seat(1), seat(2));
+        let pair = Some(CallScope::Seats { caller: ana, callee: ada });
+        let all = Some(CallScope::Town);
+        let id = [7; 16];
+        for m in &models {
+            assert_eq!(m.call_join_scope(town, id), None, "a missing open cannot authorize a join");
+        }
+        for (i, (to, town_wide, scopes)) in [
+            (vec![ada], false, [pair, pair, None, pair]), (vec![ada, ada], false, [pair, pair, None, pair]),
+            (vec![ana], false, [None; 4]), (vec![ada, ben], false, [None; 4]), (vec![], false, [None; 4]),
+            (vec![ada], true, [all; 4]), (vec![ada, ben], true, [all; 4]), (vec![], true, [all; 4]),
+        ].into_iter().enumerate() {
+            let session = [i as u8; 16];
+            let only_opener = !town_wide && to.iter().all(|&seat| seat == ana);
+            record_call_event(&mut models, 0, Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: false }, to, town_wide }));
+            record_call_event(&mut models, 1, Content::Session(SessionOp::Join { session }));
+            if only_opener {
+                assert_eq!(models[0].state.participants(&session), [models[0].me()],
+                    "an untagged open without a callee also excludes Ada's signed join");
+            }
+            for (m, scope) in models.iter().zip(scopes) {
+                assert_eq!(m.call_join_scope(town, session), scope, "the signed audience determines admission for case {i}");
+                assert_eq!(m.active_town_call(town).map(|a| a.0), scope.map(|_| session), "only an admitted seat sees the active call");
+            }
+            for who in [0, 1] {
+                record_call_event(&mut models, who, Content::Session(SessionOp::Leave { session, secs: None, why: LeaveWhy::Ended }));
+            }
+            assert!(models.iter().all(|m| m.call_join_scope(town, session).is_none()), "ended calls cannot be joined");
+        }
+    }
+
+    #[test]
+    fn two_seat_town_call_admits_mid_call_newcomer_while_card_call_refuses() {
+        use crate::{call::CallScope, view::{ChatRow, LocalClock, Workspace}};
+        let (homes, mut models) = call_history_models("mid-call-admission", 2, 1);
+        let town = models[0].open_id();
+        let caller = models[0].state.seat_of(&models[0].me()).unwrap();
+        let callee = models[0].state.seat_of(&models[1].me()).unwrap();
+        let (wide, card) = ([1; 16], [2; 16]);
+        for (session, town_wide) in [(wide, true), (card, false)] {
+            record_call_event(&mut models, 0, Content::Session(SessionOp::Open {
+                session, mode: SessionMode::Call { video: false }, to: vec![callee], town_wide,
+            }));
+        }
+        assert_eq!(models[2].call_join_scope(town, wide), Some(CallScope::Town), "Ada's other computer keeps town scope");
+        assert_eq!(models[2].call_join_scope(town, card), Some(CallScope::Seats { caller, callee }),
+            "the same snapshot on a card call keeps seat-pair scope");
+
+        let mut kit = Model::open(&homes.0.join("newcomer")).unwrap().0;
+        let (ana, peers) = models.split_first_mut().unwrap();
+        let before = ana.log.events().len();
+        admit(ana, &kit.key);
+        for peer in peers {
+            for event in &ana.log.events()[before..] { peer.open.append_signed(event.clone()).unwrap(); }
+        }
+        let mut log = Log::found(&kit.home.town_log_path(&town), ana.log.genesis().clone()).unwrap();
+        log.append_all(ana.log.events()[1..].to_vec()).unwrap();
+        kit.install_open(Town::load(&kit.home, log));
+        assert_eq!(kit.call_join_scope(town, card), None, "Kit is outside the signed card-call audience");
+        assert_eq!(kit.call_join_scope(town, wide), Some(CallScope::Town), "the town-wide call admits Kit after its open");
+        assert_eq!(kit.active_town_call(town).map(|c| c.0), Some(wide), "only the town-wide call is offered to Kit");
+        models.push(kit);
+        record_call_event(&mut models, 0, Content::Session(SessionOp::Leave { session: wide, secs: None, why: LeaveWhy::Ended }));
+        let kit = &models[3];
+        assert!(kit.active_town_call(town).is_none(), "ending the town call leaves Kit no call to join");
+        let view = Workspace::read(kit, false, &LocalClock::default());
+        assert!(!view.rows.iter().any(|row| matches!(row, ChatRow::Call(_))),
+            "Kit has no missed-call row for a call opened before the invitation");
+    }
+
+    #[test]
+    fn call_join_scope_refuses_duplicate_opens_and_removed_openers() {
+        use crate::call::CallScope;
+        let (_homes, mut models) = call_history_models("conflicting-call-opens", 4, 1);
+        let town = models[0].open_id();
+        let keys: Vec<_> = models.iter().map(Model::device_key).collect();
+        let seat = |i: usize| models[0].state.seat_of(&keys[i].public()).unwrap();
+        let (ana, ada, ben, kit) = (seat(0), seat(1), seat(2), seat(3));
+        let scope = Some(CallScope::Seats { caller: ana, callee: ada });
+        let call = SessionMode::Call { video: false };
+        let open = |session, mode, to, town_wide| Content::Session(SessionOp::Open { session, mode, to, town_wide });
+        let chat = |text: &str| Content::Chat(Chat { text: text.into(), ..Default::default() });
+        let last_by = |model: &Model, i: usize| model.log.events().iter().rev()
+            .find(|e| e.header.author == keys[i].public()).unwrap().id;
+        let cutoff = last_by(&models[0], 2);
+        // Both orders of delivery converge on the earlier open, while admission counts both.
+        for (session, other_mode) in [([1; 16], call.clone()), ([2; 16], SessionMode::Share { title: "Drawing".into() })] {
+            record_call_event(&mut models, 0, chat("before the call"));
+            let real = models[0].open.sign(&keys[0], open(session, call.clone(), vec![ada], false), Origin::Ui,
+                models[0].log.parents_for(&keys[0].public())).unwrap();
+            let other = models[2].open.sign(&keys[2], open(session, other_mode, vec![], true), Origin::Ui,
+                vec![last_by(&models[2], 2)]).unwrap();
+            for (i, model) in models.iter_mut().enumerate() {
+                if i == 4 {
+                    model.open.append_signed(real.clone()).unwrap();
+                    assert_eq!(model.call_join_scope(town, session), scope, "a sole counted call open authorizes Ada's other computer");
+                    assert_eq!(model.active_town_call(town).map(|c| c.0), Some(session), "the unambiguous call is visible");
+                    model.open.append_signed(other.clone()).unwrap();
+                } else {
+                    model.open.append_signed(other.clone()).unwrap();
+                    model.open.append_signed(real.clone()).unwrap();
+                }
+                assert_eq!(model.state.sessions[&session].open.as_ref().unwrap().opener, keys[2].public(),
+                    "Ben's lower-height open is canonical in both arrival orders");
+                assert_eq!(model.call_join_scope(town, session), None, "two counted opens cannot grant a join scope");
+                assert!(model.active_town_call(town).is_none(), "a conflicting open cannot advertise a live call");
+                assert!(model.open.logged_conflicted_sessions.borrow().contains(&session), "the conflict was logged");
+            }
+        }
+
+        let dup = [3; 16];
+        record_call_event(&mut models, 0, open(dup, call.clone(), vec![ada], false));
+        assert_eq!(models[4].call_join_scope(town, dup), scope, "warm the unique-open index");
+        record_call_event(&mut models, 1, Content::Session(SessionOp::Join { session: dup }));
+        assert!(models[4].open.session_opens.get().is_some() && models[4].call_join_scope(town, dup) == scope,
+            "a join leaves the warm open count alone");
+        record_call_event(&mut models, 0, open(dup, call.clone(), vec![ada, ben], true));
+        assert_eq!(models[4].open.session_opens.get().and_then(|counts| counts.get(&dup)), Some(&2),
+            "a second open by the same signer increments the warm cache");
+        assert!(models[4].call_join_scope(town, dup).is_none() && models[4].active_town_call(town).is_none(),
+            "a same-author duplicate refuses new joins");
+
+        let waiting = [4; 16];
+        record_call_event(&mut models, 0, open(waiting, call.clone(), vec![ada], false));
+        let m = &mut models[4];
+        assert_eq!(m.call_join_scope(town, waiting), scope, "the wait case starts with one counted open");
+        let last = last_by(m, 2);
+        let parent = m.open.sign(&keys[2], chat("parent"), Origin::Ui, vec![last]).unwrap();
+        let child = m.open.sign(&keys[2], open(waiting, call.clone(), vec![], true), Origin::Ui, vec![last, parent.id]).unwrap();
+        let child_id = m.open.append_signed(child).unwrap();
+        assert!(m.state.waiting.contains(&child_id) && m.open.session_opens.get().is_some()
+            && m.call_join_scope(town, waiting) == scope, "a missing parent keeps the second open outside the count");
+        m.open.append_signed(parent).unwrap();
+        assert!(m.open.session_opens.get().is_none() && m.call_join_scope(town, waiting).is_none(),
+            "releasing an open on a chat append invalidates the cached scope");
+
+        let first = [1; 16];
+        let after_cut = m.open.sign(&keys[2], open(first, call.clone(), vec![], true), Origin::Ui, vec![child_id]).unwrap();
+        let remove = Content::Member(Member::Remove { seat: ben, device: keys[2].public(), last: cutoff });
+        m.open.append(&keys[0], remove, Origin::Ui).unwrap();
+        assert!(m.open.session_opens.get().is_none() && m.call_join_scope(town, first) == scope,
+            "a removal that voids Ben's second open restores the original scope");
+        let void_id = m.open.append_signed(after_cut).unwrap();
+        assert!(m.state.void_events.contains_key(&void_id) && m.call_join_scope(town, first) == scope,
+            "an already-void second open cannot block joins");
+
+        // End the calls restored by Ben's removal so the final visibility check isolates Kit's call.
+        for session in [first, [2; 16], waiting] {
+            m.open.append(&keys[0], Content::Session(SessionOp::Leave { session, secs: None, why: LeaveWhy::Ended }), Origin::Ui).unwrap();
+        }
+        let revoked = [5; 16];
+        let anchor = m.open.append(&keys[3], open(revoked, call, vec![ada], false), Origin::Ui).unwrap();
+        m.open.append(&keys[1], Content::Session(SessionOp::Join { session: revoked }), Origin::Ui).unwrap();
+        m.open.append(&keys[0], Content::Member(Member::Remove { seat: kit, device: keys[3].public(), last: anchor }), Origin::Ui).unwrap();
+        let summary = m.state.session_summary(&revoked, Some(ada)).unwrap();
+        assert!(!summary.ended && summary.opener_seat == Some(kit) && !m.state.active_member(&keys[3].public())
+            && m.open.has_unique_open(&revoked), "the removed signer's open still counts and Ada remains in the call");
+        assert!(m.call_join_scope(town, revoked).is_none() && m.active_town_call(town).is_none(),
+            "a removed opener cannot authorize a fresh join");
     }
 
     // Drive real model sessions over ordered, lossless natsim paths.
@@ -6767,7 +7895,7 @@ pub(crate) mod tests {
             let words = PairWords::read(&invites[i].1.to_words().join(" "), &invites[1-i].1.to_words().join(" ")).unwrap();
             let ToWorker::PeerWords { words, name } = mesh.nodes[i+1].pair(side, words, start.unix_secs).unwrap()
                 else { panic!("pair supplies both sets of words") };
-            hubs[i].words(invites[i].0, words.own, words.peer, name, 0);
+            hubs[i].words(invites[i].0, words.own, words.peer, name, 0).unwrap();
         }
         for ms in 0..1000 {
             let now = Now { ms, unix_secs: start.unix_secs + ms / 1000 };
@@ -6800,7 +7928,7 @@ pub(crate) mod tests {
         assert_eq!(mesh.nodes[2].open_id(), private);
         let grant = mesh.nodes[1].state.invitation(&kit).expect("Ben has signed Kit's invitation");
         let membership_lines = |m: &Model| Workspace::read(m, false, &LocalClock::default()).rows.into_iter()
-            .filter_map(|r| if let ChatRow::Member(line) = r { Some(line) } else { None }).collect::<Vec<_>>();
+            .filter_map(|r| if let ChatRow::Member(notice) = r { Some(notice.text) } else { None }).collect::<Vec<_>>();
         assert_eq!(membership_lines(&mesh.nodes[1]).len(), 1, "a pending invitation has no timeline line");
         let offer = mesh.nodes[1].pull_sync(kit).unwrap();
         mesh.nodes[2].receive_from(ben, &offer).unwrap();
@@ -7000,16 +8128,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reconcile_mentions_tracks_edits_and_drops_edited_tokens() {
+        let token = "@Ben's AI";
+        let mention = BoundMention { range: 0..token.len(), token: token.into(), target: ComposerTarget::Agent([2; 32]) };
+        let mut bound = vec![mention.clone()];
+        reconcile_mentions(&mut bound, "@Ben's AI ", "@Ben's AI hello");
+        assert_eq!(bound, [mention], "typing a body preserves the recipient");
+        reconcile_mentions(&mut bound, "@Ben's AI hello", "é @Ben's AI hello");
+        assert_eq!(bound[0].range, 3..3 + token.len(), "a UTF-8 prefix shifts byte offsets");
+        assert!(active_mention_query("é @Ben's AI hello", 7, &bound).is_none());
+        reconcile_mentions(&mut bound, "é @Ben's AI hello", "é @Ben's A hello");
+        assert!(bound.is_empty(), "editing the token releases its identity");
+        assert_eq!(active_mention_query("é @Ben L", 9, &bound),
+            Some(MentionQuery { range: 3..9, query: "Ben L".into(), leading: false }));
+        assert!(active_mention_query("é", 1, &bound).is_none());
+        assert!(active_mention_query("foo@Ben", 7, &bound).is_none());
+        assert!(active_mention_query("  @", 3, &bound).unwrap().leading);
+    }
+
+    fn bound_agent(token: &str, id: Id) -> [BoundMention; 1] {
+        [BoundMention { range: 0..token.len(), token: token.into(), target: ComposerTarget::Agent(id) }]
+    }
+
+    #[test]
+    fn id_bound_routing_disambiguates_identical_backend_ais_and_rejects_unbound_backend_text() {
+        let mut mesh = SyncMesh::new(3, "id-bound-routing");
+        for (model, name) in mesh.nodes.iter_mut().zip(["Ana", "Ben", "Cam"]) {
+            model.set_person_name(name).unwrap();
+        }
+        mesh.link(0, 1);
+        mesh.link(0, 2);
+        let a = hook(&mut mesh.nodes[0]).0;
+        mesh.settle();
+        let check_unbound = |model: &mut Model| {
+            let draft = "@Claude Code check this";
+            assert_eq!(model.mention_target(draft), MentionTarget::UnboundAi);
+            let line = model.post_chat_draft(draft, None, None, None).unwrap();
+            let line = model.state.message(&line).unwrap();
+            assert!(line.to_agent.is_none() && !line.chat.to_ai && line.chat.text == draft);
+        };
+        check_unbound(&mut mesh.nodes[0]);
+        let b = hook(&mut mesh.nodes[1]).0;
+        let c = hook(&mut mesh.nodes[2]).0;
+        mesh.settle();
+        check_unbound(&mut mesh.nodes[0]);
+        let rows = mesh.nodes[0].mention_candidates("Claude Code", true, &BTreeMap::new());
+        assert_eq!(rows.len(), 3);
+        let my_seat = mesh.nodes[0].state.seat_of(&mesh.nodes[0].me()).unwrap();
+        assert!(!mesh.nodes[0].mention_candidates("", true, &BTreeMap::new()).iter().any(|r| r.target == ComposerTarget::Seat(my_seat)),
+            "the picker never offers your own seat");
+        for (target, short) in [(a, "Your AI"), (b, "Ben's AI"), (c, "Cam's AI")] {
+            assert!(rows.iter().any(|r| r.target == ComposerTarget::Agent(target)
+                && r.label == format!("{short} · Claude Code") && r.insert_text == short));
+        }
+        let send = |model: &mut Model, token: &str, agent: Id| {
+            let draft = format!("  {token} check this");
+            let bound = [BoundMention { range: 2..2 + token.len(), token: token.into(), target: ComposerTarget::Agent(agent) }];
+            let line = model.post_chat_draft_bound(&draft, &bound, Some(a), None, None).unwrap();
+            let event = model.log.get(&line).unwrap();
+            assert!(matches!(Content::decode(event.header.kind, event.header.kind_version, event.content().unwrap()),
+                Some(Content::AgentChat { agent: ChatAgent::Recipient(id), chat }) if id == agent && chat.text == "check this"));
+        };
+        let ben = bound_agent("@Ben's AI", b);
+        assert!(matches!(mesh.nodes[0].resolve_draft("@Ben's AI hi", &ben, Some(a), None), DraftRoute::PeerAi { agent, .. } if agent == b));
+        assert!(matches!(mesh.nodes[0].resolve_draft("@Your AI hi", &bound_agent("@Your AI", a), Some(c), None), DraftRoute::MyAi { agent: Some(id), .. } if id == a));
+        assert!(matches!(mesh.nodes[0].mention_target("@ai check this"), MentionTarget::YourAi { agent: Some(id), .. } if id == a));
+        send(&mut mesh.nodes[0], "@Ben's AI", b);
+        send(&mut mesh.nodes[0], "@Cam's AI", c);
+        mesh.nodes[1].set_person_name("Benoit").unwrap();
+        mesh.settle();
+        assert_eq!(mesh.nodes[0].mention_target_bound("@Ben's AI hi", &ben),
+            MentionTarget::PeerAi { agent: b, label: "Benoit's AI · Claude Code".into(), owner_name: "Benoit".into() });
+        send(&mut mesh.nodes[0], "@Ben's AI", b);
+        mesh.nodes[1].remove_agent(b).unwrap();
+        mesh.settle();
+        assert_eq!(mesh.nodes[0].mention_target_bound("@Ben's AI hi", &ben), MentionTarget::None);
+        let plain = mesh.nodes[0].post_chat_draft_bound("@Ben's AI hi", &ben, Some(a), None, None).unwrap();
+        let msg = mesh.nodes[0].state.message(&plain).unwrap();
+        assert!(msg.to_agent.is_none() && !msg.chat.to_ai && msg.chat.text == "@Ben's AI hi");
+    }
+
+    #[test]
     fn at_ai_is_a_prefix_word() {
         let (me, seat) = ([1; 65], [1; 32]);
         let people: Vec<_> = [([1; 32], "Ana", true), ([2; 32], "Ben", false), ([3; 32], "Ben Lind", false),
             ([4; 32], "Renée", false), ([5; 32], "Kit", false)]
-            .into_iter().map(|(seat, label, is_me)| PersonCandidate { seat, label: label.into(), is_me }).collect();
+            .into_iter().map(|(seat, label, is_me)| PersonCandidate { seat, label: label.into(), match_text: true, is_me }).collect();
         let agent = |agent: u8, owner: u8, owner_name: &str, name: &str| AgentCandidate {
-            agent: [agent; 32], owner: [owner; 65], owner_seat: [owner; 32], owner_name: owner_name.into(), name: name.into(), position: Some(agent as usize) };
+            agent: [agent; 32], owner: [owner; 65], owner_seat: [owner; 32], owner_name: owner_name.into(), name: name.into(),
+            short_label: format!("{owner_name}'s AI"), custom_name: None, position: Some(agent as usize) };
         let agents = [agent(10, 2, "Ben", "Claude Code"), agent(11, 5, "Kit", "Kit"), agent(12, 1, "Ana", "Ana Bot")];
         let shown = Some([9; 32]);
-        let route = |text: &str| resolve_route(text, None, shown, me, Some(seat), &people, &agents);
+        let route = |text: &str| resolve_route(text, &[], None, shown, me, Some(seat), &people, &agents);
         let mine = Some([12; 32]);
         for (text, body, above) in [("@ hi", "hi", None), ("@\nhi", "hi", None), ("@ai hi", "hi", None), ("  @AI\thi ", "hi", None),
             ("@ai, hi", "hi", None), ("@ ai look at ^", "ai look at", shown), ("@", "", None), ("@ai", "", None), ("@ai: go ^", "go", shown)] {
@@ -7017,7 +8227,7 @@ pub(crate) mod tests {
         }
         for text in ["@aida", "@aida is here", "@ai.com", "@poolside hi", "ask @ later", "ask @ai later", "ask @Claude Code later",
             "foo@Ben.com", "@Ben.com", "@Ben-ai", "@Ben_2", "@@Ben", "🙂 hello", "@Ana check", "@Ana"] {
-            assert_eq!(route(text), DraftRoute::Town { text: text.trim().into(), people: Vec::new(), ambiguous_ai: None },
+            assert_eq!(route(text), DraftRoute::Town { text: text.trim().into(), people: Vec::new(), unbound_ai: false },
                 "{text:?} stays plain town chat that mentions nobody else");
         }
         let ben = |seat: u8, name: &str| MentionedSeat { seat: [seat; 32], name: name.into() };
@@ -7025,19 +8235,24 @@ pub(crate) mod tests {
             ("Ask @Ben.", vec![ben(2, "Ben")]), ("(@Ben)", vec![ben(2, "Ben")]), ("@Ben Lind hi", vec![ben(3, "Ben Lind")]),
             ("Hey @Ben Lind and @RENÉE!", vec![ben(3, "Ben Lind"), ben(4, "Renée")]), ("@Kit check", vec![ben(5, "Kit")]),
             ("ask @Ben and @Ben again @Ana", vec![ben(2, "Ben")]), ("@Ben @ai", vec![ben(2, "Ben")])] {
-            assert_eq!(route(text), DraftRoute::Town { text: text.into(), people: who, ambiguous_ai: None },
+            assert_eq!(route(text), DraftRoute::Town { text: text.into(), people: who, unbound_ai: false },
                 "{text:?} mentions exactly these people by seat and starts no AI turn");
         }
-        for text in ["@Claude Code check", "@claude code: check ^"] {
-            let body = if text.ends_with('^') { ("check", shown) } else { ("check", None) };
-            assert_eq!(route(text), DraftRoute::PeerAi { agent: [10; 32], agent_name: "Claude Code".into(), owner_name: "Ben".into(), text: body.0.into(), above: body.1 },
-                "a teammate's AI answers to its own name in {text:?}");
+        for (text, token, agent, body, above) in [("@Claude Code check", "@Claude Code", [10; 32], "check", None),
+            ("@claude code: check ^", "@claude code", [10; 32], "check", shown), ("@Ana Bot hi", "@Ana Bot", [12; 32], "hi", None)] {
+            assert_eq!(route(text), DraftRoute::Town { text: text.into(), people: vec![], unbound_ai: true });
+            let bound = bound_agent(token, agent);
+            let picked = resolve_route(text, &bound, None, shown, me, Some(seat), &people, &agents);
+            let expected = if Some(agent) == mine {
+                DraftRoute::MyAi { agent: mine, text: body.into(), above }
+            } else {
+                DraftRoute::PeerAi { agent, owner_name: "Ben".into(), text: body.into(), above }
+            };
+            assert_eq!(picked, expected);
         }
-        assert_eq!(route("@Ana Bot hi"), DraftRoute::MyAi { agent: mine, text: "hi".into(), above: None }, "my own AI's name reaches it, beating the shorter @Ana");
-        let twin = [agent(10, 2, "Ben", "Claude Code"), agent(13, 3, "Ben Lind", "Claude Code"), agent(12, 1, "Ana", "Ana Bot")];
-        assert_eq!(resolve_route("@Claude Code hi @Kit", None, shown, me, Some(seat), &people, &twin),
-            DraftRoute::Town { text: "@Claude Code hi @Kit".into(), people: vec![ben(5, "Kit")], ambiguous_ai: Some(("Claude Code".into(), 2)) },
-            "two seats' AIs with one name fail safe to town chat");
+        let twin = [agent(10, 2, "Ben", "Claude Code"), agent(13, 3, "Ben Lind", "Claude Code")];
+        assert_eq!(resolve_route("@Claude Code hi @Kit", &[], None, shown, me, Some(seat), &people, &twin),
+            DraftRoute::Town { text: "@Claude Code hi @Kit".into(), people: vec![ben(5, "Kit")], unbound_ai: true });
     }
 
     #[test]
@@ -7071,6 +8286,23 @@ pub(crate) mod tests {
         assert_eq!(notice.details.map(|d| d.text), ada.read_only_line(), "the notice details match the read-only line");
         let notice = bob.chat_notice().expect("Bob's town notice");
         assert_eq!(notice.line, "Ada's history split.", "a split peer is never reported as having left");
+        assert!(bob.home_notice_without_split(Some(&ada.me())).is_none(),
+            "superseding Ada's split leaves nothing when no other notice exists");
+        let other = DeviceKey::generate().unwrap().public();
+        assert_eq!(bob.home_notice_without_split(Some(&other)).unwrap().line, "Ada's history split.",
+            "superseding a different device keeps Ada's split sentence");
+        bob.set_source_update(Some(runner::SourceUpdate::Fetching));
+        assert_eq!(bob.home_notice_without_split(Some(&ada.me())).unwrap().line, "Makepad Town is updating.",
+            "superseding Ada's split keeps unrelated home notice lines");
+        bob.set_source_update(None);
+        bob.startup.failed_selection = Some(([9; 32], "corrupt".into()));
+        let failed = bob.home_notice_without_split(Some(&ada.me())).expect("failed-selection notice");
+        assert_eq!(failed.line, "Your previous town couldn't be opened.");
+        assert_eq!(failed.details.as_ref().map(|d| d.label), Some("Show the reason"));
+        bob.startup.failed_selection = None;
+        let self_split = ada.home_notice_without_split(Some(&ada.me())).expect("self-fork notice");
+        assert!(self_split.replaces_read_only && self_split.line == split && self_split.details.is_some(),
+            "self-fork read-only line and details stay intact");
     }
 
     #[test]
@@ -7544,22 +8776,25 @@ pub(crate) mod tests {
         }
         assert!(mesh.nodes[ben].agent_requests(fab_bot).unwrap().is_empty(), "Ben's AI receives nothing for a line that mentions Ben");
 
-        // A teammate's AI answers to its own name, with the owner's approval as before.
+        // A picked teammate's AI receives the request after the owner's approval.
         let context = post(&mut mesh.nodes[ana], "the context", false).unwrap();
         mesh.settle();
         let draft = "@Fab Bot review ^";
-        assert_eq!(mesh.nodes[ana].mention_target(draft), MentionTarget::PeerAi { agent: fab_bot, agent_name: "Fab Bot".into(), owner_name: "Ben".into() },
+        let bound = bound_agent("@Fab Bot", fab_bot);
+        assert_eq!(mesh.nodes[ana].mention_target(draft), MentionTarget::UnboundAi);
+        assert_eq!(mesh.nodes[ana].mention_target_bound(draft, &bound), MentionTarget::PeerAi { agent: fab_bot, label: "Ben's AI · Fab Bot".into(), owner_name: "Ben".into() },
             "the hint names the teammate's AI and its owner");
-        let request = mesh.nodes[ana].post_chat_draft(draft, None, Some(context), None).unwrap();
+        let request = mesh.nodes[ana].post_chat_draft_bound(draft, &bound, None, Some(context), None).unwrap();
         let msg = mesh.nodes[ana].state.message(&request).unwrap();
         assert!(msg.to_agent == Some(fab_bot) && msg.chat.mentions.is_empty() && msg.chat.text == "review" && msg.chat.above == Some(context),
-            "an AI name addresses that AI, strips the name and carries no person mention");
-        assert!(mesh.nodes[ana].transcript_consent(draft, None, Some(context)).is_none(), "nothing of Ana's to confirm for a teammate's AI");
+            "a bound token addresses its AI, strips the name and carries no person mention");
+        assert!(mesh.nodes[ana].transcript_consent_bound(draft, &bound, None, Some(context)).is_none(), "nothing of Ana's to confirm for a teammate's AI");
         mesh.settle();
         assert_eq!(mesh.nodes[ben].agent_requests(fab_bot).unwrap(), [request], "Ben's AI waits for Ben's approval");
         assert!(mesh.nodes[ben].agent_wait(fab_token, None, true).unwrap().is_none(), "an unapproved line is not delivered");
         mesh.nodes[ben].decide_agent_request(town, fab_bot, request, true).unwrap();
         let delivered = mesh.nodes[ben].agent_wait(fab_token, None, true).unwrap().expect("the approved line is delivered");
+        let delivered = delivered.as_str();
         assert!(delivered.contains("review") && !delivered.contains("the context"), "an approved foreign line arrives alone");
         assert_eq!(mesh.nodes[ben].agent_read(fab_token, None), Err(NO_TURN.into()), "a foreign line opens no read-up");
 
@@ -7569,11 +8804,13 @@ pub(crate) mod tests {
         let ana_line = mesh.nodes[ana].post_chat_draft("@Rik please check", None, None, None).unwrap();
         let ask = mesh.nodes[ana].post_chat_draft("@ai summarize", None, None, Some(ana_line)).unwrap();
         let waited = mesh.nodes[ana].agent_wait(ana_token, None, true).unwrap().unwrap();
+        let waited = waited.as_str();
         let acknowledged = cursor(&json::parse(waited.as_bytes()).unwrap());
         let rik_ids = format!(r#""mentions":["{}"]"#, hex(&seat_rik));
         assert!(waited.contains(&rik_ids), "a quoted line brings its mentions as seat ids");
         assert!(!waited.contains(r#""people""#) && !waited.contains(r#""name""#), "wait carries no names for the mentioned seat");
         let read = mesh.nodes[ana].agent_read(ana_token, None).unwrap();
+        let read = read.as_str();
         let at = read.find(&format!(r#""id":"{}""#, hex(&ben_line))).expect("Ben's line is read");
         let item = &read[at..at + read[at..].find('}').unwrap()];
         assert!(item.contains(&rik_ids), "a read item lists the seat ids it mentions");
@@ -7584,12 +8821,14 @@ pub(crate) mod tests {
         let note = post(&mut mesh.nodes[ana], "a note to self", false).unwrap();
         mesh.nodes[ana].post_chat_draft("@ai plain ^", None, Some(note), None).unwrap();
         let waited = mesh.nodes[ana].agent_wait(ana_token, Some(acknowledged), true).unwrap().unwrap();
+        let waited = waited.as_str();
         let acknowledged = cursor(&json::parse(waited.as_bytes()).unwrap());
         assert_eq!(mesh.nodes[ana].check_outside(), Ok(()), "own unmentioning context leaves outside tools open");
         mesh.nodes[ana].agent_say(ana_token, "done again".into(), None).unwrap();
         let ana_ben_line = mesh.nodes[ana].post_chat_draft("@Ben check this", None, None, None).unwrap();
         mesh.nodes[ana].post_chat_draft("@ai review ^", None, Some(ana_ben_line), None).unwrap();
         let raw = mesh.nodes[ana].agent_wait(ana_token, Some(acknowledged), true).unwrap().unwrap();
+        let raw = raw.as_str();
         let acknowledged = cursor(&json::parse(raw.as_bytes()).unwrap());
         assert!(raw.contains(&format!(r#""mentions":["{}"]"#, hex(&seat_ben))), "the read-up block lists the mention");
         assert_eq!(mesh.nodes[ana].check_outside(), Err(ASK_PERSON.into()), "a mentioned seat in the context closes outside tools");
@@ -7597,12 +8836,12 @@ pub(crate) mod tests {
         // Two seats with an AI of one name: no guessing, while @ai still works.
         hook(&mut mesh.nodes[ben]);
         mesh.settle();
-        assert_eq!(mesh.nodes[ana].mention_target("@Claude Code hi"), MentionTarget::AmbiguousAi { name: "Claude Code".into(), count: 2 },
+        assert_eq!(mesh.nodes[ana].mention_target("@Claude Code hi"), MentionTarget::UnboundAi,
             "two seats' AIs share a name");
         let plain = mesh.nodes[ana].post_chat_draft("@Claude Code hi", None, None, None).unwrap();
         let msg = mesh.nodes[ana].state.message(&plain).unwrap();
-        assert!(msg.to_agent.is_none() && !msg.chat.to_ai && msg.chat.text == "@Claude Code hi", "an ambiguous AI name stays plain town chat");
-        assert_eq!(mesh.nodes[ana].mention_target("@ai hi"), MentionTarget::YourAi { has_ai: true, name: Some("Claude Code".into()) }, "@ai still means my AI");
+        assert!(msg.to_agent.is_none() && !msg.chat.to_ai && msg.chat.text == "@Claude Code hi", "an unbound AI name stays plain town chat");
+        assert_eq!(mesh.nodes[ana].mention_target("@ai hi"), MentionTarget::YourAi { has_ai: true, agent: Some(ana_agent), label: Some("Your AI · Claude Code".into()) }, "@ai still means my AI");
         let mine = mesh.nodes[ana].post_chat_draft("@ai hi", None, None, None).unwrap();
         assert!(mesh.nodes[ana].state.mentions(&ana_agent).contains(&mine) && !mesh.nodes[ana].state.mentions(&ana_agent).contains(&plain),
             "only @ai reached my AI");
@@ -7618,9 +8857,16 @@ pub(crate) mod tests {
         assert_eq!(mesh.nodes[ana].state.message(&twins).unwrap().chat.mentions, both, "both seats are written, sorted");
 
         // A removed member matches nobody.
+        let tagged = mesh.nodes[ana].post_chat_draft("@Kit review this", None, None, None).unwrap();
+        assert_eq!(mesh.nodes[ana].state.message(&tagged).unwrap().chat.mentions, [seat_kit], "Kit's seat is on the signed line before removal");
         let last = mesh.nodes[ana].log.events().iter().rev().find(|e| e.header.author == keys[kit]).unwrap().id;
         mesh.nodes[ana].append(Content::Member(Member::Remove { seat: seat_kit, device: keys[kit], last }), Origin::Ui).unwrap();
         assert_eq!(mesh.nodes[ana].mention_target("@Kit hi"), MentionTarget::None, "a removed member is not mentioned");
+        let read = mesh.nodes[ana].agent_read(ana_token, None).unwrap();
+        let read = json::parse(read.as_str().as_bytes()).unwrap();
+        let people = read.get("people").unwrap();
+        assert_eq!(people.get(&hex(&seat_kit)).and_then(|who| who.get("name")), Some(&json::s(format!("Member {}", hex(&keys[kit][..4])))),
+            "a removed mentioned seat uses its device-key fallback in people");
         let gone = mesh.nodes[ana].post_chat_draft("@Kit hi", None, None, None).unwrap();
         assert!(mesh.nodes[ana].state.message(&gone).unwrap().chat.mentions.is_empty(), "no mention is written for a removed member");
 
@@ -7635,6 +8881,7 @@ pub(crate) mod tests {
         mesh.nodes[ana].post_chat_draft("@ai who is here", None, None, None).unwrap();
         mesh.nodes[ana].agent_wait(ana_token, Some(acknowledged), true).unwrap().unwrap();
         let page = mesh.nodes[ana].agent_read(ana_token, None).unwrap();
+        let page = page.as_str();
         assert!(page.len() <= MAX_RESULT_BYTES, "a page with a crowd fits the result budget");
         assert!(page.contains(r#""mentions_truncated":true"#) && page.contains(r#""text":"a crowd""#), "the page says it cut the mentions and keeps the text");
     }
@@ -7663,7 +8910,7 @@ pub(crate) mod tests {
         let mut waits = AgentWaits::default();
         let results = waits.wait(&mut model, "first", binding, None);
         assert_eq!(results.len(), 1, "the AI's first wait returns the waiting lines at once");
-        let page = json::parse(results[0].text.as_bytes()).unwrap();
+        let page = json::parse(results[0].text_for_test().as_bytes()).unwrap();
         let ids: Vec<Value> = page.get("items").unwrap().as_arr().unwrap().iter().map(|item| item.get("id").unwrap().clone()).collect();
         assert_eq!(ids, [json::s(hex(&first)), json::s(hex(&second))],
             "it reads my unanswered lines oldest first, and not the one answered before it came");
@@ -7725,8 +8972,8 @@ pub(crate) mod tests {
         assert!(waits.wait(&mut model, "reconnected", binding, None).is_empty());
         let replaced = waits.wait(&mut model, "replacement", binding, None);
         assert_eq!(replaced.len(), 1);
-        assert_eq!(replaced[0].call_id, "reconnected");
-        assert!(replaced[0].text.contains("took over"));
+        assert_eq!(replaced[0].call_id(), "reconnected");
+        assert!(replaced[0].text_for_test().contains("took over"));
         waits.cancel("reconnected");
         assert!(waits.listening(model.agent_activity(agent).unwrap().binding));
         assert_eq!(row_status(&model, &waits, agent), "listening");
@@ -7753,8 +9000,8 @@ pub(crate) mod tests {
         assert!(model.pending(None).unwrap().is_empty(), "a named mention never wakes legacy town.next");
         let results = waits.deliver(&mut model, None);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].call_id, "replacement", "late cancel and a same-name agent do not intercept a wake");
-        let page = json::parse(results[0].text.as_bytes()).unwrap();
+        assert_eq!(results[0].call_id(), "replacement", "late cancel and a same-name agent do not intercept a wake");
+        let page = json::parse(results[0].text_for_test().as_bytes()).unwrap();
         let item = &page.get("items").unwrap().as_arr().unwrap()[0];
         assert_eq!(item.get("id"), Some(&json::s(hex(&line))));
         assert_eq!(item.get("from"), Some(&json::s("the owner")));
@@ -7772,9 +9019,9 @@ pub(crate) mod tests {
         assert!(model.agent_say(binding, "stale".into(), None).is_err());
         let ended = waits.deliver(&mut model, Some(binding.town));
         assert_eq!(ended.len(), 1);
-        assert_eq!(ended[0].call_id, "old");
-        assert!(ended[0].text.contains("ended"));
-        assert!(model.agent_wait(fresh, None, true).unwrap().unwrap().contains(&hex(&next)), "pending before a wait stays queued");
+        assert_eq!(ended[0].call_id(), "old");
+        assert!(ended[0].text_for_test().contains("ended"));
+        assert!(model.agent_wait(fresh, None, true).unwrap().unwrap().as_str().contains(&hex(&next)), "pending before a wait stays queued");
         assert!(model.agent_say(fresh, "same agent".into(), None).is_ok());
         model.remove_agent(agent).unwrap();
         assert!(model.agent_wait(fresh, None, true).is_err());
@@ -7844,13 +9091,13 @@ pub(crate) mod tests {
         let tasks = model.tasks_json_in(caller.town, Some(project)).unwrap();
         let boards = model.boards_json_in(caller.town, Some(project)).unwrap();
         let default_tasks = model.tasks_json_in(caller.town, None).unwrap();
-        assert!(tasks.contains(&hex(&task)) && !tasks.contains("Ben") && boards.contains(&hex(&board)) && !boards.contains(&hex(&board_b)),
+        assert!(tasks.contains(&hex(&task)) && !tasks.contains("Ben") && boards.as_str().contains(&hex(&board)) && !boards.as_str().contains(&hex(&board_b)),
             "workspace_read_uses_bound_town: explicit project lists");
         assert!(default_tasks.contains(&hex(&project_a)) && default_tasks.contains(&hex(&default_task)) && !default_tasks.contains(&hex(&task)),
             "workspace_read_uses_bound_town: A's first project supplies the default");
-        assert!(model.board_read_json_in(caller.town, board, None, None).unwrap().contains(&hex(&design))
+        assert!(model.board_read_json_in(caller.town, board, None, None).unwrap().as_str().contains(&hex(&design))
             && model.board_read_json_in(caller.town, board_b, None, None).is_err(), "workspace_read_uses_bound_town: board contents");
-        assert!(model.read_json_in(caller.town, &crate::tools::Read::Design { item: design }).unwrap().contains("View{}"),
+        assert!(model.read_json_in(caller.town, &crate::tools::Read::Design { item: design }).unwrap().as_str().contains("View{}"),
             "workspace_read_uses_bound_town: design source");
         assert!(model.doc_read_json_in(caller.town, added_doc, None).is_ok() && model.doc_read_json_in(caller.town, doc_b, None).is_err(),
             "workspace_read_uses_bound_town: documents");
@@ -7870,18 +9117,18 @@ pub(crate) mod tests {
             let voice = SessionMode::Call { video: false };
             let share = SessionMode::Share { title: "Kit".into() };
             let leave = |session| Action::SessionLeave { session, secs: Some(5), why: LeaveWhy::Ended };
-            let join = |session| Action::SessionJoin { town: None, session };
+            let join = |session| Action::SessionJoin { peer: None, town: None, session };
             let incoming = |model: &mut Model, session, mode| {
                 model.in_town(town_b, |town, me| {
                     let to = vec![town.state.seat_of(&me.public()).unwrap()];
-                    town.append(&ben, Content::Session(SessionOp::Open { session, mode, to }), Origin::Ui)
+                    town.append(&ben, Content::Session(SessionOp::Open { town_wide: false, session, mode, to }), Origin::Ui)
                 }).unwrap();
             };
             let (voice_b, share_b, voice_a, ring_b, late_b, watched_b, unwatched_b) =
                 ([1; 16], [2; 16], [3; 16], [4; 16], [5; 16], [6; 16], [7; 16]);
             let open_voice = |m: &mut Model, session| {
                 let to = vec![m.state.seat_of(&peer).unwrap()];
-                m.act(Action::SessionOpen { town: None, session, mode: voice.clone(), to }, Origin::Ui).unwrap();
+                m.act(Action::SessionOpen { town_wide: false, town: None, session, mode: voice.clone(), to }, Origin::Ui).unwrap();
             };
             open_voice(&mut model, voice_b);
             incoming(&mut model, share_b, share.clone());
@@ -7895,8 +9142,10 @@ pub(crate) mod tests {
                 jobs: Arc::new(|_, _| panic!("call_state_isolated_across_towns: no audio job")) });
             let mut cx = makepad_widgets::Cx::new(Box::new(|_, _| {}));
             let port = ctl.link_up(&mut cx, model.me(), peer, "Ben").unwrap();
+            ctl.set_open_town(Some((town_b, vec![(peer, "Ben".into())])));
+            ctl.set_peer_caps(peer, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
             port.messages_in.try_send(call::Message::Share { session: share_b, title: "Kit".into(),
-                w: 20., h: 20., ext: Default::default() }.encode()).unwrap();
+                w: 20., h: 20., ext: call::ShareOfferExt { town: Some(town_b), ..Default::default() } }.encode()).unwrap();
             ctl.poll(&mut cx);
             let mut shown = ctl.shown();
             let offers = Arc::make_mut(&mut shown.share.offers);
@@ -7904,19 +9153,26 @@ pub(crate) mod tests {
             shown.view = Arc::new(CallView { phase: call::Phase::Live, peer_name: "Ben".into(), transcribing_me: true, ..Default::default() });
             shown.share.control_session = Some(share_b);
             shown.share.control.active = Some([8; 16]);
+            shown.share.control.holder = Some((peer, "UI label".into()));
             shown.share.watching = Some(share_b);
             let now = Instant::now();
             shown.share.capture.recording = Some(crate::record::capture::RecordingShown { title: "Rik".into(), started: now });
 
+            let render = |m: &Model, shown: &CallShown, caller| {
+                let gate = Gate::new(&m.loaded_town(caller).unwrap().state, LocalPolicy::Members);
+                let call_peers: Vec<_> = shown.view.participants.iter().map(|p| p.peer).collect();
+                let ctx = call::ai::CallGateContext { call_peers: &call_peers, peers: m.peers(), me: m.me(), person_name: m.person_name.as_deref() };
+                call::ai::state(&gate, shown, now, &ctx, None).unwrap().into_string()
+            };
             let state = |m: &Model, shown: &CallShown, ringing, caller| {
                 let filtered = filter_call_shown(shown, m.call_town(ringing), |s| m.share_offer_town(s), Some(town_b), caller);
-                call::ai::state(&filtered, now)
+                render(m, &filtered, caller)
             };
             let allowed = |m: &Model, shown: &CallShown, tool, ringing, caller| {
                 check_call_tool_town(tool, shown, m.call_town(ringing), |s| m.share_offer_town(s), Some(town_b), caller)
             };
             let refused = Err("Active call belongs to another town.");
-            let neutral = call::ai::state(&CallShown::default(), now);
+            let neutral = render(&model, &CallShown::default(), caller.town);
             assert_eq!(model.call_town(None), Some(town_b), "call_state_isolated_across_towns: own voice Open survives the UI switch");
             assert_eq!(state(&model, &shown, None, caller.town), neutral, "call_state_isolated_across_towns: foreign voice, offers, control and recording all disappear");
             for tool in [CallTool::HangUp, CallTool::Mute, CallTool::TranscribeOff, CallTool::ShareStop, CallTool::ShareClose,
@@ -7950,7 +9206,7 @@ pub(crate) mod tests {
             model.observe_ring(Some(late_b), Some(peer), None);
             assert_eq!(model.call_town(Some(late_b)), None, "call_state_isolated_across_towns: unsynced multi-town ring fails closed");
             model.act(join(late_b), Origin::Ui).unwrap();
-            model.observe_voice_call(Some(late_b));
+            model.observe_voice_call(Some(late_b), None, None);
             model.observe_ring(None, None, None);
             voice_shown.view = shown.view.clone();
             for synced in [false, true] {
@@ -7959,7 +9215,7 @@ pub(crate) mod tests {
                 for town in [town_a, town_b] {
                     let visible = synced && town == town_b;
                     let view = state(&model, &voice_shown, None, town);
-                    assert_eq!(view, if visible { call::ai::state(&voice_shown, now) } else { neutral.clone() },
+                    assert_eq!(view, if visible { render(&model, &voice_shown, town) } else { neutral.clone() },
                         "call_state_isolated_across_towns: pre-sync Join never exposes the call to A");
                     for tool in [CallTool::HangUp, CallTool::Mute, CallTool::TranscribeOff] {
                         assert_eq!(allowed(&model, &voice_shown, tool, None, town), if visible { Ok(()) } else { refused },
@@ -7994,7 +9250,7 @@ pub(crate) mod tests {
         let offered = model.agent_wait(binding, None, true).unwrap().unwrap();
         model.agent_read(binding, None).unwrap();
         assert_eq!(model.check_outside(), Err(ASK_PERSON.into()), "check_outside_uses_cached_foreign_turns: background read opens a foreign turn");
-        model.agent_wait(binding, Some(cursor(&json::parse(offered.as_bytes()).unwrap())), true).unwrap();
+        model.agent_wait(binding, Some(cursor(&json::parse(offered.as_str().as_bytes()).unwrap())), true).unwrap();
         assert_eq!(model.check_outside(), Ok(()), "check_outside_uses_cached_foreign_turns: acknowledgement clears the turn");
         model.open_town(town_a).unwrap();
         model.mention_agent(agent, "Read again".into(), None).unwrap();
@@ -8031,18 +9287,19 @@ pub(crate) mod tests {
         assert!(b.agent_code(Some(agent)).is_err());
         let owned_reply = a.agent_say(token, "an earlier answer".into(), None).unwrap();
         let session = [9; 16];
-        b.act(Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: vec![b.call_seat(&a.me()).unwrap()] }, Origin::Ui).unwrap();
+        b.act(Action::SessionOpen { town_wide: false, town: None, session, mode: SessionMode::Call { video: false }, to: vec![b.call_seat(&a.me()).unwrap()] }, Origin::Ui).unwrap();
         b.act(Action::SessionLeave { session, secs: None, why: LeaveWhy::Ended }, Origin::Ui).unwrap();
-        let allowed = b.post_chat_draft("@claude CODE one foreign request", None, None, None).unwrap();
+        let allowed = b.post_chat_draft_bound("@claude CODE one foreign request", &bound_agent("@claude CODE", agent), None, None, None).unwrap();
         let line = b.state.message(&allowed).unwrap();
         assert_eq!((line.to_agent, line.chat.text.as_str()), (Some(agent), "one foreign request"),
-            "the typed AI name sends the body to the last AI of that name");
+            "the picked AI id receives the body");
         let refused = b.mention_agent(agent, "another foreign request".into(), None).unwrap();
         exchange(&mut a, &mut b);
         assert!(a.agent_requests(older).unwrap().is_empty(), "an earlier AI receives no request");
-        assert!(a.agent_wait(token, None, true).unwrap().is_none(), "a typed peer mention waits for owner approval");
+        assert!(a.agent_wait(token, None, true).unwrap().is_none(), "a picked peer AI waits for owner approval");
         a.mention_agent(agent, "owner request".into(), Some(allowed)).unwrap();
         let raw = a.agent_wait(token, None, true).unwrap().unwrap();
+        let raw = raw.as_str();
         assert!(!raw.contains("foreign request"), "an unapproved line cannot ride along as a quote");
         a.agent_read(token, None).unwrap();
         a.open_town(private).unwrap();
@@ -8051,7 +9308,7 @@ pub(crate) mod tests {
         let last = cursor(&json::parse(raw.as_bytes()).unwrap());
         assert!(a.agent_wait(token, Some(last), true).unwrap().is_none());
         a.mention_agent(agent, "follow up".into(), Some(owned_reply)).unwrap();
-        let followup = json::parse(a.agent_wait(token, None, true).unwrap().unwrap().as_bytes()).unwrap();
+        let followup = json::parse(a.agent_wait(token, None, true).unwrap().unwrap().as_str().as_bytes()).unwrap();
         let from: Vec<_> = followup.get("items").unwrap().as_arr().unwrap().iter()
             .filter_map(|i| i.get("from")?.as_str()).collect();
         assert_eq!(from, ["the owner", "the owner's AI"]);
@@ -8079,6 +9336,7 @@ pub(crate) mod tests {
         assert_eq!(a.open_id(), private);
         assert!(a.agent_say(token, "wrong town".into(), Some(only_private)).is_err());
         let raw = a.agent_wait(token, None, true).unwrap().unwrap();
+        let raw = raw.as_str();
         assert!(raw.contains("one foreign request") && raw.contains("the other person"));
         assert_eq!(a.agent_read(token, None), Err(NO_TURN.into()), "approval of a foreign request opens no timeline window");
         for hidden in ["Ada", "Bob", "another foreign request", "private"] { assert!(!raw.contains(hidden)); }
@@ -8104,7 +9362,8 @@ pub(crate) mod tests {
             let empty = Event::from_parts(m.open_id(), signed.header_bytes, Vec::new(), signed.sig).unwrap();
             m.open.append_signed(empty).unwrap()
         }
-        fn envelope(s: &str) -> Value {
+        fn envelope(out: &AiOut) -> Value {
+            let s = out.as_str();
             assert!(s.len() <= MAX_RESULT_BYTES, "the complete escaped envelope fits the tool result");
             json::parse(s.as_bytes()).unwrap()
         }
@@ -8144,7 +9403,7 @@ pub(crate) mod tests {
         let boundary = m.agent_say(token, "old exchange".into(), None).unwrap();
         m.agent_wait(token, Some(cursor(&first)), true).unwrap();
         let call = [3; 16];
-        let opened = m.append(Content::Session(SessionOp::Open { session: call, mode: SessionMode::Call { video: false },
+        let opened = m.append(Content::Session(SessionOp::Open { town_wide: false, session: call, mode: SessionMode::Call { video: false },
             to: vec![m.state.seat_of(&peer.public()).unwrap()] }), Origin::Ui).unwrap();
         m.append(Content::Said { session: call, lines: vec![SaidLine { at_ms: 20, dur_ms: 3, text: "private transcript phrase".into() }] }, Origin::Ui).unwrap();
         let delayed = m.sign(&delayed_peer, Content::Chat(Chat { text: "late arrival".into(), ..Chat::default() }),
@@ -8236,10 +9495,11 @@ pub(crate) mod tests {
         let mut m = Model::open(&homes.0).unwrap().0;
         let (agent, binding) = hook(&mut m);
         let session = [7; 16];
-        let entry = m.append(Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: false }, to: vec![] }), Origin::Ui).unwrap();
+        let entry = m.append(Content::Session(SessionOp::Open { town_wide: true, session, mode: SessionMode::Call { video: false }, to: vec![] }), Origin::Ui).unwrap();
         m.append(Content::Said { session, lines: vec![SaidLine { at_ms: 1, dur_ms: 2, text: "private".into() }] }, Origin::Ui).unwrap();
         let line = m.mention_with_context(agent, "read up".into(), None, Some(entry)).unwrap();
         let page = m.agent_wait(binding, None, true).unwrap().unwrap();
+        let page = page.as_str();
         assert!(!page.contains("private"), "a context block contains only local availability");
         let last = cursor(&json::parse(page.as_bytes()).unwrap());
         (homes, m, agent, binding, session, entry, line, last)
@@ -8280,7 +9540,7 @@ pub(crate) mod tests {
     fn a_share_for_an_earlier_request_grants_nothing_in_the_next_turn() {
         let (_homes, mut m, agent, binding, session, entry, line, ack) = request_with_local_transcript("earlier-share-line");
         m.act(Action::Shared { session, agent, line }, Origin::Ui).unwrap();
-        assert!(m.read_page(binding, Some(entry), None).unwrap().contains("private"), "the exact confirmed line opens its transcript");
+        assert!(m.read_page(binding, Some(entry), None).unwrap().as_str().contains("private"), "the exact confirmed line opens its transcript");
         assert_eq!(m.check_outside(), Err(ASK_PERSON.into()), "reading a shared transcript closes outside tools even for the owner's own words");
         let (other, second) = hook(&mut m);
         m.mention_agent(other, "another reader".into(), None).unwrap();
@@ -8307,21 +9567,21 @@ pub(crate) mod tests {
         a.append(Content::Profile { name: "Ben".into(), colour: 0 }, Origin::Ui).unwrap();
         let session = [8; 16];
         let other = [9; 16];
-        let open = |session| Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: vec![] };
+        let open = |session| Action::SessionOpen { town_wide: true, town: None, session, mode: SessionMode::Call { video: false }, to: vec![] };
         let speech = |session, at_ms, text| Action::Said { session, lines: vec![SaidLine { at_ms, dur_ms: 1, text }] };
         let earlier = a.act(open(other), Origin::Ui).unwrap();
         a.act(speech(other, 2, "earlier words".into()), Origin::Ui).unwrap();
         let asked = a.mention_agent(agent, "first exchange".into(), None).unwrap();
         let first = a.agent_wait(binding, None, true).unwrap().unwrap();
-        a.agent_wait(binding, Some(cursor(&json::parse(first.as_bytes()).unwrap())), true).unwrap();
+        a.agent_wait(binding, Some(cursor(&json::parse(first.as_str().as_bytes()).unwrap())), true).unwrap();
         let entry = a.act(open(session), Origin::Ui).unwrap();
         exchange(&mut a, &mut b);
-        b.act(Action::SessionJoin { town: None, session }, Origin::Ui).unwrap();
+        b.act(Action::SessionJoin { peer: None, town: None, session }, Origin::Ui).unwrap();
         let long = "🦀".repeat(MAX_RESULT_BYTES / 4);
         b.act(speech(session, 3, long.clone()), Origin::Ui).unwrap();
         a.act(speech(session, 2, "first words".into()), Origin::Ui).unwrap();
         exchange(&mut a, &mut b);
-        let consent = a.transcript_consent("@ai read ^", Some(agent), Some(entry)).unwrap();
+        let consent = a.transcript_consent_bound("@Your AI read ^", &bound_agent("@Your AI", agent), None, Some(entry)).unwrap();
         assert!(consent.prompt.contains("Kit's") && consent.prompt.contains("your") && consent.prompt.contains("(cloud)"),
             "the question identifies both speakers and the cloud recipient");
         assert_eq!(consent.calls.keys().copied().collect::<Vec<_>>(), [session], "the previous exchange bounds the confirmed block");
@@ -8336,6 +9596,7 @@ pub(crate) mod tests {
         let mut times = Vec::new();
         loop {
             let page = a.read_page(binding, Some(entry), after.as_deref()).unwrap();
+            let page = page.as_str();
             assert!(page.len() <= MAX_RESULT_BYTES, "the complete transcript envelope fits one tool result");
             let json = json::parse(page.as_bytes()).unwrap();
             for item in json.get("items").unwrap().as_arr().unwrap() {
@@ -8388,7 +9649,7 @@ pub(crate) mod tests {
         }
 
         m.mention_agent(agent, "another request".into(), None).unwrap();
-        let after = cursor(&json::parse(offered.as_bytes()).unwrap());
+        let after = cursor(&json::parse(offered.as_str().as_bytes()).unwrap());
         let next = m.agent_wait(binding, Some(after), true).unwrap().unwrap();
         drop(m);
         // A stop between saving the book and the turns can leave the preceding page on disk.
@@ -8412,8 +9673,8 @@ pub(crate) mod tests {
         let mut after = None;
         let mut pages = 0;
         while let Some(raw) = m.agent_wait(token, after, true).unwrap() {
-            assert!(raw.len() <= MAX_RESULT_BYTES);
-            let page = json::parse(raw.as_bytes()).unwrap();
+            assert!(raw.as_str().len() <= MAX_RESULT_BYTES);
+            let page = json::parse(raw.as_str().as_bytes()).unwrap();
             let rows = page.get("items").unwrap().as_arr().unwrap();
             assert!(!rows.is_empty());
             for row in rows {
@@ -8425,7 +9686,7 @@ pub(crate) mod tests {
             if pages == 1 {
                 drop(m);
                 m = Model::open(&dir).unwrap().0;
-                assert_eq!(m.agent_wait(token, after, true).unwrap().as_deref(), Some(raw.as_str()), "an unacknowledged page replays after restart");
+                assert_eq!(m.agent_wait(token, after, true).unwrap().as_ref().map(AiOut::as_str), Some(raw.as_str()), "an unacknowledged page replays after restart");
                 assert!(m.agent_wait(token, Some([0; 32]), true).is_err(), "arbitrary offsets cannot skip data");
             }
             after = Some(cursor(&page));
@@ -8453,7 +9714,7 @@ pub(crate) mod tests {
         let (_homes, mut a, mut b) = shared_town("unread");
         let town = a.open_id();
         let own = b.towns.keys().copied().find(|id| *id != town).unwrap();
-        // Both seats' AIs share a name, so "@Claude Code" names no one.
+        // The unbound backend label stays town chat for both seats.
         let (_, bob_binding) = hook(&mut b);
         hook(&mut a);
         let fab = b.append(Content::AgentAdded { name: "Fab Bot".into(), kind: "session".into() }, Origin::Ui).unwrap();
@@ -8497,8 +9758,8 @@ pub(crate) mod tests {
         a.post_chat_draft("@Bobx not you", None, None, None).unwrap();
         a.post_chat_draft("@Claude Code hi", None, None, None).unwrap();
         exchange(&mut a, &mut b);
-        assert_eq!(urgent(&b), Some((5, 2)), "a longer name and an ambiguous AI name wait on no one");
-        a.post_chat_draft("@Fab Bot please look", None, None, None).unwrap();
+        assert_eq!(urgent(&b), Some((5, 2)), "a longer name and an unbound AI name wait on no one");
+        a.post_chat_draft_bound("@Fab Bot please look", &bound_agent("@Fab Bot", fab), None, None, None).unwrap();
         exchange(&mut a, &mut b);
         assert_eq!(urgent(&b), Some((6, 3)), "a request to my AI waits on my approval");
         b.agent_say(bob_binding, "on it".into(), None).unwrap();
@@ -8581,6 +9842,136 @@ pub(crate) mod tests {
         model.act(Action::AddTask { title: title.into(), text: String::new() }, Origin::Ui).unwrap()
     }
 
+    #[test]
+    fn copy_by_code_writers_emit_copied_from() {
+        use crate::store_worker::StoredFile;
+        use crate::tweak::{AppEdit, Change as Edit};
+
+        // Check the signed refs before the fold can normalize them or discard an unwritten target.
+        // Then check every written field (including fields expected to have no provenance).
+        fn check(model: &Model, writer: Id, target: Id, expected: Vec<(Key, Vec<CopySource>)>) {
+            let event = model.log.get(&writer).unwrap();
+            let content = Content::decode(event.header.kind, event.header.kind_version, event.content().unwrap()).unwrap();
+            let (target_entity, signed, writes): (_, _, Vec<_>) = match content {
+                Content::Entity { fields, copied_from, derive, .. } => {
+                    assert_eq!(target, derive.map_or(writer, |(doc, at)| makepad_town_core::entity::derived_task(doc, at)));
+                    (None, copied_from, fields.into_iter().map(|(field, _)| (target, field)).collect())
+                }
+                Content::Set { changes, copied_from, .. } =>
+                    (Some(target), copied_from, changes.into_iter().map(|c| (c.entity, c.field)).collect()),
+                _ => panic!("expected an entity creation or set"),
+            };
+            let mut want = expected.into_iter().map(|(target_field, sources)|
+                CopyRef { target_entity, target_field, sources }).collect();
+            normalize_copy_refs(&mut want);
+            assert_eq!(signed, want, "exact canonical provenance in the signed event");
+            for r in &signed {
+                assert!(writes.contains(&(target, r.target_field.clone())), "missing write for {}", r.target_field);
+            }
+            for (entity, key) in writes {
+                let sources = want.iter().find(|r| r.target_field == key && entity == target)
+                    .map_or(&[][..], |r| r.sources.as_slice());
+                assert_eq!(model.state.copied_from(writer, entity, &key), sources, "folded provenance for {key}");
+            }
+        }
+        fn fields(keys: &[Key], sources: &[CopySource]) -> Vec<(Key, Vec<CopySource>)> {
+            keys.iter().map(|key| (key.clone(), sources.to_vec())).collect()
+        }
+
+        let (_homes, mut ana, mut ben) = shared_town("copy-by-code");
+        let town = ana.open_id();
+        let project = ana.current_project().unwrap().id;
+        let ui = Origin::Ui;
+        let doc = ana.act(Action::AddDoc { title: "Review".into(), project }, ui).unwrap();
+        let edit_doc = |markdown: &str| Action::EditDoc { doc, markdown: markdown.into() };
+        let first = ana.act(edit_doc("- [ ] Review"), ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        let second = ben.act(edit_doc("- [ ] Review sketch"), ui).unwrap();
+        let tick = ben.act(edit_doc("- [x] Review sketch"), ui).unwrap();
+        let undo = ben.act(Action::Undo { of: tick }, ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        let at = BreakRef::Root;
+        let line = &ana.state.docs[&doc];
+        assert_eq!(line.attribute_writer(at, attr::CHECKBOX), Some(undo));
+        assert_eq!(line.attribute_origin(at, attr::CHECKBOX), Some(first));
+        let task_id = makepad_town_core::entity::derived_task(doc, line.root_id());
+        let convert = ana.act(Action::LineToTask { doc, at }, ui).unwrap();
+        check(&ana, convert, task_id, vec![
+            (field::TITLE, vec![CopySource::DocLine { doc, events: vec![first, second] }]),
+            (field::STATUS, vec![CopySource::DocLine { doc, events: vec![undo, first] }]),
+        ]);
+
+        let add = |m: &mut Model, title: &str, text: &str|
+            m.act(Action::AddTask { title: title.into(), text: text.into() }, ui).unwrap();
+        let into = add(&mut ana, "Review", "Background");
+        let a = add(&mut ana, "Colour", "Red");
+        let b = add(&mut ana, "Shape", "Square");
+        let edit = |value: &str| Action::EditTask { task: a, title: None, text: Some(value.into()) };
+        ana.act(edit("Blue"), ui).unwrap();
+        let over = ana.act(edit("Green"), ui).unwrap();
+        let undo = ana.act(Action::Undo { of: over }, ui).unwrap();
+        assert_eq!(ana.state.entities[&a].fields[&field::TEXT].writer, undo);
+        let merge = ana.act(Action::MergeTasks { into, from: vec![a, b], title: None, text: None }, ui).unwrap();
+        let source = |entity, field, writer| CopySource::EntityField { entity, field, writer };
+        check(&ana, merge, into, vec![(field::TEXT, vec![source(into, field::TEXT, into), source(a, field::TITLE, a),
+            source(a, field::TEXT, undo), source(b, field::TITLE, b), source(b, field::TEXT, b)])]);
+        let other = add(&mut ana, "Next", "");
+        let explicit = ana.act(Action::MergeTasks { into, from: vec![other], title: None, text: Some("custom".into()) }, ui).unwrap();
+        check(&ana, explicit, into, vec![]);
+
+        let session = [1; 16];
+        let open = ana.act(Action::SessionOpen { town_wide: true, town: Some(town), session, to: vec![],
+            mode: SessionMode::Share { title: "Sketch".into() } }, ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        ben.act(Action::SessionJoin { town: Some(town), session, peer: Some(ana.me()) }, ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        let anchor = CopySource::Record(open);
+        let sharer = CopySource::SharePeer { peer: ana.me() };
+        let viewer = CopySource::SharePeer { peer: ben.me() };
+        let app = ana.act(Action::AddApp { town, board: None, geometry: [0, 0, 64, 64], session, name: "Sketch".into() }, ui).unwrap();
+        check(&ana, app, app, fields(&[field::TITLE], &[sharer.clone(), anchor.clone()]));
+        for (change, keys) in [
+            (Edit::Applied { old: "1".into(), new: "2".into(), seq: 1 }, vec![field::WIDGET_PATH, field::PROPERTY, field::OLD_VALUE, field::NEW_VALUE]),
+            (Edit::Note("Check size".into()), vec![field::WIDGET_PATH, field::PROPERTY, field::TEXT]),
+            (Edit::Sidebar("Review".into()), vec![field::WIDGET_PATH, field::PROPERTY, field::TEXT]),
+        ] {
+            let edit = AppEdit { seat: ben.me(), agent: None, path: "ui.panel".into(), prop: "padding".into(), change };
+            let id = ana.act(Action::RecordAppEdit { town, item: app, edit }, ui).unwrap();
+            check(&ana, id, id, fields(&keys, std::slice::from_ref(&viewer)));
+        }
+
+        let stored = |tag| StoredFile { size: 1, root: [tag; 32], id: blob::id(1, &[tag; 32]) };
+        let [picture, poster, video] = [stored(1), stored(2), stored(3)];
+        for model in [&mut ana, &mut ben] {
+            model.files.holdings.entry(town).or_default().extend([picture.id, poster.id, video.id]);
+        }
+        let dest = issues::IssueProject { town, project };
+        let issue = ben.file_issue(dest, [picture, poster], [1, 1], "Sketch", "My note", Some(session),
+            Some((video, 500)), Some(ana.me())).unwrap();
+        check(&ben, issue, issue, fields(&[field::LABEL, field::BLOB, field::POSTER, field::VIDEO], &[sharer.clone(), anchor.clone()]));
+        let issue = ben.file_issue(dest, [picture, poster], [1, 1], "Sketch", "My note", Some(session), None, None).unwrap();
+        check(&ben, issue, issue, fields(&[field::LABEL, field::BLOB, field::POSTER], &[sharer, anchor.clone()]));
+        let local = ben.file_issue(dest, [picture, poster], [1, 1], "Local", "My note", None, None, None).unwrap();
+        check(&ben, local, local, vec![]);
+
+        let clip = |session, poster| Action::PostClip { project: Some(project), title: "Review".into(),
+            media: (video.size, video.root), poster, duration_ms: 500, width: 1, height: 1, media_kind: "video/mp4".into(), session };
+        let post = ana.act(clip(Some(session), Some((poster.size, poster.root))), ui).unwrap();
+        check(&ana, post, post, fields(&[field::TITLE, field::BLOB, field::POSTER], &[viewer.clone(), anchor.clone()]));
+        let post = ana.act(clip(Some(session), None), ui).unwrap();
+        check(&ana, post, post, fields(&[field::TITLE, field::BLOB], &[viewer, anchor]));
+        let post = ana.act(clip(None, Some((poster.size, poster.root))), ui).unwrap();
+        check(&ana, post, post, vec![]);
+
+        let request = ben.append(Content::Request { job: [2; 16], session, project: Some(project), provider: ana.me(),
+            service: Service::Tasks }, ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        assert!(ana.propose_task(town, project, request, "Review sketch".into(), "Check size".into()).unwrap());
+        let proposal = ana.log.events().last().unwrap().id;
+        assert!(ana.state.entities[&proposal].flag(field::PROPOSED));
+        check(&ana, proposal, proposal, fields(&[field::TITLE, field::TEXT], &[CopySource::Record(request)]));
+    }
+
     /// Two linked homes that share `a`'s town, for tests of what crosses a link. Keep the homes
     /// alive until both models are dropped.
     pub(crate) fn shared_town(label: &str) -> (ShareHomes, Model, Model) {
@@ -8629,9 +10020,9 @@ pub(crate) mod tests {
         let screen = SessionMode::Share { title: "Drawing".into() };
         let open = |m: &mut Model, session, mode, town| {
             let to = vec![m.seat_in_town(town, &ben).unwrap()];
-            m.act(Action::SessionOpen { session, mode, to, town: Some(town) }, ui).unwrap()
+            m.act(Action::SessionOpen { town_wide: false, session, mode, to, town: Some(town) }, ui).unwrap()
         };
-        let join = |session, town| Action::SessionJoin { session, town: Some(town) };
+        let join = |session, town| Action::SessionJoin { peer: None, session, town: Some(town) };
         let leave = |session| Action::SessionLeave { session, secs: None, why: LeaveWhy::Ended };
         let second_counts = (a.open_event_count(), b.open_event_count());
         open(&mut a, call, voice.clone(), first);
@@ -8640,7 +10031,7 @@ pub(crate) mod tests {
         assert_eq!(b.call_town(Some(call)), Some(first), "a verified ring identifies the background town immediately");
         assert_eq!(b.transcript_town(call, Some(ana), Some(first)), Some(first), "transcript consent names the wire town");
         let joined = b.act(join(call, first), ui).unwrap();
-        b.observe_voice_call(Some(call));
+        b.observe_voice_call(Some(call), None, None);
         b.observe_ring(None, None, None);
         let said = b.act(Action::Said { session: call, lines: vec![SaidLine { text: "Ready".into(), at_ms: 0, dur_ms: 200 }] }, ui).unwrap();
         let left = b.act(leave(call), ui).unwrap();
@@ -8669,6 +10060,27 @@ pub(crate) mod tests {
         }
         assert_eq!((a.open_event_count(), b.open_event_count()), second_counts, "neither open log gained any voice or share facts");
 
+        b.act(Action::AddProject { title: "Drawings".into() }, ui).unwrap();
+        let declined = [7; 16];
+        b.observe_ring(Some(declined), Some(ana), Some(second));
+        let event = b.act(Action::SessionDecline { peer: None, session: declined, why: DeclineWhy::Declined, town: Some(second) }, ui).unwrap();
+        b.observe_ring(None, None, None);
+        assert!(b.log.get(&event).is_some(), "the verified decline was recorded in the second town");
+        assert!(!b.session_towns.contains_key(&declined), "declining does not create a joined session");
+        assert_eq!(b.recording_destination().unwrap().session, None, "a recording cannot attach to a declined call");
+        let ignored_share = [8; 16];
+        b.observe_share_offer(ignored_share, ana, Some(second));
+        assert_eq!(b.share_offer_town(ignored_share), Some(second), "an unwatched offer has a verified town");
+        assert!(!b.session_towns.contains_key(&ignored_share), "an unwatched offer does not count as a joined session");
+        assert_eq!(b.recording_destination().unwrap().session, None, "a recording cannot attach to an unwatched share");
+        b.end_share_offer(ignored_share);
+        assert!(!b.share_offer_peers.contains_key(&ignored_share), "ending the unwatched offer releases its record");
+        assert_eq!(b.share_offer_town(ignored_share), None, "the ended offer no longer identifies a town");
+        let peer_swap = [9; 16];
+        b.observe_share_offer(peer_swap, ana, Some(first));
+        b.observe_share_offer(peer_swap, ana, None);
+        assert_eq!(b.share_offer_town(peer_swap), None, "an ambiguous legacy offer cannot inherit the previous wire town");
+
         // The receiver belongs to the private town. The sender only belongs to the shared towns.
         b.open_town(private).unwrap();
         let counts = |m: &Model| (m.open_event_count(), m.background[&first].log.events().len(), m.background[&second].log.events().len());
@@ -8676,17 +10088,35 @@ pub(crate) mod tests {
         assert_eq!(b.verify_wire_town(private, None), Some(private), "the local device is active in the named town");
         assert_eq!(b.verify_wire_town(private, Some(ana)), None, "a linked peer cannot name a foreign town");
         b.observe_ring(Some(call), Some(ana), Some(first));
+        assert_eq!(b.transcript_town(call, Some(ana), Some(second)), None, "transcript consent cannot override the observed ring town");
+        b.observe_voice_call(Some(call), Some(ana), Some(second));
+        assert_eq!(b.transcript_town(call, None, None), None, "conflicting ring and active towns have no transcript audience");
+        b.observe_voice_call(None, None, None);
         b.observe_ring(Some(call), Some(ana), Some(private));
+        assert_eq!(b.transcript_town(call, Some(ana), None), None, "omitting the wire town cannot bypass a rejected ring");
+        assert_eq!(b.transcript_town(call, None, None), None, "omitting the peer still verifies the rejected ring's sender");
         assert_eq!(b.call_town(Some(call)), None, "changing only the wire town invalidates the earlier ring pin");
         assert_eq!(b.transcript_town(call, Some(ana), Some(private)), None, "a signed Open elsewhere cannot pin a spoofed transcript");
         assert!(b.act(join(call, private), ui).is_err(), "a spoofed ring cannot be joined");
-        assert!(b.act(Action::SessionDecline { session: call, why: DeclineWhy::Busy, town: Some(private) }, ui).is_err(),
+        assert!(b.act(Action::SessionDecline { peer: None, session: call, why: DeclineWhy::Busy, town: Some(private) }, ui).is_err(),
             "a spoofed ring cannot write a decline");
-        b.observe_voice_call(Some(call));
+        b.observe_voice_call(Some(call), None, None);
         b.observe_ring(None, None, None);
         assert_eq!(b.call_town(None), None, "clearing the ring after a rejected Join cannot authorize a different town");
-        b.observe_voice_call(None);
+        b.observe_voice_call(None, None, None);
+        let busy = |session, town, peer| Action::SessionDecline { session, why: DeclineWhy::Busy, town: Some(town), peer };
+        let from = |session, town, peer| Action::SessionJoin { session, town: Some(town), peer: Some(peer) };
+        let busy_unseen = [12; 16];
+        assert!(b.act(busy(busy_unseen, private, None), ui).is_err(), "an unattributed auto-Busy needs a signed Open");
+        assert!(b.act(busy(busy_unseen, private, Some(ana)), ui).is_err(), "a non-member cannot cause auto-Busy in the private town");
+        assert!(b.act(join(busy_unseen, private), ui).is_err(), "an unattributed Join cannot create a pre-sync session");
+        assert!(b.act(from(call, private, ana), ui).is_err(), "a Join without an observed ring must still verify its sender");
+        b.observe_voice_call(Some(call), Some(ana), Some(private));
+        assert_eq!(b.call_town(None), None, "a rejected Join retains its wire town even without an observed ring");
+        assert_eq!(b.transcript_town(call, None, None), None, "the active Join's sender and town also constrain transcript consent");
+        b.observe_voice_call(None, None, None);
         b.observe_share_offer(share, ana, Some(private));
+        assert_eq!(b.session_write_town(share), None, "a conflicting offer blocks writes for the joined share");
         assert_eq!(b.share_offer_town(share), None, "a spoofed share cannot reuse its earlier town pin");
         assert_eq!(b.tweak_town(share), None, "a spoofed offer has no live editing town");
         assert!(b.act(join(share, private), ui).is_err(), "the rejected offer still binds Join verification to its sharer");
@@ -8694,9 +10124,29 @@ pub(crate) mod tests {
         b.observe_share_offer(unseen, ana, Some(private));
         assert!(b.act(join(unseen, private), ui).is_err(), "a first-time spoof has a known sender even without a session pin");
         let foreign_seat = b.seat_in_town(first, &ana).unwrap();
-        assert!(b.act(Action::SessionOpen { session: [3; 16], mode: voice.clone(), to: vec![foreign_seat], town: Some(private) }, ui).is_err(),
+        assert!(b.act(Action::SessionOpen { town_wide: false, session: [3; 16], mode: voice.clone(), to: vec![foreign_seat], town: Some(private) }, ui).is_err(),
             "an explicit local Open cannot address another town's seats");
         assert_eq!(counts(&b), before, "rejected actions append nothing to any of the three towns");
+        b.end_share_offer(share);
+        assert_eq!(b.session_write_town(share), Some(first), "clearing a spoof preserves the original joined town");
+        let left = b.act(leave(share), ui).unwrap();
+        assert!(b.background[&first].log.get(&left).is_some(), "the joined share's Leave reaches the first town");
+
+        let busy_ok = [13; 16];
+        let event = b.act(busy(busy_ok, first, Some(ana)), ui).unwrap();
+        assert!(b.background[&first].log.get(&event).is_some(), "an attributed pre-sync auto-Busy reaches its wire town");
+        assert!(!b.session_towns.contains_key(&busy_ok), "auto-Busy leaves no session pin");
+        let glare_call = [14; 16];
+        let event = b.act(from(glare_call, first, ana), ui).unwrap();
+        assert!(b.background[&first].log.get(&event).is_some(), "an attributed glare Join reaches its wire town without a ring");
+        assert!(b.act(from(glare_call, second, ana), ui).is_err(), "a second Join cannot replace a confident pin");
+        assert!(b.act(busy(glare_call, second, Some(ana)), ui).is_err(), "a Decline cannot contradict the glare Join's pin");
+        let left = b.act(leave(glare_call), ui).unwrap();
+        assert!(b.background[&first].log.get(&left).is_some(), "the glare session leaves its original town");
+        let priv_call = [15; 16];
+        b.act(Action::SessionOpen { town_wide: true, session: priv_call, mode: voice.clone(), to: vec![], town: Some(private) }, ui).unwrap();
+        assert!(b.act(busy(priv_call, private, Some(ana)), ui).is_err(), "a signed Open does not authorize a non-member's Busy");
+        b.act(leave(priv_call), ui).unwrap();
 
         // A surviving member can announce a call opened by another member, even after the opener disconnects.
         let group = [4; 16];
@@ -8706,16 +10156,43 @@ pub(crate) mod tests {
         exchange(&mut a, &mut b);
         b.open_town(second).unwrap();
         b.sync_start(&third.public());
+        b.observe_ring(Some(group), Some(ana), Some(second));
+        b.act(from(group, second, ana), ui).unwrap();
+        b.observe_voice_call(Some(group), Some(ana), Some(second));
+        b.observe_ring(None, None, None);
+        assert_eq!(b.call_town(None), Some(second), "the joined group call belongs to the second town");
+        let drop_offer = [10; 16];
+        let kept_offer = [11; 16];
+        b.observe_share_offer(drop_offer, ana, Some(second));
+        b.observe_share_offer(kept_offer, third.public(), Some(second));
+        assert!(b.act(from(kept_offer, second, ana), ui).is_err(), "another member cannot claim the observed sharer's Join");
         b.end_carrier(ana, true);
+        assert_eq!(b.call_town(None), Some(second), "the joined call survives its initial ringer disconnecting");
+        assert_eq!(b.transcript_town(group, None, None), Some(second), "the joined call keeps its transcript audience after the ringer drops");
+        let stale_ring = [16; 16];
+        b.observe_ring(Some(stale_ring), Some(ana), Some(second));
+        assert_eq!(b.call_town(Some(stale_ring)), None, "a new ring still requires a connected ringer");
+        assert!(!b.share_offer_peers.contains_key(&drop_offer), "carrier loss releases the disconnected peer's offer");
+        assert_eq!(b.share_offer_town(drop_offer), None, "the disconnected peer's offer no longer names a town");
+        assert_eq!(b.share_offer_town(kept_offer), Some(second), "the other peer's offer stays available");
+        b.end_share_offer(kept_offer);
         b.observe_ring(Some(group), Some(third.public()), Some(second));
         assert!(matches!(b.opened_session(group, Some(false), Some(third.public()), Some(second)), OpenedTown::One(town) if town == second),
             "a verified group call accepts another active member's signed Open");
         b.observe_share_offer(shared_screen, third.public(), Some(second));
         assert_eq!(b.share_offer_town(shared_screen), None, "a share's signed opener must match the sharer");
+        let presync_group = [17; 16];
+        b.observe_ring(Some(presync_group), Some(third.public()), Some(second));
+        b.act(from(presync_group, second, third.public()), ui).unwrap();
+        b.observe_voice_call(Some(presync_group), Some(third.public()), Some(second));
+        b.observe_ring(None, None, None);
+        b.end_carrier(third.public(), true);
+        assert_eq!(b.call_town(None), Some(second), "the pre-sync joined town survives its ringer dropping before Open arrives");
     }
 
     #[test]
     fn peer_multiparty_and_linked_town_peers_gate_on_media_caps() {
+        use makepad_town_core::share::hello::MULTIPARTY_CALL_LEVEL;
         let (_homes, mut a, mut b) = shared_town("media-caps");
         let town = a.open_id();
         let peer = b.me();
@@ -8727,15 +10204,25 @@ pub(crate) mod tests {
         a.heard_hello(peer, Hello { media_caps: caps, min_peer: hello.level + 1, ..hello.clone() });
         assert_eq!(a.peer_media_caps(&peer), caps, "raw capabilities are readable even on an incompatible greeting");
         assert!(!a.peer_multiparty(&peer) && a.linked_town_peers(town).is_empty(), "the capability requires a compatible greeting");
-        a.heard_hello(peer, Hello { media_caps: caps, ..hello });
+        a.heard_hello(peer, Hello { media_caps: caps, ..hello.clone() });
         assert!(a.peer_multiparty(&peer), "a compatible peer advertising the bit supports group calls");
         assert_eq!(a.linked_town_peers(town), [peer], "the linked member is eligible in the shared town");
         assert!(a.linked_town_peers([0xff; 32]).is_empty(), "capabilities alone grant no town membership");
+        assert!(!a.peer_multiparty_share(&peer) && a.linked_town_share_peers(town).is_empty(),
+            "voice support alone does not admit a peer to shares");
+        let share_caps = MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1);
+        a.heard_hello(peer, Hello { media_caps: share_caps, min_peer: hello.level + 1, ..hello.clone() });
+        assert!(!a.peer_multiparty_share(&peer) && a.linked_town_share_peers(town).is_empty(),
+            "a share capability on an incompatible greeting cannot admit a peer");
+        a.heard_hello(peer, Hello { media_caps: share_caps, ..hello });
+        assert!(a.peer_multiparty_share(&peer), "a compatible peer can advertise multi-viewer shares");
+        assert_eq!(a.linked_town_share_peers(town), [peer], "the shared town admits its linked share-capable member");
+        assert!(a.linked_town_share_peers([0xff; 32]).is_empty(), "a share-capable peer has no access to a foreign town");
 
         let call = [1; 16];
-        let open = |session, mode| Action::SessionOpen { session, mode, to: vec![], town: None };
+        let open = |session, mode| Action::SessionOpen { town_wide: true, session, mode, to: vec![], town: None };
         a.act(open(call, SessionMode::Call { video: false }), Origin::Ui).unwrap();
-        b.act(Action::SessionJoin { session: call, town: None }, Origin::Ui).unwrap();
+        b.act(Action::SessionJoin { peer: None, session: call, town: None }, Origin::Ui).unwrap();
         b.append(Content::Profile { name: "Ben".into(), colour: 0 }, Origin::Ui).unwrap();
         exchange(&mut a, &mut b);
         a.act(open([2; 16], SessionMode::Share { title: "Drawing".into() }), Origin::Ui).unwrap();
@@ -8747,9 +10234,18 @@ pub(crate) mod tests {
         b.act(leave, Origin::Ui).unwrap();
         exchange(&mut a, &mut b);
         assert_eq!(a.active_town_call(town), None, "a completed call is no longer offered");
+        b.hello = Hello { level: MULTIPARTY_CALL_LEVEL, min_peer: 0, sources: Vec::new(), media_caps: caps };
+        b.update_checks.pending = false;
+        b.set_source_update(None);
+        b.receive_from(a.me(), &Message::Hello(Hello::local(std::iter::empty())).encode()).unwrap();
+        assert!(b.peer_update(&a.me()).is_none() && b.sync_compatible(a.me()), "a voice-only copy can still sync with a share-capable peer");
+        assert!(b.update_checks.pending, "the newer share level requests an update check");
+        assert_eq!(b.home_notice().unwrap().line, REBUILD_NOTICE, "a voice-only copy shows the rebuild notice");
         a.end_carrier(peer, false);
         assert_eq!(a.peer_media_caps(&peer), MediaCaps::NONE, "a dropped carrier has no greeting");
         assert!(a.linked_town_peers(town).is_empty(), "an offline member is ineligible");
+        assert!(!a.peer_multiparty_share(&peer) && a.linked_town_share_peers(town).is_empty(),
+            "ending the carrier also removes share eligibility");
     }
 
     #[test]
@@ -8800,7 +10296,7 @@ pub(crate) mod tests {
         let leave = |session, why| Action::SessionLeave { session, secs: None, why };
         let call_k = [1; 16];
         let len_a = model.open_event_count();
-        let open = model.act(Action::SessionOpen { town: None, session: call_k, mode: call.clone(), to: vec![kit_seat] }, Origin::Ui).unwrap();
+        let open = model.act(Action::SessionOpen { town_wide: false, town: None, session: call_k, mode: call.clone(), to: vec![kit_seat] }, Origin::Ui).unwrap();
         assert!(model.background[&town_k].log.get(&open).is_some());
         assert_eq!(model.open_event_count(), len_a, "calling Kit leaves the open town untouched");
         assert_eq!(model.call_town(None), Some(town_k));
@@ -8814,7 +10310,7 @@ pub(crate) mod tests {
         model.observe_ring(Some(ring_k), Some(kit), None);
         assert_eq!(model.call_town(Some(ring_k)), Some(town_k), "Kit shares exactly one town");
         assert_eq!(model.transcript_town(ring_k, Some(kit), None), Some(town_k));
-        let joined = model.act(Action::SessionJoin { town: None, session: ring_k }, Origin::Ui).unwrap();
+        let joined = model.act(Action::SessionJoin { peer: None, town: None, session: ring_k }, Origin::Ui).unwrap();
         assert!(model.background[&town_k].log.get(&joined).is_some());
         assert_eq!(model.open_event_count(), len_a);
         model.act(leave(ring_k, LeaveWhy::Ended), Origin::Ui).unwrap();
@@ -8827,7 +10323,7 @@ pub(crate) mod tests {
         let kit_open = |model: &mut Model, session, mode| {
             model.in_town(town_k, |town, me| {
                 let to = vec![town.state.seat_of(&me.public()).unwrap()];
-                town.append(&kit_key, Content::Session(SessionOp::Open { session, mode, to }), Origin::Ui)
+                town.append(&kit_key, Content::Session(SessionOp::Open { town_wide: false, session, mode, to }), Origin::Ui)
             }).unwrap();
         };
         let kit_old = [4; 16];
@@ -8837,7 +10333,7 @@ pub(crate) mod tests {
         model.observe_ring(None, None, None);
 
         let share_k = [5; 16];
-        model.act(Action::SessionJoin { town: None, session: share_k }, Origin::Ui).unwrap();
+        model.act(Action::SessionJoin { peer: None, town: None, session: share_k }, Origin::Ui).unwrap();
         assert_eq!(model.share_offer_town(share_k), None, "a peerless Join has no certain town yet");
         kit_open(&mut model, share_k, SessionMode::Share { title: "Fab".into() });
         assert_eq!(model.share_offer_town(share_k), Some(town_k));
@@ -8859,10 +10355,10 @@ pub(crate) mod tests {
         let session = [1; 16];
         let ui = Origin::Ui;
         let seat_b = a.call_seat(&b.me()).unwrap();
-        let ring = |session| Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: vec![seat_b] };
+        let ring = |session| Action::SessionOpen { town_wide: false, town: None, session, mode: SessionMode::Call { video: false }, to: vec![seat_b] };
         let leave = |session, secs| Action::SessionLeave { session, secs, why: LeaveWhy::Ended };
         a.act(ring(session), ui).unwrap();
-        b.act(Action::SessionJoin { town: None, session }, ui).unwrap();
+        b.act(Action::SessionJoin { peer: None, town: None, session }, ui).unwrap();
         let spoken = Action::Said { session, lines: vec![
             SaidLine { at_ms: 63000, dur_ms: 230, text: "Ready to share.".into() },
             SaidLine { at_ms: 1500, dur_ms: 240, text: "Let's check the build.".into() }] };
@@ -8874,13 +10370,15 @@ pub(crate) mod tests {
         for (model, opener) in [(&a, "You"), (&b, "Ada")] {
             let view = Workspace::read_chat(model, false, &LocalClock::default(), &Default::default(),
                 &BTreeSet::from([TranscriptId(town, session)]));
-            let [ChatRow::Member(_), ChatRow::Call(call)] = view.rows.as_slice() else { panic!("the shared call follows admission") };
+            let rows: Vec<_> = view.rows.iter().filter(|r| !matches!(r, ChatRow::Day(_))).collect();
+            let [ChatRow::Member(_), ChatRow::Call(call)] = rows.as_slice() else { panic!("the shared call follows admission") };
             assert_eq!(model.state.sessions.len(), 1, "both devices fold the same session");
             assert_eq!(call.words, format!("{opener} called · 12 min"), "each seat reads the opener's name");
             assert_eq!(call.count, 2, "the disclosure counts both utterances");
             assert_eq!(call.transcript, Some(format!("{opener} · 0:01 · Let's check the build.\n{opener} · 1:03 · Ready to share.")), "expanded transcript follows the session clock");
             let folded = Workspace::read(model, false, &LocalClock::default());
-            assert!(matches!(&folded.rows[..], [ChatRow::Member(_), ChatRow::Call(row)] if row.transcript.is_none()), "transcript starts folded");
+            let rows: Vec<_> = folded.rows.iter().filter(|r| !matches!(r, ChatRow::Day(_))).collect();
+            assert!(matches!(rows.as_slice(), [ChatRow::Member(_), ChatRow::Call(row)] if row.transcript.is_none()), "transcript starts folded");
         }
 
         let media = (3, [8; 32]);
@@ -8906,7 +10404,7 @@ pub(crate) mod tests {
         a.act(ring(interrupted), ui).unwrap();
         // Move the shared town into the background, then let teardown discard the sync engine.
         let own = b.towns.keys().copied().find(|id| *id != town).unwrap();
-        b.act(Action::SessionJoin { town: None, session: disconnected }, ui).unwrap();
+        b.act(Action::SessionJoin { peer: None, town: None, session: disconnected }, ui).unwrap();
         b.open_town(own).unwrap();
         b.sync_stop();
         assert_eq!(b.sync_town(), None, "teardown cleared the sync destination");
@@ -8916,6 +10414,10 @@ pub(crate) mod tests {
         assert!(b.log.get(&dropped).is_some(), "link loss writes the leave in the original town");
         a.act(leave(disconnected, None), ui).unwrap();
 
+        let rejoined = [4; 16];
+        a.act(ring(rejoined), ui).unwrap();
+        a.act(leave(rejoined, None), ui).unwrap();
+        a.act(Action::SessionJoin { peer: None, session: rejoined, town: None }, ui).unwrap();
         drop(a);
         for _ in 0..2 {
             let (reopened, notes) = Model::open(&homes.0.join("a")).unwrap();
@@ -8926,6 +10428,14 @@ pub(crate) mod tests {
                     _ => None,
                 }).collect();
             assert_eq!(departures, [(None, LeaveWhy::Dropped)], "restart closes the interrupted call exactly once");
+            let after_rejoin: Vec<_> = reopened.log.events().iter().filter_map(|event| {
+                match Content::decode(event.header.kind, event.header.kind_version, event.content()?) {
+                    Some(Content::Session(SessionOp::Leave { session, secs, why })) if session == rejoined => Some((secs, why)),
+                    _ => None,
+                }
+            }).collect();
+            assert_eq!(after_rejoin, [(None, LeaveWhy::Ended), (None, LeaveWhy::Dropped)],
+                "restart closes the rejoined call once and preserves the original departure");
         }
     }
 
@@ -8988,7 +10498,7 @@ pub(crate) mod tests {
             assert!(view(model).projects.iter().any(|p| p.id == project), "ordinary undo restores the same project");
         }
         for kind in [kind::TASK, kind::DOC, kind::BOARD, kind::STICKY] {
-            let child = me.append(Content::Entity { kind: Key::Number(kind), derive: None, project: Some(project), fields: vec![] },
+            let child = me.append(Content::Entity { copied_from: vec![], kind: Key::Number(kind), derive: None, project: Some(project), fields: vec![] },
                 Origin::Ui).unwrap();
             assert_eq!(view(&me).removable, None, "a live child of kind {kind} hides Remove");
             let n = me.log.events().len();
@@ -9140,7 +10650,7 @@ pub(crate) mod tests {
         assert!(!ana.update_checks.pending, "further unknown records leave the upstream check quiet");
         let workspace = Workspace::read(&ana, false, &LocalClock::default());
         let lines: Vec<_> = workspace.rows.iter().filter_map(|row| match row {
-            ChatRow::Message(m) => Some(m.text.as_str()), ChatRow::Member(text) => Some(text.as_str()), _ => None,
+            ChatRow::Message(m) => Some(m.text.as_str()), ChatRow::Member(notice) => Some(notice.text.as_str()), _ => None,
         }).skip_while(|line| *line != "First").collect();
         assert_eq!(lines, ["First", "A newer Makepad Town wrote something here.", "Second",
             "A newer Makepad Town wrote 2 things here.", "Third"], "unknown runs keep causal position and a skipped tag leaves its chat row intact");
@@ -9218,7 +10728,7 @@ pub(crate) mod tests {
 
     #[test]
     fn v15_joiner_receives_hello_before_the_first_offer() {
-        use makepad_town_core::share::hello::{LEVEL, MIN_PEER};
+        use makepad_town_core::share::hello::{LEVEL, MIN_PEER, TAG_MEDIA_CAPS};
         let homes = ShareHomes::new("v15-hello");
         let (mut ana, mut ben) = homes.pair();
         let (a, b, town) = (ana.me(), ben.me(), ana.open_id());
@@ -9231,7 +10741,7 @@ pub(crate) mod tests {
         prefix.extend(LEVEL.to_le_bytes());
         prefix.extend(MIN_PEER.to_le_bytes());
         let mut empty = prefix.clone();
-        empty.extend([1, 1, 0, 0]);
+        empty.extend([1, 1, 0, 0, TAG_MEDIA_CAPS, 4, 0, 96, 0, 0, 0]);
         assert_eq!(Message::Hello(Hello::local(std::iter::empty())).encode(), empty, "the frozen prefix and empty SOURCES have their literal layout");
 
         ana.offer_town(false).unwrap();
@@ -9398,11 +10908,13 @@ pub(crate) mod tests {
         assert_eq!(a.pair_problem(town), None, "two active devices can invite another");
         assert_eq!(a.pair_problem([7; 32]).as_deref(), Some("This town is unavailable."));
         a.remove_device(b.me(), false).unwrap();
-        a.pair(PairSide::Add(town, AddComputer::SomeoneElse), words.clone(), 4).unwrap();
         let before = history(&a);
-        assert_eq!(a.link_proved(&b.me(), 3, "Second", Some(&words)).unwrap_err(), THAT_CANNOT_REJOIN);
-        assert_eq!(history(&a), before, "spent keys get no new grant");
-        assert!(a.pairing_since().is_none() && a.sync_outgoing().is_empty());
+        for choice in [AddComputer::SomeoneElse, AddComputer::Mine] {
+            a.pair(PairSide::Add(town, choice), words.clone(), 4).unwrap();
+            assert_eq!(a.link_proved(&b.me(), 3, "Ben", Some(&words)).unwrap_err(), THAT_CANNOT_REJOIN);
+            assert_eq!(history(&a), before, "spent keys get no new grant");
+            assert!(a.pairing_since().is_none() && a.sync_outgoing().is_empty());
+        }
     }
 
     #[test]
@@ -9546,7 +11058,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unknown_towns_uninvited_devices_and_paused_devices_get_the_same_silence() {
+    fn unknown_towns_uninvited_devices_and_blocked_devices_get_the_same_silence() {
         let (_homes, mut a, b) = shared_town("silent");
         let town = a.open_id();
         let ask = |town| Message::Heads { town, heads: &[] }.encode();
@@ -9568,14 +11080,15 @@ pub(crate) mod tests {
         silence(&mut a, stranger, &Message::Events { town, records: &[] }.encode());
 
         a.sync_start(&b.me());
-        a.set_paused(&b.me(), true).unwrap(); // The opening HEADS is still pending.
+        a.peers.as_mut().unwrap().set_state(&b.me(), DeviceState::Blocked).unwrap();
+        a.end_carrier(b.me(), false);
         a.sync_start(&b.me());
         for msg in [Message::Heads { town, heads: &[] }, Message::Events { town, records: &[] },
             Message::Offer { town, offer: Offer::New }, Message::Answer { town, yes: true },
             Message::Cancel { town }, Message::Join { town, genesis: a.log.genesis().clone() }] {
             silence(&mut a, b.me(), &msg.encode());
         }
-        assert_eq!(a.share_state(), ShareState::Idle, "a paused device cannot open a share prompt");
+        assert_eq!(a.share_state(), ShareState::Idle, "a blocked device cannot open a share prompt");
     }
 
     #[test]
@@ -9586,12 +11099,14 @@ pub(crate) mod tests {
             for bytes in messages { to.sync_receive(&bytes).unwrap(); }
         }
 
-        fn closed(model: &mut Model, town: TownId, peer: PublicKey, proof: &[u8]) {
+        fn closed(model: &mut Model, town: TownId, peer: PublicKey, end: Id, proof: &[u8]) {
             assert!(model.engines.is_empty(), "closure detached the town from the link");
             assert_eq!(model.alone_with(), Some(Alone { peer, why: AloneReason::Ended }),
                 "the local town remembers the removal on either side of the link");
             assert_eq!(model.share_state(), ShareState::Idle);
-            assert_eq!(model.home.closed_finals().unwrap(), [(town, peer)].into_iter().collect());
+            assert_eq!(model.home.closed_finals().unwrap(), BTreeMap::from([
+                ((town, peer), BTreeSet::from([FinalClosure::Removal(end)])),
+            ]), "the home records exactly the removal that ended this exchange");
             for bytes in [proof, &Message::Heads { town, heads: &[] }.encode(),
                 &Message::Offer { town, offer: Offer::New }.encode()] {
                 assert!(!model.sync_receive(bytes).unwrap());
@@ -9663,17 +11178,17 @@ pub(crate) mod tests {
                     assert_eq!(learner.read_only_line().as_deref(), Some("Ada stopped sharing this town. What reached you stays here; new changes don't. This device can't rejoin this town."));
                 }
                 for (model, peer) in [(source, learner_key), (learner, source_key)] {
-                    closed(model, town, peer, &proof);
+                    closed(model, town, peer, end.id, &proof);
                     model.sync_start(&peer);
                     assert!(model.sync_outgoing().is_empty(), "reconnect advertises no heads for the town");
-                    closed(model, town, peer, &proof);
+                    closed(model, town, peer, end.id, &proof);
                 }
                 drop((a, b));
                 let (mut a, mut b) = homes.pair();
                 let (ka, kb) = (a.me(), b.me());
                 for (model, peer) in [(&mut a, kb), (&mut b, ka)] {
                     assert!(model.sync_outgoing().is_empty(), "the reopened home advertises no heads");
-                    closed(model, town, peer, &proof);
+                    closed(model, town, peer, end.id, &proof);
                 }
             }
         }
@@ -9736,7 +11251,8 @@ pub(crate) mod tests {
             let mut reply = source.sync_outgoing();
             assert_eq!(reply.pop(), Some(Message::HeadsDone { town, heads: &[end] }.encode()), "the bounded reply ends at the removal");
             assert!(source.engines.is_empty(), "queuing the complete reply closes before transport delivery");
-            assert!(source.home.closed_finals().unwrap().contains(&(town, peer)), "the sender recorded closure without peer evidence");
+            assert_eq!(source.home.closed_finals().unwrap().get(&(town, peer)), Some(&BTreeSet::from([FinalClosure::Removal(end)])),
+                "the sender recorded the exact removal without peer evidence");
             assert!(reply.len() >= 2, "the missing prefix required multiple batches");
             let mut delivered = Vec::new();
             for bytes in reply {
@@ -9762,6 +11278,275 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_final_closure_reopens_on_fork_reinstatement_handles_me_reinstated_re_removal_and_earlier_boundary() {
+        use std::io::Write;
+
+        fn invite(model: &mut Model, signer: &DeviceKey, guest: &DeviceKey) -> (Id, Id) {
+            model.in_town(model.open_id(), |town, _| {
+                let entry = town.append(signer, Content::Member(Member::Invite { subject: guest.public(), role: 0 }), Origin::Ui)?;
+                let accept = town.append(guest, Content::Member(Member::Accept { entry }), Origin::Ui)?;
+                Ok((entry, accept))
+            }).unwrap()
+        }
+
+        fn copy_town(from: &Model, to: &mut Model) {
+            let mut log = Log::found(&to.home.town_log_path(&from.open_id()), from.log.genesis().clone()).unwrap();
+            log.append_all(from.log.events()[1..].to_vec()).unwrap();
+            to.install_open(Town::load(&to.home, log));
+        }
+
+        fn send(from: &mut Model, to: &mut Model) -> bool {
+            let mut sent = false;
+            while let Some(bytes) = from.pull_sync(to.me()) {
+                to.receive_from(from.me(), &bytes).unwrap();
+                sent = true;
+            }
+            sent
+        }
+
+        fn settle(a: &mut Model, b: &mut Model) {
+            loop {
+                let sent = send(a, b);
+                if !send(b, a) && !sent { return }
+            }
+        }
+
+        fn link(a: &mut Model, b: &mut Model) {
+            a.sync_start(&b.me());
+            b.sync_start(&a.me());
+            settle(a, b);
+        }
+
+        fn silent(model: &mut Model, town: TownId, peer: PublicKey, property: &str) {
+            assert!(model.final_closed(town, &peer), "{property}: the recorded proof still bounds this pair");
+            for probe in [Message::Heads { town, heads: &[] }, Message::Events { town, records: &[] },
+                Message::Offer { town, offer: Offer::New }] {
+                assert!(!model.receive_from(peer, &probe.encode()).unwrap(), "{property}: a closed town ignores the probe");
+                assert!(model.pull_sync(peer).is_none(), "{property}: a closed town answers with zero bytes");
+            }
+        }
+
+        // These small histories fit one Events frame. Compare the entire reply to the signed
+        // record saved at the boundary, including the frontier on both sides of that frame.
+        fn bounded_reply(model: &mut Model, peer: PublicKey, known: &[Id], tips: &[Id], record: &[u8], property: &str) {
+            let town = model.open_id();
+            model.sync_start(&peer);
+            model.receive_from(peer, &Message::Heads { town, heads: known }.encode()).unwrap();
+            let bytes: Vec<_> = std::iter::from_fn(|| model.pull_sync(peer)).collect();
+            assert_eq!(bytes, [
+                Message::Heads { town, heads: tips }.encode(),
+                Message::Events { town, records: record }.encode(),
+                Message::HeadsDone { town, heads: tips }.encode(),
+            ], "{property}: exactly one bounded reply contains only the missing record and the cut's heads");
+            silent(model, town, peer, property);
+        }
+
+        fn log_len(model: &Model) -> usize {
+            std::fs::metadata(model.home.town_log_path(&model.open_id())).unwrap().len() as usize
+        }
+
+        fn tail(model: &Model, from: usize) -> Vec<u8> {
+            std::fs::read(model.home.town_log_path(&model.open_id())).unwrap()[from..].to_vec()
+        }
+
+        fn branch(model: &Model, key: &DeviceKey, parent: Id, text: &str) -> Event {
+            model.sign(key, Content::Chat(Chat { text: text.into(), ..Chat::default() }), Origin::Ui, vec![parent]).unwrap()
+        }
+
+        let homes = ShareHomes::new("scoped-reinstatement");
+        let [mut ana, mut ben, mut kit, mut eve] = ["ana", "ben", "kit", "eve"]
+            .map(|name| Model::open(&homes.0.join(name)).unwrap().0);
+        let (t, t2) = (ana.open_id(), ben.open_id());
+        let (ana_key, ben_key, eve_key, kit_key) = (ana.me(), ben.me(), eve.me(), kit.me());
+        let ana_signer = ana.device_key();
+        let ben_signer = ben.device_key();
+        let (kit_seat, kit_accept) = invite(&mut ana, &ana_signer, &kit.key);
+        invite(&mut ana, &ana_signer, &eve.key);
+        let (invite_ben, _) = invite(&mut ana, &eve.key, &ben.key);
+        invite(&mut ben, &ben_signer, &ana_signer);
+        copy_town(&ben, &mut ana);
+        ana.open_town(t).unwrap();
+        for other in [&mut ben, &mut kit, &mut eve] { copy_town(&ana, other); }
+        for (model, name, peer) in [
+            (&mut ana, "Ben", ben_key), (&mut ben, "Ana", ana_key),
+        ] { model.pin_linked(&peer, 3, name).unwrap(); }
+        ana.pin_linked(&kit_key, 3, "Kit").unwrap();
+        ben.pin_linked(&kit_key, 3, "Kit").unwrap();
+        kit.pin_linked(&ana_key, 3, "Ana").unwrap();
+        kit.pin_linked(&ben_key, 3, "Ben").unwrap();
+        ben.pin_linked(&eve_key, 3, "Eve").unwrap();
+        eve.pin_linked(&ben_key, 3, "Ben").unwrap();
+        link(&mut ana, &mut ben);
+        link(&mut kit, &mut ana);
+        link(&mut kit, &mut ben);
+        link(&mut eve, &mut ben);
+
+        // Properties 1 and 2. Kit has the common history and keeps both links open
+        // without receiving R1. Ben and Ana each learn the fork through Kit.
+        eve.remove_device(ben_key, false).unwrap();
+        let removal = eve.log.events().last().unwrap().clone();
+        let r1 = removal.id;
+        ana.in_town(t, |town, _| town.append_signed(removal)).unwrap();
+        settle(&mut ana, &mut ben);
+        settle(&mut eve, &mut ben);
+        let first = BTreeSet::from([FinalClosure::Removal(r1)]);
+        for (model, peer) in [(&mut ana, ben_key), (&mut ben, ana_key)] {
+            assert_eq!(model.home.closed_finals().unwrap().get(&(t, peer)), Some(&first),
+                "reinstatement starts with R1 recorded on both homes");
+            assert!(!model.engines.contains_key(&(peer, t)) && model.engines.contains_key(&(peer, t2)),
+                "closing T detaches only T and keeps the live T2 carrier");
+            silent(model, t, peer, "closed removal before reinstatement");
+        }
+        assert_eq!(ben.home.closed_finals().unwrap().get(&(t, eve_key)), Some(&first),
+            "Ben also closed the remover's own link on R1");
+        assert!(kit.log.get(&r1).is_none(), "the third member can deliver the sibling before learning R1");
+        let e_fork = branch(&kit, &eve.key, invite_ben, "Eve's other copy");
+        let e2 = e_fork.id;
+        let before_fork = log_len(&kit);
+        kit.in_town(t, |town, _| town.append_signed(e_fork)).unwrap();
+        let fork_record = tail(&kit, before_fork);
+        let revision = ana.wanted_revision();
+        send(&mut kit, &mut ana);
+        send(&mut kit, &mut ben);
+        assert_ne!(ana.wanted_revision(), revision, "learning the fork refreshes Ana's carrier snapshot");
+        for (model, peer) in [(&ana, ben_key), (&ben, ana_key)] {
+            assert!(model.state.active_member(&ben_key) && !model.final_closed(t, &peer),
+                "the voided removal reopens the pair for both the reinstated peer and the reinstated local device");
+            assert!(model.wanted().1.contains(&(peer, t)) && model.engines.contains_key(&(peer, t)),
+                "reinstatement wants T and automatically reattaches its engine on the live carrier");
+            assert_eq!(model.state_for(peer), ShareState::Shared(t), "the reopened T session is shared");
+            assert_eq!(model.home.closed_finals().unwrap().get(&(t, peer)), Some(&first),
+                "reopening preserves the historical removal in the journal");
+        }
+        settle(&mut ana, &mut ben);
+        let from_ana = post(&mut ana, "Ben is back", false).unwrap();
+        let from_ben = post(&mut ben, "I can write again", false).unwrap();
+        settle(&mut ben, &mut ana);
+        assert!(ben.state.message(&from_ana).is_some() && ana.state.message(&from_ben).is_some(),
+            "both homes fold new chat delivered over the reopened T engine");
+
+        // Property 4. Eve's fork replaced her removal as Ben's boundary with Eve.
+        // His chat above was written after e2. Probe as the copy of Eve that has only R1.
+        assert!(ben.state.active_member(&ben_key) && ben.state.forked(&eve_key).is_some() && !ben.final_closed(t, &eve_key),
+            "Ben is reinstated and the old R1 closure permits the exchange for Eve's two siblings");
+        let mut tips = [r1, e2];
+        tips.sort();
+        bounded_reply(&mut ben, eve_key, &[r1], &tips, &fork_record, "remover's fork");
+        assert_eq!(ben.home.closed_finals().unwrap().get(&(t, eve_key)),
+            Some(&BTreeSet::from([FinalClosure::Removal(r1), FinalClosure::fork(r1, e2).unwrap()])),
+            "Ben retains both Eve's voided removal and the completed fork exchange");
+
+        ana.open_town(t2).unwrap();
+        drop(ana);
+        let mut ana = Model::open(&homes.0.join("ana")).unwrap().0;
+        assert!(ana.open_id() == t2 && ana.loaded_town(t).is_none(), "after restart T2 is open and T is unloaded");
+        assert!(!ana.final_closed(t, &ben_key) && ana.wanted().1.contains(&(ben_key, t)),
+            "the unloaded town summary wants the reinstated peer despite the journaled R1");
+        assert!(ana.open_id() == t2 && ana.loaded_town(t).is_none(), "reading wanted leaves T unloaded and T2 open");
+        ana.open_town(t).unwrap();
+        link(&mut ana, &mut ben);
+
+        // Property 3. The peer receives a fresh exchange for R2, once.
+        ana.remove_device(ben_key, false).unwrap();
+        let r2 = ana.log.events().last().unwrap().id;
+        assert!(!ana.final_closed(t, &ben_key), "the old R1 closure allows a fresh R2 exchange");
+        let after_r2 = post(&mut ana, "after the second removal", false).unwrap();
+        settle(&mut ana, &mut ben);
+        assert!(ben.log.get(&r2).is_some() && ben.log.get(&after_r2).is_none(), "Ben receives R2 and no post-R2 chat");
+        for (model, peer) in [(&mut ana, ben_key), (&mut ben, ana_key)] {
+            assert_eq!(model.home.closed_finals().unwrap().get(&(t, peer)),
+                Some(&BTreeSet::from([FinalClosure::Removal(r1), FinalClosure::Removal(r2)])),
+                "the fresh exchange appends R2 alongside R1 on both homes");
+            silent(model, t, peer, "re-removal");
+        }
+
+        // Property 5. An additional sibling and a later removal leave the first fork proof in force.
+        let [c1, c2, c3] = ["first", "second", "third"].map(|text| branch(&ana, &kit.key, kit_accept, text));
+        let expected = FinalClosure::fork(c1.id, c2.id).unwrap();
+        ana.in_town(t, |town, _| town.append_signed(c1)).unwrap();
+        let known = ana.log.heads();
+        let before_c2 = log_len(&ana);
+        ana.in_town(t, |town, _| town.append_signed(c2)).unwrap();
+        let c2_record = tail(&ana, before_c2);
+        let tips = ana.log.heads();
+        bounded_reply(&mut ana, kit_key, &known, &tips, &c2_record, "initial Kit fork");
+        ana.in_town(t, |town, _| town.append_signed(c3)).unwrap();
+        ana.append(Content::Member(Member::Remove { seat: kit_seat, device: kit_key, last: kit_accept }), Origin::Ui).unwrap();
+        assert!(ana.final_closed(t, &kit_key), "a third sibling and later removal preserve the fork closure");
+        drop(ana);
+        let mut ana = Model::open(&homes.0.join("ana")).unwrap().0;
+        ana.sync_start(&kit_key);
+        assert_eq!(ana.home.closed_finals().unwrap().get(&(t, kit_key)), Some(&BTreeSet::from([expected])),
+            "only Kit's original sibling pair is recorded across restart");
+        silent(&mut ana, t, kit_key, "permanent fork after restart");
+
+        // Property 6. Arrival order puts R1 first, while canonical height puts Kit's
+        // removal of Eve first. Forking Kit reverses that decision after R2 closed.
+        let earlier = ShareHomes::new("scoped-earlier");
+        let mut ana = Model::open(&earlier.0.join("ana")).unwrap().0;
+        let mut ben = Model::open(&earlier.0.join("ben")).unwrap().0;
+        let ana_signer = ana.device_key();
+        let clean = Model::found_town(&ana.home, Model::new_genesis(&ana_signer).unwrap()).unwrap();
+        ana.install_open(clean);
+        let (t, ana_key, ben_key) = (ana.open_id(), ana.me(), ben.me());
+        invite(&mut ana, &ana_signer, &kit.key);
+        let (i_eve, _) = invite(&mut ana, &kit.key, &eve.key);
+        let (i_ben, a_ben) = invite(&mut ana, &eve.key, &ben.key);
+        copy_town(&ana, &mut ben);
+        let k_fork = branch(&ana, &kit.key, i_eve, "Kit's other copy");
+        let before_r1 = log_len(&ana);
+        let r1 = ana.sign(&eve.key, Content::Member(Member::Remove { seat: i_ben, device: ben_key, last: a_ben }),
+            Origin::Ui, vec![i_ben, a_ben]).unwrap();
+        let r1 = ana.in_town(t, |town, _| town.append_signed(r1)).unwrap();
+        let r1_record = tail(&ana, before_r1);
+        let p1 = ana.log.position(&r1).unwrap();
+        assert_eq!(ana.towns[&t].final_boundary(&ana_key, &ben_key), Some(FinalClosure::Removal(r1)),
+            "R1 is initially counted at the earlier arrival index");
+        let r_eve = ana.sign(&kit.key, Content::Member(Member::Remove { seat: i_eve, device: eve_key, last: i_ben }),
+            Origin::Ui, vec![i_eve, i_ben]).unwrap();
+        let r_eve = ana.in_town(t, |town, _| town.append_signed(r_eve)).unwrap();
+        assert_eq!((ana.state.order_of(&r_eve).unwrap().0, ana.state.order_of(&r1).unwrap().0), (6, 7),
+            "Kit's later-arriving removal of Eve precedes R1 in canonical order");
+        assert!(ana.state.active_member(&ben_key) && ana.towns[&t].final_boundary(&ana_key, &ben_key).is_none(),
+            "Kit's cutoff preserves Ben's seat and voids R1");
+        post(&mut ana, "after p1", false).unwrap();
+        ana.remove_device(ben_key, false).unwrap();
+        let r2 = ana.log.events().last().unwrap().id;
+        assert!(ana.log.position(&r2).unwrap() > p1, "R2 first ends the exchange at the later arrival index");
+        link(&mut ana, &mut ben);
+        for (model, peer) in [(&ana, ben_key), (&ben, ana_key)] {
+            assert_eq!(model.home.closed_finals().unwrap().get(&(t, peer)), Some(&BTreeSet::from([FinalClosure::Removal(r2)])),
+                "both homes initially close on R2 alone");
+        }
+        ana.in_town(t, |town, _| town.append_signed(k_fork)).unwrap();
+        let current = ana.state.final_boundary(&ana.log, &ana_key, &ben_key).unwrap();
+        assert_eq!((current.at, current.closure()), (p1, Some(FinalClosure::Removal(r1))),
+            "Kit's fork voids his removal of Eve and moves the boundary back to R1");
+        assert!(!ana.final_closed(t, &ben_key), "the earlier R1 boundary allows one tighter exchange");
+        bounded_reply(&mut ana, ben_key, &[a_ben], &[r1], &r1_record, "earlier boundary");
+        assert_eq!(ana.home.closed_finals().unwrap().get(&(t, ben_key)),
+            Some(&BTreeSet::from([FinalClosure::Removal(r2), FinalClosure::Removal(r1)])),
+            "the tighter reply closes R1 and keeps R2");
+
+        // Property 7. Insert a legacy line only after the owner has closed its journal.
+        let (_legacy_homes, nodes) = group_town("scoped-legacy", 2);
+        let [ana, mut ben]: [Model; 2] = nodes.try_into().ok().unwrap();
+        let (t, path, ana_key, ben_key) = (ana.open_id(), ana.home.dir.clone(), ana.me(), ben.me());
+        drop(ana);
+        let mut journal = std::fs::OpenOptions::new().append(true).create(true).open(path.join("local/home")).unwrap();
+        writeln!(journal, "final exchange closed {} {}", hex(&t), hex(&ben_key)).unwrap();
+        drop(journal);
+        let (mut ana, problems) = Model::open(&path).unwrap();
+        assert!(problems.is_empty() && ana.home.closed_finals().unwrap().is_empty(),
+            "a legacy id-less line opens without a problem or a closure");
+        link(&mut ana, &mut ben);
+        let line = post(&mut ben, "hello again", false).unwrap();
+        send(&mut ben, &mut ana);
+        assert!(ana.state_for(ben_key) == ShareState::Shared(t) && ben.state_for(ana_key) == ShareState::Shared(t)
+            && ana.state.message(&line).is_some(), "an id-less legacy closure allows the pair to sync new chat");
+    }
+
+    #[test]
     fn fork_final_exchange_refreshes_admits_start_forks_and_waits_for_both_siblings() {
         use makepad_town_core::fold::ForkPoint;
 
@@ -9779,9 +11564,10 @@ pub(crate) mod tests {
             send(a, b);
         }
 
-        fn closed(model: &mut Model, peer: PublicKey, property: &str) {
+        fn closed(model: &mut Model, peer: PublicKey, expected: FinalClosure, property: &str) {
             let town = model.open_id();
-            assert!(model.home.closed_finals().unwrap().contains(&(town, peer)), "{property}: the home records closure");
+            assert_eq!(model.home.closed_finals().unwrap().get(&(town, peer)), Some(&BTreeSet::from([expected])),
+                "{property}: the home records the two fork siblings");
             let probe = Message::Heads { town, heads: &[] }.encode();
             for reconnect in [false, true] {
                 if reconnect { model.sync_start(&peer); }
@@ -9833,8 +11619,9 @@ pub(crate) mod tests {
             send(ben, ana);
             assert!(ben.log.get(&right).is_some() && ben.state.forked(&ben_key).is_some(), "{property}: Ben receives and folds the other chat");
             assert!(ben.log.get(&after).is_none(), "{property}: the post after the fork never crosses to Ben");
-            closed(ana, ben_key, property);
-            closed(ben, ana_key, property);
+            let expected = FinalClosure::fork(left, right).unwrap();
+            closed(ana, ben_key, expected, property);
+            closed(ben, ana_key, expected, property);
         }
 
         // Capture the actual log record to compare the complete Events frame, including any duplicates.
@@ -9907,14 +11694,15 @@ pub(crate) mod tests {
                 assert!(ana.pull_sync(ben_key).is_none(),
                     "{property}: draining the live queue after HeadsDone withholds the post-fork write");
             }
-            assert!(ana.home.closed_finals().unwrap().contains(&(town, ben_key)),
+            let expected = FinalClosure::fork(first, second).unwrap();
+            assert_eq!(ana.home.closed_finals().unwrap().get(&(town, ben_key)), Some(&BTreeSet::from([expected])),
                 "{property}: queuing the complete reply closes Ana's home");
             ben2.receive_from(ana_key, &done).unwrap();
             send(&mut ben2, &mut ana);
             assert_eq!(ben2.state.forked(&ben_key), Some(expected_fork), "{property}: Ben folds both siblings at their common predecessor");
             assert!(ben2.log.get(&after).is_none(), "{property}: Ben never receives the later post");
-            closed(&mut ana, ben_key, property);
-            closed(&mut ben2, ana_key, property);
+            closed(&mut ana, ben_key, expected, property);
+            closed(&mut ben2, ana_key, expected, property);
             if start_fork {
                 assert_eq!(ben2.read_only_line().as_deref(), Some("This computer's history split. This town is read-only here."),
                     "{property}: Ben's read-only line identifies the start fork");
@@ -10226,6 +12014,156 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn active_members_pairing_relinks_or_reports_seat_mismatch() {
+        use crate::link_worker::{pair_workers, ConnectView, FromWorker, Progress};
+        use crate::view::{LocalClock, Presence, TownMembers, Workspace};
+        use makepad_town_core::link::VERSION;
+
+        fn prove(model: &mut Model, side: PairSide, peer: &Model, name: &str, words: &PairWords) -> Result<(), String> {
+            model.pair(side, words.clone(), 1).unwrap();
+            model.link_proved(&peer.me(), VERSION, name, Some(words))
+        }
+
+        fn relink(a: &mut Model, b: &mut Model, side: PairSide, private: Option<TownId>) {
+            let town = a.open_id();
+            let before = (a.open_event_count(), b.open_event_count());
+            assert_eq!(b.open_id(), town);
+            a.sync_stop();
+            b.sync_stop();
+            if let Some(id) = private { b.open_town(id).unwrap(); }
+            let progress = Arc::new(Progress::default());
+            let [(wa, words_a), (wb, words_b)] = pair_workers(a.device_key(), b.device_key(), progress.clone());
+            assert!(wa.try_send(a.pair(side, words_a, 1).unwrap()).is_ok());
+            assert!(wb.try_send(b.pair(PairSide::Join, words_b, 1).unwrap()).is_ok());
+            let (ana, peer) = (a.me(), b.me());
+            let mut adding = ConnectView { side: Some(side), first_contact: true, ..Default::default() };
+            let mut joining = ConnectView { side: Some(PairSide::Join), first_contact: true, ..Default::default() };
+            for (model, worker, view, side, expected) in [
+                (&mut *a, &wa, &mut adding, side, peer), (&mut *b, &wb, &mut joining, PairSide::Join, ana),
+            ] {
+                'proof: loop {
+                    let seen = progress.said();
+                    while let Some(event) = worker.try_recv() {
+                        view.apply(&event);
+                        match event {
+                            FromWorker::Linked { peer_device, version, peer_name, contact, .. } => {
+                                assert_eq!(peer_device, expected);
+                                model.link_proved(&peer_device, version, &peer_name, contact.as_ref()).unwrap();
+                                assert!(!view.shows_pairing(side), "the proved link closes the pairing form");
+                                assert_eq!(model.state_for(peer_device), ShareState::Shared(town));
+                                assert_eq!(model.open_id(), town, "the shared town opens before sync");
+                                break 'proof
+                            }
+                            FromWorker::Failed(why) => panic!("pairing failed: {why}"),
+                            _ => {}
+                        }
+                    }
+                    progress.wait_past(seen);
+                }
+            }
+            exchange(a, b);
+            assert_eq!((a.open_event_count(), b.open_event_count()), before, "relinking appends no events");
+            for (model, other, view) in [(&*a, peer, &adding), (&*b, ana, &joining)] {
+                assert_eq!(model.pairing_since(), None, "opening sync consumes Join");
+                assert!(model.synced_with(&other));
+                let members = TownMembers::read(model, view, &Workspace::default(), &LocalClock::default(), 0);
+                let device = members.seats.iter().flat_map(|s| &s.devices).find(|d| d.key == other).unwrap();
+                assert_eq!((device.presence, device.status.as_str()), (Presence::Here, "here"));
+            }
+            let from_a = post(a, "Hello from Ana", false).unwrap();
+            let from_b = post(b, "Hello back", false).unwrap();
+            exchange(a, b);
+            assert!(b.event(&from_a).is_some() && a.event(&from_b).is_some(), "chat crosses the relink both ways");
+        }
+
+        let homes = ShareHomes::new("active-relink");
+        let home = |name: &str| {
+            let model = Model::open(&homes.0.join(name)).unwrap().0;
+            model.home.set_computer_label(name).unwrap();
+            model
+        };
+        let (mut a, mut b) = (home("Ana"), home("Ben"));
+        let (town, ben_own) = (a.open_id(), b.open_id());
+        let words_a = words();
+        let words_b = PairWords { own: words_a.peer.clone(), peer: words_a.own.clone() };
+        let add = PairSide::Add(town, AddComputer::SomeoneElse);
+        let mine = PairSide::Add(town, AddComputer::Mine);
+        prove(&mut a, add, &b, "Ben", &words_a).unwrap();
+        prove(&mut b, PairSide::Join, &a, "Ana", &words_b).unwrap();
+        exchange(&mut a, &mut b);
+        let ana_seat = a.state.seat_of(&a.me()).unwrap();
+        assert_ne!(a.state.seat_of(&b.me()).unwrap(), ana_seat);
+
+        // A and E share the same starting town. Exercise both before adding a second common town.
+        for side in [add, PairSide::Join] {
+            relink(&mut a, &mut b, side, Some(ben_own));
+            let follow_up = Message::Offer { town: [7; 32], offer: Offer::New }.encode();
+            b.receive_from(a.me(), &follow_up).unwrap();
+            let prompt = b.offer_prompt().expect("a later offer needs fresh consent");
+            assert_eq!((prompt.peer, prompt.town), (a.me(), [7; 32]));
+            assert!(b.sync_outgoing().is_empty());
+            assert!(b.answer_prompt(prompt, false));
+            assert!(b.offer_prompt().is_none());
+        }
+
+        // B: either Add choice relinks a computer already on Ana's seat.
+        a.sync_stop();
+        b.sync_stop();
+        let mut mira = home("Mira");
+        prove(&mut a, mine, &mira, "Mira", &words_a).unwrap();
+        prove(&mut mira, PairSide::Join, &a, "Ana", &words_b).unwrap();
+        exchange(&mut a, &mut mira);
+        assert_eq!(a.state.seat_of(&mira.me()), Some(ana_seat));
+        for side in [mine, add] { relink(&mut a, &mut mira, side, None); }
+        a.sync_stop();
+        mira.sync_stop();
+
+        // C: Mine cannot move Ben onto Ana's seat.
+        let before = history(&a);
+        let err = prove(&mut a, mine, &b, "Ben", &words_a).unwrap_err();
+        assert_eq!(err, ALREADY_IN_TOWN);
+        assert_eq!(crate::pair_failure(&err), ALREADY_IN_TOWN);
+        assert!(a.pairing_since().is_none() && !a.linked_with(&b.me()) && a.sync_outgoing().is_empty());
+        for grant in [Member::Invite { subject: b.me(), role: 0 }, Member::AddDevice { seat: ana_seat, device: b.me() }] {
+            assert_eq!(a.append(Content::Member(grant), Origin::Ui).unwrap_err(), ALREADY_IN_TOWN);
+        }
+        assert_eq!(history(&a), before, "neither the proof nor a direct grant changes history");
+        prove(&mut b, PairSide::Join, &a, "Ana", &words_b).unwrap();
+        assert_eq!(b.state_for(a.me()), ShareState::Shared(town));
+
+        // D: the offer for a second town arrives before the shared town's opening heads.
+        a.sync_stop();
+        b.sync_stop();
+        let second = Model::found_town(&a.home, Model::new_genesis(&a.key).unwrap()).unwrap();
+        a.install_open(second);
+        let second = a.open_id();
+        prove(&mut a, PairSide::Add(second, AddComputer::SomeoneElse), &b, "Ben", &words_a).unwrap();
+        prove(&mut b, PairSide::Join, &a, "Ana", &words_b).unwrap();
+        exchange(&mut a, &mut b);
+        assert_eq!(b.open_id(), second);
+        assert!(b.offer_prompt().is_none() && b.state.active_member(&b.me()));
+        for (model, peer) in [(&a, b.me()), (&b, a.me())] {
+            assert_eq!(model.state_for(peer), ShareState::Shared(second));
+            assert_eq!(model.pairing_since(), None);
+        }
+
+        // F: Kit's removed device cannot receive a fresh grant through either Add choice.
+        a.sync_stop();
+        b.sync_stop();
+        a.open_town(town).unwrap();
+        let kit = home("Kit");
+        admit(&mut a, &kit.key);
+        a.remove_device(kit.me(), false).unwrap();
+        let before = history(&a);
+        for side in [add, mine] {
+            assert_eq!(prove(&mut a, side, &kit, "Kit", &words_a).unwrap_err(), THAT_CANNOT_REJOIN);
+            assert!(a.pairing_since().is_none() && a.sync_outgoing().is_empty());
+        }
+        assert_eq!(a.append(Content::Member(Member::Invite { subject: kit.me(), role: 0 }), Origin::Ui).unwrap_err(), THAT_CANNOT_REJOIN);
+        assert_eq!(history(&a), before, "a removed device gets no new event");
+    }
+
+    #[test]
     fn unsupported_town_is_kept_byte_for_byte_before_log_repair() {
         use makepad_network::digest::sha256_hash;
         use makepad_town_core::key::Domain;
@@ -10467,10 +12405,10 @@ pub(crate) mod tests {
         let earlier_key = peer.state.entities[&keyed].fields[&field::Z].clone();
         let mut keyless = Vec::new();
         for key in [vec![], vec![255, 255], vec![1], vec![0, 7]] {
-            keyless.push(peer.append(Content::Entity { kind: Key::Number(kind::STICKY), project: Some(project), derive: None,
+            keyless.push(peer.append(Content::Entity { copied_from: vec![], kind: Key::Number(kind::STICKY), project: Some(project), derive: None,
                 fields: vec![(field::PARENT, FieldValue::Id(board)), (field::Z, FieldValue::Key(key))] }, Origin::Ui).unwrap());
         }
-        let bad_set = || Content::Set { changes: vec![Change { entity: keyed, field: field::Z,
+        let bad_set = || Content::Set { copied_from: vec![], changes: vec![Change { entity: keyed, field: field::Z,
             value: FieldValue::Key(vec![255]) }], label: None };
         peer.append(bad_set(), Origin::Ui).unwrap();
         assert_eq!(peer.state, fold::fold(peer.log.events()), "incremental field refusals match replay");
@@ -10515,7 +12453,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn disconnect_pauses_reconnecting_and_a_restart_keeps_the_pause() {
+    fn wanted_follows_standing_offers_and_multi_town_carriers() {
         let ben = DeviceKey::generate().unwrap();
         let key = ben.public();
         let dir = std::env::temp_dir().join(format!("makepad-work-pause-{}", hex(&key[1..17])));
@@ -10530,14 +12468,9 @@ pub(crate) mod tests {
         model.remember_open();
         let known = model.wanted().0.pop().expect("an active peer in this town is wanted");
         assert_eq!((known.pin.device, known.pin.min_version, known.path), (key, 3, seen), "the worker gets the pin and the path as recorded");
-        model.set_paused(&key, true).unwrap();
-        assert!(model.wanted().0.is_empty(), "a disconnected device isn't reached");
-        assert!(model.peer_paused(&key) && model.known_device(&key).is_some(), "and the app can offer to reconnect it");
         drop(model);
         let (mut model, _) = Model::open(&dir).unwrap();
-        assert!(model.wanted().0.is_empty(), "a restart keeps the pause");
-        model.set_paused(&key, false).unwrap();
-        assert!(!model.wanted().0.is_empty() && !model.peer_paused(&key), "connecting again lifts it");
+        assert!(!model.wanted().0.is_empty(), "a restart keeps the active peer wanted");
         let first = model.open_id();
         let kit = DeviceKey::generate().unwrap();
         let next = Model::found_town(&model.home, Model::new_genesis(&model.key).unwrap()).unwrap();
@@ -10607,18 +12540,18 @@ pub(crate) mod tests {
             TownMembers::read(model, &link, &workspace, &LocalClock::default(), 0).seats
         };
         let before = seats_in(&mut model, first);
-        for (seats, peer) in [(&before, key), (&seats_in(&mut model, third), kit.public())] {
-            let seat = seats.iter().find(|s| s.id == MemberId::Computer(peer)).expect("the peer has a seat");
+        for (seats, town, peer) in [(&before, first, key), (&seats_in(&mut model, third), third, kit.public())] {
+            let seat = seats.iter().find(|s| s.id == MemberId::Seat(model.seat_in_town(town, &peer).unwrap())).expect("the peer has a seat");
             assert!(seat.presence == Presence::Here && seat.status == "here", "{} is syncing while the window tracks Kit", seat.name);
         }
         model.end_carrier(key, true);
         let after = seats_in(&mut model, first);
         let ids = |seats: &[crate::view::MemberSeat]| seats.iter().map(|s| s.id).collect::<Vec<_>>();
-        assert_eq!(ids(&before), [MemberId::You, MemberId::Computer(key), MemberId::YourAi]);
+        assert_eq!(ids(&before), [MemberId::You, MemberId::Seat(model.seat_in_town(first, &key).unwrap()), MemberId::YourAi]);
         assert_eq!(ids(&after), ids(&before), "Ben keeps his place ahead of the listening AI when his carrier ends");
         let ben_seat = &after[1];
         assert!(ben_seat.presence == Presence::Away && ben_seat.status.starts_with("away · last seen "), "Ben is away after his carrier ends");
-        let kit_seat = seats_in(&mut model, third).into_iter().find(|s| s.id == MemberId::Computer(kit.public())).unwrap();
+        let kit_seat = seats_in(&mut model, third).into_iter().find(|s| s.id == MemberId::Seat(model.seat_in_town(third, &kit.public()).unwrap())).unwrap();
         assert!(kit_seat.presence == Presence::Here && kit_seat.status == "here", "Kit keeps syncing in the other town");
 
         model.remove_device(kit.public(), false).unwrap();
@@ -10636,7 +12569,7 @@ pub(crate) mod tests {
 
     #[test]
     fn members_and_agents_follow_canonical_join_order_across_appends_and_switches() {
-        use crate::view::MemberId::{Agent, Computer, You};
+        use crate::view::MemberId::{Agent, Seat, You};
 
         // Choosing opposite halves keeps the expected setup work small for either event.
         fn append_in_id_half(model: &mut Model, content: Content, upper: bool) -> Id {
@@ -10667,7 +12600,7 @@ pub(crate) mod tests {
         let members = [a.me(), b.public(), c.public(), d.me()];
         assert_eq!(a.active_members_in_join_order(), members, "causally later admissions follow the founder in join order");
         assert_eq!(a.active_agents_in_join_order(), [agent1, agent2], "AI additions follow join order across reversed IDs");
-        assert_eq!(member_seat_ids(&a), [You, Computer(b.public()), Computer(c.public()), Computer(d.me()), Agent(agent1), Agent(agent2)],
+        assert_eq!(member_seat_ids(&a), [You, Seat(invite_b), Seat(invite_c), Seat(a.state.seat_of(&d.me()).unwrap()), Agent(agent1), Agent(agent2)],
             "the people row shows the ordered member and AI sections");
         post(&mut a, "ordinary chat", false).unwrap();
         assert!(a.open.member_order.get().is_some(), "ordinary chat keeps the join-order cache");
@@ -10707,7 +12640,7 @@ pub(crate) mod tests {
 
     #[test]
     fn concurrent_ai_joins_converge_to_canonical_order() {
-        use crate::view::MemberId::{Agent, Computer, You};
+        use crate::view::MemberId::{Agent, Seat, You};
         let (_homes, mut a, mut b) = shared_town("concurrent-ai-join");
         let (ka, kb) = (a.me(), b.me());
         a.end_carrier(kb, false);
@@ -10724,7 +12657,7 @@ pub(crate) mod tests {
         let expected = if ka < kb { [agent_a, agent_b] } else { [agent_b, agent_a] };
         for (model, peer) in [(&a, kb), (&b, ka)] {
             assert_eq!(model.active_agents_in_join_order(), expected, "both computers order concurrent joins by author");
-            assert_eq!(member_seat_ids(model), [You, Computer(peer), Agent(expected[0]), Agent(expected[1])],
+            assert_eq!(member_seat_ids(model), [You, Seat(model.state.seat_of(&peer).unwrap()), Agent(expected[0]), Agent(expected[1])],
                 "each people row keeps You first and shows the same AI order");
         }
         let (agent_c, _) = hook(&mut a);
@@ -10732,6 +12665,151 @@ pub(crate) mod tests {
         for model in [&a, &b] {
             assert_eq!(model.active_agents_in_join_order(), [expected[0], expected[1], agent_c], "a causally later AI appends on both computers");
         }
+    }
+
+    #[test]
+    fn renaming_ai_updates_all_views_preserves_id_routing_and_keeps_backend_consent() {
+        use crate::ai_trace::Traces;
+        use crate::view::{ChatRow, LocalClock, MemberId, TownMembers, Workspace};
+        let (_homes, mut models) = call_history_models("ai-rename", 2, 0);
+        let [ana, ben, sibling] = models.as_mut_slice() else { unreachable!() };
+        let (owner, peer) = (ana.me(), ben.me());
+        let (agent, binding) = hook(ana);
+        let sync_pair = |a: &mut Model, b: &mut Model| loop {
+            let outgoing = a.pull_sync(b.me());
+            let incoming = b.pull_sync(a.me());
+            if outgoing.is_none() && incoming.is_none() { break }
+            if let Some(bytes) = outgoing { b.receive_from(a.me(), &bytes).unwrap(); }
+            if let Some(bytes) = incoming { a.receive_from(b.me(), &bytes).unwrap(); }
+        };
+        ben.set_person_name("Ben").unwrap();
+        ana.sync_start(&peer);
+        ben.sync_start(&owner);
+        let reply = ana.agent_say(binding, "Ready".into(), None).unwrap();
+        let request = ana.mention_agent(agent, "Check the draft".into(), None).unwrap();
+        sync_pair(ana, ben);
+        let token = "@Ana's AI";
+        let bound = bound_agent(token, agent);
+        let draft = "@Ana's AI hi";
+        let peer_target = |label: &str| MentionTarget::PeerAi { agent, label: label.into(), owner_name: "Ana".into() };
+        assert_eq!(ben.mention_target_bound(draft, &bound), peer_target("Ana's AI · Claude Code"));
+        assert!(!ben.can_rename_agent(agent));
+        assert!(ben.rename_agent(agent, "Scout").is_err());
+
+        let clock = LocalClock::default();
+        let mut traces = Traces::default();
+        traces.offer(binding, agent, &ana.agent_short_label(agent), request, 0, 0);
+        assert_eq!(traces.rows(&request)[0].headline(2000, &clock), "Your AI hasn't picked this up · 2 s");
+        ana.rename_agent(agent, " Scout ").unwrap();
+        let count = ana.open_event_count();
+        ana.rename_agent(agent, "Scout").unwrap();
+        assert_eq!(ana.open_event_count(), count, "re-entering the name signs nothing");
+        sync_pair(ana, ben);
+        traces.sync_names(ana.open_id(), |id| Some(ana.agent_short_label(id)));
+        assert_eq!(traces.rows(&request)[0].headline(2000, &clock), "Scout hasn't picked this up · 2 s");
+
+        for (model, short) in [(&*ana, "Scout"), (&*ben, "Ana's Scout")] {
+            let label = format!("{short} · Claude Code");
+            let ws = Workspace::read(model, false, &clock);
+            let members = TownMembers::read(model, &Default::default(), &ws, &clock, 0);
+            assert_eq!(members.seats.iter().find(|s| s.id == MemberId::Agent(agent)).unwrap().name, label);
+            assert!(ws.rows.iter().any(|row| matches!(row, ChatRow::Message(m) if m.id == reply && m.name == label)),
+                "an existing reply follows the rename");
+            assert!(model.mention_candidates("Scout", true, &BTreeMap::new()).iter().any(|candidate|
+                candidate.target == ComposerTarget::Agent(agent) && candidate.label == label && candidate.insert_text == short));
+            assert_eq!(model.mention_target("@Scout hi"), MentionTarget::UnboundAi);
+        }
+        assert_eq!(ana.ai_request_label_for(&owner, Some(agent), &owner), "You asked Scout");
+        assert_eq!(ana.ai_request_label_for(&peer, Some(agent), &owner), "Ben asked Scout");
+        assert_eq!(ben.ai_request_label_for(&peer, Some(agent), &owner), "You asked Ana's Scout");
+        assert_eq!(ben.ai_request_label_for(&owner, Some(agent), &owner), "Ana asked Ana's Scout");
+        assert_eq!(ben.mention_target_bound(draft, &bound), peer_target("Ana's Scout · Claude Code"));
+        let line = ben.post_chat_draft_bound(draft, &bound, None, None, None).unwrap();
+        let event = ben.event(&line).unwrap();
+        assert!(matches!(Content::decode(event.header.kind, event.header.kind_version, event.content().unwrap()),
+            Some(Content::AgentChat { agent: ChatAgent::Recipient(id), chat }) if id == agent && chat.text == "hi"));
+        sync_pair(ana, ben);
+        let ws = Workspace::read(ana, false, &clock);
+        let (_, pending, approval) = ws.connect.first_pending().unwrap();
+        assert_eq!(pending, line);
+        assert_eq!((&*approval.cue, &*approval.label), ("Ben asked Scout", "Let Scout do it"));
+
+        let session = [7; 16];
+        let entry = ana.append(Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: false },
+            to: vec![], town_wide: true }), Origin::Ui).unwrap();
+        ana.append(Content::Said { session, lines: vec![SaidLine { at_ms: 1, dur_ms: 1, text: "hello".into() }] }, Origin::Ui).unwrap();
+        let consent = ana.transcript_consent("@ai read ^", Some(agent), Some(entry)).unwrap();
+        assert_eq!(consent.prompt, "Send this transcript to Claude Code (cloud)? It includes your words.");
+
+        // Bring the owner's second device up to date, then clear the name there.
+        ana.sync_start(&sibling.me());
+        sibling.sync_start(&owner);
+        sync_pair(ana, sibling);
+        assert_eq!(sibling.agent_custom_name(agent).as_deref(), Some("Scout"));
+        assert!(sibling.can_rename_agent(agent));
+        assert!(sibling.remove_agent(agent).is_err());
+        sibling.rename_agent(agent, "   ").unwrap();
+        sync_pair(ana, sibling);
+        sync_pair(ana, ben);
+        let count = ana.open_event_count();
+        ana.rename_agent(agent, "").unwrap();
+        assert_eq!(ana.open_event_count(), count, "clearing an unnamed AI signs nothing");
+        assert_eq!(ana.agent_display_label(agent), "Your AI · Claude Code");
+        assert_eq!(ben.agent_display_label(agent), "Ana's AI · Claude Code");
+        assert_eq!(ana.ai_request_label_for(&owner, Some(agent), &owner), "You asked your AI");
+        assert_eq!(ana.ai_request_label_for(&peer, Some(agent), &owner), "Ben asked your AI");
+        assert_eq!(ben.ai_request_label_for(&peer, Some(agent), &owner), "You asked Ana's AI");
+        assert_eq!(ben.ai_request_label_for(&owner, Some(agent), &owner), "Ana asked their AI");
+        sibling.leave_town().unwrap();
+        assert!(!sibling.can_rename_agent(agent), "the owner's read-only device cannot rename");
+        assert!(sibling.rename_agent(agent, "Scout").is_err());
+    }
+
+    #[test]
+    fn agent_display_labels_distinguish_multiple_same_backend_ais() {
+        use crate::view::{ChatRow, LocalClock, MemberId, TownMembers, Workspace};
+        let mut mesh = SyncMesh::new(3, "agent-display");
+        let mut agents = Vec::new();
+        for (model, person) in mesh.nodes.iter_mut().zip(["Kit", "Ana", "Ben"]) {
+            model.set_person_name(person).unwrap();
+            let (agent, token) = hook(model);
+            let reply = model.agent_say(token, format!("{person}'s update"), None).unwrap();
+            agents.push((agent, reply));
+        }
+        mesh.link(0, 1);
+        mesh.link(0, 2);
+        mesh.settle();
+        let request = mesh.nodes[2].mention_agent(agents[0].0, "Check the draft".into(), None).unwrap();
+        mesh.settle();
+        let viewer = &mut mesh.nodes[0];
+        let clock = LocalClock::default();
+        let quotes: Vec<_> = agents.iter().map(|&(_, reply)| viewer.post_chat_draft("Following up", None, None, Some(reply)).unwrap()).collect();
+        let check_reply = |ws: &Workspace, reply, quote, name| {
+            let message = |id| ws.rows.iter().find_map(|row| match row {
+                ChatRow::Message(m) if m.id == id => Some(m), _ => None,
+            }).unwrap();
+            assert_eq!(message(reply).name, name, "the reply identifies its AI");
+            assert_eq!(message(quote).quote.as_ref().unwrap().name, name, "the quote keeps the reply's attribution");
+        };
+        let ws = Workspace::read(viewer, false, &clock);
+        let members = TownMembers::read(viewer, &Default::default(), &ws, &clock, 0);
+        for ((&(agent, reply), quote), expected) in agents.iter().zip(&quotes)
+            .zip(["Your AI · Claude Code", "Ana's AI · Claude Code", "Ben's AI · Claude Code"]) {
+            let chip = members.seats.iter().find(|s| s.id == MemberId::Agent(agent)).unwrap();
+            assert_eq!(chip.name, expected, "each AI has its own owner's name on the people row");
+            check_reply(&ws, reply, *quote, expected);
+        }
+        let (_, line, approval) = ws.connect.first_pending().unwrap();
+        assert_eq!(line, request);
+        assert_eq!(approval.cue, "Ben asked your AI");
+
+        let (ana_ai, reply) = agents[1];
+        mesh.nodes[1].remove_agent(ana_ai).unwrap();
+        mesh.settle();
+        let viewer = &mesh.nodes[0];
+        assert!(!viewer.state.agents.contains_key(&ana_ai));
+        assert_eq!(viewer.agent_backend(ana_ai).as_deref(), Some("Claude Code"));
+        check_reply(&Workspace::read(viewer, false, &clock), reply, quotes[1], "Ana's AI · Claude Code");
     }
 
     #[test]
@@ -10762,7 +12840,7 @@ pub(crate) mod tests {
             exchange(&mut a, &mut b);
             let ws = Workspace::read(&b, false, &clock);
             let members = TownMembers::read(&b, &Default::default(), &ws, &clock, 0);
-            assert!(members.seats.iter().any(|s| s.id == MemberId::Computer(ana) && s.name == name), "the same chip follows the rename");
+            assert!(members.seats.iter().any(|s| s.id == MemberId::Seat(b.state.seat_of(&ana).unwrap()) && s.name == name), "the same chip follows the rename");
             assert_eq!(label(&ws, "hello"), name, "an existing chat line shows the new name");
             assert_eq!(b.state.profiles[&ana].colour, 9, "renaming preserves the colour of this town");
             a.open_town(private).unwrap();
@@ -10778,15 +12856,15 @@ pub(crate) mod tests {
         let request = a.post_chat_draft("@ai check", Some(agent), None, None).unwrap();
         a.agent_say(token, "done".into(), Some(request)).unwrap();
         exchange(&mut a, &mut b);
-        b.post_chat_draft("@Claude Code hello there", None, None, None).unwrap();
+        b.post_chat_draft_bound("@Claude Code hello there", &bound_agent("@Claude Code", agent), None, None, None).unwrap();
         let hi = b.post_chat_draft("@Ana hi Ana", None, None, None).unwrap();
         exchange(&mut a, &mut b);
         let hi = a.state.message(&hi).expect("a mention line reaches Ana's computer");
         assert!(hi.to_agent.is_none() && !hi.chat.to_ai && hi.chat.text == "@Ana hi Ana" && a.state.mentions_device(hi, &ana)
             && !a.state.mentions_device(hi, &ben), "@Ana is plain chat that mentions Ana's seat and starts no AI turn");
         for (model, ai, asked, foreign) in [
-            (&a, "Your AI", "You asked your AI", "Ben asked your AI"),
-            (&b, "Ana's AI", "Ana asked their AI", "You asked Ana's AI"),
+            (&a, "Your AI · Claude Code", "You asked your AI", "Ben asked your AI"),
+            (&b, "Ana's AI · Claude Code", "Ana asked their AI", "You asked Ana's AI"),
         ] {
             let ws = Workspace::read(model, false, &clock);
             assert_eq!(label(&ws, "check"), asked, "a request identifies whose AI it reached");
@@ -10863,7 +12941,7 @@ pub(crate) mod tests {
         let (agent, binding) = hook(&mut model);
         model.mention_agent(agent, "inspect".into(), None).unwrap();
         model.agent_wait(binding, None, true).unwrap();
-        assert!(!model.agent_read(binding, None).unwrap().contains(&hex(&event.id)), "another person’s private AI request is absent during an authorized read");
+        assert!(!model.agent_read(binding, None).unwrap().as_str().contains(&hex(&event.id)), "another person’s private AI request is absent during an authorized read");
         assert_eq!(model.author_label(&key, Actor::Ai), "Ana's AI", "the peer AI uses its device name");
         assert_eq!(Model::who(&model.me(), &key, Actor::Human), "the other person", "the AI receives a neutral author label");
         let older = DeviceKey::generate().unwrap().public();
@@ -11013,8 +13091,8 @@ pub(crate) mod tests {
         let (mut model, _) = Model::open(&dir).unwrap();
         let project = model.project().id;
         let task = model.act(Action::AddTask { title: "Outline".into(), text: "First draft".into() }, Origin::Ui).unwrap();
-        let other = model.append(Content::Entity { derive: None, kind: Key::Number(kind::PROJECT), project: None, fields: vec![] }, Origin::Ui).unwrap();
-        model.append(Content::Entity { derive: None, kind: Key::Number(kind::TASK), project: Some(other), fields: vec![] }, Origin::Ui).unwrap();
+        let other = model.append(Content::Entity { copied_from: vec![], derive: None, kind: Key::Number(kind::PROJECT), project: None, fields: vec![] }, Origin::Ui).unwrap();
+        model.append(Content::Entity { copied_from: vec![], derive: None, kind: Key::Number(kind::TASK), project: Some(other), fields: vec![] }, Origin::Ui).unwrap();
         let before = model.tasks_json();
         let listing = json::parse(before.as_bytes()).unwrap();
         assert_eq!(listing.get("tasks").and_then(Value::as_arr).unwrap().len(), 1, "the listing contains only this project's tasks");
@@ -11099,7 +13177,7 @@ pub(crate) mod tests {
         assert_eq!(m.tasks_json(), before_merge, "one undo restores the survivor, both sources and their order");
 
         // A tie from concurrent appends and keyless older records still admit precise moves.
-        let old = m.append(Content::Set { label: None, changes: vec![
+        let old = m.append(Content::Set { copied_from: vec![], label: None, changes: vec![
             Change { entity: b, field: field::ORDER, value: FieldValue::Null },
             Change { entity: c, field: field::ORDER, value: FieldValue::Null },
         ] }, Origin::Ui).unwrap();
@@ -11109,7 +13187,7 @@ pub(crate) mod tests {
         m.act(Action::Undo { of: placed }, Origin::Ui).unwrap();
         m.act(Action::Undo { of: old }, Origin::Ui).unwrap();
         let key = m.state.entities[&a].value(field::ORDER).unwrap().clone();
-        m.append(Content::Set { label: None, changes: vec![Change { entity: b, field: field::ORDER, value: key }] }, Origin::Ui).unwrap();
+        m.append(Content::Set { copied_from: vec![], label: None, changes: vec![Change { entity: b, field: field::ORDER, value: key }] }, Origin::Ui).unwrap();
         call(&mut m, "task_move", format!(r#"{{"task":"{cc}","before":"{bb}"}}"#)).unwrap();
         check(&m, &[("A", "open"), ("C", "open"), ("Beta", "open")], "between concurrent equal keys");
 
@@ -11476,6 +13554,96 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn peer_board_media(peer: &mut Model, town: TownId, project: Id) -> (Id, Id, [crate::store_worker::StoredFile; 3]) {
+        use crate::store_worker::StoredFile;
+        let file = |n| StoredFile { size: 1, root: [n; 32], id: blob::id(1, &[n; 32]) };
+        let [still, poster, video] = [file(1), file(2), file(3)];
+        peer.files.holdings.entry(town).or_default().extend([still.id, poster.id, video.id]);
+        let clip = peer.act(Action::PostClip { project: Some(project), title: "Print".into(), media: (1, video.root),
+            poster: Some((1, poster.root)), media_kind: "video/mp4".into(), duration_ms: 8123, width: 960, height: 720,
+            session: None }, Origin::Ui).unwrap();
+        let issue = peer.file_issue(issues::IssueProject { town, project }, [still, poster], [32, 16], "",
+            "First layer\nSecond line", None, Some((video, 17)), None).unwrap();
+        (clip, issue, [still, poster, video])
+    }
+
+    #[test]
+    fn board_pin_copies_clip_and_issue_with_copied_from_and_never_pollutes_timeline() {
+        use crate::tools::{read_in_test_town, Request};
+        use makepad_town_core::trust::Withheld;
+        let (_homes, mut owner, mut peer) = shared_town("board-media-pin");
+        let town = owner.open_id();
+        let project = owner.current_project().unwrap().id;
+        let board = owner.act(Action::AddBoard { title: "Review".into(), project }, Origin::Ui).unwrap();
+        let (clip, issue, [still, poster, _]) = peer_board_media(&mut peer, town, project);
+        exchange(&mut owner, &mut peer);
+        let pin = |m: &mut Model, from: Id| {
+            let args = format!(r#"{{"board":"{}","from":"{}"}}"#, hex(&board), hex(&from));
+            let Request::Do { action, .. } = read_in_test_town(town, "board_pin", &args)? else { panic!("expected board_pin action") };
+            m.act(action, Origin::Tool)
+        };
+        let local_pin = Action::PinMedia { board, parent: None, x: 0, y: 0, w: 64, h: 64, title: "Print".into(),
+            blob: (still.size, still.root), poster: Some((poster.size, poster.root)), media: "image/png".into(),
+            duration_ms: None, source: None, session: None };
+        assert_eq!(owner.act(local_pin, Origin::Ui), Err("The picture or its poster is missing from local storage.".into()));
+        let before = owner.state.timeline.len();
+        let movie = pin(&mut owner, clip).unwrap();
+        let picture = pin(&mut owner, issue).unwrap();
+        assert_eq!(owner.state.timeline.len(), before, "pinning creates no chat entry");
+        for (id, from) in [(movie, clip), (picture, issue)] {
+            let e = &owner.state.entities[&id];
+            assert_eq!(e.kind, Key::Number(kind::IMAGE));
+            assert_eq!(e.value(field::FROM), Some(&FieldValue::Id(from)));
+            assert_eq!(e.value(field::BOARD), Some(&FieldValue::Id(board)));
+            let sources = owner.state.copied_from(id, id, &field::BLOB);
+            assert!(sources.contains(&CopySource::Record(from)));
+            assert!(sources.contains(&CopySource::EntityField { entity: from, field: field::BLOB, writer: from }));
+        }
+        let e = &owner.state.entities[&movie];
+        assert_eq!((coordinate(e, field::X), coordinate(e, field::Y), coordinate(e, field::W), coordinate(e, field::H)),
+            (0, 0, 480 * 64, 360 * 64));
+        let e = &owner.state.entities[&picture];
+        assert_eq!(coordinate(e, field::X), (480 + 32) * 64);
+        assert_eq!(e.text(field::TITLE), "First layer");
+        assert!(e.value(field::DURATION).is_none(), "an issue pin is its still, even when the issue includes video");
+        let read = |m: &Model| {
+            let reply = json::parse(m.board_read_json(board, None, None).unwrap().as_str().as_bytes()).unwrap();
+            reply.get("splash").unwrap().as_str().unwrap().to_owned()
+        };
+        let page = read(&owner);
+        assert!(page.contains(&format!("Image{{id: @{}", hex(&picture))) && page.contains(&format!("blob: @{}", hex(&still.id))));
+        assert!(page.contains("media: \"image/png\"") && page.contains("duration: 8123"), "{page}");
+        owner.remove_device(peer.me(), false).unwrap();
+        let gate = Gate::new(&owner.state, LocalPolicy::Members);
+        for id in [movie, picture] { assert_eq!(gate.entity_field_value(&id, &field::BLOB), Err(Withheld::External)); }
+        assert!(!read(&owner).contains("Image{"), "withheld media disappears as a whole from board_read");
+        assert!(pin(&mut owner, issue).is_err(), "a removed author cannot be copied through a new pin");
+    }
+
+    #[test]
+    fn pin_from_chat_and_issue_places_non_overlapping_cards_with_provenance() {
+        use crate::board::BoardView;
+        let (_homes, mut owner, mut peer) = shared_town("board-pin-placement");
+        let town = owner.open_id();
+        let project = owner.current_project().unwrap().id;
+        let board = owner.act(Action::AddBoard { title: "Review".into(), project }, Origin::Ui).unwrap();
+        let (clip, issue, files) = peer_board_media(&mut peer, town, project);
+        exchange(&mut owner, &mut peer);
+        assert!(files.iter().all(|file| !owner.complete_blobs(&town).is_some_and(|held| held.contains(&file.id))));
+        let [movie, picture] = [(clip, (480., 360.)), (issue, (32., 16.))].map(|(from, size)| {
+            let (x, y) = BoardView::build(&owner.state, board).next_free_spot(None, size);
+            let id = owner.act(Action::PinFrom { board, from, parent: None, x: Some(x), y: Some(y), w: None, h: None }, Origin::Ui).unwrap();
+            assert!(owner.state.copied_from(id, id, &field::BLOB).contains(
+                &CopySource::EntityField { entity: from, field: field::BLOB, writer: from }));
+            id
+        });
+        let view = BoardView::build(&owner.state, board);
+        let a = view.get(&movie).unwrap().rect;
+        let b = view.get(&picture).unwrap().rect;
+        assert!(a.x1 <= b.x0 || b.x1 <= a.x0 || a.y1 <= b.y0 || b.y1 <= a.y0, "the pinned cards must not overlap");
+        assert_eq!((b.x0, b.y0), (a.x1 + 32., a.y0), "the issue sits beside the chat clip");
+    }
+
     #[test]
     fn board_tools_round_trip_section_moves_and_item_additions() {
         use crate::tools::{read_in_test_town, Request};
@@ -11489,9 +13657,10 @@ pub(crate) mod tests {
             let result = model.act(action, Origin::Tool);
             assert_eq!(model.log.events().len() - before, usize::from(result.is_ok()), "{tool} signs one event on success");
             result.map(|id| {
-                let reply = crate::tools::action_reply(model, &id, verb);
+                let gate = Gate::new(&model.state, LocalPolicy::Members);
+                let reply = crate::tools::action_reply(&gate, model, &id, verb).unwrap();
                 if model.board_edit_report(&id).is_some_and(|r| !r.locked.is_empty()) {
-                    reply
+                    reply.into_string()
                 } else {
                     hex(&id)
                 }
@@ -11516,7 +13685,7 @@ pub(crate) mod tests {
             model.board_read_json(board, rect, after)
         };
         let inspect = |model: &Model, extra: &str| {
-            let reply = json::parse(page(model, extra).unwrap().as_bytes()).unwrap();
+            let reply = json::parse(page(model, extra).unwrap().as_str().as_bytes()).unwrap();
             reply.get("splash").unwrap().as_str().unwrap().to_owned()
         };
         let undo = |model: &mut Model, of: &str| call(model, "undo", format!(r#"{{"of":"{of}"}}"#)).unwrap();
@@ -11618,7 +13787,7 @@ pub(crate) mod tests {
         assert_eq!(ids(&remaining), [&a, &b, &c].map(String::clone), "the ungrouped members survive");
         assert!(remaining.starts_with(&format!(r#"Board{{title: "Layout" items: [Sticky{{id: @{a}"#)), "ungroup returns an item to the board");
         assert!(matches!(read_in_test_town(model.open_id(), "board_list", "{}"), Ok(Request::BoardList { project: None, .. })));
-        let listing = json::parse(model.boards_json().as_bytes()).unwrap();
+        let listing = json::parse(model.boards_json().unwrap().as_str().as_bytes()).unwrap();
         let boards = listing.get("boards").unwrap().as_arr().unwrap();
         assert_eq!(boards.len(), 1, "the listing is scoped to the current project");
         assert_eq!(boards[0], json::obj(vec![("id", json::s(&board)), ("title", json::s("Layout")), ("item_count", Value::Int(3))]),
@@ -11636,8 +13805,8 @@ pub(crate) mod tests {
         let mut first_cursor = None;
         loop {
             let raw = page(&model, &args).unwrap();
-            assert!(raw.len() <= MAX_RESULT_BYTES - 512, "each encoded page fits with room for the envelope");
-            let reply = json::parse(raw.as_bytes()).unwrap();
+            assert!(raw.as_str().len() <= MAX_RESULT_BYTES - 512, "each encoded page fits with room for the envelope");
+            let reply = json::parse(raw.as_str().as_bytes()).unwrap();
             assert_eq!(reply.get("total"), Some(&Value::Int(3)), "total counts all matches on every page");
             let splash = reply.get("splash").unwrap().as_str().unwrap();
             let items = ids(splash);
@@ -11656,7 +13825,7 @@ pub(crate) mod tests {
         let cursor = first_cursor.expect("the complete board needs more than one page");
         let after = format!(r#"{rect},"after":"{cursor}""#);
         call(&mut model, "item_move", format!(r#"{{"moves":[{{"item":"{cursor}","x":100,"y":100}}]}}"#)).unwrap();
-        let resumed = json::parse(page(&model, &after).unwrap().as_bytes()).unwrap();
+        let resumed = json::parse(page(&model, &after).unwrap().as_str().as_bytes()).unwrap();
         assert_eq!(resumed.get("total"), Some(&Value::Int(2)), "total follows the current rectangle");
         assert_eq!(ids(resumed.get("splash").unwrap().as_str().unwrap()), [c], "a cursor moved outside the rect still marks its z position");
         call(&mut model, "item_delete", format!(r#"{{"items":["{cursor}"]}}"#)).unwrap();
@@ -11704,7 +13873,7 @@ pub(crate) mod tests {
         assert!(a.act(Action::DeleteStep { step: middle }, Origin::Tool).unwrap_err().contains("unknown or deleted step"));
         a.act(Action::Undo { of: deleted }, Origin::Ui).unwrap();
         assert_eq!(ids(&a), [last, first, middle, front], "undo puts it back in its place");
-        assert!(page::print(&a.state, board).unwrap().contains(&format!("path: [Step{{id: @{} target: @{}}}", hex(&last), hex(&board))));
+        assert!(page::print(&a.state, &Gate::new(&a.state, LocalPolicy::Members), board).unwrap().as_str().contains(&format!("path: [Step{{id: @{} target: @{}}}", hex(&last), hex(&board))));
 
         let open = |m: &mut Model, entity, name: &str| m.act(Action::SetFields { changes: vec![Change { entity,
             field: Key::Name(name.into()), value: FieldValue::Literal("1".into()) }], label: None }, Origin::Tool);

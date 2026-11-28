@@ -1,5 +1,5 @@
 //! The UI side of a call. The link outlives its calls, and the device callbacks outlive the link.
-use super::{CallAction, CallShown, PickerShown, Talking, CallFlow, CallId, CallView, DeviceChanges, DeviceKind, Devices, Effect, Fact, Now, Phase, Press, Secret, ShareEndReason};
+use super::{CallAction, CallShown, PickerShown, Talking, CallFlow, CallId, CallScope, CallView, DeviceChanges, DeviceKind, Devices, Effect, Fact, Ignored, Now, Phase, Press, ShareEndReason};
 use super::{TranscribeShown, transcribe::{Recognizer, Transcriber, TranscriberConfig, TranscriberEvent}};
 use super::media_key::MediaKey;
 use super::media_session::{Changes, MediaSession};
@@ -12,20 +12,19 @@ use makepad_call::driver::{
     codec::platform_codecs, Call, CallConfig, CallEvent, EchoCancelMode, Inlet, Join, PeerId, Spawn, VoiceSource,
 };
 use makepad_widgets::{log, Cx, CxMediaApi, LiveId, Timer, makepad_platform::audio::{AudioDeviceDesc, AudioDeviceId, AudioDeviceType, AudioInputOptions}};
-use makepad_town_core::{home_writer::PrivateFiles, key::PublicKey};
+use makepad_town_core::{event::{Id, TownId}, home_writer::PrivateFiles, key::PublicKey, share::hello::MediaCaps};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc, Mutex,
     },
     time::Instant,
 };
 
-const PEER: PeerId = 1;
 const ECHO_CANCEL_NOTICE: &str = "Echo cancellation is off — use headphones to avoid echo.";
 
 fn platform_echo_cancel() -> EchoCancelMode {
@@ -68,6 +67,7 @@ pub struct CallEnv {
     pub spawn: Spawn,
     pub jobs: Spawn,
     pub signal: Arc<dyn Fn() + Send + Sync>,
+    /// Where the picked audio devices are saved. Empty: none are read or saved.
     pub devices_path: PathBuf,
     pub voice: VoiceSource,
 }
@@ -97,16 +97,51 @@ impl AudioHost for Cx {
     fn use_outputs(&mut self, ids: &[AudioDeviceId]) { self.use_audio_outputs(ids); }
 }
 
-#[derive(Default)]
 struct SyntheticHost {
-    ports: Option<(MicPort, OutputPort)>,
+    spawn: Spawn,
+    ports: Option<(MicPort, Arc<SyntheticSpeaker>)>,
     input: Option<AudioDeviceId>,
     output: Option<AudioDeviceId>,
+}
+
+struct SyntheticSpeaker {
+    port: Mutex<OutputPort>,
+    open: AtomicBool,
+    stop: AtomicBool,
+}
+
+impl SyntheticSpeaker {
+    fn run(&self) {
+        let mut block = [0.0f32; 480];
+        let tick = std::time::Duration::from_millis(10);
+        let mut deadline = Instant::now();
+        loop {
+            deadline += tick;
+            if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            if self.stop.load(Ordering::Relaxed) { break }
+            if self.open.load(Ordering::Relaxed) {
+                let mut port = self.port.lock().unwrap_or_else(|err| err.into_inner());
+                port.fill_planar(48_000.0, 480, 1, &mut block);
+            }
+        }
+    }
 }
 
 impl SyntheticHost {
     const MIC: AudioDeviceId = AudioDeviceId(LiveId::from_str("town_synthetic_microphone"));
     const SPEAKER: AudioDeviceId = AudioDeviceId(LiveId::from_str("town_synthetic_speaker"));
+
+    fn new(spawn: Spawn) -> Self {
+        Self { spawn, ports: None, input: None, output: None }
+    }
+
+    #[cfg(test)]
+    fn received_seq(&self, peer: PeerId, stream: u8) -> Option<u32> {
+        let (_, speaker) = self.ports.as_ref()?;
+        speaker.port.lock().unwrap_or_else(|err| err.into_inner()).received_seq(peer, stream)
+    }
 
     fn descs() -> [AudioDeviceDesc; 2] {
         [(Self::MIC, AudioDeviceType::Input, "Synthetic microphone"),
@@ -124,9 +159,29 @@ impl SyntheticHost {
 }
 
 impl AudioHost for SyntheticHost {
-    fn install(&mut self, mic: MicPort, speaker: OutputPort) { self.ports = Some((mic, speaker)); }
+    fn install(&mut self, mic: MicPort, speaker: OutputPort) {
+        let speaker = Arc::new(SyntheticSpeaker {
+            port: Mutex::new(speaker),
+            open: AtomicBool::new(self.output.is_some()),
+            stop: AtomicBool::new(false),
+        });
+        self.ports = Some((mic, speaker.clone()));
+        (self.spawn)("town synthetic speaker", Box::new(move || speaker.run()));
+    }
+
     fn use_inputs(&mut self, ids: &[AudioDeviceId]) { Self::select(&mut self.input, Self::MIC, ids); }
-    fn use_outputs(&mut self, ids: &[AudioDeviceId]) { Self::select(&mut self.output, Self::SPEAKER, ids); }
+    fn use_outputs(&mut self, ids: &[AudioDeviceId]) {
+        Self::select(&mut self.output, Self::SPEAKER, ids);
+        if let Some((_, speaker)) = &self.ports {
+            speaker.open.store(self.output.is_some(), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for SyntheticHost {
+    fn drop(&mut self) {
+        if let Some((_, speaker)) = &self.ports { speaker.stop.store(true, Ordering::Relaxed); }
+    }
 }
 
 /// The platform callback records the first block after reopening, including a silent block.
@@ -160,6 +215,9 @@ struct Link {
     peer_media_key: Option<MediaKey>,
     media: MediaSession,
     name: String,
+    peer_id: PeerId,
+    media_held: Option<u32>,
+    caps: MediaCaps,
     epoch: u64,
     out: SyncSender<Vec<u8>>,
     cap: Arc<AtomicU64>,
@@ -170,7 +228,7 @@ struct Link {
 }
 
 impl Link {
-    fn new(me: PublicKey, peer: PublicKey, local_media_key: MediaKey, name: String, epoch: u64, inlet: &Inlet) -> (Self, MediaPort) {
+    fn new(me: PublicKey, peer: PublicKey, local_media_key: MediaKey, name: String, peer_id: PeerId, epoch: u64, inlet: &Inlet) -> (Self, MediaPort) {
         // The workers retain outbound traffic on backpressure. Signalling has its own queue.
         let (out, datagrams_out) = sync_channel(256);
         let (messages_in, incoming) = sync_channel(16);
@@ -180,7 +238,7 @@ impl Link {
             datagrams_in: inlet.sender(), datagrams_out, messages_in, messages_out,
             rate_cap: cap.clone(), sent_bytes: Arc::default(),
         };
-        (Self { me, peer, local_media_key, peer_media_key: None, media: MediaSession::default(), name, epoch, out, cap, incoming, outgoing,
+        (Self { me, peer, local_media_key, peer_media_key: None, media: MediaSession::default(), name, peer_id, media_held: None, caps: MediaCaps::NONE, epoch, out, cap, incoming, outgoing,
             pending: VecDeque::new(), peer_messages: PeerMessages::default(), share_parts: Vec::new() }, port)
     }
 
@@ -223,7 +281,10 @@ pub struct CallController {
     links: BTreeMap<PublicKey, Link>,
     inlet: Inlet,
     next_epoch: u64,
-    active_peer: Option<PublicKey>,
+    open_town: Option<(TownId, Vec<PublicKey>)>,
+    next_peer_id: PeerId,
+    id_to_peer: BTreeMap<PeerId, PublicKey>,
+    call_generation: u64,
     current: Option<Call>,
     voice_wanted: bool,
     voice_attached: bool,
@@ -260,7 +321,8 @@ impl Default for CallController {
             codecs: platform_codecs(),
             echo_cancel: platform_echo_cancel(),
             talking: Talking::default(), last_talking: Instant::now(), devices: Devices::default(), env: None,
-            inlet: Inlet::new(), links: BTreeMap::new(), next_epoch: 0, active_peer: None, current: None, stopping: Vec::new(), control,
+            inlet: Inlet::new(), links: BTreeMap::new(), next_epoch: 0,
+            open_town: None, next_peer_id: 1, id_to_peer: BTreeMap::new(), call_generation: 0, current: None, stopping: Vec::new(), control,
             uninstalled: Some((MicPort { input, blocks: blocks.clone() }, output)),
             blocks, unmute_at: 0, enumerated_or_requested: false, want_input: false,
             want_output: false, input: None, output: None, facts: Vec::new(), muted_sessions: Vec::new(),
@@ -277,21 +339,25 @@ impl CallController {
         if self.env.is_some() {
             return;
         }
-        let text = match env.files.read(&env.devices_path)
-            .and_then(|bytes| String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                log!("Town call: couldn't read the audio devices: {err}");
-                String::new()
+        let text = if env.devices_path.as_os_str().is_empty() {
+            String::new()
+        } else {
+            match env.files.read(&env.devices_path)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))) {
+                Ok(text) => text,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(err) => {
+                    log!("Town call: couldn't read the audio devices: {err}");
+                    String::new()
+                }
             }
         };
         self.devices = Devices::new(&text);
         if matches!(env.voice, VoiceSource::Synthetic { .. }) {
-            self.synthetic = Some(SyntheticHost::default());
+            self.synthetic = Some(SyntheticHost::new(env.spawn.clone()));
             self.devices.update(&SyntheticHost::descs());
             self.enumerated_or_requested = true;
-            log!("Town call: synthetic mode for live checks: no microphone or speaker will open");
+            log!("Town call: synthetic mode for live checks: no microphone or speaker will open; the synthetic speaker plays out received voice");
         }
         self.env = Some(env);
     }
@@ -299,33 +365,62 @@ impl CallController {
     pub fn configured(&self) -> bool { self.env.is_some() }
     pub fn linked(&self) -> bool { !self.links.is_empty() }
     pub fn inlet(&self) -> Inlet { self.inlet.clone() }
-    pub fn active_peer(&self) -> Option<PublicKey> { self.active_peer }
+    pub fn set_peer_caps(&mut self, peer: PublicKey, caps: MediaCaps) -> bool {
+        let could_share = self.can_share();
+        if let Some(link) = self.links.get_mut(&peer) { link.caps = caps; }
+        let changed = self.sync_share_members() || self.can_share() != could_share;
+        if changed { self.notify_link_change(); }
+        changed
+    }
+    pub fn can_call(&self) -> bool { self.flow.can_call() }
+
+    pub fn can_join_call(&self, town: TownId, scope: CallScope) -> bool { self.flow.can_join_call(town, scope) }
+
+    pub fn set_town_peer_seats(&mut self, seats: BTreeMap<TownId, BTreeMap<PublicKey, Id>>) {
+        self.flow.set_town_peer_seats(seats);
+    }
+
+    pub fn can_call_seat(&self, town: TownId, seat: Id) -> bool { self.flow.can_call_seat(town, seat) }
+    pub fn calling_peers(&self, town: TownId) -> Vec<PublicKey> { self.flow.calling_peers(town) }
+
+    pub fn set_town_peers(&mut self, host: &mut dyn AudioHost, towns: BTreeMap<TownId, BTreeSet<PublicKey>>) -> bool {
+        let mut effects = Vec::new();
+        let could_share = self.can_share();
+        self.flow.set_town_peers(towns, self.now(), &mut effects);
+        let mut changed = self.sync_share_members() || self.can_share() != could_share;
+        if !effects.is_empty() { changed |= self.apply(host, effects); }
+        if changed { self.notify_link_change(); }
+        changed
+    }
+
+    pub fn open_town(&self) -> Option<(TownId, &[PublicKey])> {
+        self.open_town.as_ref().map(|(town, peers)| (*town, peers.as_slice()))
+    }
+    pub fn ignored(&self) -> Ignored { self.flow.ignored() }
+    pub fn voice_peers(&self) -> Vec<PublicKey> { self.flow.voice_peers().collect() }
+    pub fn peer_level(&self, peer: &PublicKey) -> f32 { self.peer_level.peer_level(peer) }
+    pub fn active_call_town(&self) -> Option<TownId> { self.flow.active_town() }
+    pub fn ringing_call_town(&self) -> Option<TownId> { self.flow.ringing_town() }
+    pub fn ringing_from(&self) -> Option<PublicKey> { self.flow.ringing_from() }
+    pub fn call_generation(&self) -> u64 { self.call_generation }
     pub fn linked_peers(&self) -> impl Iterator<Item = PublicKey> + '_ { self.links.keys().copied() }
     pub fn peer_epochs(&self) -> impl Iterator<Item = (PublicKey, u64)> + '_ {
         self.links.values().map(|link| (link.peer, link.epoch))
     }
-    pub fn peer_epoch(&self) -> Option<(PublicKey, u64)> {
-        self.active_link().map(|link| (link.peer, link.epoch))
-    }
-    fn active_link(&self) -> Option<&Link> { self.links.get(&self.active_peer?) }
-    fn active_link_mut(&mut self) -> Option<&mut Link> { self.links.get_mut(&self.active_peer?) }
-
-    fn is_idle(&self) -> bool {
-        self.view().phase == Phase::Idle && self.sharing.shown.offers.is_empty() && self.current.is_none()
+    pub(super) fn peer_epoch_of(&self, peer: &PublicKey) -> Option<(PublicKey, u64)> {
+        self.links.get(peer).map(|link| (link.peer, link.epoch))
     }
 
-    fn select_active_peer(&mut self, host: &mut dyn AudioHost, peer: PublicKey) {
-        self.active_peer = Some(peer);
+    pub fn set_open_town(&mut self, open: Option<(TownId, Vec<(PublicKey, String)>)>) -> bool {
+        let could_share = self.can_share();
+        let targets = open.as_ref().map(|(id, peers)| (*id, peers.iter().map(|(p, _)| *p).collect()));
         let mut effects = Vec::new();
-        self.flow.linked(peer, &self.links[&peer].name, self.now(), &mut effects);
-        self.apply(host, effects);
-    }
-
-    pub fn set_preferred_peer(&mut self, host: &mut dyn AudioHost, peer: Option<PublicKey>) {
-        if let Some(peer) = peer.filter(|p| self.active_peer != Some(*p) && self.links.contains_key(p) && self.is_idle()) {
-            self.select_active_peer(host, peer);
-            self.notify_link_change();
-        }
+        self.flow.set_open_town(open, &mut effects);
+        let mut changed = targets != self.open_town || !effects.is_empty();
+        self.open_town = targets;
+        changed |= self.sync_share_members() || self.can_share() != could_share;
+        if changed { self.notify_link_change(); }
+        changed
     }
 
     pub fn wants_input(&self) -> bool { self.want_input }
@@ -338,11 +433,14 @@ impl CallController {
             view: Arc::new(self.view().clone()),
             input: PickerShown::read(&self.devices, DeviceKind::Input),
             output: PickerShown::read(&self.devices, DeviceKind::Output),
-            linked: self.linked(), mic_open: self.mic_open(), talking: self.talking,
+            linked: self.linked(), can_call: self.can_call(), can_share: self.can_share(), mic_open: self.mic_open(), talking: self.talking,
             transcribe: self.transcription_status(),
             peer_level: self.peer_level.step.clone(),
             transcript_town: self.speech.town.as_ref().map(|(_, name)| name.clone()).unwrap_or_default(),
-            share: ShareShown { media_held: self.current.is_some(), ..self.sharing.shown.clone() },
+            share: ShareShown {
+                media_held: self.sharing.shown.watching_sharer.and_then(|p| self.links.get(&p)).is_some_and(|l| l.media_held.is_some()),
+                ..self.sharing.shown.clone()
+            },
         }
     }
 
@@ -359,9 +457,9 @@ impl CallController {
     /// Opening actions must go through the consent gate of the originating input event.
     fn opening(&self, action: CallAction) -> bool {
         match action {
-            CallAction::Press(Press::Share(_) | Press::Watch | Press::Clip | Press::Snap | Press::FirstCaptureWindow | Press::LetControl | Press::AllowAll(true)) => true,
-            CallAction::OnShare(_, Press::Watch | Press::LetControl | Press::AllowAll(true)) => true,
-            CallAction::Press(Press::Call | Press::Answer | Press::Unmute | Press::Transcribe) => true,
+            CallAction::Press(Press::Share(_) | Press::Watch | Press::Clip | Press::Snap | Press::FirstCaptureWindow | Press::LetControl(_) | Press::AllowAll(true)) => true,
+            CallAction::OnShare(_, Press::Watch | Press::LetControl(_) | Press::AllowAll(true)) => true,
+            CallAction::Press(Press::Call | Press::CallSeat(_) | Press::JoinCall(..) | Press::Answer | Press::Unmute | Press::Transcribe) => true,
             CallAction::Pick(DeviceKind::Input, _) => self.wants_input(),
             _ => false,
         }
@@ -376,12 +474,16 @@ impl CallController {
     }
 
     pub fn call_actions(&mut self, host: &mut dyn AudioHost, action: CallAction) -> bool {
-        if matches!(action, CallAction::OnShare(_, Press::Watch | Press::LetControl | Press::AllowAll(true)) | CallAction::Press(Press::Share(_) | Press::Watch | Press::Clip | Press::Snap | Press::FirstCaptureWindow | Press::LetControl | Press::AllowAll(true))) { return false }
+        if matches!(action, CallAction::OnShare(_, Press::Watch | Press::LetControl(_) | Press::AllowAll(true)) | CallAction::Press(Press::Share(_) | Press::Watch | Press::Clip | Press::Snap | Press::FirstCaptureWindow | Press::LetControl(_) | Press::AllowAll(true))) { return false }
         (self.synthetic.is_some() || !self.opening(action)) && self.act(host, action)
     }
 
     pub fn call_opening_presses(&mut self, host: &mut dyn AudioHost, action: CallAction) -> bool {
-        if let CallAction::OnShare(session, Press::Watch) = action { return self.watch(session) }
+        if let CallAction::OnShare(session, Press::Watch) = action {
+            let changed = self.watch(session);
+            if changed { self.settle_media(); }
+            return changed
+        }
         if let CallAction::Press(press @ (Press::Share(_) | Press::Watch | Press::Clip | Press::Snap | Press::FirstCaptureWindow)) = action { return self.share_press(press) }
         self.synthetic.is_none() && self.opening(action) && self.act(host, action)
     }
@@ -415,7 +517,6 @@ impl CallController {
             log!("Town call: configure the controller before linking");
             return None;
         }
-        let was_active = self.active_peer == Some(peer);
         if self.links.contains_key(&peer) {
             self.link_down(host, peer);
         }
@@ -427,32 +528,34 @@ impl CallController {
             }
         };
         self.next_epoch = self.next_epoch.wrapping_add(1);
-        let (mut link, port) = Link::new(me, peer, key, peer_name.to_owned(), self.next_epoch, &self.inlet);
+        let peer_id = self.allocate_peer_id(peer);
+        let (mut link, port) = Link::new(me, peer, key, peer_name.to_owned(), peer_id, self.next_epoch, &self.inlet);
         link.send(link.local_media_key.encode(), &mut self.sent);
+        self.flow.set_local_key(me);
+        self.flow.set_peer_name(peer, link.name.clone());
         self.links.insert(peer, link);
-        if self.active_peer.is_none() || (was_active && self.is_idle()) {
-            self.select_active_peer(host, peer);
-        }
         self.notify_link_change();
         Some(port)
     }
 
     pub fn link_down(&mut self, host: &mut dyn AudioHost, peer: PublicKey) -> bool {
         let Some(link) = self.links.remove(&peer) else { return false };
-        link.report_unsent(&mut self.peer_events);
-        if self.active_peer == Some(peer) {
-            let offers = self.sharing.shown.offers.clone();
-            self.sharing.close_picker();
-            for offer in offers.iter() { self.end_share(offer.session, ShareEndReason::LinkDropped, false); }
-            self.sharing.shown.ended = Default::default();
-            self.sharing.shown.closed_notice = None;
-            let mut effects = Vec::new();
-            self.flow.unlinked(self.now(), &mut effects);
-            self.apply_effects(host, effects);
-            self.retire_call();
-            self.active_peer = None;
-            if let Some(&next) = self.links.keys().next() { self.select_active_peer(host, next); }
+        self.id_to_peer.remove(&link.peer_id);
+        if let Some(call) = &mut self.current {
+            if link.media_held.is_some() { call.leave(link.peer_id); }
         }
+        let interrupted: Vec<_> = if self.current.as_ref().is_some_and(Call::stopping) {
+            self.links.iter().filter_map(|(&peer, link)| link.media_held.map(|_| peer)).collect()
+        } else { Vec::new() };
+        self.retire_if_unused();
+        self.sharing.detach_peer(peer, link.peer_id);
+        link.report_unsent(&mut self.peer_events);
+        self.peer_level.remove_peer(&peer);
+        if let Some((_, peers)) = &mut self.open_town { peers.retain(|p| *p != peer); }
+        self.share_peer_down(peer);
+        let mut effects = Vec::new();
+        self.flow.peer_down(peer, self.now(), &mut effects);
+        self.apply_with_ended(host, effects, &interrupted);
         self.notify_link_change();
         true
     }
@@ -492,7 +595,7 @@ impl CallController {
     pub fn pick(&mut self, host: &mut dyn AudioHost, kind: DeviceKind, id: AudioDeviceId) -> bool {
         let Some((changes, remember)) = self.devices.pick(kind, id) else { return false };
         self.route(host);
-        if let Some(env) = &self.env {
+        if let Some(env) = self.env.as_ref().filter(|env| !env.devices_path.as_os_str().is_empty()) {
             if let Err(err) = env.files.replace_rebuildable(&env.devices_path, remember.0.into_bytes()) {
                 log!("Town call: couldn't save the audio devices: {err}");
             }
@@ -516,10 +619,12 @@ impl CallController {
         if input != self.input {
             self.host(host).use_inputs(input.as_slice());
             self.input = input;
+            if let Some(call) = &self.current { call.reset_echo_cancel(); }
         }
         if output != self.output {
             self.host(host).use_outputs(output.as_slice());
             self.output = output;
+            if let Some(call) = &self.current { call.reset_echo_cancel(); }
         }
     }
 
@@ -542,6 +647,8 @@ impl CallController {
     }
 
     fn retire_call(&mut self) {
+        self.talking = Talking::default();
+        for link in self.links.values_mut() { link.media_held = None; }
         if let Some(mut call) = self.current.take() {
             call.stop();
             self.stopping.push(call);
@@ -557,80 +664,149 @@ impl CallController {
         }
     }
 
-    fn retire_ended(&mut self) -> bool {
-        if self.current.as_ref().is_some_and(Call::stopping) {
-            self.retire_call();
-            true
-        } else { false }
-    }
-
-    fn start_session(&mut self, n: u32) {
-        let link = self.active_link().unwrap();
-        let remote = link.peer_media_key.as_ref().expect("session start needs both keys");
-        let call_id = MediaKey::media_id(n, (&link.me, &link.local_media_key), (&link.peer, remote));
-        let env = self.env.as_ref().unwrap();
-        let send_secret = link.local_media_key.session_secret(&call_id, &link.me);
-        let recv_secret = remote.session_secret(&call_id, &link.peer);
-        self.current = Some(Call::start(CallConfig {
-            inlet: Some(self.inlet()), my_pub: link.me.to_vec(), call_id, video: None, voice: VoiceSource::Off,
-            echo_cancel: self.echo_cancel,
-            codecs: self.codecs.clone(), spawn: env.spawn.clone(), signal: env.signal.clone(), clock: self.clock,
-        }));
-        self.join_media(send_secret, recv_secret);
-    }
-
-    fn join_media(&mut self, send_secret: Secret, recv_secret: Secret) {
-        let link = self.active_link().unwrap();
-        let join = Join {
-            peer: PEER, their_pub: link.peer.to_vec(), key_id: 0, send_secret, recv_secret,
-            out: link.out.clone(), stream_cap: Some(link.cap.clone()),
-        };
-        self.current.as_mut().unwrap().join(join);
-    }
-
-    fn send_media(&mut self, signal: MediaSignal) {
-        let body = Vec::try_from(signal).expect("the session machine sends valid numbers");
-        self.send_active(body);
-    }
-
-    fn send_active(&mut self, body: Vec<u8>) {
-        if let Some(link) = self.active_peer.and_then(|p| self.links.get_mut(&p)) {
-            link.send(body, &mut self.sent);
-        }
-    }
-
-    fn apply_media(&mut self, changes: Changes) -> bool {
-        if changes.retire { self.retire_call(); }
-        if let Some(n) = changes.announce_end { self.send_media(MediaSignal::Media { n, on: false }); }
-        if let Some(n) = changes.start { self.start_session(n); }
-        if let Some(signal) = changes.send { self.send_media(signal); }
-        if changes.exhausted {
-            let why = "Relink to start another media session.";
-            if self.sharing.shown.problem.as_deref() != Some(why) {
-                log!("Town call: {why}");
-                self.sharing.shown.problem = Some(why.into());
-                return true
+    fn retire_if_unused(&mut self) -> bool {
+        if let Some(call) = &self.current {
+            if call.stopping() || self.links.values().all(|link| link.media_held.is_none()) {
+                self.retire_call();
+                return true;
             }
         }
-        changes.retire || changes.start.is_some()
+        false
+    }
+
+    fn allocate_peer_id(&mut self, peer: PublicKey) -> PeerId {
+        let id = self.next_peer_id;
+        self.next_peer_id = id.checked_add(1).expect("media peer IDs exhausted");
+        self.id_to_peer.insert(id, peer);
+        id
+    }
+
+    fn start_session(&mut self, peer: PublicKey, n: u32) {
+        let link = &self.links[&peer];
+        let remote = link.peer_media_key.as_ref().expect("session start needs both keys");
+        let call_id = MediaKey::media_id(n, (&link.me, &link.local_media_key), (&peer, remote));
+        let join = Join {
+            peer: link.peer_id, their_pub: peer.to_vec(), key_id: 0,
+            send_secret: link.local_media_key.session_secret(&call_id, &link.me),
+            recv_secret: remote.session_secret(&call_id, &peer),
+            out: link.out.clone(), stream_cap: Some(link.cap.clone()),
+        };
+        if self.current.is_none() {
+            let env = self.env.as_ref().unwrap();
+            self.current = Some(Call::start(CallConfig {
+                inlet: Some(self.inlet()), my_pub: link.me.to_vec(), call_id, video: None, voice: VoiceSource::Off,
+                echo_cancel: self.echo_cancel, codecs: self.codecs.clone(), spawn: env.spawn.clone(),
+                signal: env.signal.clone(), clock: self.clock,
+            }));
+            self.call_generation += 1;
+        }
+        self.current.as_mut().unwrap().join_peer(join, call_id, self.flow.is_voice_peer(&peer));
+        self.links.get_mut(&peer).unwrap().media_held = Some(n);
+    }
+
+    #[cfg(test)]
+    fn send_media_to(&mut self, peer: PublicKey, signal: MediaSignal) {
+        self.send_to(peer, Vec::try_from(signal).expect("the session machine sends valid numbers"));
+    }
+
+    fn send_to(&mut self, peer: PublicKey, body: Vec<u8>) {
+        if let Some(link) = self.links.get_mut(&peer) { link.send(body, &mut self.sent); }
+    }
+
+    fn retire_peer(&mut self, peer: PublicKey) {
+        let old = self.links[&peer].peer_id;
+        if let Some(call) = &mut self.current {
+            call.leave(old);
+        }
+        self.sharing.detach_peer(peer, old);
+        self.id_to_peer.remove(&old);
+        let id = self.allocate_peer_id(peer);
+        let link = self.links.get_mut(&peer).unwrap();
+        link.media_held = None;
+        link.peer_id = id;
+    }
+
+    fn apply_media_for(&mut self, peer: PublicKey, changes: Changes) -> bool {
+        self.apply_media_changes(vec![(peer, changes)])
+    }
+
+    fn apply_media_changes(&mut self, changes: Vec<(PublicKey, Changes)>) -> bool {
+        let mut changed = false;
+        for (peer, change) in &changes {
+            if change.retire {
+                self.retire_peer(*peer);
+                changed = true;
+            }
+        }
+        let mut interrupted: Vec<_> = if self.current.as_ref().is_some_and(Call::stopping) {
+            self.links.iter().filter_map(|(&peer, link)| link.media_held.map(|_| peer)).collect()
+        } else { Vec::new() };
+        changed |= self.retire_if_unused();
+        for (peer, change) in changes {
+            if let Some(n) = change.announce_end {
+                self.send_to(peer, Vec::try_from(MediaSignal::Media { n, on: false }).unwrap());
+            }
+            if let Some(n) = change.start { self.start_session(peer, n); changed = true; }
+            if let Some(signal) = change.send { self.send_to(peer, Vec::try_from(signal).unwrap()); }
+            if change.exhausted {
+                let why = "Relink to start another media session.";
+                if self.sharing.shown.problem.as_deref() != Some(why) {
+                    log!("Town call: {why}");
+                    self.sharing.shown.problem = Some(why.into());
+                    changed = true;
+                }
+            }
+        }
+        self.attach_share();
+        if self.current.as_ref().is_some_and(Call::stopping) {
+            for (&peer, link) in &self.links {
+                if link.media_held.is_some() && !interrupted.contains(&peer) { interrupted.push(peer); }
+            }
+            self.retire_call();
+        }
+        if !interrupted.is_empty() {
+            let followup = self.media_changes(&interrupted);
+            changed |= self.apply_media_changes(followup);
+        }
+        changed
+    }
+
+    fn media_changes(&mut self, ended: &[PublicKey]) -> Vec<(PublicKey, Changes)> {
+        let mut changes = Vec::new();
+        for (&peer, link) in &mut self.links {
+            let own = self.flow.is_voice_peer(&peer)
+                || self.sharing.peer_needs_share(&peer);
+            let change = link.media.settle(link.me < peer, own, link.media_held.is_some(),
+                ended.contains(&peer), link.peer_media_key.is_some());
+            if change.retire || change.announce_end.is_some() || change.start.is_some() || change.send.is_some() || change.exhausted {
+                changes.push((peer, change));
+            }
+        }
+        changes
     }
 
     fn settle_media(&mut self) -> bool {
-        let ended = self.retire_ended();
-        let own = self.voice_wanted || !self.sharing.shown.offers.is_empty();
-        let running = self.current.is_some();
-        let Some(link) = self.active_link_mut() else { return ended };
-        let keeper = link.me < link.peer;
-        let changes = link.media.settle(keeper, own, running, ended, link.peer_media_key.is_some());
-        if !keeper { self.attach_share(); }
-        let changed = self.apply_media(changes);
-        if keeper { self.attach_share(); }
-        ended || changed
+        self.settle_media_ended(&[])
+    }
+
+    fn settle_media_ended(&mut self, extra_ended: &[PublicKey]) -> bool {
+        let stopped = self.current.as_ref().is_some_and(Call::stopping);
+        let mut ended = extra_ended.to_vec();
+        if stopped {
+            ended.extend(self.links.iter().filter_map(|(&peer, link)| link.media_held.map(|_| peer)));
+            self.retire_call();
+        }
+        let changes = self.media_changes(&ended);
+        stopped | self.apply_media_changes(changes)
     }
 
     fn apply(&mut self, host: &mut dyn AudioHost, effects: Vec<Effect>) -> bool {
+        self.apply_with_ended(host, effects, &[])
+    }
+
+    fn apply_with_ended(&mut self, host: &mut dyn AudioHost, effects: Vec<Effect>, ended: &[PublicKey]) -> bool {
         let changed = self.apply_effects(host, effects);
-        let media_changed = self.settle_media();
+        let media_changed = self.settle_media_ended(ended);
         self.attach_voice(host);
         changed || media_changed
     }
@@ -642,14 +818,25 @@ impl CallController {
         let mut changed = false;
         for effect in effects {
             match effect {
-                Effect::Start { .. } => self.voice_wanted = true,
-                Effect::Stop => {
+                Effect::StartLocalAudio => self.voice_wanted = true,
+                Effect::PeerVoice { peer, on } => {
+                    if let Some(link) = self.links.get(&peer).filter(|l| l.media_held.is_some()) {
+                        if let Some(call) = &mut self.current { call.set_peer_voice(link.peer_id, on); }
+                    }
+                    if !on { self.peer_level.remove_peer(&peer); }
+                }
+                Effect::StopLocalAudio => {
                     self.sharing.close_picker();
                     self.speech.tap = None;
                     self.speech.status = TranscribeShown::Off;
                     self.talking = Talking::default();
                     self.peer_level.clear();
                     self.voice_wanted = false;
+                    if let Some(call) = &mut self.current {
+                        for link in self.links.values().filter(|l| l.media_held.is_some()) {
+                            call.set_peer_voice(link.peer_id, false);
+                        }
+                    }
                     if std::mem::take(&mut self.voice_attached) {
                         self.control.detach();
                         if let Some(call) = &mut self.current { call.remove_voice(); }
@@ -689,7 +876,7 @@ impl CallController {
                     self.install(host);
                     self.control.ring(on);
                 }
-                Effect::Send(body) => self.send_active(body),
+                Effect::SendTo { peer, body } => self.send_to(peer, body),
                 Effect::Changed => changed = true,
             }
         }
@@ -759,41 +946,25 @@ impl CallController {
                         body = std::mem::take(&mut link.share_parts);
                         if !super::Message::is_share_message(&body) { continue }
                     }
-                    if self.active_peer != Some(peer) {
-                        if self.is_idle() {
-                            if !super::Message::is_share_message(&body) && MediaSignal::decode(&body).is_none()
-                                && !matches!(super::decode(&body), Ok(Some(_))) { continue }
-                            self.select_active_peer(host, peer);
-                            changed = true;
-                        } else {
-                            if let Ok(Some(super::Message::Ring { call_id, .. })) = super::decode(&body) {
-                                let decline = super::Message::Decline { call_id, why: super::Why::Busy };
-                                self.links.get_mut(&peer).unwrap().send(decline.encode(), &mut self.sent);
-                            }
-                            continue;
-                        }
-                    }
                     if MediaSignal::has_tag(&body) {
                         let link = self.links.get_mut(&peer).unwrap();
                         match MediaSignal::decode(&body) {
-                            Some(signal) => match link.media.receive(link.me < link.peer, self.current.is_some(), link.peer_media_key.is_some(), signal) {
-                                Ok(changes) => changed |= self.apply_media(changes),
+                            Some(signal) => match link.media.receive(link.me < link.peer, link.media_held.is_some(), link.peer_media_key.is_some(), signal) {
+                                Ok(changes) => changed |= self.apply_media_for(peer, changes),
                                 Err(why) => log!("Town call: ignoring {why}"),
                             },
                             None => log!("Town call: refused malformed media signal"),
                         }
                     } else if super::Message::is_share_message(&body) {
-                        changed |= self.share_message(&body);
+                        changed |= self.share_message(peer, &body);
                     } else {
                         let mut effects = Vec::new();
-                        self.flow.message(&body, self.now(), &mut effects);
+                        self.flow.receive(peer, &body, self.now(), &mut effects);
                         changed |= self.apply_effects(host, effects);
                     }
                 }
-                if self.active_peer == Some(peer) {
-                    changed |= self.settle_media();
-                    self.attach_voice(host);
-                }
+                changed |= self.settle_media();
+                self.attach_voice(host);
             }
         }
         for link in self.links.values_mut() {
@@ -806,7 +977,21 @@ impl CallController {
             if !effects.is_empty() { changed |= self.apply(host, effects); }
         }
         self.attach_voice(host);
-        for call in self.current.iter_mut().chain(&mut self.stopping) {
+        let watched_peer = self.watched_peer_id();
+        if let Some(call) = &mut self.current {
+            for event in call.poll() {
+                if let CallEvent::Problem { peer, what } = event {
+                    log!("Town call: {what}");
+                    if peer.is_some() && peer == watched_peer && self.sharing.shown.picture.is_none() {
+                        if let Some(offer) = self.sharing.shown.watching.and_then(|s| self.sharing.shown.offer_mut(s)) {
+                            offer.decode_problem = Some(Arc::from(what));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for call in &mut self.stopping {
             for event in call.poll() {
                 if let CallEvent::Problem { what, .. } = event {
                     log!("Town call: {what}");
@@ -819,7 +1004,9 @@ impl CallController {
                 let mut talking = Talking::default();
                 for tile in call.tiles() {
                     if tile.who.is_none() { talking.you = tile.talking; }
-                    else if tile.who == Some(PEER) { talking.peer = tile.talking; }
+                    else if tile.who.and_then(|id| self.id_to_peer.get(&id)).is_some_and(|peer| self.flow.is_voice_peer(peer)) {
+                        talking.peer |= tile.talking;
+                    }
                 }
                 changed |= talking != self.talking;
                 self.talking = talking;
@@ -850,11 +1037,15 @@ impl CallController {
     }
 
     fn sample_peer_level(&mut self) {
-        let view = self.flow.view();
+        let flow = &self.flow;
         let call = self.current.as_ref();
-        self.peer_level.sample(view.phase, view.peer_muted, self.now().mono_us, || {
-            call.and_then(|call| call.tiles().iter().find(|tile| tile.who == Some(PEER)))
-                .filter(|tile| !tile.muted).map_or(0.0, |tile| tile.level)
+        let keys = &self.id_to_peer;
+        let now = self.now().mono_us;
+        self.peer_level.sample(flow.view().phase, &flow.view().participants, now, || {
+            call.into_iter().flat_map(|call| call.tiles()).filter_map(|tile| {
+                let peer = keys.get(&tile.who?)?;
+                (flow.is_voice_peer(peer) && !flow.is_peer_muted(peer) && !tile.muted).then_some((*peer, tile.level))
+            })
         });
     }
 }
@@ -943,7 +1134,7 @@ type RecognizerFactory = Box<dyn Fn(&TranscriberConfig, WakeHook) -> Box<dyn Rec
 
 struct Stretch {
     session: CallId,
-    media_number: u32,
+    call_generation: u64,
     worker: Transcriber,
     stopping: bool,
     lines: VecDeque<Heard>,
@@ -968,10 +1159,6 @@ impl Default for Speech {
 
 impl CallController {
     /// Queue an opaque message for this link. Call signals get the first free slots on poll.
-    pub fn send_peer(&mut self, topic: u8, body: Vec<u8>) -> Result<(), NotLinked> {
-        self.send_peer_to(self.active_peer.ok_or(NotLinked)?, topic, body)
-    }
-
     pub fn send_peer_to(&mut self, peer: PublicKey, topic: u8, body: Vec<u8>) -> Result<(), NotLinked> {
         let link = self.links.get_mut(&peer).ok_or(NotLinked)?;
         let wake = link.peer_messages.outgoing.is_empty();
@@ -985,10 +1172,6 @@ impl CallController {
     /// For a latest-only topic, mark its first frame as replaceable. Once that frame crosses
     /// the carrier, its remaining fragments must finish before the next whole message.
     /// All producers of the topic must use this method.
-    pub fn send_peer_latest(&mut self, topic: u8, body: Vec<u8>) -> Result<(), NotLinked> {
-        self.send_peer_latest_to(self.active_peer.ok_or(NotLinked)?, topic, body)
-    }
-
     pub fn send_peer_latest_to(&mut self, peer: PublicKey, topic: u8, body: Vec<u8>) -> Result<(), NotLinked> {
         use super::signal::{encode_peer, peer_payload, PEER_PAYLOAD};
         let link = self.links.get_mut(&peer).ok_or(NotLinked)?;
@@ -1021,10 +1204,6 @@ impl CallController {
     }
 
     /// Drain this topic in arrival order. Each link starts with fresh inboxes.
-    pub fn take_peer(&mut self, topic: u8) -> Vec<Vec<u8>> {
-        self.active_link_mut().and_then(|link| link.peer_messages.incoming.remove(&topic)).unwrap_or_default()
-    }
-
     pub fn take_peer_with_sender(&mut self, topic: u8) -> Vec<(PublicKey, Vec<u8>)> {
         let mut received = Vec::new();
         for (&peer, link) in &mut self.links {
@@ -1111,8 +1290,7 @@ impl CallController {
         let config = TranscriberConfig::new(self.flow.origin_us);
         let rec = (self.speech.recognize)(&config, env.signal.clone());
         let worker = Transcriber::start(tap, config, rec, &env.spawn, env.signal.clone());
-        let media_number = self.active_link().unwrap().media.session_last;
-        self.speech.stretches.push(Stretch { session, media_number, worker, stopping: false, lines: VecDeque::new(), leave: None });
+        self.speech.stretches.push(Stretch { session, call_generation: self.call_generation, worker, stopping: false, lines: VecDeque::new(), leave: None });
     }
 
     fn poll_transcription(&mut self, host: &mut dyn AudioHost) -> bool {
@@ -1121,13 +1299,13 @@ impl CallController {
         let sender = self.speech.sender.as_ref().expect("a transcriber has a timeline sender");
         let mut changed = false;
         let mut failed = None;
-        let media_number = self.active_link().filter(|_| self.voice_attached).map(|link| link.media.session_last);
+        let generation = self.voice_attached.then_some(self.call_generation);
         let mut draining = None;
         self.speech.stretches.retain_mut(|s| {
             // A restarted microphone can already capture while the old one's final words drain.
             if draining == Some(s.session) { return true }
             draining = Some(s.session);
-            let mine = active == Some(s.session) && media_number == Some(s.media_number);
+            let mine = active == Some(s.session) && generation == Some(s.call_generation);
             for event in s.worker.poll() {
                 match event {
                     TranscriberEvent::Line { at_ms, dur_ms, text } => s.lines.push_back(Heard {
@@ -1215,12 +1393,12 @@ mod tests {
         ctl.flow = CallFlow::new(Box::new(|bytes| bytes.fill(7)));
         let now = Now::default();
         let mut effects = Vec::new();
-        ctl.flow.linked([1; 65], "Peer", now, &mut effects);
+        ctl.flow.set_open_town(Some(([9; 32], vec![([1; 65], "Peer".into())])), &mut effects);
         ctl.flow.press(Press::Call, now, &mut effects);
         assert_eq!(ctl.view().phase, Phase::Calling, "outbound call entered Calling");
         assert_eq!(ctl.shown().echo_cancel_notice, None, "no headphone notice while calling");
-        let answer = super::super::Message::Answer { call_id: [7; 16], secret: [8; 32], ext: Default::default() };
-        ctl.flow.message(&answer.encode(), now, &mut effects);
+        let answer = super::super::Message::Answer { call_id: [7; 16], secret: [8; 32], ext: super::super::AnswerExt { town: Some([9; 32]), ..Default::default() } };
+        ctl.flow.receive([1; 65], &answer.encode(), now, &mut effects);
         assert_eq!(ctl.view().phase, Phase::Live, "peer answer made the call live");
         assert_eq!(ctl.shown().echo_cancel_notice.as_deref(), Some("Echo cancellation is off — use headphones to avoid echo."),
             "an unprotected live microphone shows the headphone notice");
@@ -1329,7 +1507,7 @@ mod tests {
         }
 
         fn seq(&mut self) -> Option<u32> {
-            self.speaker.as_mut()?.received_seq(PEER, VOICE)
+            self.speaker.as_mut()?.received_seq(1, VOICE)
         }
     }
 
@@ -1364,7 +1542,7 @@ mod tests {
                 self.drain_events();
                 for (index, seat) in self.seats.iter_mut().enumerate() {
                     seat.controller.poll(&mut seat.host);
-                    assert!(seat.controller.active_link().is_some(), "link worker {index} stopped");
+                    assert!(seat.controller.linked_peers().next().is_some(), "link worker {index} stopped");
                     assert!(!seat.controller.current.as_ref().is_some_and(Call::stopped), "active call worker {index} stopped");
                     seat.host.deliver_devices(&mut seat.controller, index == 0);
                 }
@@ -1449,7 +1627,10 @@ mod tests {
                 devices_path: dir.0.join("devices"),
             });
             assert!(!ctl.link_down(&mut host, key) && host.history.is_empty(), "a failure before link proof is a no-op");
-            let port = ctl.link_up(&mut host, key, DeviceKey::generate().unwrap().public(), "Peer").unwrap();
+            let peer = DeviceKey::generate().unwrap().public();
+            let port = ctl.link_up(&mut host, key, peer, "Peer").unwrap();
+            ctl.set_open_town(Some(([9; 32], vec![(peer, "Peer".into())])));
+            ctl.set_peer_caps(peer, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
             let desc = AudioDeviceDesc { device_type: AudioDeviceType::Input, device_id: MIC,
                 name: "Manual mic".into(), is_default: false, has_failed: false, channel_count: 1 };
             ctl.audio_devices(&mut host, &[desc]);
@@ -1470,7 +1651,8 @@ mod tests {
                 assert_eq!((fake.input, fake.output), (Some(SyntheticHost::MIC), None), "unknown IDs cannot change a synthetic route");
                 fake.use_inputs(&[]);
             }
-            for press in [Press::Call, Press::Answer, Press::Unmute, Press::Transcribe, Press::Clip, Press::Snap, Press::FirstCaptureWindow] {
+            for press in [Press::Call, Press::CallSeat([9; 32]),
+                Press::JoinCall([9; 16], [9; 32], crate::call::CallScope::Seats { caller: [1; 32], callee: [2; 32] }), Press::Answer, Press::Unmute, Press::Transcribe, Press::Clip, Press::Snap, Press::FirstCaptureWindow] {
                 assert!(ctl.opening(CallAction::Press(press)), "{press:?} needs the person's input");
             }
             for press in [Press::Decline, Press::Cancel, Press::HangUp, Press::Mute, Press::StopTranscribing, Press::NotMe, Press::StopRecording] {
@@ -1485,7 +1667,7 @@ mod tests {
             if !synthetic { assert!(ctl.call_opening_presses(&mut host, call)); }
             assert_eq!(ctl.shown().view.phase, Phase::Calling);
             assert!(ctl.call_actions(&mut host, CallAction::Press(Press::Cancel)));
-            port.messages_in.try_send(Message::Ring { call_id: [9; 16], secret: [3; 32], video: false, ext: Default::default() }.encode()).unwrap();
+            port.messages_in.try_send(Message::Ring { call_id: [9; 16], secret: [3; 32], video: false, ext: super::super::RingExt { town: Some([9; 32]), ..Default::default() } }.encode()).unwrap();
             ctl.poll(&mut host);
             assert!(ctl.shown().view.ringing() && !ctl.wants_input());
             let answer = CallAction::Press(Press::Answer);
@@ -1548,6 +1730,7 @@ mod tests {
             });
             let mut host = Host { tone: [700.0, 1100.0][i], ..Default::default() };
             let port = controller.link_up(&mut host, keys[i].public(), peer, ["Bob", "Ada"][i]).unwrap();
+            controller.set_open_town(Some((caller.open_id(), vec![(peer, ["Bob", "Ada"][i].into())])));
             // A delivery to this port means the worker is past its initial Linked/Path events.
             port.sent_bytes.store(u64::MAX, Ordering::Relaxed);
             attached.push(port.sent_bytes.clone());
@@ -1628,7 +1811,7 @@ mod tests {
         assert_eq!(rig.seats[0].host.input, None, "mute closes the selected microphone immediately");
         rig.wait(|s| s[1].controller.view().peer_muted);
         let stale = rig.seats[1].controller.current.as_ref().unwrap().tiles().iter()
-            .find(|tile| tile.who == Some(PEER)).unwrap().level;
+            .find(|tile| tile.who == Some(rig.seats[1].controller.links.values().next().unwrap().peer_id)).unwrap().level;
         assert!(stale > 0.0, "B has not rendered a new block since A muted");
         assert_eq!(meters[1].peer_level_step(), 0, "the mute signal clears even a previously shown meter");
         eprintln!("peer ring: talk {speaking:?}/16, silence 0, mute 0 at cached RMS {stale:.3}");
@@ -1648,7 +1831,7 @@ mod tests {
             assert!(!seat.controller.mic_open(), "seat {i} has no live mic indicator after hang-up");
             let facts = &seat.controller.facts;
             let session = match (i, facts.first()) {
-                (0, Some(Fact::Open { session, video: false, .. })) | (1, Some(Fact::Join { session })) => *session,
+                (0, Some(Fact::Open { session, video: false, .. })) | (1, Some(Fact::Join { session, .. })) => *session,
                 other => panic!("seat {i} must record its own open or join: {other:?}"),
             };
             assert_eq!(facts.len(), 2, "each seat records exactly two facts");
@@ -1674,16 +1857,16 @@ mod tests {
             jobs: Arc::new(|_, _| panic!("linking started an audio job")),
         });
         let (me, peer) = ([1; 65], [2; 65]);
-        assert_eq!(call.peer_epoch(), None, "an idle controller has no peer");
+        assert_eq!(call.peer_epoch_of(&peer), None, "an idle controller has no peer");
         let _first = call.link_up(&mut host, me, peer, "Peer").unwrap();
-        let (key, first) = call.peer_epoch().unwrap();
+        let (key, first) = call.peer_epoch_of(&peer).unwrap();
         assert_eq!(key, peer, "the active link supplies the peer's key");
         call.poll(&mut host);
-        assert_eq!(call.peer_epoch(), Some((peer, first)), "polling preserves the active epoch");
+        assert_eq!(call.peer_epoch_of(&peer), Some((peer, first)), "polling preserves the active epoch");
         call.link_down(&mut host, peer);
-        assert_eq!(call.peer_epoch(), None, "unlink clears the peer identity");
+        assert_eq!(call.peer_epoch_of(&peer), None, "unlink clears the peer identity");
         let _second = call.link_up(&mut host, me, peer, "Peer").unwrap();
-        let (key, second) = call.peer_epoch().unwrap();
+        let (key, second) = call.peer_epoch_of(&peer).unwrap();
         assert_eq!(key, peer, "the reconnected link belongs to the same peer");
         assert_ne!(second, first, "reconnecting to the same key starts a new epoch");
     }
@@ -1707,7 +1890,8 @@ mod tests {
             // The second link_up replaces a live link to the same peer on both seats.
             let ports: [_; 2] = std::array::from_fn(|i| {
                 let port = controllers[i].link_up(&mut hosts[i], devices[i], devices[1-i], "Peer").unwrap();
-                assert!(controllers[i].active_link().unwrap().peer_media_key.is_none());
+                controllers[i].set_open_town(Some(([9; 32], vec![(devices[1-i], "Peer".into())])));
+                assert!(controllers[i].links.get(&devices[1-i]).unwrap().peer_media_key.is_none());
                 port
             });
             // Hold both directions. The carrier hasn't drained either key when the person presses Call.
@@ -1728,16 +1912,16 @@ mod tests {
             assert!(matches!(super::super::decode(&ring), Ok(Some(super::super::Message::Ring { .. }))));
             for (ctl, host) in controllers.iter_mut().zip(&mut hosts) { ctl.poll(host); }
             for i in 0..2 {
-                let link = controllers[i].active_link().unwrap();
-                assert!(link.peer_media_key.as_ref() == Some(&controllers[1-i].active_link().unwrap().local_media_key));
+                let link = controllers[i].links.get(&devices[1-i]).unwrap();
+                assert!(link.peer_media_key.as_ref() == Some(&controllers[1-i].links.get(&devices[i]).unwrap().local_media_key));
                 // Offer a different, well-formed key as a duplicate.
                 ports[i].messages_in.try_send(link.local_media_key.encode()).unwrap();
             }
             ports[1-caller].messages_in.try_send(ring).unwrap();
             for (ctl, host) in controllers.iter_mut().zip(&mut hosts) { ctl.poll(host); }
             for i in 0..2 {
-                let link = controllers[i].active_link().unwrap();
-                assert!(link.peer_media_key.as_ref() == Some(&controllers[1-i].active_link().unwrap().local_media_key),
+                let link = controllers[i].links.get(&devices[1-i]).unwrap();
+                assert!(link.peer_media_key.as_ref() == Some(&controllers[1-i].links.get(&devices[i]).unwrap().local_media_key),
                     "a duplicate replaced the first peer key");
                 assert!(ports[i].messages_out.try_recv().is_err(), "key exchange sends no reply");
             }
@@ -1748,7 +1932,7 @@ mod tests {
     #[test]
     fn a_full_port_gives_its_next_slot_to_the_call() {
         use super::super::{Message, topic::TWEAK};
-        let (mut link, port) = Link::new([1; 65], [2; 65], MediaKey::generate().unwrap(), "Peer".into(), 1, &Inlet::new());
+        let (mut link, port) = Link::new([1; 65], [2; 65], MediaKey::generate().unwrap(), "Peer".into(), 1, 1, &Inlet::new());
         let mut sent = 0;
         // Stop reading the bounded port until both a peer message and a Ring are waiting.
         while link.outgoing.try_send(Vec::new()).is_ok() {}
@@ -1776,53 +1960,54 @@ mod tests {
     fn peer_messages_on_idle_link(rig: &mut Rig) {
         use super::super::topic::TWEAK;
         const MARKER: u8 = 2;
+        let peers = rig.seats.each_ref().map(|s| s.controller.linked_peers().next().unwrap());
         let burst: Vec<_> = (0..1000u16).map(|n| n.to_be_bytes().to_vec()).collect();
         for body in &burst {
-            rig.seats[0].controller.send_peer(TWEAK, body.clone()).unwrap();
+            rig.seats[0].controller.send_peer_to(peers[0], TWEAK, body.clone()).unwrap();
         }
-        rig.seats[0].controller.send_peer(MARKER, vec![]).unwrap();
+        rig.seats[0].controller.send_peer_to(peers[0], MARKER, vec![]).unwrap();
         let large: Vec<_> = (0..2 * makepad_town_core::connect::MAX_CALL).map(|n| (n % 251) as u8).collect();
         let reverse = [vec![2], large, vec![], vec![1]];
         for body in &reverse {
-            rig.seats[1].controller.send_peer(TWEAK, body.clone()).unwrap();
+            rig.seats[1].controller.send_peer_to(peers[1], TWEAK, body.clone()).unwrap();
         }
         // A topic this build does not take, short and in pieces, sent ahead of the marker.
         const UNKNOWN: u8 = 200;
         for body in [vec![9], vec![9; 2 * makepad_town_core::connect::MAX_CALL]] {
-            rig.seats[1].controller.send_peer(UNKNOWN, body).unwrap();
+            rig.seats[1].controller.send_peer_to(peers[1], UNKNOWN, body).unwrap();
         }
-        rig.seats[1].controller.send_peer(MARKER, vec![]).unwrap();
+        rig.seats[1].controller.send_peer_to(peers[1], MARKER, vec![]).unwrap();
 
         let mut arrived = [false; 2];
         rig.wait(|seats| {
             for (side, seat) in seats.iter_mut().enumerate() {
                 assert_eq!(seat.controller.view().phase, Phase::Idle, "peer traffic needs no call");
-                if !seat.controller.take_peer(MARKER).is_empty() { arrived[side] = true; }
+                if !seat.controller.take_peer_with_sender(MARKER).is_empty() { arrived[side] = true; }
             }
             arrived == [true; 2]
         });
-        assert!(rig.seats[0].controller.take_peer(TWEAK) == reverse, "reverse path preserves order and entire multi-frame bodies");
-        assert!(rig.seats[0].controller.take_peer(UNKNOWN).is_empty(),
+        assert!(rig.seats[0].controller.take_peer_with_sender(TWEAK).into_iter().map(|(_, body)| body).collect::<Vec<_>>() == reverse, "reverse path preserves order and entire multi-frame bodies");
+        assert!(rig.seats[0].controller.take_peer_with_sender(UNKNOWN).is_empty(),
             "a topic this build does not take is dropped on arrival, whole or in pieces, never buffered for the link's life");
         rig.press(0, Press::Call);
         rig.wait(|seats| seats[1].controller.view().ringing());
-        assert_eq!(rig.seats[1].controller.take_peer(TWEAK), burst, "Ring arrives before anyone drains the 1000 messages");
-        assert!(rig.seats[1].controller.take_peer(TWEAK).is_empty(), "a drain delivers each message once");
+        assert_eq!(rig.seats[1].controller.take_peer_with_sender(TWEAK).into_iter().map(|(_, body)| body).collect::<Vec<_>>(), burst, "Ring arrives before anyone drains the 1000 messages");
+        assert!(rig.seats[1].controller.take_peer_with_sender(TWEAK).is_empty(), "a drain delivers each message once");
 
         rig.press(0, Press::Cancel);
         rig.wait(|seats| seats[1].controller.view().phase == Phase::Idle);
         let seat = &mut rig.seats[0];
-        seat.controller.send_peer(MARKER, vec![]).unwrap();
-        seat.controller.send_peer(TWEAK, vec![7; makepad_town_core::connect::MAX_CALL]).unwrap();
-        seat.controller.send_peer(MARKER, vec![]).unwrap();
-        let peer = seat.controller.active_peer().unwrap();
+        seat.controller.send_peer_to(peers[0], MARKER, vec![]).unwrap();
+        seat.controller.send_peer_to(peers[0], TWEAK, vec![7; makepad_town_core::connect::MAX_CALL]).unwrap();
+        seat.controller.send_peer_to(peers[0], MARKER, vec![]).unwrap();
+        let peer = seat.controller.linked_peers().next().unwrap();
         seat.controller.link_down(&mut seat.host, peer);
         assert_eq!(seat.controller.take_peer_events(), [
             PeerEvent::PeerUndelivered { peer, topic: TWEAK, count: 1 },
             PeerEvent::PeerUndelivered { peer, topic: MARKER, count: 2 },
         ], "report only messages still in the old link's queue, grouped by topic");
         assert!(seat.controller.take_peer_events().is_empty());
-        assert_eq!(seat.controller.send_peer(TWEAK, vec![]), Err(NotLinked));
+        assert_eq!(seat.controller.send_peer_to(peers[0], TWEAK, vec![]), Err(NotLinked));
     }
     struct Recording {
         samples: usize,
@@ -1853,6 +2038,7 @@ mod tests {
             ctl.configure(CallEnv { files: Default::default(), voice: VoiceSource::Feed, devices_path: Default::default(),
                 signal: Arc::new(|| {}), spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn() });
             let port = ctl.link_up(&mut host, [me; 65], [peer; 65], "Peer").unwrap();
+            ctl.set_open_town(Some(([9; 32], vec![([peer; 65], "Peer".into())])));
             let (submit, submitted) = channel();
             let (engines, started) = channel();
             ctl.speech.recognize = Box::new(move |_, _| {
@@ -1863,7 +2049,7 @@ mod tests {
             let (sender, _sink) = crate::transcript::channel();
             ctl.set_transcript_sender(sender);
             let session = [9; 16];
-            port.messages_in.try_send(super::super::Message::Ring { call_id: session, secret: [3; 32], video: false, ext: Default::default() }.encode()).unwrap();
+            port.messages_in.try_send(super::super::Message::Ring { call_id: session, secret: [3; 32], video: false, ext: super::super::RingExt { town: Some([9; 32]), ..Default::default() } }.encode()).unwrap();
             ctl.poll(&mut host);
             ctl.press(&mut host, Press::Answer);
             ctl.set_transcript_town(session, Some("Workshop".into()));
@@ -1942,11 +2128,11 @@ mod tests {
             session
         };
         let session = start_call(rig);
-        let Some(Fact::Open { session: opened, to, .. }) = rig.seats[0].controller.take_facts().pop() else { panic!("A opens the session") };
+        let Some(Fact::Open { session: opened, town, .. }) = rig.seats[0].controller.take_facts().pop() else { panic!("A opens the session") };
         assert_eq!(opened, session);
-        assert_eq!(rig.seats[1].controller.take_facts(), [Fact::Join { session }]);
-        a.act(Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: vec![a.call_seat(&to).unwrap()] }, Origin::Ui).unwrap();
-        b.act(Action::SessionJoin { town: None, session }, Origin::Ui).unwrap();
+        assert_eq!(rig.seats[1].controller.take_facts(), [Fact::Join { session, from: a.me(), town: a.open_id() }]);
+        a.act(Action::SessionOpen { town_wide: false, town: Some(town), session, mode: SessionMode::Call { video: false }, to: vec![a.seat_in_town(town, &b.me()).unwrap()] }, Origin::Ui).unwrap();
+        b.act(Action::SessionJoin { peer: Some(a.me()), town: Some(town), session }, Origin::Ui).unwrap();
         let local = |rig: &mut Rig, i| {
             let seat: &mut Seat = &mut rig.seats[i];
             let press = CallAction::Press(Press::Transcribe);
@@ -2047,4 +2233,322 @@ mod tests {
         rig.wait(|s| s.iter().all(|seat| seat.controller.speech.stretches.is_empty() && !seat.controller.has_call_workers()));
     }
 
+
+    #[test]
+    fn callee_card_call_gives_bystander_no_ack_or_voice_link() {
+        use super::super::{decode, Message};
+        let town = [9; 32];
+        let keys: [PublicKey; 3] = [[1; 65], [2; 65], [3; 65]];
+        let seats = [[1; 32], [2; 32], [3; 32]];
+        let names = ["Ana", "Ada", "Ben"];
+        let mut controllers: [CallController; 3] = Default::default();
+        let mut hosts: [Host; 3] = Default::default();
+        let mut ports = BTreeMap::new();
+        for (i, ctl) in controllers.iter_mut().enumerate() {
+            ctl.codecs = Arc::new(makepad_call::driver::codec::TestCodecs);
+            ctl.configure(CallEnv { files: Default::default(), devices_path: Default::default(), signal: Arc::new(|| {}),
+                voice: VoiceSource::Synthetic { tone_hz: 440. + 220. * i as f32 },
+                spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn() });
+            let mut linked = Vec::new();
+            for j in (0..3).filter(|j| *j != i) {
+                ports.insert((i, j), ctl.link_up(&mut hosts[i], keys[i], keys[j], names[j]).unwrap());
+                ctl.set_peer_caps(keys[j], MediaCaps(MediaCaps::MULTIPARTY_V1));
+                linked.push((keys[j], names[j].into()));
+            }
+            ctl.set_town_peer_seats(BTreeMap::from([(town, keys.into_iter().zip(seats).collect())]));
+            ctl.set_open_town(Some((town, linked)));
+        }
+        let pump = |controllers: &mut [CallController; 3], hosts: &mut [Host; 3]| {
+            for (&(i, j), out) in &ports {
+                let dest = &ports[&(j, i)];
+                for body in out.messages_out.try_iter() {
+                    if j == 2 {
+                        assert!(!matches!(decode(&body), Ok(Some(Message::CallJoinAck { .. } | Message::Ring { .. }))),
+                            "Ben receives neither a ring nor a join acknowledgement");
+                    }
+                    dest.messages_in.try_send(body).expect("deliver the signalling frame");
+                }
+                for body in out.datagrams_out.try_iter() {
+                    assert_ne!(j, 2, "neither participant sends voice to Ben");
+                    let addr = std::net::SocketAddr::from(([192, 0, 2, i as u8 + 1], 4000));
+                    dest.datagrams_in.try_send((addr, body)).expect("deliver authorized media");
+                }
+            }
+            for (ctl, host) in controllers.iter_mut().zip(hosts) { ctl.poll(host); }
+            thread::yield_now();
+        };
+        controllers[0].press(&mut hosts[0], Press::CallSeat(seats[1]));
+        while !controllers[1].view().ringing() { pump(&mut controllers, &mut hosts); }
+        let call_id = controllers[0].flow.session().unwrap();
+        let join = Message::CallJoin { call_id, town, muted: false, transcribing: false };
+        for phase in [Phase::Ringing, Phase::Live] {
+            let stale = controllers[1].flow.ignored().stale;
+            assert_eq!(controllers[1].view().phase, phase, "test both admission paths at Ada");
+            ports[&(1, 2)].messages_in.try_send(join.encode()).expect("deliver the same-town join request");
+            while controllers[1].flow.ignored().stale == stale { pump(&mut controllers, &mut hosts); }
+            if phase == Phase::Ringing { controllers[1].press(&mut hosts[1], Press::Answer); }
+        }
+        let received = |ctl: &mut CallController, from| {
+            let id = ctl.links[&from].peer_id;
+            ctl.synthetic.as_ref()?.received_seq(id, VOICE)
+        };
+        while !(0..2).all(|i| received(&mut controllers[i], keys[1-i]).is_some()) { pump(&mut controllers, &mut hosts); }
+        let first = [0, 1].map(|i| received(&mut controllers[i], keys[1-i]).unwrap());
+        let peer_lit = |ctl: &CallController| {
+            let shown = ctl.shown();
+            shown.talking.peer && shown.peer_level_step() > 0
+        };
+        while !controllers[..2].iter().all(peer_lit)
+            && (0..2).any(|i| received(&mut controllers[i], keys[1-i]).unwrap().wrapping_sub(first[i]) < 50)
+        {
+            pump(&mut controllers, &mut hosts);
+        }
+        for i in 0..2 {
+            assert!(peer_lit(&controllers[i]),
+                "{}'s synthetic speaker plays out the peer's voice, so the peer's talking mark and level rise", names[i]);
+        }
+        assert_eq!(controllers[1].voice_peers(), [keys[0]], "Ada exchanges voice only with Ana");
+        assert!(controllers[1].links[&keys[2]].media_held.is_none() && !controllers[2].has_call_workers(),
+            "the bystander's link stays free of media");
+        controllers[0].press(&mut hosts[0], Press::HangUp);
+        while controllers.iter().any(CallController::has_call_workers) { pump(&mut controllers, &mut hosts); }
+    }
+
+    #[test]
+    fn foreign_town_carrier_gets_no_voice_in_live_call() {
+        use super::super::{decode, Message};
+        let (town_a, town_b) = ([0xaa; 32], [0xbb; 32]);
+        let keys: [PublicKey; 3] = [[0; 65], [1; 65], [2; 65]];
+        let names = ["Alice", "Ben", "Eve"];
+        let mut controllers: [CallController; 3] = Default::default();
+        let mut hosts: [Host; 3] = Default::default();
+        let mut ports = BTreeMap::new();
+        for (i, ctl) in controllers.iter_mut().enumerate() {
+            ctl.codecs = Arc::new(makepad_call::driver::codec::TestCodecs);
+            ctl.configure(CallEnv {
+                files: Default::default(), devices_path: Default::default(), signal: Arc::new(|| {}),
+                voice: VoiceSource::Synthetic { tone_hz: 440. + 220. * i as f32 },
+                spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn(),
+            });
+            let mut towns = BTreeMap::<_, BTreeSet<_>>::new();
+            let neighbors: &[(usize, TownId)] = match i {
+                0 => &[(1, town_a), (2, town_b)],
+                1 => &[(0, town_a)],
+                _ => &[(0, town_b)],
+            };
+            for &(j, town) in neighbors {
+                let port = ctl.link_up(&mut hosts[i], keys[i], keys[j], names[j]).unwrap();
+                ctl.set_peer_caps(keys[j], MediaCaps(MediaCaps::MULTIPARTY_V1));
+                ports.insert((i, j), port);
+                towns.entry(town).or_default().insert(keys[j]);
+            }
+            ctl.set_town_peers(&mut hosts[i], towns);
+            let target = if i == 0 { 1 } else { 0 };
+            ctl.set_open_town(Some((if i == 2 { town_b } else { town_a }, vec![(keys[target], names[target].into())])));
+        }
+
+        let until = |controllers: &mut [CallController; 3], hosts: &mut [Host; 3],
+                         ready: &mut dyn FnMut(&mut [CallController; 3]) -> bool| {
+            let start = Instant::now();
+            loop {
+                for (&(i, j), out) in &ports {
+                    let dest = &ports[&(j, i)];
+                    for frame in out.messages_out.try_iter() {
+                        if j == 2 {
+                            assert!(!matches!(decode(&frame), Ok(Some(Message::CallJoinAck { .. }))),
+                                "the foreign carrier must never receive a join acknowledgement");
+                        }
+                        dest.messages_in.try_send(frame).expect("deliver the signaling frame");
+                    }
+                    for bytes in out.datagrams_out.try_iter() {
+                        assert_ne!(j, 2, "no media datagram can be sent to the foreign carrier");
+                        let addr = std::net::SocketAddr::from(([192, 0, 2, i as u8 + 1], 4000));
+                        dest.datagrams_in.try_send((addr, bytes)).expect("deliver the voice datagram");
+                    }
+                }
+                for (ctl, host) in controllers.iter_mut().zip(hosts.iter_mut()) { ctl.poll(host); }
+                if ready(controllers) { break }
+                assert!(start.elapsed() < Duration::from_secs(15), "the authorized voice path must make progress");
+                thread::yield_now();
+            }
+        };
+        let received = |ctl: &mut CallController, from| {
+            let id = ctl.links[&from].peer_id;
+            ctl.synthetic.as_ref()?.received_seq(id, VOICE)
+        };
+        controllers[0].press(&mut hosts[0], Press::Call);
+        until(&mut controllers, &mut hosts, &mut |c| c[1].view().ringing());
+        controllers[1].press(&mut hosts[1], Press::Answer);
+        until(&mut controllers, &mut hosts, &mut |c| received(&mut c[0], keys[1]).is_some() && received(&mut c[1], keys[0]).is_some());
+        let before = [0, 1].map(|i| received(&mut controllers[i], keys[1-i]).unwrap());
+        let generations = [0, 1].map(|i| controllers[i].call_generation());
+        let call_id = controllers[0].flow.session().unwrap();
+        controllers[0].set_open_town(Some((town_b, vec![(keys[2], names[2].into())])));
+        for msg in [Message::CallJoinAck { call_id, muted: false, transcribing: false, seats: None },
+                    Message::CallJoin { call_id, town: town_a, muted: false, transcribing: false }] {
+            ports[&(0, 2)].messages_in.try_send(msg.encode()).expect("deliver Eve's signaling to Alice");
+        }
+        until(&mut controllers, &mut hosts, &mut |c| (0..2).all(|i|
+            received(&mut c[i], keys[1-i]).is_some_and(|seq| seq > before[i])));
+        assert_eq!(controllers[0].voice_peers(), [keys[1]], "only Ben has voice in Alice's live town");
+        assert!(controllers[0].links[&keys[2]].media_held.is_none(), "the foreign link has no media session");
+        assert_eq!([0, 1].map(|i| controllers[i].call_generation()), generations,
+            "both directions advanced on their original calls");
+        controllers[0].press(&mut hosts[0], Press::HangUp);
+        until(&mut controllers, &mut hosts, &mut |c| c.iter().all(|ctl| !ctl.has_call_workers()));
+    }
+
+    fn keeper_with_two_links(peers: [PublicKey; 2]) -> (CallController, Host, [MediaPort; 2]) {
+        let mut ctl = CallController::default();
+        ctl.codecs = Arc::new(makepad_call::driver::codec::TestCodecs);
+        ctl.configure(CallEnv {
+            files: Default::default(), devices_path: Default::default(), signal: Arc::new(|| {}),
+            voice: VoiceSource::Off, spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn(),
+        });
+        let mut host = Host::default();
+        let ports = peers.map(|peer| {
+            let port = ctl.link_up(&mut host, [1; 65], peer, "Peer").unwrap();
+            port.messages_in.try_send(MediaKey::generate().unwrap().encode()).unwrap();
+            port
+        });
+        ctl.poll(&mut host);
+        (ctl, host, ports)
+    }
+
+    #[test]
+    fn link_down_that_stops_the_call_ends_the_other_links_media() {
+        use super::super::Message;
+        let (b, c) = ([2; 65], [3; 65]);
+        let (mut ctl, mut host, [sharer, follower]) = keeper_with_two_links([b, c]);
+        let town = [9; 32];
+        ctl.set_open_town(Some((town, vec![(b, "Ben".into()), (c, "Cam".into())])));
+        ctl.set_peer_caps(b, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
+        sharer.messages_in.try_send(Message::Share {
+            session: [7; 16], title: "Drawing".into(), w: 640., h: 480., ext: super::super::ShareOfferExt { town: Some(town), ..Default::default() },
+        }.encode()).unwrap();
+        ctl.poll(&mut host);
+        assert!(ctl.call_opening_presses(&mut host, CallAction::OnShare([7; 16], Press::Watch)), "the viewer starts the sharer's media");
+        let want = |last, running| Vec::try_from(MediaSignal::Want { on: true, last, running }).unwrap();
+        let signals = || follower.messages_out.try_iter().filter_map(|body| MediaSignal::decode(&body)).collect::<Vec<_>>();
+        follower.messages_in.try_send(want(0, false)).unwrap();
+        ctl.poll(&mut host);
+        assert_eq!(signals(), [MediaSignal::Media { n: 1, on: true }], "the keeper starts the follower's requested media");
+        follower.messages_in.try_send(want(1, true)).unwrap();
+        ctl.poll(&mut host);
+        assert_eq!(ctl.links[&c].media_held, Some(1), "the follower is running session 1 when the sharer drops");
+
+        ctl.link_down(&mut host, b);
+        assert!(ctl.current.is_none(), "losing the only remote share retires the call");
+        assert_eq!(signals(), [MediaSignal::Media { n: 1, on: false }], "the keeper tells the surviving follower that session 1 ended");
+        ctl.shutdown(&mut host);
+        while ctl.has_call_workers() { ctl.poll(&mut host); thread::yield_now(); }
+    }
+
+    #[test]
+    fn retiring_the_call_clears_the_talking_light() {
+        use super::super::{decode, AnswerExt, Message};
+        let (b, c) = ([2; 65], [3; 65]);
+        let (mut ctl, mut host, [answering, ringing]) = keeper_with_two_links([b, c]);
+        let town = [9; 32];
+        ctl.set_open_town(Some((town, vec![(b, "Ben".into()), (c, "Cam".into())])));
+        ctl.press(&mut host, Press::Call);
+        let session = ctl.flow.session().unwrap();
+        assert!(ringing.messages_out.try_iter().any(|body|
+            matches!(decode(&body), Ok(Some(Message::Ring { call_id, .. })) if call_id == session)),
+            "the other peer was rung for this call");
+        answering.messages_in.try_send(Message::Answer {
+            call_id: session, secret: [0; 32], ext: AnswerExt { town: Some(town), ..Default::default() },
+        }.encode()).unwrap();
+        ctl.poll(&mut host);
+        assert_eq!(ctl.voice_peers(), [b], "only the answering peer is live");
+        assert!(ctl.current.is_some(), "the answering peer has started media");
+        ctl.talking = Talking { you: false, peer: true };
+
+        ctl.link_down(&mut host, b);
+        assert!(ctl.current.is_none(), "dropping the only live peer retires media");
+        let shown = ctl.shown();
+        assert_eq!(shown.view.phase, Phase::Live, "the call stays live while the other peer is ringing");
+        assert_eq!(shown.talking, Talking::default(), "retiring media clears the departed peer's talking light immediately");
+        ctl.shutdown(&mut host);
+        while ctl.has_call_workers() { ctl.poll(&mut host); thread::yield_now(); }
+    }
+
+    #[test]
+    fn three_party_voice_mesh_stays_live_when_one_peer_disconnects() {
+        struct Mesh {
+            controllers: [CallController; 3],
+            hosts: [Host; 3],
+            ports: BTreeMap<(usize, usize), MediaPort>,
+        }
+
+        fn key(i: usize) -> PublicKey { [i as u8 + 1; 65] }
+        impl Mesh {
+            fn pump(&mut self) {
+                for (&(i, j), out) in &self.ports {
+                    let incoming = &self.ports[&(j, i)];
+                    for body in out.messages_out.try_iter() {
+                        incoming.messages_in.try_send(body).expect("the other seat receives the signalling frame");
+                    }
+                    for body in out.datagrams_out.try_iter() {
+                        let from = std::net::SocketAddr::from(([192, 0, 2, i as u8 + 1], 4000));
+                        incoming.datagrams_in.try_send((from, body)).expect("the destination inlet accepts the media datagram");
+                    }
+                }
+                for (controller, host) in self.controllers.iter_mut().zip(&mut self.hosts) { controller.poll(host); }
+            }
+
+            fn until(&mut self, mut ready: impl FnMut(&mut Self) -> bool) {
+                let start = Instant::now();
+                loop {
+                    self.pump();
+                    if ready(self) { break }
+                    assert!(start.elapsed() < Duration::from_secs(15), "the voice mesh must make progress");
+                    thread::yield_now();
+                }
+            }
+
+            fn received(&mut self, i: usize, from: usize) -> Option<u32> {
+                let ctl = &mut self.controllers[i];
+                let peer_id = ctl.links[&key(from)].peer_id;
+                ctl.synthetic.as_ref()?.received_seq(peer_id, VOICE)
+            }
+        }
+
+        let mut m = Mesh { controllers: Default::default(), hosts: Default::default(), ports: BTreeMap::new() };
+        for i in 0..3 {
+            let ctl = &mut m.controllers[i];
+            ctl.codecs = Arc::new(makepad_call::driver::codec::TestCodecs);
+            ctl.configure(CallEnv { files: Default::default(), devices_path: Default::default(), signal: Arc::new(|| {}),
+                voice: VoiceSource::Synthetic { tone_hz: 440. + 220. * i as f32 },
+                spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn() });
+            let mut peers = Vec::new();
+            for j in (0..3).filter(|j| *j != i) {
+                let name = format!("Peer {j}");
+                let port = ctl.link_up(&mut m.hosts[i], key(i), key(j), &name).unwrap();
+                m.ports.insert((i, j), port);
+                ctl.set_peer_caps(key(j), MediaCaps(MediaCaps::MULTIPARTY_V1));
+                peers.push((key(j), name));
+            }
+            ctl.set_open_town(Some(([9; 32], peers)));
+        }
+        m.controllers[0].press(&mut m.hosts[0], Press::Call);
+        m.until(|m| m.controllers[1..].iter().all(|ctl| ctl.view().ringing()));
+        for i in [1, 2] { m.controllers[i].press(&mut m.hosts[i], Press::Answer); }
+        m.until(|m| (0..3).all(|i| (0..3).all(|j| i == j || m.received(i, j).is_some())));
+        let generations = [0, 2].map(|i| m.controllers[i].call_generation());
+        let removed = [0, 2].map(|i| m.controllers[i].links[&key(1)].peer_id);
+        for (index, i) in [0, 2].into_iter().enumerate() {
+            m.controllers[i].link_down(&mut m.hosts[i], key(1));
+            m.controllers[1].link_down(&mut m.hosts[1], key(i));
+            m.ports.remove(&(i, 1));
+            m.ports.remove(&(1, i));
+            assert!(!m.controllers[i].id_to_peer.contains_key(&removed[index]), "seat {i} discarded the departed media ID");
+            assert_eq!(m.controllers[i].voice_peers(), [key(2-i)], "seat {i} keeps its surviving partner");
+        }
+        let before = [m.received(0, 2).unwrap(), m.received(2, 0).unwrap()];
+        m.until(|m| m.received(0, 2).is_some_and(|s| s > before[0]) && m.received(2, 0).is_some_and(|s| s > before[1]));
+        assert_eq!([0, 2].map(|i| m.controllers[i].call_generation()), generations, "surviving voice advances on the original workers");
+        m.controllers[0].press(&mut m.hosts[0], Press::HangUp);
+        m.until(|m| m.controllers.iter().all(|ctl| !ctl.has_call_workers()));
+    }
 }

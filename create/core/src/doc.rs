@@ -77,6 +77,7 @@ impl Node {
     const HIDDEN: u32 = 1 << 31;
 
     fn ch(self) -> char { char::from_u32(self.scalar & !Self::HIDDEN).unwrap() }
+    fn newline(self) -> bool { self.scalar & !Self::HIDDEN == '\n' as u32 }
     fn live(self) -> bool { self.scalar & Self::HIDDEN == 0 }
 
     fn visibility(&mut self, hide: bool, overlaps: &mut BTreeMap<(usize, u32), usize>) {
@@ -102,13 +103,28 @@ struct Run {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Inverse {
     Visibility { run: usize, first: u32, last: u32, hide: bool },
-    Attr { at: BreakRef, attr: u16, before: Value },
+    Attr { at: BreakRef, attr: u16, before: Value, before_writer: Option<Id>, before_origin: Option<Id>, before_source: Option<CheckboxSource> },
     Move { block: BreakRef, before: Option<BreakRef>, stop: Option<BreakRef> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopiedStatus {
+    /// Copied from `task`'s `field::STATUS` at `writer` (an earlier write or undo).
+    TaskStatus(Id),
+    /// Copied from an earlier tick in the same `Text` event on `at` via `link_writer`.
+    SameEventTick { at: BreakRef, link_writer: Id },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckboxSource {
+    pub task: Id,
+    pub link_writer: Id,
+    pub status: Option<CopiedStatus>,
 }
 
 #[derive(Default)]
 pub(crate) struct TaskEffects {
-    pub writes: BTreeMap<Id, Value>,
+    pub writes: BTreeMap<Id, (Value, BreakRef, Id)>,
     pub links: BTreeSet<Id>,
 }
 
@@ -130,6 +146,7 @@ pub struct DocState {
     inverses: BTreeMap<Id, Vec<Inverse>>,
     undone: BTreeSet<Id>,
     pub(crate) task_states: BTreeMap<Id, Value>,
+    checkbox_sources: BTreeMap<BreakRef, CheckboxSource>,
 }
 
 impl DocState {
@@ -138,11 +155,19 @@ impl DocState {
             nodes: vec![Node { run: 0, index: 0, scalar: '\n' as u32 }],
             runs: vec![Run { event: doc, positions: vec![0] }],
             slots: [(doc, 0)].into(), overlaps: BTreeMap::new(), attributes: BTreeMap::new(),
-            inverses: BTreeMap::new(), undone: BTreeSet::new(), task_states: BTreeMap::new(),
+            inverses: BTreeMap::new(), undone: BTreeSet::new(), task_states: BTreeMap::new(), checkbox_sources: BTreeMap::new(),
         }
     }
 
     pub fn root_id(&self) -> CharId { CharId { event: self.runs[0].event, index: 0 } }
+
+    /// Canonical block key: maps the root delimiter's `CharId` to `BreakRef::Root`.
+    pub fn canonical(&self, at: BreakRef) -> BreakRef {
+        match at {
+            BreakRef::Char(id) if id == self.root_id() => BreakRef::Root,
+            at => at,
+        }
+    }
 
     pub fn has_linked_tasks(&self) -> bool { !self.task_states.is_empty() }
 
@@ -161,7 +186,7 @@ impl DocState {
     }
 
     fn pos(&self, id: CharId) -> Option<usize> {
-        self.runs[*self.slots.get(&id.event)?].positions.get(id.index as usize).copied()
+        self.runs.get(*self.slots.get(&id.event)?)?.positions.get(id.index as usize).copied()
     }
 
     pub(crate) fn delimiter(&self, id: CharId) -> Option<BreakRef> {
@@ -171,7 +196,7 @@ impl DocState {
 
     fn position(&self, at: BreakRef) -> Option<usize> {
         match at {
-            BreakRef::Root => Some(self.runs[0].positions[0]),
+            BreakRef::Root => self.runs.first()?.positions.first().copied(),
             BreakRef::Char(id) => self.pos(id),
             BreakRef::Inserted(_) => None,
         }
@@ -184,10 +209,41 @@ impl DocState {
     }
 
     pub fn attribute_writer(&self, at: BreakRef, attr: u16) -> Option<Id> {
+        let at = self.canonical(at);
         self.attributes.get(&(at, attr)).map(|f| f.writer)
     }
 
+    /// Original authoring event of a live attribute, including after undo or redo.
+    pub fn attribute_origin(&self, at: BreakRef, attr: u16) -> Option<Id> {
+        let at = self.canonical(at);
+        self.attributes.get(&(at, attr)).filter(|f| f.value != Value::Null).map(|f| f.origin)
+    }
+
+    /// Signed runs contributing live characters to this block, in event id order.
+    pub fn block_run_events(&self, at: BreakRef) -> Option<Vec<Id>> {
+        let at = self.canonical(at);
+        let start = self.position(at)?;
+        let delim = self.nodes.get(start)?;
+        if !delim.newline() || (start != 0 && !delim.live()) { return None }
+        let mut events = self.nodes[start + 1..self.end_of_block(start)].iter()
+            .filter(|n| n.live()).map(|n| self.runs.get(n.run).map(|run| run.event)).collect::<Option<Vec<_>>>()?;
+        events.sort_unstable();
+        events.dedup();
+        Some(events)
+    }
+
+    /// Distinct authoring events for the block's live attributes, in event id order.
+    pub fn block_attr_origins(&self, at: BreakRef) -> Vec<Id> {
+        let at = self.canonical(at);
+        let mut origins: Vec<_> = self.attributes.range((at, 0)..=(at, u16::MAX))
+            .filter(|(_, f)| f.value != Value::Null).map(|(_, f)| f.origin).collect();
+        origins.sort_unstable();
+        origins.dedup();
+        origins
+    }
+
     pub fn attribute(&self, at: BreakRef, attr: u16) -> Option<&Value> {
+        let at = self.canonical(at);
         if attr == attr::CHECKBOX {
             if let Some(Value::Id(task)) = self.attribute(at, attr::TASK) {
                 return self.task_states.get(task);
@@ -196,8 +252,77 @@ impl DocState {
         self.attributes.get(&(at, attr)).map(|f| &f.value).filter(|v| **v != Value::Null)
     }
 
+    fn replace_checkbox_source(&mut self, at: BreakRef, attr: u16, source: Option<CheckboxSource>) -> Option<CheckboxSource> {
+        if attr != attr::CHECKBOX { return None }
+        match source {
+            Some(source) => self.checkbox_sources.insert(at, source),
+            None => self.checkbox_sources.remove(&at),
+        }
+    }
+
+    /// Source selected by the unlink that wrote the current unlinked checkbox.
+    pub fn block_checkbox_source(&self, at: BreakRef) -> Option<CheckboxSource> {
+        let at = self.canonical(at);
+        if matches!(self.attribute(at, attr::TASK), Some(Value::Id(_))) { return None }
+        self.attributes.get(&(at, attr::CHECKBOX)).filter(|f| f.value != Value::Null)?;
+        self.checkbox_sources.get(&at).copied()
+    }
+
+    pub(crate) fn block_attr_writers(&self, at: BreakRef) -> Vec<(u16, Id)> {
+        let at = self.canonical(at);
+        self.attributes.range((at, 0)..=(at, u16::MAX)).map(|(&(_, key), f)| (key, f.writer)).collect()
+    }
+
+    pub(crate) fn attr_undo_prev(&self, undo: &Id, of: &Id, at: BreakRef, attr: u16) -> Option<Id> {
+        let at = self.canonical(at);
+        if !self.attr_written_by(undo, at, attr) { return None }
+        self.inverses.get(of)?.iter().find_map(|inv| match inv {
+            Inverse::Attr { at: a, attr: k, before_writer, .. } if *a == at && *k == attr => *before_writer,
+            _ => None,
+        })
+    }
+
+    /// State of `(at, attr)` immediately after the latest effective write in `in_past`'s causal past:
+    /// `(writer, value, checkbox_source)` (`checkbox_source` is populated only when `attr == attr::CHECKBOX`).
+    pub(crate) fn attr_state_before(
+        &self,
+        at: BreakRef,
+        attr: u16,
+        mut in_past: impl FnMut(Id) -> bool,
+    ) -> Option<(Id, Value, Option<CheckboxSource>)> {
+        let at = self.canonical(at);
+        let fs = self.attributes.get(&(at, attr))?;
+        let mut writer = fs.writer;
+        let mut value = fs.value.clone();
+        let mut source = (attr == attr::CHECKBOX)
+            .then(|| self.checkbox_sources.get(&at).copied())
+            .flatten();
+        loop {
+            if in_past(writer) {
+                return Some((writer, value, source));
+            }
+            let inv = self.inverses.get(&writer)?.iter().find(|inv| {
+                matches!(inv, Inverse::Attr { at: a, attr: k, .. } if *a == at && *k == attr)
+            })?;
+            let Inverse::Attr { before, before_writer, before_source, .. } = inv else { unreachable!() };
+            writer = (*before_writer)?;
+            value = before.clone();
+            if attr == attr::CHECKBOX {
+                source = *before_source;
+            }
+        }
+    }
+
+    /// True iff `event` recorded an effective `Inverse::Attr` on `(at, attr)`.
+    pub(crate) fn attr_written_by(&self, event: &Id, at: BreakRef, attr: u16) -> bool {
+        let at = self.canonical(at);
+        self.inverses.get(event).is_some_and(|invs| {
+            invs.iter().any(|inv| matches!(inv, Inverse::Attr { at: a, attr: k, .. } if *a == at && *k == attr))
+        })
+    }
+
     fn end_of_block(&self, start: usize) -> usize {
-        self.nodes[start + 1..].iter().position(|n| n.ch() == '\n' && n.live())
+        self.nodes[start + 1..].iter().position(|n| n.newline() && n.live())
             .map_or(self.nodes.len(), |offset| start + 1 + offset)
     }
 
@@ -231,7 +356,7 @@ impl DocState {
     }
 
     pub(crate) fn apply_event(&mut self, event: Id, ops: &[TextOp], mut past: impl FnMut(Id) -> bool,
-        actor: Actor, status: impl Fn(Id) -> Option<Value>) -> TaskEffects {
+        actor: Actor, status: impl Fn(Id) -> Option<(Value, Id)>) -> TaskEffects {
         let mut tasks = TaskEffects::default();
         let mut count = 0usize;
         let mut new_breaks = BTreeSet::new();
@@ -303,30 +428,38 @@ impl DocState {
                 TextOp::Attr { at, attr, value } => {
                     let at = match at {
                         BreakRef::Inserted(index) => BreakRef::Char(CharId { event, index: *index }),
-                        BreakRef::Char(id) if *id == self.root_id() => BreakRef::Root,
-                        at => *at,
+                        at => self.canonical(*at),
                     };
-                    if let Some(Value::Id(task)) = self.attribute(at, attr::TASK).cloned() {
+                    if let Some((task, link_writer)) = self.attributes.get(&(at, attr::TASK))
+                        .and_then(|f| match f.value { Value::Id(task) => Some((task, f.writer)), _ => None })
+                    {
                         if *attr == attr::CHECKBOX {
                             if let Value::Text(wanted) = value {
                                 let state = match wanted.as_str() {
                                     "done" if actor == Actor::Ai => "review",
                                     "done" => "done", "review" => "review", "open" => "open", _ => continue,
                                 };
-                                tasks.writes.insert(task, Value::Text(state.into()));
+                                tasks.writes.insert(task, (Value::Text(state.into()), at, link_writer));
                             }
                             continue
                         }
                         if *attr == attr::TASK && *value == Value::Null {
-                            let before = tasks.writes.get(&task).cloned().or_else(|| status(task));
-                            self.write_attr(event, at, attr::CHECKBOX, checkbox(before), &mut inverse, &mut attr_writes);
+                            let (before, copied) = if let Some((val, tick_at, tick_link_writer)) = tasks.writes.get(&task) {
+                                (Some(val.clone()), Some(CopiedStatus::SameEventTick { at: *tick_at, link_writer: *tick_link_writer }))
+                            } else if let Some((val, status_writer)) = status(task) {
+                                (Some(val), Some(CopiedStatus::TaskStatus(status_writer)))
+                            } else {
+                                (None, None)
+                            };
+                            let source = Some(CheckboxSource { task, link_writer, status: copied });
+                            self.write_attr(event, at, attr::CHECKBOX, checkbox(before), source, &mut inverse, &mut attr_writes);
                         }
                     }
                     if let (attr::TASK, Value::Id(task)) = (*attr, value) {
-                        self.task_states.insert(*task, checkbox(status(*task)));
+                        self.task_states.insert(*task, checkbox(status(*task).map(|(v, _)| v)));
                         tasks.links.insert(*task);
                     }
-                    self.write_attr(event, at, *attr, value.clone(), &mut inverse, &mut attr_writes);
+                    self.write_attr(event, at, *attr, value.clone(), None, &mut inverse, &mut attr_writes);
                 }
                 TextOp::Move { block, after } => {
                     if let Some(change) = self.move_block(*block, *after) { inverse.push(change); }
@@ -337,11 +470,14 @@ impl DocState {
         tasks
     }
 
-    fn write_attr(&mut self, event: Id, at: BreakRef, attr: u16, value: Value,
+    fn write_attr(&mut self, event: Id, at: BreakRef, attr: u16, value: Value, source: Option<CheckboxSource>,
         inverse: &mut Vec<Inverse>, written: &mut BTreeSet<(BreakRef, u16)>) {
-        let before = self.attributes.insert((at, attr), FieldState { value, writer: event });
+        let before = self.attributes.insert((at, attr), FieldState { value, writer: event, origin: event });
+        let before_source = self.replace_checkbox_source(at, attr, source);
         if written.insert((at, attr)) {
-            inverse.push(Inverse::Attr { at, attr, before: before.map_or(Value::Null, |s| s.value) });
+            let before_writer = before.as_ref().map(|s| s.writer);
+            let before_origin = before.as_ref().map(|s| s.origin);
+            inverse.push(Inverse::Attr { at, attr, before_writer, before_origin, before_source, before: before.map_or(Value::Null, |s| s.value) });
         }
     }
 
@@ -358,12 +494,15 @@ impl DocState {
                     }
                     inverse.push(Inverse::Visibility { run, first, last, hide: !hide });
                 }
-                Inverse::Attr { at, attr, before } => {
+                Inverse::Attr { at, attr, before, before_writer: _, before_origin, before_source } => {
                     let current = self.attributes.get_mut(&(at, attr)).unwrap();
                     if current.writer == of {
-                        current.writer = event;
+                        let prev_writer = std::mem::replace(&mut current.writer, event);
                         let before = std::mem::replace(&mut current.value, before);
-                        inverse.push(Inverse::Attr { at, attr, before });
+                        let prev_origin = std::mem::replace(&mut current.origin, before_origin.unwrap_or(event));
+                        let prev_source = self.replace_checkbox_source(at, attr, before_source);
+                        inverse.push(Inverse::Attr { at, attr, before, before_writer: Some(prev_writer),
+                            before_origin: Some(prev_origin), before_source: prev_source });
                     }
                 }
                 Inverse::Move { block, before, stop } => {
@@ -658,12 +797,29 @@ fn plan_write_nodes(doc: &DocState, nodes: &[Node], old_blocks: &[Block], first_
 use crate::fold::cache::{fields as cache_fields, Cached};
 cache_fields!(Node { run, index, scalar });
 cache_fields!(Run { event, positions });
-cache_fields!(DocState { nodes, runs, slots, overlaps, attributes, inverses, undone, task_states });
+cache_fields!(DocState { nodes, runs, slots, overlaps, attributes, inverses, undone, task_states, checkbox_sources });
 
 impl Cached for BreakRef {
     fn save(&self, out: &mut Vec<u8>) { self.bytes().save(out); }
     fn load(input: &mut &[u8]) -> Option<Self> { Self::decode(&Vec::<u8>::load(input)?) }
 }
+
+impl Cached for CopiedStatus {
+    fn save(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::TaskStatus(writer) => { out.push(0); writer.save(out); }
+            Self::SameEventTick { at, link_writer } => { out.push(1); at.save(out); link_writer.save(out); }
+        }
+    }
+    fn load(input: &mut &[u8]) -> Option<Self> {
+        Some(match u8::load(input)? {
+            0 => Self::TaskStatus(Cached::load(input)?),
+            1 => Self::SameEventTick { at: Cached::load(input)?, link_writer: Cached::load(input)? },
+            _ => return None,
+        })
+    }
+}
+cache_fields!(CheckboxSource { task, link_writer, status });
 
 impl Cached for Inverse {
     fn save(&self, out: &mut Vec<u8>) {
@@ -671,14 +827,17 @@ impl Cached for Inverse {
             Self::Visibility { run, first, last, hide } => {
                 out.push(u8::from(*hide)); run.save(out); first.save(out); last.save(out);
             }
-            Self::Attr { at, attr, before } => { out.push(2); at.save(out); attr.save(out); before.save(out); }
+            Self::Attr { at, attr, before, before_writer, before_origin, before_source } => {
+                out.push(2); at.save(out); attr.save(out); before.save(out); before_writer.save(out); before_origin.save(out); before_source.save(out);
+            }
             Self::Move { block, before, stop } => { out.push(3); block.save(out); before.save(out); stop.save(out); }
         }
     }
     fn load(input: &mut &[u8]) -> Option<Self> {
         Some(match u8::load(input)? {
             tag @ 0..=1 => Self::Visibility { run: usize::load(input)?, first: u32::load(input)?, last: u32::load(input)?, hide: tag == 1 },
-            2 => Self::Attr { at: Cached::load(input)?, attr: Cached::load(input)?, before: Cached::load(input)? },
+            2 => Self::Attr { at: Cached::load(input)?, attr: Cached::load(input)?, before: Cached::load(input)?,
+                before_writer: Cached::load(input)?, before_origin: Cached::load(input)?, before_source: Cached::load(input)? },
             3 => Self::Move { block: Cached::load(input)?, before: Cached::load(input)?, stop: Cached::load(input)? },
             _ => return None,
         })

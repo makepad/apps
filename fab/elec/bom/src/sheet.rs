@@ -176,7 +176,8 @@ pub fn sheet(design: &Design, unit: BoardId, view: &SheetView) -> Result<BomShee
         // circuit component's part is approved.
         let lifecycle = comps.iter().filter_map(|id| {
             let c = &unit.circuit.comps[id.ix()];
-            c.fields.get("lifecycle").filter(|v| !v.is_empty()).and_then(Lifecycle::of_name).or(c.part.lifecycle)
+            c.fields.0.iter().find(|(key, _)| key.eq_ignore_ascii_case("lifecycle")).map(|(_, v)| v.as_str())
+                .filter(|v| !v.is_empty()).and_then(Lifecycle::of_name).or(c.part.lifecycle)
         }).max();
         let approved = !comps.is_empty() && comps.iter().all(|id| unit.circuit.comps[id.ix()].part.approved);
         match lifecycle {
@@ -247,7 +248,7 @@ mod lifecycle_tests {
             part(cid, &|p| p.lifecycle = Some(Lifecycle::Active));
         }
         let field_comp = before.rows[field_row].comps[0];
-        circuit.comps[field_comp.ix()].fields.0.push(("lifecycle".into(), "obsolete".into()));
+        circuit.comps[field_comp.ix()].fields.0.push(("Lifecycle".into(), "obsolete".into()));
 
         let after = sheet(&design, id, &SheetView::default()).unwrap();
         assert_eq!(after.rows.len(), before.rows.len(), "lifecycle and approval change no row count");
@@ -267,7 +268,7 @@ mod lifecycle_tests {
         assert!(row.checks.contains("obsolete") && !row.checks.contains("NRND"), "{:?}", row.checks);
         let row = &after.rows[field_row];
         assert!(!row.approved, "unapproved parts make no approved line");
-        assert_eq!(row.lifecycle, Some(Lifecycle::Obsolete), "the component field wins over the part's lifecycle");
+        assert_eq!(row.lifecycle, Some(Lifecycle::Obsolete), "the mixed-case component field wins over the part's lifecycle");
         assert!(row.checks.contains("obsolete"));
         for (i, row) in after.rows.iter().enumerate() {
             if ![approved_row, nrnd_row, pair, field_row].contains(&i) {

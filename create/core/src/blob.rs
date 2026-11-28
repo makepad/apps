@@ -1464,7 +1464,7 @@ mod tests {
     fn signed_blob_reference_has_a_big_endian_size_and_root() {
         let root = [0x55; 32];
         let size = 0x0102_0304_0506_0708;
-        let content = Content::Entity {
+        let content = Content::Entity { copied_from: vec![],
             kind: Key::Name("Card".into()), project: None, derive: None,
             fields: vec![(Key::Number(1), Value::Blob { size, root })],
         };

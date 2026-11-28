@@ -47,7 +47,7 @@ pub struct LiveRow {
 impl LiveRow {
     pub(super) fn share(session: SessionId, role: ShareRole, peer: &str, title: &str) -> Self {
         let label = match role {
-            ShareRole::Viewer => format!("{peer} is sharing {title}"),
+            ShareRole::Viewer { .. } => format!("{peer} is sharing {title}"),
             ShareRole::Sharer { .. } => format!("You are sharing {title}"),
         };
         Self { item: Live::Share(session), label }
@@ -327,7 +327,7 @@ mod tests {
         let plain = state.lines.clone();
         let session = [8; 16];
         for (role, expected) in [
-            (ShareRole::Viewer, "Ada is sharing Drawing"),
+            (ShareRole::Viewer { sharer: [2; 65] }, "Ada is sharing Drawing"),
             (ShareRole::Sharer { link: crate::app_link::LinkId::TEST, window: crate::app_link::WindowId(1) }, "You are sharing Drawing"),
         ] {
             state.set_live(vec![LiveRow::share(session, role, "Ada", "Drawing")]);
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(state.lines[1].node, Node::Live(Live::Share(session)), "the share precedes the projects in the wide rail");
         assert_eq!(state.lines[2].node, Node::Project(id(30)));
         let mut call = CallView { peer_name: "Ada".into(), ..Default::default() };
-        let share = LiveRow::share(session, ShareRole::Viewer, "Ada", "Drawing");
+        let share = LiveRow::share(session, ShareRole::Viewer { sharer: [2; 65] }, "Ada", "Drawing");
         for (phase, secs, label) in [
             (Phase::Calling, 0, "Calling Ada…"), (Phase::Ringing, 0, "Ada is calling"),
             (Phase::Live, 59, "Call with Ada · 0:59"), (Phase::Live, 60, "Call with Ada · 1:00"),

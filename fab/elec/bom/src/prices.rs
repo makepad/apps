@@ -281,8 +281,8 @@ pub fn breaks_from_text(input: &str) -> Result<BTreeMap<i64,i64>,String> {
         } else { Ok(()) }
     };
     if input.trim_start().starts_with('[') {
-        // The action bridge separates array elements with a space in Splash. Each break
-        // is a flat JSON object containing integer min and micros fields.
+        // A JSON list of breaks, each a flat object with integer min and micros fields. The
+        // objects may be separated by commas, by spaces, or by both.
         let body = input.trim().strip_prefix('[').and_then(|s| s.strip_suffix(']')).ok_or("expected a list of breaks")?;
         let mut tail = body.trim();
         while !tail.is_empty() {

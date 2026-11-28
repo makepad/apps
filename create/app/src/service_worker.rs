@@ -295,7 +295,7 @@ impl<H: SummaryHub> ServiceWorker<H> {
                 // Each proposal leaves the queue once written, so a retry never repeats one.
                 while let Some((project, queue)) = &mut report.proposals {
                     let Some((title, text)) = queue.front().cloned() else { break };
-                    if !model.propose_task(report.town, *project, title, text)? {
+                    if !model.propose_task(report.town, *project, report.request, title, text)? {
                         report.content = Content::Failed { job: report.job, why: Failure::ProjectGone };
                         report.proposals = None;
                         break
@@ -382,7 +382,7 @@ mod tests {
         let spoken = [2; 16];
         let chat = [1; 16];
         let ui = Origin::Ui;
-        let ring = |session| Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: Vec::new() };
+        let ring = |session| Action::SessionOpen { town_wide: true, town: None, session, mode: SessionMode::Call { video: false }, to: Vec::new() };
         let leave = |session| Action::SessionLeave { session, secs: Some(12), why: LeaveWhy::Ended };
         let request = |session| Action::RequestSummary { session };
         let message = |text: &str| Action::PostChat { text: text.into(), to_ai: false, reply_to: None };
@@ -501,7 +501,7 @@ mod tests {
         let existing = a.act(Action::AddTask { title: "Existing task".into(), text: String::new() }, ui).unwrap();
         let project = a.current_project().unwrap().id;
         for session in [chat, gone] {
-            a.act(Action::SessionOpen { town: None, session, mode: SessionMode::Call { video: false }, to: Vec::new() }, ui).unwrap();
+            a.act(Action::SessionOpen { town_wide: true, town: None, session, mode: SessionMode::Call { video: false }, to: Vec::new() }, ui).unwrap();
             a.act(message(if session == chat { "Keep the date" } else { "Close the project" }), ui).unwrap();
             a.act(Action::SessionLeave { session, secs: Some(12), why: LeaveWhy::Ended }, ui).unwrap();
         }

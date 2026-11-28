@@ -4,6 +4,7 @@ use crate::lists::{open_label, Live, Node, ViewData};
 use crate::ui::town_tree::LiveRow;
 use makepad_widgets::*;
 use makepad_town_core::event::SessionId;
+use makepad_town_core::key::PublicKey;
 
 script_mod! {
     use mod.prelude.workspace.*
@@ -29,7 +30,21 @@ script_mod! {
                     }
                     peer_name := Name{width: Fill}
                     peer_talking := Mark{a11y: {label: "is talking"}}
+                    people_gap := View{visible: false width: Fill height: 1}
                     duration := Kicker{}
+                }
+                peer_roster := View{visible: false width: Fill height: Fit
+                    peer_list := FlatList{width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center} spacing: 6
+                        scroll_bars +: {show_scroll_y: false}
+                        PeerChip := RoundedView{width: Fit height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                            padding: Inset{left: 4 right: 4 top: 2 bottom: 2}
+                            draw_bg +: {color: palette.panel2 border_radius: 4}
+                            badge := PeerBadge{}
+                            name := Name{width: Fit{max: 110}}
+                            muted := Kicker{visible: false text: "muted"}
+                            transcribing := Kicker{visible: false text: "transcribing"}
+                        }
+                    }
                 }
                 controls := CallControls{flow: Right{wrap: true}
                     cancel := CallControl{text: "Cancel" a11y: {label: "Cancel the call"}}
@@ -109,7 +124,17 @@ script_mod! {
                     }
                 }
             }
+            share_watchers := BodyNote{visible: false width: Fill}
             sharer_status := BodyNote{visible: false width: Fill a11y: {live: @Polite}}
+            pending_requests := View{visible: false width: Fill height: Fit
+                control_requests := FlatList{width: Fill height: Fit flow: Down spacing: 4
+                    scroll_bars +: {show_scroll_y: false}
+                    RequestRow := View{width: Fill height: Fit flow: Right{wrap: true} spacing: 6 align: Align{y: 0.5}
+                        prompt := BodyNote{width: Fit}
+                        allow := CallControl{text: "Allow"}
+                    }
+                }
+            }
             share_picture_panel := Picture{}
         }
     }
@@ -136,10 +161,46 @@ pub struct LiveSharePage {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
     #[rust] chips: Vec<WidgetRef>,
+    #[rust] request_rows: Vec<WidgetRef>,
+    #[rust] let_control_buttons: Vec<WidgetUid>,
     #[rust] switch_key: Option<(KeyCode, SessionId)>,
 }
 
 impl LiveSharePage {
+    pub fn let_control_buttons(&self) -> &[WidgetUid] { &self.let_control_buttons }
+
+    fn bind_requests(&mut self, cx: &mut Cx, offer: Option<&crate::call::ShareOffer>, requests: &[(SessionId, PublicKey, String)]) {
+        if self.request_rows.is_empty() && requests.is_empty() { return }
+        let list = self.view.flat_list(cx, ids!(control_requests));
+        self.request_rows.clear();
+        self.let_control_buttons.clear();
+        {
+            let Some(mut list) = list.borrow_mut() else { return };
+            let before = list.items.len();
+            if let Some(o) = offer {
+                for (s, peer, name) in requests.iter().filter(|(s, p, _)| *s == o.session && o.watchers.iter().any(|(w, _)| w == p)) {
+                    let id = LiveId::from_bytes(LiveId::SEED, peer, 0, peer.len(), 0);
+                    let Some(row) = list.item(cx, id, id!(RequestRow)) else { continue };
+                    let prompt = row.label(cx, ids!(prompt));
+                    let mut allow = row.button(cx, ids!(allow));
+                    let line = format!("{name} asks to control {}", o.title);
+                    if prompt.text() != line {
+                        prompt.set_text(cx, &line);
+                        let label = cx.with_vm(|vm| vm.new_string(&format!("Allow {name} to control {}", o.title)));
+                        script_apply_eval!(cx, allow, {a11y_name: #(label)});
+                    }
+                    allow.set_action_data(CallAction::OnShare(*s, Press::LetControl(*peer)));
+                    self.let_control_buttons.push(allow.widget_uid());
+                    self.request_rows.push(row);
+                }
+            }
+            list.items.retain_visible();
+            if list.items.len() != before { cx.widget_tree_mark_dirty(list.widget_uid()); }
+        }
+        self.view.widget(cx, ids!(pending_requests)).set_visible(cx, !self.request_rows.is_empty());
+        list.redraw(cx);
+    }
+
     fn bind_chips(&mut self, cx: &mut Cx, offer: Option<&crate::call::ShareOffer>) {
         if self.chips.is_empty() && offer.is_none_or(|o| o.allowed().is_empty()) { return }
         let list = self.view.flat_list(cx, ids!(chips));
@@ -168,8 +229,10 @@ impl LiveSharePage {
 impl Widget for LiveSharePage {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
-            if step.borrow::<FlatList>().is_none() { return Err(step) }
-            for chip in &self.chips { chip.draw_all(cx, scope); }
+            let rows = if step.widget_uid() == self.view.widget(cx, ids!(chips)).widget_uid() { &self.chips }
+                else if step.widget_uid() == self.view.widget(cx, ids!(control_requests)).widget_uid() { &self.request_rows }
+                else { return Err(step) };
+            for row in rows { row.draw_all(cx, scope); }
         }
         DrawStep::done()
     }
@@ -221,7 +284,7 @@ impl ViewData {
     pub fn sync_live_rows(&mut self, cx: &mut Cx, ui: &WidgetRef) {
         let call = LiveRow::call(&self.call.view);
         let shares = self.call.share.offers.iter().map(|o|
-            LiveRow::share(o.session, o.role, &self.call.view.peer_name, &o.title));
+            LiveRow::share(o.session, o.role, &o.sharer_name, &o.title));
         let ended = self.call.share.ended.iter()
             .map(|e| LiveRow { item: Live::Share(e.session), label: e.notice.trim_end_matches('.').to_owned() });
         let rows: Vec<_> = call.into_iter().chain(shares).chain(ended).collect();
@@ -286,15 +349,15 @@ impl ViewData {
         let shown = &self.call;
         let session = self.share_page();
         let offer = session.and_then(|s| shown.share.offer(s));
-        let row = offer.map(|o| LiveRow::share(o.session, o.role, &shown.view.peer_name, &o.title));
+        let row = offer.map(|o| LiveRow::share(o.session, o.role, &o.sharer_name, &o.title));
         let page = ui.widget(cx, ids!(live_share));
         let popout = ui.widget(cx, ids!(share_popout));
         // The pop-out is one more view of the watched picture; the page keeps showing it.
         let detached = self.share_in_window();
         let ended = shown.share.ended.iter().find(|e| Some(e.session) == session);
         popout.widget(cx, ids!(share_view)).set_visible(cx, detached);
-        let viewer_title = |o: &crate::call::ShareOffer| format!("{} shared by {}", o.title, shown.view.peer_name);
-        let title = offer.filter(|o| o.role == ShareRole::Viewer).map(|o| viewer_title(o));
+        let viewer_title = |o: &crate::call::ShareOffer| format!("{} shared by {}", o.title, o.sharer_name);
+        let title = offer.filter(|o| matches!(o.role, ShareRole::Viewer { .. })).map(|o| viewer_title(o));
         page.widget(cx, ids!(embedded)).set_visible(cx, ended.is_none());
         page.button(cx, ids!(close_ended)).set_visible(cx, ended.is_some());
         let status = page.label(cx, ids!(status));
@@ -322,12 +385,19 @@ impl ViewData {
         let pop_name = watched.map(|o| viewer_title(o));
         let center = page.widget(cx, ids!(share_picture_panel));
         let was_visible = center.visible();
-        let member = self.share_peer.and_then(|key| self.members.seats.iter()
-            .find(|s| s.id == crate::view::MemberId::Computer(key)));
-        let peer = member.map_or(shown.view.peer_name.as_str(), |s| s.name.as_str());
-        let scale_label = shown.share.show_panel(cx, &center, session, true, name, peer, member.is_some());
+        let panel_peer = |offer: Option<&crate::call::ShareOffer>| {
+            let Some(offer) = offer else { return (String::new(), false) };
+            let ShareRole::Viewer { sharer } = offer.role else { return (String::new(), false) };
+            match self.members.seats.iter().find(|s| s.has_device(&sharer)) {
+                Some(member) => (member.name.clone(), true),
+                None => (offer.sharer_name.clone(), false),
+            }
+        };
+        let (peer, member) = panel_peer(offer.map(AsRef::as_ref));
+        let scale_label = shown.share.show_panel(cx, &center, session, true, name, &peer, member);
         scale.set_text(cx, scale_label);
-        shown.share.show_panel(cx, &popout.widget(cx, ids!(popout_picture)), self.watched_share(), detached, pop_name.as_deref().unwrap_or(name), peer, member.is_some());
+        let (peer, member) = panel_peer(watched.map(AsRef::as_ref));
+        shown.share.show_panel(cx, &popout.widget(cx, ids!(popout_picture)), self.watched_share(), detached, pop_name.as_deref().unwrap_or(name), &peer, member);
         if center.visible() != was_visible { self.show_panes(cx, ui); }
     }
 }
@@ -338,36 +408,54 @@ fn show_controls(cx: &mut Cx, page: &WidgetRef, shown: &CallShown, session: Opti
     let role = offer.map(|o| o.role);
     let local = matches!(role, Some(ShareRole::Sharer { .. }));
     page.widget(cx, ids!(share_rights)).set_visible(cx, local);
-    if let Some(mut live_page) = page.borrow_mut::<LiveSharePage>() { live_page.bind_chips(cx, offer); }
-    if let Some(offer) = offer.filter(|_| local) {
+    let local_offer = offer.filter(|_| local);
+    let mut requests = share.control.requests.iter();
+    let request = local_offer.and_then(|o| requests.find(|(s, p, _)| *s == o.session && o.watchers.iter().any(|(w, _)| w == p)));
+    if let Some(mut live_page) = page.borrow_mut::<LiveSharePage>() {
+        live_page.bind_chips(cx, offer);
+        live_page.bind_requests(cx, local_offer, if request.is_some() { requests.as_slice() } else { &[] });
+    }
+    let watchers = page.label(cx, ids!(share_watchers));
+    watchers.set_visible(cx, local_offer.is_some_and(|o| !o.watchers.is_empty()));
+    if let Some(o) = local_offer.filter(|o| !o.watchers.is_empty()) {
+        let names: Vec<_> = o.watchers.iter().map(|(_, name)| name.as_str()).collect();
+        watchers.set_text(cx, &format!("Watching: {}", names.join(", ")));
+    }
+    if let Some(offer) = local_offer {
         let switch = page.check_box(cx, ids!(allow_all));
         if switch.active(cx) != offer.allow_all() { switch.set_active(cx, offer.allow_all(), Animate::No); }
         switch.set_action_data(offer.session);
     }
-    let viewer = role == Some(ShareRole::Viewer);
+    let viewer = matches!(role, Some(ShareRole::Viewer { .. }));
     share_button(cx, page, session, ids!(stop_share), local, Press::StopShare);
     share_button(cx, page, session, ids!(watch), viewer && share.watching != session, Press::Watch);
     share_button(cx, page, session, ids!(close_watch), viewer && share.watching == session, Press::CloseWatch);
 
     let active = share.control.active.is_some() && share.control_session == session;
-    let requested = local && session.is_some() && share.control.requested == session;
-    let can_grant = local && (shown.view.phase == Phase::Live || requested)
-        && share.peer_watching == session && share.control.active.is_none();
-    let grant = share_button(cx, page, session, ids!(let_control), can_grant, Press::LetControl);
-    if can_grant {
-        if requested { grant.set_text(cx, "Allow"); }
-        else { grant.set_text(cx, &format!("Let {} control", shown.view.peer_name)); }
-    }
+    let watcher = request.map(|(_, peer, name)| (peer, name)).or_else(||
+        local_offer.filter(|_| share.control.active.is_none() && shown.view.phase == Phase::Live)
+            .and_then(|o| o.watchers.iter().find(|(p, _)| shown.view.participants.iter().any(|s| s.peer == *p)))
+            .map(|(peer, name)| (peer, name)));
+    if let Some((peer, name)) = watcher {
+        let grant = share_button(cx, page, session, ids!(let_control), true, Press::LetControl(*peer));
+        if request.is_some() { grant.set_text(cx, "Allow"); }
+        else { grant.set_text(cx, &format!("Let {name} control")); }
+    } else { visible_button(cx, page, ids!(let_control), false).set_action_data(()); }
     share_button(cx, page, session, ids!(take_back), local && active, Press::TakeBack);
     let label = page.label(cx, ids!(sharer_status));
     let notice = share.control.notice.as_deref().filter(|_| share.control_session == session);
     // Both seats keep how control ended on the page; the overlay only holds the button.
-    label.set_visible(cx, (local && (requested || active)) || notice.is_some());
-    match offer {
-        Some(offer) if local && requested => label.set_text(cx, &format!("{} asks to control {}", shown.view.peer_name, offer.title)),
-        Some(offer) if local && active => label.set_text(cx, &format!("{} is controlling {}", shown.view.peer_name, offer.title)),
-        _ => if let Some(text) = notice { label.set_text(cx, text) },
-    }
+    let status = local_offer.and_then(|o| {
+        let holder = share.control.holder.as_ref().filter(|_| active).map(|(_, name)| format!("{name} is controlling {}", o.title));
+        let ask = request.map(|(_, _, name)| format!("{name} asks to control {}", o.title));
+        match (holder, ask) {
+            (Some(holder), Some(ask)) => Some(format!("{holder} · {ask}")),
+            (holder, ask) => holder.or(ask),
+        }
+    });
+    let status = status.as_deref().or(notice);
+    label.set_visible(cx, status.is_some());
+    if let Some(text) = status { label.set_text(cx, text); }
 }
 
 fn share_button(cx: &mut Cx, page: &WidgetRef, session: Option<SessionId>, path: &[LiveId], visible: bool, press: Press) -> ButtonRef {

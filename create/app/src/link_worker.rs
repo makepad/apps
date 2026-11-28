@@ -7,7 +7,10 @@
 //! Call media shares the socket and follows the current link peer, including on a LAN path.
 
 use makepad_town_core::{connect::Kind, home::{Home, LinkPortLease}, hub::{self, Attempt, BatchEnd, Carrier, Event, Hub, Now, Output, SlotPhase, Topic}, key::{DeviceKey, PublicKey}, link::{InviteSession, Pin}, peers::PathMemory};
-pub use makepad_town_core::hub::{Status, VERSION_TEXT, GATE_REFUSED};
+pub use makepad_town_core::hub::{
+    BlockReason, Status, WordsRejected, BLOCKED_NETWORKS, GATE_REFUSED, SAME_NETWORK_LAN_OFF_HERE,
+    SAME_NETWORK_NO_LOCAL_ADDRESS, SAME_NETWORK_PEER_LAN_OFF, VERSION_TEXT,
+};
 use makepad_widgets::makepad_platform::thread::{Class, TaskPool};
 #[cfg(test)]
 use makepad_town_core::{hub::Start, connect::{self, Connection, Failure, Phase, ProbeTags, Remembered}, link::{INVITE_LIFETIME_MS, Mode, Reconnect, Refusal}, hub::{describe, FAREWELL_MS}};
@@ -57,6 +60,11 @@ impl PairWords {
 /// What the UI asks of the worker.
 pub type Request = (Option<Attempt>, ToWorker);
 pub type Notice = (Option<Attempt>, FromWorker);
+
+pub enum SendError {
+    Full(Request),
+    Disconnected(Request),
+}
 
 pub enum ToWorker {
     SetWanted { devices: Vec<Known>, final_sync: Vec<(Attempt, Vec<u8>)> },
@@ -216,6 +224,7 @@ impl CallTraffic {
 pub enum FromWorker {
     /// The UI request and (in the notice envelope) the generation it opened.
     WordsOpened(u64),
+    WordsRejected(WordsRejected),
     Idle(u64),
     BlobWorker(blobs::Endpoint),
     BlobStatus,
@@ -369,7 +378,7 @@ fn phase_of(event: &FromWorker) -> Option<&'static str> {
         FromWorker::Phase(Status::Linked) | FromWorker::Linked { .. } => "verified and linked",
         FromWorker::Lost => "lost",
         FromWorker::WordsChanged => "words changed",
-        FromWorker::Blocked(_) => "blocked by the Local Network setting",
+        FromWorker::Blocked(_) => "path blocked",
         FromWorker::Refused(_) => "refused by the other device",
         FromWorker::KeyChanged => "the other device's key changed",
         FromWorker::Failed(_) => "stopped",
@@ -383,7 +392,7 @@ impl Commands {
         self.waker.pending.store(false, Ordering::SeqCst);
         loop {
             let (at, command) = self.queue.try_recv()?;
-            if at.is_none_or(|at| hub.attempt(at.carrier) == Some(at)) {
+            if matches!(command, ToWorker::PeerWords { .. }) || at.is_none_or(|at| hub.attempt(at.carrier) == Some(at)) {
                 if command.changes_slots() { self.config.set(self.config.get().wrapping_add(1)); }
                 return Ok((at, command));
             }
@@ -403,7 +412,8 @@ pub struct LinkWorker {
 impl LinkWorker {
     pub fn new(home: Arc<Home>, device: Arc<DeviceKey>, signal: impl Fn() + Send + 'static) -> io::Result<Self> {
         Self::spawn(signal, move |commands, tell| {
-            run(&home, device.public(), Hub::new(device), commands, tell, LinkClock::Real(Instant::now()), bind_link)
+            let lan_allowed = makepad_network::lan::allowed();
+            run(&home, device.public(), Hub::with_lan(device, lan_allowed), commands, tell, LinkClock::Real(Instant::now()), bind_link)
         })
     }
 
@@ -430,23 +440,44 @@ impl LinkWorker {
             let tell = |at: Option<Attempt>, event: FromWorker| {
                 if let Some(line) = phase_of(&event).and_then(|phase| commands.phases.borrow_mut().enter(phase, Instant::now())) {
                     match &event {
-                        FromWorker::Failed(why) | FromWorker::Refused(why) => makepad_widgets::log!("{line}: {why}"),
+                        FromWorker::Failed(why) | FromWorker::Refused(why) => makepad_widgets::log!("{line}: {}", why.replace('\n', " ")),
+                        FromWorker::Blocked(why) => makepad_widgets::log!("{line}: {}", why.replace('\n', " ")),
                         _ => makepad_widgets::log!("{line}"),
                     }
                 }
                 let _ = events.send((at, event));
                 (commands.signal)();
             };
-            if let Err(why) = body(&commands, &tell) {
-                tell(None, FromWorker::Failed(why));
+            use std::panic::{catch_unwind, AssertUnwindSafe};
+            let failure = match catch_unwind(AssertUnwindSafe(|| body(&commands, &tell))) {
+                Ok(Ok(())) => None,
+                Ok(Err(why)) => Some((why, None)),
+                Err(payload) => Some(("the link worker stopped unexpectedly".into(), Some(payload))),
+            };
+            if let Some((why, panic)) = failure {
+                // The signal or the logger itself may be what panicked. Deliver the failure first.
+                let _ = events.send((None, FromWorker::Failed(why.clone())));
+                let _ = catch_unwind(AssertUnwindSafe(|| (commands.signal)()));
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    if let Some(payload) = panic {
+                        let msg = payload.downcast_ref::<&str>().copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("unknown panic");
+                        makepad_widgets::log!("Town link: worker panicked: {msg}");
+                    }
+                    if let Some(line) = commands.phases.borrow_mut().enter("stopped", Instant::now()) {
+                        makepad_widgets::log!("{line}: {}", why.replace('\n', " "));
+                    }
+                }));
             }
+            // Once notices close, every send reports Disconnected, so both signs of worker exit agree.
+            drop(commands);
+            drop(events);
         })?;
         Ok(LinkWorker { to, from, config: Cell::new(0), waker, #[cfg(test)] observed: Cell::new(None) })
     }
 
-    /// Hands the worker `command` without waiting, and wakes it. `Err` gives it back when the
-    /// queue is full, for another try on a later frame.
-    pub fn send(&self, request: Request) -> Result<(), Request> {
+    /// Queue and wake without waiting. Only a full queue can be retried on a later frame.
+    pub fn send(&self, request: Request) -> Result<(), SendError> {
         let stop = matches!(request.1, ToWorker::Stop);
         let config = request.1.changes_slots();
         match self.to.try_send(request) {
@@ -456,24 +487,26 @@ impl LinkWorker {
                 self.waker.wake();
                 Ok(())
             }
-            Err(TrySendError::Full(request)) => Err(request),
-            Err(TrySendError::Disconnected(_)) => Ok(()),
+            Err(TrySendError::Full(request)) => Err(SendError::Full(request)),
+            Err(TrySendError::Disconnected(request)) => Err(SendError::Disconnected(request)),
         }
     }
 
     pub fn configuration(&self) -> u64 { self.config.get() }
 
-    pub fn next_event(&self) -> Option<Notice> { self.from.try_recv().ok() }
+    pub fn next_event(&self) -> Result<Notice, mpsc::TryRecvError> { self.from.try_recv() }
 
     #[cfg(test)]
     pub(crate) fn try_send(&self, command: ToWorker) -> Result<(), ToWorker> {
         let at = if matches!(command, ToWorker::Stop) { None } else { self.observed.get() };
-        self.send((at, command)).map_err(|(_, c)| c)
+        self.send((at, command)).map_err(|err| match err {
+            SendError::Full((_, c)) | SendError::Disconnected((_, c)) => c,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn try_recv(&self) -> Option<FromWorker> {
-        self.next_event().map(|notice| self.observe(notice))
+        self.next_event().ok().map(|notice| self.observe(notice))
     }
 
     #[cfg(test)]
@@ -623,6 +656,7 @@ fn run<S: LinkSocket>(
 ) -> Result<(), String> {
     let mut blobs = worker_blobs(me, commands, tell);
     let mut resolver = None;
+    let mut words_request = None;
     let waker = &commands.waker;
     let _ = waker.worker.set(std::thread::current());
     let _ = waker.home.set(Arc::downgrade(home));
@@ -658,7 +692,7 @@ fn run<S: LinkSocket>(
             if let Err(why) = begin_reflection(&mut hub, at, &servers, env.now()) { hub.fail_words(at, why); }
         }
         hub.rebound(env.now());
-        match drive(&env, &mut hub, &mut blobs, &mut resolver, &mut servers)? {
+        match drive(&env, &mut hub, &mut blobs, &mut resolver, &mut servers, &mut words_request)? {
             None => return Ok(()),
             Some(error) => makepad_widgets::log!("Town link: receive failed ({error}). Rebinding the device port."),
         }
@@ -729,6 +763,7 @@ fn drive<S: LinkSocket>(
     blobs: &mut blobs::BlobPump,
     resolver: &mut Option<(Attempt, Resolver)>,
     servers: &mut Vec<SocketAddr>,
+    words_request: &mut Option<u64>,
 ) -> Result<Option<io::Error>, String> {
     let mut buf = [0u8; 2048];
     let mut pumps = BTreeMap::<Attempt, Pump>::new();
@@ -762,18 +797,26 @@ fn drive<S: LinkSocket>(
                 }
                 Ok((_, ToWorker::OpenWords { request, same_network, lookup })) => {
                     reported_idle = false;
+                    *words_request = Some(request);
                     let words = hub.start_words(same_network, now);
                     (env.tell)(Some(words), FromWorker::WordsOpened(request));
                     *resolver = Some((words, lookup));
                 }
                 Ok((_, ToWorker::CancelWords)) => {
                     reported_idle = false;
+                    *words_request = None;
                     hub.cancel_words(now.ms);
                     *resolver = None;
                 }
-                Ok((_, ToWorker::PeerWords { words, name })) => {
-                    if let Some(at) = hub.attempt(Carrier::Words) {
-                        hub.words(at, words.own, words.peer, name, now.ms);
+                Ok((target, ToWorker::PeerWords { words, name })) => {
+                    let result = match (target, hub.attempt(Carrier::Words)) {
+                        (Some(at), Some(cur)) if at != cur => Err(WordsRejected::StaleAttempt),
+                        (_, Some(cur)) => hub.words(cur, words.own, words.peer, name, now.ms),
+                        (_, None) => Err(WordsRejected::StaleAttempt),
+                    };
+                    if let Err(reason) = result {
+                        makepad_widgets::log!("Town link: peer words rejected ({reason:?}) [words]");
+                        (env.tell)(target, FromWorker::WordsRejected(reason));
                     }
                 }
                 Ok((Some(at), ToWorker::Call(port))) if hub.phase(at.carrier) == Some(SlotPhase::Up) => {
@@ -813,7 +856,14 @@ fn drive<S: LinkSocket>(
         hub.set_call_cap(cap, now);
         for &at in &attached {
             if let Some(pump) = pumps.get_mut(&at) {
-                pump.call.outgoing(hub, at, |to, bytes| { let _ = env.socket.send_to(bytes, to); }, now);
+                let lan_off = !hub.lan_allowed();
+                pump.call.outgoing(hub, at, |to, bytes| {
+                    if lan_off && makepad_network::lan::is_local_network(to.ip()) {
+                        let _ = makepad_network::lan::check("p2p send", to);
+                        return;
+                    }
+                    let _ = env.socket.send_to(bytes, to);
+                }, now);
             }
         }
         let more = if broken.is_some() {
@@ -834,9 +884,14 @@ fn drive<S: LinkSocket>(
         };
         if broken.is_some() {
             hub.socket_lost(at(env));
+            if let (Some(request), Some(cur)) = (*words_request, hub.attempt(Carrier::Words)) {
+                (env.tell)(Some(cur), FromWorker::WordsOpened(request));
+                if let Some((res_at, _)) = resolver.as_mut() { *res_at = cur; }
+            }
         }
         let events = if broken.is_some() { hub.take_events() }
             else { hub.poll(at(env), if more { BatchEnd::MoreQueued } else { BatchEnd::Drained }) };
+        if hub.attempt(Carrier::Words).is_none() { *words_request = None; }
         let mut changed = false;
         for Output { attempt, event } in events {
             let lost = matches!(event, Event::Lost { .. });
@@ -922,6 +977,10 @@ impl Pump {
             .select(attempt.carrier, matches!(event, Event::Linked { words: Some(_), .. }));
         match event {
             Event::Send(to, bytes) => {
+                if !hub.lan_allowed() && makepad_network::lan::is_local_network(to.ip()) {
+                    let _ = makepad_network::lan::check("p2p send", to);
+                    return Ok(false);
+                }
                 if env.socket.send_to(&bytes, to).is_err_and(|e| local_network_off(&e)) && !self.blocked {
                     self.blocked = true;
                     tell(FromWorker::Blocked(LOCAL_NETWORK_OFF));
@@ -935,7 +994,7 @@ impl Pump {
                 let opened = env.now();
                 let session = InviteSession::open(opened).map_err(|e| format!("no invite key: {e}"))?;
                 let lan = if include_lan {
-                    lan_address(env.socket, addr)
+                    env.socket.lan_address(addr)
                         .map_err(|why| makepad_widgets::log!("Town link: no LAN address for the words ({why})"))
                         .ok()
                 } else {
@@ -945,7 +1004,7 @@ impl Pump {
                 changed = true;
             }
             Event::CheckAddress { addr, include_lan } => {
-                let lan = if include_lan { lan_address(env.socket, addr).ok() } else { None };
+                let lan = if include_lan { env.socket.lan_address(addr).ok() } else { None };
                 let mut tx = [0; 12];
                 makepad_network::tls::os_random(&mut tx).map_err(|e| e.to_string())?;
                 hub.check_address(attempt, lan, tx);
@@ -960,6 +1019,7 @@ impl Pump {
             }
             Event::Invite(invite) => tell(FromWorker::Invite { words: invite.to_words() }),
             Event::WordsChanged => tell(FromWorker::WordsChanged),
+            Event::Blocked(reason) => tell(FromWorker::Blocked(reason.text())),
             Event::Phase(status) => tell(FromWorker::Phase(status)),
             Event::Note(phase) => {
                 if let Some(line) = env.commands.phases.borrow_mut().enter(phase, Instant::now()) {
@@ -1029,7 +1089,9 @@ fn pair_version_text(peer_newest: Option<u16>) -> &'static str {
 
 pub const LOCAL_NETWORK_OFF: &str = "Allow Local Network access in System Settings.";
 pub const BAD_WORDS: &str = "Those words don't add up. Check them.";
-pub const BLOCKED_NETWORKS: &str = "Couldn't reach it: both networks block direct links.";
+pub const WORDS_OUT_OF_DATE: &str = "These words are out of date. Try again.";
+pub const NOT_REACHED_SECS: u64 = 15;
+pub const START_WAIT_SECS: u64 = 5;
 
 /// The developer switch that sends the link through one network interface (`en1`), so a machine
 /// whose routes prefer another one (Ethernet first) can still link over this one (a phone's
@@ -1198,6 +1260,14 @@ impl ConnectView {
                 self.own_words = None;
                 self.waiting_since = None;
                 self.renewed = true;
+                self.status = None;
+                self.blocked = None;
+            }
+            FromWorker::WordsRejected(WordsRejected::AlreadyPairing) => {}
+            FromWorker::WordsRejected(WordsRejected::StaleAttempt | WordsRejected::OlderInvite | WordsRejected::NotReady) => {
+                self.waiting_since = None;
+                self.blocked = None;
+                self.failed = Some(WORDS_OUT_OF_DATE.into());
             }
             FromWorker::Blocked(why) => self.blocked = Some(*why),
             FromWorker::Phase(status) => {
@@ -1208,9 +1278,14 @@ impl ConnectView {
                 }
                 if matches!(status, Status::Securing | Status::Proving | Status::Linked) {
                     self.blocked = None;
+                    self.failed = None;
+                } else if matches!(status, Status::Reaching { .. }) {
+                    self.failed = None;
                 }
             }
             FromWorker::Linked { peer_device, peer_name, .. } => {
+                self.blocked = None;
+                self.failed = None;
                 self.linked = Some(peer_name.clone());
                 (self.peer, self.reaching_since, self.refused) = (Some(*peer_device), None, None);
             }
@@ -1399,7 +1474,7 @@ mod tests {
         hub.wait_for_words(selected, session,own,watch.map(|w| w.core));
         env.commands.waker.serve(env.socket);
         let mut blobs = worker_blobs(env.device.unwrap().public(), env.commands, env.tell);
-        match drive(env,&mut hub,&mut blobs,&mut None,&mut Vec::new())? {
+        match drive(env,&mut hub,&mut blobs,&mut None,&mut Vec::new(),&mut None)? {
             Some(e) => Err(e.to_string()), None => Ok(()),
         }
     }
@@ -1746,13 +1821,13 @@ mod tests {
         assert!(a.send((Some(at_a), ToWorker::Call(port_a))).is_ok());
         assert!(b.send((Some(at_b), ToWorker::Call(port_b))).is_ok());
         let call_id = [1; 16];
-        let ring = Message::Ring { call_id, secret: [2; 32], video: false, ext: Default::default() };
+        let ring = Message::Ring { call_id, secret: [2; 32], video: false, ext: crate::call::RingExt { town: Some([9; 32]), ..Default::default() } };
         ends_a.messages_out.send(ring.encode()).unwrap();
         let mut ben = CallFlow::new(Box::new(|bytes| bytes.fill(3)));
         let now = CallNow::default();
         let mut effects = Vec::new();
-        ben.linked(keys[0].public(), "Ana", now, &mut effects);
-        ben.message(&ends_b.messages_in.recv().expect("the link worker stopped"), now, &mut effects);
+        ben.set_open_town(Some(([9; 32], vec![(keys[0].public(), "Ana".into())])), &mut effects);
+        ben.receive(keys[0].public(), &ends_b.messages_in.recv().expect("the link worker stopped"), now, &mut effects);
         assert!(ben.view().ringing() && ben.session() == Some(call_id), "Ben rings on the first-contact call");
         // B's port is attached once it has delivered the ring, so media from A now has somewhere to go.
         ends_a.datagrams_out.send(vec![CALL_DATAGRAM, 7]).unwrap();
@@ -1904,7 +1979,7 @@ mod tests {
                 commands.waker.serve(&socket);
                 let env = Env { socket: &socket, clock: LinkClock::Real(Instant::now()), device: None, commands, tell };
                 let mut blobs = worker_blobs(key.public(), commands, tell);
-                drive(&env, &mut Hub::new(key), &mut blobs, &mut None, &mut Vec::new()).map(|_| ())
+                drive(&env, &mut Hub::new(key), &mut blobs, &mut None, &mut Vec::new(), &mut None).map(|_| ())
             }).unwrap()
         }).collect();
         (net, workers, devices)
@@ -2024,6 +2099,197 @@ mod tests {
         }
         for worker in &workers { assert!(worker.send((None, ToWorker::Stop)).is_ok()); }
         for worker in &workers { while worker.from.recv().is_ok() {} }
+    }
+
+    // Answer one production STUN transaction with the router's shared public IP and
+    // the sender's original port. MemNet::default waits for a packet on logical time.
+    fn reflect_once(reflector: &socket::mem::MemSocket) {
+        let mut packet = [0; 128];
+        let (len, from) = reflector.recv_from_within(&mut packet, Duration::ZERO).unwrap();
+        let tx = makepad_network::p2p::stun::parse(&packet[..len]).unwrap().transaction;
+        let mapped = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), from.port()));
+        let reply = reflect::answer(&reflect::request(&tx, Style::Padded), mapped).unwrap();
+        reflector.send_to(&reply, from).unwrap();
+    }
+
+    fn open_mem_words(worker: &LinkWorker, reflector: &socket::mem::MemSocket) -> (Attempt, Invite) {
+        let (send, lookup) = mpsc::channel();
+        send.send(Ok(vec![reflector.local_addr().unwrap()])).unwrap();
+        assert!(worker.send((None, ToWorker::OpenWords { request: 1, same_network: true, lookup })).is_ok());
+        wait_for(worker, "words attempt", |e| matches!(e, FromWorker::WordsOpened(1)).then_some(()));
+        let at = worker.observed.get().unwrap();
+        reflect_once(reflector);
+        let invite = wait_for(worker, "reflected invite", |e| match e {
+            FromWorker::Invite { words } => Some(PairWords::decode(&words.join(" ")).unwrap()),
+            _ => None,
+        });
+        (at, invite)
+    }
+
+    #[test]
+    fn two_workers_behind_same_nat_with_one_lan_off_both_explain_why_instead_of_counting() {
+        use makepad_network::p2p::punch::{Config, Punch};
+        let net = MemNet::default();
+        let sends = net.watch_sends();
+        let reflector = net.bind_addr("203.0.113.1:3478".parse().unwrap()).unwrap();
+        let local = ["192.168.77.10:4100", "192.168.77.20:4200"].map(|s| s.parse().unwrap());
+        let progress = Arc::new(Progress::default());
+        let workers = [0, 1].map(|seat| {
+            let socket = net.bind_addr(local[seat]).unwrap();
+            let clock = LinkClock::Pair { progress: progress.clone(), seat };
+            LinkWorker::spawn(|| {}, move |commands, tell| {
+                let device = Arc::new(DeviceKey::generate().unwrap());
+                let mut blobs = worker_blobs(device.public(), commands, tell);
+                let mut hub = Hub::with_lan(device, seat == 0);
+                commands.waker.serve(&socket);
+                let env = Env { socket: &socket, clock, device: None, commands, tell };
+                drive(&env, &mut hub, &mut blobs, &mut None, &mut Vec::new(), &mut None).map(|_| ())
+            }).unwrap()
+        });
+        let [(at_a, a), (at_b, b)] = workers.each_ref().map(|w| open_mem_words(w, &reflector));
+        assert_eq!((a.to_words().len(), a.lan.map(SocketAddr::V4)), (14, Some(local[0])));
+        assert_eq!((b.to_words().len(), b.lan), (10, None));
+        let mut views = [0, 1].map(|_| ConnectView { waiting_since: Some(0), ..Default::default() });
+        let receive = |seat: usize, view: &mut ConnectView| {
+            net.wait_for_reader(local[seat]);
+            for (_, event) in workers[seat].from.try_iter() {
+                assert!(!matches!(event, FromWorker::Failed(_) | FromWorker::WordsChanged | FromWorker::WordsRejected(_)),
+                    "worker {seat} lost the pairing attempt: {event:?}");
+                view.apply(&event);
+            }
+        };
+        let advance = |step| {
+            progress.advance(0, step);
+            progress.advance(1, step);
+            for worker in &workers { worker.waker.wake(); }
+        };
+        let submit = |seat: usize, at, own: &Invite, peer: &Invite, name: &str| {
+            let words = PairWords { own: own.clone(), peer: peer.clone() };
+            assert!(workers[seat].send((Some(at), ToWorker::PeerWords { words, name: name.into() })).is_ok());
+        };
+
+        // Ben enters Ana's words first. No public endpoint loops back to a worker yet.
+        submit(1, at_b, &b, &a, "Ben");
+        receive(1, &mut views[1]);
+        assert_eq!(views[1].blocked, Some(SAME_NETWORK_LAN_OFF_HERE));
+        while !matches!(views[1].status, Some(Status::Reaching { secs }) if secs >= NOT_REACHED_SECS) {
+            assert!(progress.link_time() < KEEP_MAPPING.as_millis() as u64);
+            advance(1_000);
+            receive(1, &mut views[1]);
+        }
+        assert_eq!(views[1].wait_status(100), SAME_NETWORK_LAN_OFF_HERE);
+
+        let spare = net.bind_addr("192.168.77.30:4300".parse().unwrap()).unwrap();
+        // first_contact_tag calls the core's crate-private invite_tag on these two invites.
+        let key = Arc::new(DeviceKey::generate().unwrap());
+        let tag = connect::first_contact_tag(&Mode::FirstContact(makepad_town_core::link::FirstContact {
+            device: key.clone(), invite_key: key, own_invite: a.clone(), peer_invite: b.clone(), name: "Ana".into(),
+        })).unwrap();
+        let now = progress.link_time();
+        let mut punch = Punch::new(Config::new(tag), local[0], [3; 8], now);
+        let (_, probe) = punch.poll(now).0.pop().unwrap();
+        spare.send_to(&probe, local[0]).unwrap();
+        net.wait_for_reader(local[0]);
+        submit(0, at_a, &a, &b, "Ana");
+        receive(0, &mut views[0]);
+        assert!(matches!(views[0].status, Some(Status::Reaching { .. })), "Ana must answer the submitted words");
+        assert_eq!(views[0].blocked, Some(SAME_NETWORK_PEER_LAN_OFF));
+        assert_eq!(views[0].wait_status(100), SAME_NETWORK_PEER_LAN_OFF);
+
+        // Enable hairpin translation on the same router while the original attempts keep dialing.
+        net.set_hairpin(local[0], a.addr.into());
+        net.set_hairpin(local[1], b.addr.into());
+        while views.iter().any(|v| v.linked.is_none()) {
+            advance(20);
+            for (seat, view) in views.iter_mut().enumerate() { receive(seat, view); }
+        }
+        assert_eq!(views[0].linked.as_deref(), Some("Ben"));
+        assert_eq!(views[1].linked.as_deref(), Some("Ana"));
+        assert!(views.iter().all(|v| v.blocked.is_none()));
+        let ben_sends: Vec<_> = sends.try_iter().filter_map(|(from, to)| (from == local[1]).then_some(to)).collect();
+        assert!(ben_sends.contains(&SocketAddr::V4(a.addr)), "Ben dialed Ana's public address");
+        assert!(ben_sends.iter().all(|to| !makepad_network::lan::is_local_network(to.ip())),
+            "Ben sent a datagram to the local network: {ben_sends:?}");
+        for worker in &workers { assert!(worker.send((None, ToWorker::Stop)).is_ok()); }
+        net.close();
+        for worker in &workers { for _ in worker.from.iter() {} }
+    }
+
+    #[test]
+    fn peer_words_never_drop_silently_across_socket_rebind_stale_attempt_or_worker_exit() {
+        let dirs = crate::model::tests::ShareHomes::new("words-rebind");
+        let home = Arc::new(Home::open(&dirs.0).unwrap());
+        let net = Arc::new(MemNet::default());
+        let local: SocketAddr = "192.168.77.10:4100".parse().unwrap();
+        let reflector = net.bind_addr("203.0.113.1:3478".parse().unwrap()).unwrap();
+        home.lease_link_port(&AtomicBool::new(false)).unwrap().remember(local.port().try_into().unwrap()).unwrap();
+        let worker = {
+            let net = net.clone();
+            LinkWorker::spawn(|| {}, move |commands, tell| {
+                let device = Arc::new(DeviceKey::generate().unwrap());
+                let progress = Arc::new(Progress::default());
+                progress.turns[1].store(u64::MAX, Ordering::SeqCst);
+                run(&home, device.public(), Hub::with_lan(device, true), commands, tell,
+                    LinkClock::Pair { progress, seat: 0 }, |port| net.bind_addr(SocketAddr::new(local.ip(), port)))
+            }).unwrap()
+        };
+        let (at1, own) = open_mem_words(&worker, &reflector);
+        net.fail_receive(local, io::ErrorKind::NotConnected);
+        wait_for(&worker, "rebound words attempt", |e| matches!(e, FromWorker::WordsOpened(1)).then_some(()));
+        let at2 = worker.observed.get().unwrap();
+        assert_ne!(at1, at2);
+        reflect_once(&reflector);
+        net.wait_for_reader(local);
+        let peer = Invite { addr: "192.0.2.2:4200".parse().unwrap(), lan: None, ..own.clone() };
+        let submit = |at, own: &Invite| {
+            let words = PairWords { own: own.clone(), peer: peer.clone() };
+            assert!(worker.send((Some(at), ToWorker::PeerWords { words, name: "Ana".into() })).is_ok());
+        };
+        let rejected = |at, why| {
+            let reason = wait_for(&worker, "words rejection", |event| match event {
+                FromWorker::WordsRejected(reason) => Some(reason),
+                _ => None,
+            });
+            assert_eq!((worker.observed.get(), reason), (Some(at), why));
+        };
+        submit(at1, &own);
+        rejected(at1, WordsRejected::StaleAttempt);
+        submit(at2, &Invite { commit: own.commit ^ 1, ..own.clone() });
+        rejected(at2, WordsRejected::OlderInvite);
+        submit(at2, &own);
+        wait_for(&worker, "current words start dialing", |e| matches!(e, FromWorker::Phase(Status::Reaching { secs: 0 })).then_some(()));
+        assert_eq!(worker.observed.get(), Some(at2));
+        reflect_once(&reflector);
+        assert!(worker.send((Some(at2), ToWorker::CancelWords)).is_ok());
+        submit(at2, &own);
+        rejected(at2, WordsRejected::StaleAttempt);
+        assert!(worker.send((None, ToWorker::Stop)).is_ok());
+        for _ in worker.from.iter() {}
+
+        let stopped = LinkWorker::spawn(|| {}, |_, _| panic!("test worker exit")).unwrap();
+        assert!(matches!(stopped.from.recv().unwrap(), (None, FromWorker::Failed(why)) if why == "the link worker stopped unexpectedly"));
+        assert!(stopped.from.recv().is_err(), "worker exited after reporting its panic");
+        let words = PairWords { own, peer };
+        assert!(matches!(stopped.send((Some(at2), ToWorker::PeerWords { words, name: "Ana".into() })),
+            Err(SendError::Disconnected((Some(at), ToWorker::PeerWords { .. }))) if at == at2));
+    }
+
+    #[test]
+    fn worker_exit_reports_failure_even_when_signal_and_phase_logging_panic() {
+        let worker = LinkWorker::spawn(|| {}, |_, _| Ok(())).unwrap();
+        assert!(worker.from.recv().is_err());
+        assert!(matches!(worker.send((None, ToWorker::Stop)), Err(SendError::Disconnected((None, ToWorker::Stop)))));
+        assert!(matches!(worker.next_event(), Err(mpsc::TryRecvError::Disconnected)));
+
+        for (body_panics, expected) in [(false, "boom"), (true, "the link worker stopped unexpectedly")] {
+            let worker = LinkWorker::spawn(|| panic!("signal panic"), move |commands, _| {
+                std::mem::forget(commands.phases.borrow_mut());
+                if body_panics { panic!("body panic") }
+                Err("boom".into())
+            }).unwrap();
+            assert!(matches!(worker.from.recv().unwrap(), (None, FromWorker::Failed(why)) if why == expected));
+            assert!(worker.from.recv().is_err(), "the worker must deliver exactly one failure");
+        }
     }
 
     #[test]

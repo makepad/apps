@@ -92,6 +92,9 @@ pub struct Gl {
     /// its format's), until freed.
     pub live_textures: std::collections::HashMap<usize, u64>,
     pub peak_texture_bytes: u64,
+    /// The repaint's packed uniform stream (`FromWasmUploadUniformStream`): the draws' uniform
+    /// ranges are byte ranges of it.
+    uniform_stream: Vec<u8>,
 }
 
 /// What the page sends back for a GL message.
@@ -122,6 +125,7 @@ impl Gl {
             live_textures: Default::default(),
             peak_texture_bytes: 0,
             buffer_bytes: 0,
+            uniform_stream: Vec::new(),
         }
     }
 
@@ -343,6 +347,9 @@ impl Gl {
             self.hash.u64(f.to_bits() as u64);
         }
     }
+    pub fn uniform_stream(&mut self, m: FromWasmUploadUniformStream) {
+        self.uniform_stream = u8s(&m.data);
+    }
     pub fn draw(&mut self, m: FromWasmDrawCall, out: &mut Vec<Reply>) {
         // first draws spread (web_gl.js FromWasmDrawCall): a waiting program's first draw goes in a
         // frame of its own; a second one waits for the next frame
@@ -360,13 +367,16 @@ impl Gl {
         }
         self.frame.draw_calls += 1;
         self.hash.u64(15);
-        for v in [m.vao_id, m.shader_id, m.index_width as usize, m.depth_write as usize, m.alpha_blend as usize, m.blend_max as usize, m.backface_culling as usize, m.reset_draw_uniforms as usize] {
+        for v in [m.vao_id, m.shader_id, m.index_width as usize, m.depth_write as usize, m.alpha_blend as usize, m.blend_max as usize, m.cull_mode as usize] {
             self.hash.u64(v as u64);
         }
-        for u in [&m.pass_uniforms, &m.draw_list_uniforms, &m.draw_call_uniforms, &m.user_uniforms, &m.live_uniforms, &m.const_table] {
-            let b = f32s(u);
+        // each block's bytes in the stream (clamped to it, as nodegate's subarray is)
+        for r in [m.pass_uniforms, m.draw_list_uniforms, m.draw_call_uniforms, m.user_uniforms, m.live_uniforms] {
+            let s = &self.uniform_stream;
+            let start = (r.off as usize).min(s.len());
+            let b = &s[start..(r.off as usize + r.len as usize).min(s.len())];
             self.hash.u64(b.len() as u64);
-            self.hash.bytes(&b);
+            self.hash.bytes(b);
         }
         for c in &m.custom_uniforms {
             self.hash.str(&c.block_name);

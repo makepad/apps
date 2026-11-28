@@ -11,7 +11,9 @@
 
 use crate::edit_actions::{arg, check_tool, error, find_part, required_part, units, unique, Args};
 use crate::{Docs, Plan};
-use fab_elec_circuit::{Circuit, CircuitOp, Component, End, Net, RefKind};
+use fab_elec_bom::prices::Prices;
+use fab_elec_bom::shortlist::{rank_candidates, Candidate, PriceCoverage, RankMode, ShortlistContext, ShortlistEntry, ShortlistQuery};
+use fab_elec_circuit::{BlockDef, Circuit, CircuitOp, Component, End, Net, RefKind};
 use fab_elec_core::{CompId, Diag, PinIx};
 use fab_elec_design::action::{ActionDef, FieldDef, FieldKind, Risk};
 use fab_elec_design::{By, Design, DesignOp, Resolved, Unit};
@@ -19,8 +21,9 @@ use fab_elec_explore::edit::{Target, Toward};
 use fab_elec_explore::plan::{delete_parts, plan, Gesture, Planned};
 use fab_elec_explore::sheet::TagKind;
 use fab_elec_lang::{Catalog, CatalogEntry, CatalogKind};
-use fab_elec_parts::{lifecycle_rank, Lifecycle, PinKind};
+use fab_elec_parts::{lifecycle_rank, Lifecycle, PartKind, PinKind};
 use makepad_widgets_core::makepad_script::syntax::write::quote;
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 /// What an edit that can make parts or nets answers.
@@ -73,6 +76,50 @@ entries: [{..}]
             name: "from", kind: FieldKind::Int { min: 0, max: i64::MAX }, required: false, default: "0",
             help: "The first entry of the page: a reply's next.",
         },
+    ],
+    inputs: &[], risk: Risk::Read, keys: "",
+};
+
+pub const PARTS_SHORTLIST: ActionDef = ActionDef {
+    name: "elec.parts.shortlist", label: "Shortlist parts", group: "Parts",
+    help: "Rank parts from local libraries. Call once without arguments for every planned block.",
+    returns: "local_only: bool
+targets: [{..}]  one per planned block in path order without block, role or find (even with kind); otherwise one target
+  unit: text  when targeting a block instance
+  block: text  its instance path
+  def: text  its definition
+  role: text  when declared
+  ports: [text]  signal and power declarations, including voltage and current
+  entries: [{..}]  up to five per block by default, or eight for a single target
+    name: text
+    lib: text
+    in_project: bool  whether the part can be placed in this project
+    kind: text
+    tier: choice project|pinned|used|imported|std|library
+    approved: bool
+    lifecycle: choice active|nrnd|obsolete  when declared
+    footprint: text
+    pins: [text]
+    mpn: text  when declared
+    alternates: [{..}]
+      mpn: text
+      supplier: text
+      supplier_part: text
+    price: {..}
+      status: choice priced|unpriced
+      unit_micros: int
+      qty_break: int
+      currency: text
+      source: text
+      date: text",
+    fields: &[UNIT,
+        FieldDef { name: "block", kind: FieldKind::Text, required: false, default: "", help: "One planned block's path." },
+        FieldDef { name: "role", kind: FieldKind::Text, required: false, default: "", help: "Rank one target by its function." },
+        FieldDef { name: "find", kind: FieldKind::Text, required: false, default: "", help: "Search one target by these words." },
+        FieldDef { name: "kind", kind: FieldKind::Text, required: false, default: "",
+            help: "Restrict parts to this kind. With no block, role or find this filters every planned block's list, or one list if there are no planned blocks." },
+        FieldDef { name: "limit", kind: FieldKind::Int { min: 1, max: 25 }, required: false, default: "",
+            help: "Entries per list (1 to 25). Defaults to five per block in grouped reads and eight for a single target." },
     ],
     inputs: &[], risk: Risk::Read, keys: "",
 };
@@ -224,7 +271,7 @@ const PIN_NC: ActionDef = ActionDef {
 };
 
 pub static ACTIONS: &[ActionDef] = &[
-    LIBRARY_LIST, PART_ADD, PART_REMOVE, PART_RENAME, PART_FIELD, NET_CONNECT, NET_DISCONNECT, NET_RENAME, PIN_NC,
+    LIBRARY_LIST, PARTS_SHORTLIST, PART_ADD, PART_REMOVE, PART_RENAME, PART_FIELD, NET_CONNECT, NET_DISCONNECT, NET_RENAME, PIN_NC,
 ];
 
 /// A Library page's size: about this many entries per answer.
@@ -364,6 +411,108 @@ pub fn library_list(catalog: Option<&Catalog>, args: &Args) -> Result<String, Di
         write!(out, " next: {}", from + LIBRARY_PAGE).unwrap();
     }
     out.push('}');
+    Ok(out)
+}
+
+fn shortlist_row(out: &mut String, row: ShortlistEntry, entry: &CatalogEntry, in_project: bool) {
+    let pins = entry.pins.iter().map(|p| quote(&format!("{}:{}", p.name, pin_kind(p.kind)))).collect::<Vec<_>>();
+    write!(out, "{{name: {} lib: {} in_project: {in_project} kind: {} tier: {} approved: {} footprint: {} pins: [{}]",
+        quote(&row.name), quote(&row.lib), quote(entry.part.as_ref().unwrap().kind.name()), quote(row.tier.name()),
+        row.approved, quote(row.footprint.as_deref().unwrap_or("")), pins.join(" ")).unwrap();
+    if let Some(lc) = row.lifecycle { write!(out, " lifecycle: {}", quote(lc.name())).unwrap(); }
+    if let Some(mpn) = row.mpn { write!(out, " mpn: {}", quote(&mpn)).unwrap(); }
+    out.push_str(" alternates: [");
+    for alt in row.alternates {
+        write!(out, "{{mpn: {} supplier: {} supplier_part: {}}} ", quote(&alt.mpn), quote(&alt.supplier), quote(&alt.supplier_part)).unwrap();
+    }
+    out.push_str("] price: ");
+    match row.price {
+        PriceCoverage::Unpriced => out.push_str(r#"{status: "unpriced"}"#),
+        PriceCoverage::Priced { unit_micros, qty_break, currency, source, date } => {
+            write!(out, r#"{{status: "priced" unit_micros: {unit_micros} qty_break: {qty_break} currency: {} source: {} date: {}}}"#,
+                quote(&currency), quote(&source), quote(&date)).unwrap();
+        }
+    }
+    out.push_str("} ");
+}
+
+fn shortlist_ports(def: &BlockDef) -> String {
+    use fab_elec_circuit::PortKind;
+    def.ports.iter().map(|p| {
+        let kind = match &p.kind {
+            PortKind::PowerIn => "power_in", PortKind::PowerOut => "power_out", PortKind::Ground => "ground",
+            PortKind::In => "in", PortKind::Out => "out", PortKind::Passive => "passive", PortKind::Bidi => "bidi",
+            PortKind::Bus { .. } => "bus", PortKind::Pair => "pair", PortKind::Protocol(name) => name,
+        };
+        let mut text = format!("{}:{kind}", p.name);
+        if let PortKind::Bus { width } = &p.kind { write!(text, "[{width}]").unwrap(); }
+        if let Some(v) = p.volts { write!(text, " [{}V {}V]", v.min, v.max).unwrap(); }
+        if let Some(a) = p.current { write!(text, " {a}A").unwrap(); }
+        quote(&text)
+    }).collect::<Vec<_>>().join(" ")
+}
+
+/// One offline ranking per planned block or one ranking for an explicit target. The catalog and
+/// price book are snapshots, so this read also works before any component or board exists.
+pub fn parts_shortlist(design: &Design, catalog: &Catalog, imported: &[CatalogEntry], ctx: &ShortlistContext<'_>, prices: &Prices, args: &Args) -> Result<String, Diag> {
+    PARTS_SHORTLIST.check_args(args)?;
+    let block = arg(args, "block");
+    let role = arg(args, "role");
+    let find = arg(args, "find");
+    let kind = arg(args, "kind").map(|s| PartKind::of_name(s.trim_start_matches('@')));
+    let mut blocks = Vec::new();
+    for unit in units(design, args)? {
+        for b in &unit.circuit.tree {
+            if let Some(def) = b.def.and_then(|id| unit.circuit.block_defs.get(id.0 as usize)).filter(|d| d.planned) {
+                if block.is_none_or(|path| b.path == path) { blocks.push((b.path.as_str(), unit.name.as_str(), def)); }
+            }
+        }
+    }
+    blocks.sort_by_key(|&(path, unit, _)| (path, unit));
+    let grouped = block.is_none() && role.is_none() && find.is_none() && !blocks.is_empty();
+    if let Some(path) = block {
+        if blocks.is_empty() { return Err(error("block", format_args!("no planned block with path {path}"))); }
+        if blocks.len() > 1 { return Err(error("block", format_args!("{path} is in several units; pass unit"))); }
+    }
+    let limit = arg(args, "limit").map(|s| s.trim().replace('_', "").parse::<usize>().expect("checked integer"))
+        .unwrap_or(if grouped { 5 } else { 8 });
+    // Until imported definitions can join a project, only its evaluated catalog is placeable.
+    let project: BTreeSet<_> = catalog.entries.iter().filter(|e| e.lib.is_empty() || e.lib == "imported").map(|e| e.name.as_str()).collect();
+    let mut entries: Vec<_> = catalog.entries.iter().filter(|e| e.part.is_some()).collect();
+    let in_project = entries.len();
+    entries.extend(imported.iter().filter(|e| e.part.is_some() && !project.contains(e.name.as_str())));
+    let extras: Vec<Vec<String>> = entries.iter().map(|e| e.pins.iter().map(|p| p.name.clone())
+        .chain(e.defaults.iter().map(|(_, value)| value.clone())).collect()).collect();
+    let candidates: Vec<_> = entries.iter().zip(&extras).map(|(e, tokens)| Candidate {
+        lib: &e.lib, name: &e.name, title: &e.title, stem: &e.stem, summary: &e.summary, kind_label: match e.kind {
+            CatalogKind::Passive => "passive", CatalogKind::Part => "part", CatalogKind::Block => "block",
+        }, extra_tokens: tokens, part: e.part.as_deref(),
+    }).collect();
+    let mut out = String::from("{local_only: true targets: [");
+    let mut target = |block: Option<(&str, &str, &BlockDef)>| {
+        out.push('{');
+        if let Some((path, unit, def)) = block {
+            write!(out, "unit: {} block: {} def: {} ", quote(unit), quote(path), quote(&def.name)).unwrap();
+            if let Some(role) = &def.role { write!(out, "role: {} ", quote(role)).unwrap(); }
+            write!(out, "ports: [{}] ", shortlist_ports(def)).unwrap();
+        }
+        let text = role.or_else(|| block.map(|(_, _, d)| d.role.as_deref().unwrap_or(&d.name)))
+            .into_iter().chain(find).collect::<Vec<_>>().join(" ");
+        let query = ShortlistQuery { text: &text, kind: kind.clone(), limit, mode: RankMode::Shortlist };
+        out.push_str("entries: [");
+        for row in rank_candidates(&candidates, ctx, prices, &query) {
+            let entry = entries[row.index];
+            let placeable = row.index < in_project;
+            shortlist_row(&mut out, row, entry, placeable);
+        }
+        out.push_str("]} ");
+    };
+    if grouped || block.is_some() {
+        for b in blocks { target(Some(b)); }
+    } else {
+        target(None);
+    }
+    out.push_str("]}");
     Ok(out)
 }
 
@@ -516,8 +665,12 @@ pub fn part_field(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args
 /// the person's, set on the part definition, as `brief` and `waive` are; a `lifecycle` override
 /// is one `Lifecycle::of_name` takes. O(1).
 pub(crate) fn check_part_field(key: &str, text: Option<&str>, by: By) -> Result<(), Diag> {
-    if key.eq_ignore_ascii_case("approved") && by != By::Person {
-        return Err(error("key", "approved is set by the person on the part definition"));
+    if key.eq_ignore_ascii_case("approved") {
+        return Err(error("key", if by == By::Person {
+            "approved is set on the part definition (approved: true), not as a component field"
+        } else {
+            "approved is set by the person on the part definition"
+        }));
     }
     if key.eq_ignore_ascii_case("lifecycle") {
         if let Some(text) = text.filter(|text| !text.is_empty()) {
@@ -604,6 +757,68 @@ mod tests {
 
     fn args(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn parts_shortlist_groups_by_planned_block_and_respects_limit() {
+        check_returns(PARTS_SHORTLIST.returns).expect("the shortlist's published reply shape must read");
+        let mut src = fab_elec_lang::Sources::new();
+        src.add("device.blocks.splash", r#"let e = mod.elec
+let indicator = e.block({name: "Indicator" role: "status LED" planned: true ports: {io: e.port(@in)}})
+let regulator = e.block({name: "Supply" role: "3.3V LDO" planned: true ports: {out: e.port(@power_out, {volts: 3.3V current: 50mA})}})
+"#).unwrap();
+        src.add("device.ckt.splash", "use mod.project.*\nlet supply = regulator({})\nlet light = indicator({})\n").unwrap();
+        let (design, docs) = Docs::load(src, fab_elec_lang::std_libs());
+        let sample = docs.catalog().entries.iter().find(|e| e.part.is_some()).expect("the standard catalog provides a part");
+        let mut catalog = Catalog { entries: vec![] };
+        for i in 0..10 {
+            let mut e = sample.clone();
+            e.lib = if i == 0 { "".into() } else { "std".into() };
+            e.name = format!("candidate{i}");
+            e.summary = "status LED 3.3V LDO".into();
+            Arc::make_mut(e.part.as_mut().unwrap()).kind = if i % 2 == 0 { PartKind::Regulator } else { PartKind::Led };
+            catalog.entries.push(e);
+        }
+        let empty = BTreeSet::new();
+        let ctx = ShortlistContext { pinned: &[], used_parts: &empty, imported_ids: &empty };
+        let read = |pairs: &[(&str, &str)]| parts_shortlist(&design, &catalog, &[], &ctx, &Prices::default(), &args(pairs)).unwrap();
+        let all = read(&[]);
+        let groups: Vec<_> = all.split("block: ").skip(1).collect();
+        assert!(all.starts_with("{local_only: true") && groups.len() == 2, "one local read must group both planned blocks: {all}");
+        assert!(groups[0].starts_with(r#""light""#) && groups[1].starts_with(r#""supply""#), "block sections must follow path order: {all}");
+        assert!(groups.iter().all(|g| g.matches("{name: ").count() == 5 && g.contains(r#"tier: "project""#) && g.contains(r#"tier: "std""#)),
+            "each group must report provenance and default to five matches: {all}");
+        assert!(all.contains("power_out") && all.contains("3.3V") && all.contains("0.05A"), "the block should carry its electrical summary: {all}");
+        let filtered = read(&[("kind", "regulator")]);
+        let sections: Vec<_> = filtered.split("block: ").skip(1).collect();
+        assert!(sections.len() == 2 && sections.iter().all(|g| g.matches("{name: ").count() == 5
+            && g.matches(r#"kind: "regulator""#).count() == 5), "kind alone must filter every entry of both groups: {filtered}");
+        assert_eq!(read(&[("limit", "1")]).matches("{name: ").count(), 2, "an explicit limit applies per block");
+        assert_eq!(read(&[("block", "supply")]).matches("{name: ").count(), 8, "an explicit block gets one list with the single-target default");
+        let mut cached = catalog.entries[0].clone();
+        cached.lib = "imported".into();
+        cached.name = "cached".into();
+        let mut evaluated = cached.clone();
+        evaluated.name = "evaluated".into();
+        catalog.entries.push(evaluated.clone());
+        let reply = parts_shortlist(&design, &catalog, &[cached, evaluated], &ctx, &Prices::default(), &args(&[("block", "supply")])).unwrap();
+        assert!(reply.contains(r#"name: "candidate0" lib: "" in_project: true"#)
+            && reply.contains(r#"name: "cached" lib: "imported" in_project: false"#)
+            && reply.contains(r#"name: "evaluated" lib: "imported" in_project: true"#) && reply.matches(r#"name: "evaluated""#).count() == 1,
+            "only cache-only parts should be unplaceable and an evaluated import must appear once: {reply}");
+    }
+
+    #[test]
+    fn parts_shortlist_works_on_req_only_plate_without_board() {
+        let mut src = fab_elec_lang::Sources::new();
+        src.add("device.req.splash", r#"brief("A simple indicator")"#).unwrap();
+        let (design, docs) = Docs::load(src, fab_elec_lang::std_libs());
+        assert!(design.units.is_empty(), "the read must exercise a requirements-only plate");
+        let empty = BTreeSet::new();
+        let ctx = ShortlistContext { pinned: &[], used_parts: &empty, imported_ids: &empty };
+        let reply = parts_shortlist(&design, docs.catalog(), &[], &ctx, &Prices::default(), &args(&[("find", "resistor")])).unwrap();
+        assert!(reply.contains(r#"kind: "resistor""#) && reply.contains(r#"price: {status: "unpriced"}"#),
+            "parts and their offline price coverage must be available before a board exists: {reply}");
     }
 
     /// The `(part, lib)` of each entry a library page lists, in order.

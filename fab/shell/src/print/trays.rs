@@ -50,7 +50,7 @@ script_mod! {
                     sdf.stroke(fab.color_border_light, 1.0)
                     sdf.move_to(c.x - r * 0.5, c.y + r * 0.5)
                     sdf.line_to(c.x + r * 0.5, c.y - r * 0.5)
-                    sdf.stroke(fab.color_text_muted, 1.2)
+                    sdf.stroke(fab.color_text_well_muted, 1.2)
                     return sdf.result
                 }
                 sdf.fill_keep(vec4(self.fill.xyz, 1.0))

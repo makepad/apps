@@ -22,7 +22,10 @@ pub struct Entity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldState {
     pub value: Value,
+    /// Most recent event that wrote or restored this field.
     pub writer: Id,
+    /// Authoring event of the current value, preserved across undo and redo.
+    pub origin: Id,
 }
 
 impl Entity {
@@ -43,7 +46,7 @@ impl Entity {
         }
     }
 
-    pub(crate) fn write(&mut self, field: Key, value: Value, writer: Id, position: u64) -> Option<FieldState> {
+    pub(crate) fn write(&mut self, field: Key, value: Value, writer: Id, origin: Id, position: u64) -> Option<FieldState> {
         self.last_activity = position;
         if field == field::ORDER {
             self.order_written = position;
@@ -52,7 +55,7 @@ impl Entity {
             self.z_written = position;
         }
         // During replay even a clear needs a writer, so a later UNDO can test ownership.
-        self.fields.insert(field, FieldState { value, writer })
+        self.fields.insert(field, FieldState { value, writer, origin })
     }
 
     /// Name keys follow all numeric keys and sort lexicographically by UTF-8 bytes.
@@ -192,8 +195,19 @@ pub mod field {
     pub const EDIT_AGENT: Key = Key::Number(38);
     /// Blob for an issue's video recording.
     pub const VIDEO: Key = Key::Number(39);
+    pub const GH_REPO: Key = Key::Number(40);
+    pub const GH_NUMBER: Key = Key::Number(41);
+    pub const GH_STATE: Key = Key::Number(42);
+    pub const GH_FOLDER: Key = Key::Number(43);
+    pub const GH_FILTER: Key = Key::Number(44);
+    pub const GH_TITLE: Key = Key::Number(45);
+    pub const GH_BODY: Key = Key::Number(46);
+    /// Reserved field number. Copy provenance is carried in event::TAG_COPIED_FROM.
+    pub const COPIED_FROM: Key = Key::Number(47);
+    /// Critical read policy of a projectless TOWN entity, written by the founder seat.
+    pub const POLICY: Key = Key::Number(48);
 }
 
 use crate::fold::cache::fields as cache_fields;
 cache_fields!(Entity { id, kind, project, author, actor, created, last_activity, fields, order_written, z_written });
-cache_fields!(FieldState { value, writer });
+cache_fields!(FieldState { value, writer, origin });

@@ -797,8 +797,11 @@ mod field_authority_tests {
                 assert!(message.contains(refused), "elec.bom.field.set {key} by {by:?}: {message}");
             }
         }
-        assert!(part("approved", "true", By::Person).is_ok(), "the person may write the field");
-        assert!(bom("approved", "true", By::Person).is_ok(), "the person may write the field");
+        let guidance = "approved is set on the part definition (approved: true), not as a component field";
+        for key in ["approved", "Approved"] {
+            assert!(part(key, "true", By::Person).unwrap_err().message.contains(guidance), "part field must direct the person to the definition");
+            assert!(bom(key, "true", By::Person).unwrap_err().message.contains(guidance), "BOM field must direct the person to the definition");
+        }
         for by in [By::Ai { turn: 1, call: 2 }, By::Person] {
             let message = part("lifecycle", "eol", by).unwrap_err().message;
             assert!(message.contains("a lifecycle is active, nrnd or obsolete"), "{message}");

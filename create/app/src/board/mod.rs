@@ -6,6 +6,7 @@ pub mod gesture;
 pub mod index;
 pub mod live;
 mod look;
+pub mod media;
 pub mod page;
 pub mod schema;
 pub(crate) mod tree;

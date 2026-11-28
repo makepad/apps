@@ -1,31 +1,47 @@
 //! The Calibrate panel's steps, test parts and stored results.
 //! A made coupon becomes a project on the model worker, then prints through the Print button.
 
-use fab::print::calibrate::{AnswerKind, CalStepRow, CalibrateAction, CalibrateState, CouponView};
-use fab_calibrate::results::names;
-use fab_calibrate::{Answer, Coupon, Results, Step};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::print::{CalWriteOutcome, CalibrationOwner, EffectiveCalibration, Printing};
+use fab::print::PrintState;
+use fab::print::calibrate::{cleared_status, inherited_summary, saved_status, AnswerKind, CalStepRow, CalibrateAction, CalibrateState, CouponView};
+use fab_calibrate::results::{names, EffectiveResults};
+use fab_calibrate::{Answer, Coupon, Step};
 use std::sync::Arc;
 
-static REVISION: AtomicU64 = AtomicU64::new(0);
-
-/// Bumped whenever stored results change (part of the slice settings' identity).
-pub fn revision() -> u64 {
-    REVISION.load(Ordering::Relaxed)
+/// The destination that produced a coupon is retained even if the target later changes.
+#[derive(Clone, Debug)]
+pub struct CapturedCoupon {
+    pub coupon: Arc<Coupon>,
+    pub owner: Option<CalibrationOwner>,
+    pub preset: String,
+    pub filament: String,
 }
 
 /// Posted by the model worker after making a test part.
 #[derive(Debug)]
 pub enum CalEvent {
-    Made(Result<(Arc<Coupon>, [f32; 4]), String>),
+    Made(Result<(CapturedCoupon, [f32; 4]), String>),
+}
+
+impl CalEvent {
+    pub(super) fn make(step: Step, setup: &crate::print::CheckSetup, colour: [f32; 4]) -> Self {
+        let made = fab_calibrate::make(step, &setup.coupon_setup()).map(|mut coupon| {
+            let (preset, filament) = setup.calibration_names();
+            coupon.printer.clone_from(&preset);
+            coupon.filament.clone_from(&filament);
+            (CapturedCoupon { coupon: Arc::new(coupon), owner: setup.calibration_owner().cloned(), preset, filament }, colour)
+        });
+        Self::Made(made.ok_or_else(|| format!("{} has no test part", step.title())))
+    }
 }
 
 #[derive(Default)]
 pub struct Calibrate {
     /// The last made part (its numbers and setup are what an answer refers to).
-    coupon: Option<Arc<Coupon>>,
-    results: Results,
-    results_loaded: bool,
+    coupon: Option<CapturedCoupon>,
+    effective: Arc<EffectiveCalibration>,
+    synced: bool,
+    pending_make: Option<(Step, [f32; 4])>,
     making: bool,
 }
 
@@ -40,7 +56,7 @@ fn answer_kind(step: Step) -> AnswerKind {
 }
 
 /// A step's stored values, said short.
-fn summary(step: Step, r: &Results) -> String {
+fn summary(step: Step, r: &EffectiveResults) -> String {
     let g = |n: &str| r.get(n);
     let s = match step {
         Step::Clearance => g(names::C_XY).map(|v| format!("{v:.2} mm")),
@@ -56,47 +72,51 @@ fn summary(step: Step, r: &Results) -> String {
     s.unwrap_or_default()
 }
 
-/// The values a step stores (to forget them).
-fn step_names(step: Step) -> &'static [&'static str] {
-    match step {
-        Step::Clearance => &[names::C_XY],
-        Step::ZGap => &[names::C_Z_LAYERS],
-        Step::SlipFit => &[names::SLIP_FIT, names::PRESS_FIT],
-        Step::Snap => &[names::SNAP_MAX, names::SNAP_HOLD],
-        Step::Friction => &[names::MU],
-        Step::Flow => &[names::FLOW_RATIO],
-        Step::Temperature => &[names::NOZZLE_TEMP],
-        Step::PressureAdvance => &[names::PRESSURE_ADVANCE],
-        Step::HeadEnvelope => &[],
-    }
-}
-
 impl Calibrate {
-    /// Load a different printer/filament pair and fill the panel.
-    pub fn refresh(&mut self, state: &mut CalibrateState, printer: &str, filament: &str) {
-        if !self.results_loaded || self.results.printer != printer || self.results.filament != filament {
-            self.results = Results::load(printer, filament);
-            self.results_loaded = true;
+    /// Reuse the panel rows until the target, material, or resolved measurements change.
+    pub fn sync(
+        &mut self, state: &mut CalibrateState, effective: &Arc<EffectiveCalibration>,
+        owner: Option<&CalibrationOwner>, preset: &str, filament: &str,
+    ) -> bool {
+        if self.synced && Arc::ptr_eq(&self.effective, effective) && state.owner_id.as_deref() == owner.map(|o| o.id.as_str())
+            && state.printer == preset && state.filament == filament && !state.steps.is_empty() {
+            return false;
         }
-        state.printer = printer.to_string();
-        state.filament = filament.to_string();
+        self.effective = effective.clone();
+        state.owner_id = owner.map(|o| o.id.clone());
+        state.owner_title = owner.map(|o| o.title.clone());
+        preset.clone_into(&mut state.printer);
+        filament.clone_into(&mut state.filament);
         self.fill(state);
+        self.synced = true;
+        true
     }
 
     fn fill(&self, state: &mut CalibrateState) {
-        state.steps = Step::ALL
-            .iter()
-            .map(|&s| CalStepRow {
-                title: s.title().to_string(),
-                feeds: s.feeds().to_string(),
-                done: self.results.done(s).map(|d| d.to_string()),
-                summary: summary(s, &self.results),
-                blocked: (s == Step::HeadEnvelope).then(|| "Coming with non-planar printing: the head measurement form and its checks.".to_string()),
-            })
-            .collect();
+        let effective = &self.effective;
+        let results = if effective.owner.as_ref().map(|o| &o.id) == state.owner_id.as_ref()
+            && effective.preset == state.printer {
+            effective.for_filament(&state.filament)
+        } else {
+            None
+        };
+        state.steps = Step::ALL.iter().map(|&s| {
+            let mut value = results.map_or_else(String::new, |r| summary(s, r));
+            if !value.is_empty() && results.is_some_and(|r| r.step_from_preset(s)) {
+                value = inherited_summary(&value, &state.printer);
+            }
+            CalStepRow {
+                title: s.title().into(),
+                feeds: s.feeds().into(),
+                done: results.and_then(|r| r.done(s)).map(|d| d.date.clone()),
+                summary: value,
+                can_clear: results.is_some_and(|r| r.can_clear(s)),
+                blocked: (s == Step::HeadEnvelope).then(|| "Coming with non-planar printing: the head measurement form and its checks.".into()),
+            }
+        }).collect();
         state.selected = state.selected.min(state.steps.len().saturating_sub(1));
         let selected = Step::ALL[state.selected];
-        state.coupon = self.coupon.as_ref().filter(|c| c.step == selected).map(|c| CouponView {
+        state.coupon = self.coupon.as_ref().map(|captured| &captured.coupon).filter(|c| c.step == selected).map(|c| CouponView {
             name: c.name.clone(),
             check: c.check.clone(),
             variants: c.variants.iter().map(|v| format!("{}: {}", v.number, v.label)).collect(),
@@ -106,24 +126,29 @@ impl Calibrate {
 
     /// Handle a panel action with the job's settings snapshot for the coupon.
     /// Returns true when the panel changed.
-    pub fn action(&mut self, state: &mut CalibrateState, a: &CalibrateAction, setup: crate::print::CheckSetup, colour: [f32; 4], host: Option<&mut crate::model_host::ModelHost>) -> bool {
-        let (printer, filament) = setup.calibration_names();
+    pub fn action(&mut self, print_state: &mut PrintState, a: &CalibrateAction, printing: &mut Printing, colour: [f32; 4], host: Option<&mut crate::model_host::ModelHost>) -> bool {
+        let state = &mut print_state.calibrate;
         match a {
             CalibrateAction::Select(i) => {
                 state.selected = (*i).min(Step::ALL.len() - 1);
                 state.status.clear();
                 self.fill(state);
-                return true;
             }
             CalibrateAction::MakePart => {
                 if self.making {
                     return false;
                 }
                 let step = Step::ALL[state.selected.min(Step::ALL.len() - 1)];
+                if printing.calibration_pending() {
+                    self.pending_make = Some((step, colour));
+                    state.status = "Loading calibration...".into();
+                    self.making = true;
+                    return true;
+                }
                 self.making = true;
                 state.status = format!("Making the {} test part ...", step.title().to_lowercase());
                 match host {
-                    Some(host) => host.make_calibration(step, setup, colour),
+                    Some(host) => host.make_calibration(step, printing.check_setup(print_state), colour),
                     None => {
                         self.making = false;
                         state.status = "The model worker is not ready yet.".into();
@@ -131,68 +156,67 @@ impl Calibrate {
                 }
             }
             CalibrateAction::Answer { a, b, angle } => {
-                let Some(c) = self.coupon.clone() else {
+                let Some(captured) = self.coupon.as_ref() else {
                     state.status = "Make and print the test part first: the numbers refer to it.".into();
                     return true;
                 };
-                let answer = match answer_kind(c.step) {
+                let answer = match answer_kind(captured.coupon.step) {
                     AnswerKind::Number => Answer::Number(*a),
                     AnswerKind::Two(..) => Answer::Two(*a, *b),
                     AnswerKind::Angle => Answer::Angle(*angle),
                     AnswerKind::Measure => return false,
                 };
-                let mut r = Results::load(&c.printer, &c.filament);
-                match r.record(&c, &answer, &makepad_fab_slice::today()) {
-                    Ok(set) => match r.save() {
-                        Ok(_) => {
-                            REVISION.fetch_add(1, Ordering::Relaxed);
-                            state.status = format!("Saved for {}: {}.", c.step.feeds(), set.iter().map(|(k, v)| format!("{k} {v:.3}")).collect::<Vec<_>>().join(", "));
-                            if c.printer != printer || c.filament != filament {
-                                state.status.push_str(&format!(" Printer: {}; filament: {}.", c.printer, c.filament));
-                            }
-                            self.results_loaded = false;
-                        }
-                        Err(e) => state.status = format!("Could not save: {e}"),
-                    },
-                    Err(e) => state.status = e,
-                }
+                printing.save_calibration(
+                    print_state, captured.owner.clone(), captured.preset.clone(), captured.filament.clone(),
+                    captured.coupon.clone(), answer, makepad_fab_slice::today(),
+                );
+                print_state.calibrate.status = "Saving result...".into();
             }
             CalibrateAction::Clear => {
                 let step = Step::ALL[state.selected.min(Step::ALL.len() - 1)];
-                let mut r = Results::load(&printer, &filament);
-                for n in step_names(step) {
-                    r.values.remove(*n);
-                }
-                r.dates.remove(step.key());
-                match r.save() {
-                    Ok(_) => {
-                        REVISION.fetch_add(1, Ordering::Relaxed);
-                        state.status = format!("{}: back to Fab's defaults.", step.title());
-                        self.results_loaded = false;
-                    }
-                    Err(e) => state.status = format!("Could not save: {e}"),
-                }
+                printing.clear_calibration(print_state, step);
+                print_state.calibrate.status = "Clearing result...".into();
             }
         }
-        self.refresh(state, &printer, &filament);
         true
     }
 
     /// A made part arrived: remember it; the caller opens its plate and slices it.
-    pub fn made(&mut self, state: &mut CalibrateState, made: &Result<(Arc<Coupon>, [f32; 4]), String>) {
+    pub fn made(&mut self, state: &mut CalibrateState, made: &Result<(CapturedCoupon, [f32; 4]), String>) {
         self.making = false;
         match made {
             Ok((c, _)) => {
                 self.coupon = Some(c.clone());
-                state.status = format!("{} is open as its own plate and slicing; your plate is saved in File > Open Recent. Check its layers, then Print and confirm when you are ready.", c.name);
-                let (p, f) = (state.printer.clone(), state.filament.clone());
-                self.refresh(state, &p, &f);
+                state.status = format!("{} is open as its own plate and slicing; your plate is saved in File > Open Recent. Check its layers, then Print and confirm when you are ready.", c.coupon.name);
+                self.fill(state);
             }
             Err(e) => {
                 state.status = e.clone();
             }
         }
     }
+
+    pub fn take_pending_make(&mut self) -> Option<(Step, [f32; 4])> {
+        self.pending_make.take()
+    }
+
+    pub fn written(
+        &mut self, state: &mut CalibrateState, outcome: &CalWriteOutcome,
+        current_owner: Option<&CalibrationOwner>, current_preset: &str, current_filament: &str,
+    ) {
+        state.status = match outcome {
+            CalWriteOutcome::Saved { owner, preset, filament, step, values } => {
+                let different = owner.as_ref() != current_owner || preset != current_preset || filament != current_filament;
+                let label = owner.as_ref().map_or(preset.as_str(), |o| o.title.as_str());
+                let values = values.iter().map(|(k, v)| format!("{k} {v:.3}")).collect::<Vec<_>>().join(", ");
+                saved_status(step.feeds(), &values, different.then_some((label, filament)))
+            }
+            CalWriteOutcome::Cleared { owner, preset, step, has_preset_fallback } =>
+                cleared_status(owner.as_ref().map(|o| o.title.as_str()), preset, step.title(), *has_preset_fallback),
+            CalWriteOutcome::Failed(error) => format!("Could not save: {error}"),
+        };
+    }
+
 }
 
 #[cfg(test)]
@@ -200,6 +224,50 @@ mod tests {
     use super::*;
     use fab_calibrate::CouponSetup;
     use fab_plate::machine::Machine;
+
+    #[test]
+    fn calibrate_panel_copy_and_source_indicators() {
+        use fab_calibrate::results::{EffectiveValue, ValueSource};
+        let p = CalibrationOwner { id: "printer:P".into(), title: "P".into() };
+        let preset = "Sim 0.4";
+        let filament = "PLA";
+        let mut r = EffectiveResults { owner: Some(p.id.clone()), preset: preset.into(), filament: filament.into(), ..Default::default() };
+        r.values.insert(names::FLOW_RATIO.into(), EffectiveValue { value: 0.91, source: ValueSource::Owner });
+        r.values.insert(names::PRESSURE_ADVANCE.into(), EffectiveValue { value: 0.035, source: ValueSource::Preset });
+        r.clearable_steps.insert(Step::Flow.key().into());
+        let mut arc = Arc::new(EffectiveCalibration {
+            owner: Some(p.clone()), preset: preset.into(), by_filament: [(filament.into(), r)].into_iter().collect(),
+        });
+        let mut panel = Calibrate::default();
+        let mut state = CalibrateState::default();
+        assert!(panel.sync(&mut state, &arc, Some(&p), preset, filament));
+        assert!(!panel.sync(&mut state, &arc, Some(&p), preset, filament), "an unchanged report reuses the panel rows");
+        assert_eq!(state.context_text(), "Calibrating P with PLA");
+        assert_eq!(state.clear_label(), "Clear P's results");
+        let flow = state.steps.iter().find(|s| s.title == Step::Flow.title()).unwrap();
+        assert!(flow.can_clear && flow.summary == "flow 0.910", "the owned measurement identifies its value without a fallback label");
+        let pa = state.steps.iter().find(|s| s.title == Step::PressureAdvance.title()).unwrap();
+        assert!(!pa.can_clear && pa.summary == "K 0.035 (from Sim 0.4)", "a fallback names its source and cannot be cleared here");
+        for (fallback, status) in [(true, "Cleared P's results for Flow; using Sim 0.4's result."), (false, "Cleared P's results for Flow; back to Fab's defaults.")] {
+            let r = Arc::make_mut(&mut arc).by_filament.get_mut(filament).unwrap();
+            r.clearable_steps.clear();
+            if fallback {
+                r.values.insert(names::FLOW_RATIO.into(), EffectiveValue { value: 0.98, source: ValueSource::Preset });
+            } else { r.values.remove(names::FLOW_RATIO); }
+            panel.sync(&mut state, &arc, Some(&p), preset, filament);
+            let flow = state.steps.iter().find(|s| s.title == Step::Flow.title()).unwrap();
+            assert!(!flow.can_clear, "a cleared owner measurement cannot be cleared again");
+            assert_eq!(flow.summary, if fallback { "flow 0.980 (from Sim 0.4)" } else { "" }, "clearing reveals the fallback or the default");
+            panel.written(&mut state, &CalWriteOutcome::Cleared {
+                owner: Some(p.clone()), preset: preset.into(), step: Step::Flow, has_preset_fallback: fallback,
+            }, Some(&p), preset, filament);
+            assert_eq!(state.status, status);
+        }
+        Arc::make_mut(&mut arc).owner = None;
+        panel.sync(&mut state, &arc, None, preset, filament);
+        assert_eq!(state.context_text(), "For Sim 0.4 · PLA");
+        assert_eq!(state.clear_label(), "Clear result");
+    }
 
     #[test]
     fn every_coupon_becomes_a_plate_on_the_bed() {

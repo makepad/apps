@@ -1,6 +1,6 @@
 //! The live call controls and the call entries in chat.
 
-use crate::lists::ViewData;
+use crate::lists::{paint_peer_badge, ActiveTownCall, SeatPalette, ViewData};
 use crate::ui::live::{button, button_events};
 use crate::view::{Seat, TownMembers};
 use super::{TranscribeShown, CallShown, PickerShown, CallView, DeviceKind, DeviceNotice, DeviceRow, Devices, Phase, Press};
@@ -26,6 +26,7 @@ script_mod! {
     mod.widgets.LiveCallPageBase = #(CallRow::register_widget(vm))
     mod.widgets.ProjectHeaderBase = #(ProjectHeader::register_widget(vm))
     mod.widgets.CallButtonBase = #(CallButton::register_widget(vm))
+    mod.widgets.JoinCallButtonBase = #(JoinCallButton::register_widget(vm))
     mod.widgets.CallEntryRowBase = #(CallEntryRow::register_widget(vm))
     mod.widgets.LiveDotBase = #(LiveDot::register_widget(vm))
     let PickerBase = #(DevicePicker::register_widget(vm))
@@ -82,11 +83,19 @@ script_mod! {
         }
         words := BodyNote{width: Fill visible: false}
     }
+    let JoinTip = Tip{visible: false call_join := Control{visible: false text: "Join call"}}
     mod.widgets.CallButton = mod.widgets.CallButtonBase{
         width: Fit height: Fit
         content := View{
             visible: false width: Fit height: Fit flow: Right spacing: 4
             tip := Tip{call_start := Control{text: "Call"}}
+            join_tip := JoinTip{}
+        }
+    }
+    mod.widgets.JoinCallButton = mod.widgets.JoinCallButtonBase{
+        width: Fit height: Fit
+        content := View{visible: false width: Fit height: Fit
+            join_tip := JoinTip{}
         }
     }
     mod.widgets.LiveDot = mod.widgets.LiveDotBase{
@@ -121,6 +130,20 @@ pub(crate) fn length(secs: u64) -> String {
     if secs < 60 { format!("{secs} s") } else { format!("{} min", secs / 60) }
 }
 
+type CallViewCache = Option<(std::sync::Arc<CallView>, bool, bool, bool, u64, u64)>;
+
+fn view_changed(last: &mut CallViewCache, data: &ViewData) -> bool {
+    let shown = &data.call;
+    if last.as_ref().is_some_and(|(view, linked, can_call, can_share, members, active)|
+        std::sync::Arc::ptr_eq(view, &shown.view) && *linked == shown.linked && *can_call == shown.can_call
+            && *can_share == shown.can_share && *members == data.member_revision && *active == data.active_town_call_revision) {
+        return false
+    }
+    *last = Some((shown.view.clone(), shown.linked, shown.can_call, shown.can_share,
+        data.member_revision, data.active_town_call_revision));
+    true
+}
+
 // The outer widget stays in the tree so it can see the next snapshot even when its
 // content has no layout or input. Unscoped embeddings can still drive the Ref's show method.
 macro_rules! call_view {
@@ -129,18 +152,13 @@ macro_rules! call_view {
         pub struct $name {
             #[source] source: ScriptObjectRef,
             #[deref] view: View,
-            $(#[rust] $scoped: Option<(std::sync::Arc<CallView>, bool, u64)>,)?
+            $(#[rust] $scoped: CallViewCache,)?
         }
 
         impl Widget for $name {
             fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
                 $(if let Some(data) = scope.data.get::<ViewData>() {
-                    let shown = &data.call;
-                    if !self.$scoped.as_ref().is_some_and(|(view, linked, revision)|
-                        std::sync::Arc::ptr_eq(view, &shown.view) && *linked == shown.linked && *revision == data.member_revision) {
-                        self.show(cx, data);
-                        self.$scoped = Some((shown.view.clone(), shown.linked, data.member_revision));
-                    }
+                    if view_changed(&mut self.$scoped, data) { self.show(cx, data); }
                     if !self.view.child(id!(content)).visible() { return DrawStep::done() }
                 })?
                 self.view.draw_walk(cx, scope, walk)
@@ -153,11 +171,38 @@ macro_rules! call_view {
     };
 }
 
-call_view!(CallRow, last_view);
 call_view!(CallEntryRow);
 call_view!(CallButton, last_view);
+call_view!(JoinCallButton, last_view);
 call_view!(ProjectHeader, last_view);
 call_view!(LiveDot, last_view);
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct CallRow {
+    #[source] source: ScriptObjectRef,
+    #[deref] view: View,
+    #[rust] last_view: CallViewCache,
+    #[rust] peer_chips: Vec<WidgetRef>,
+}
+
+impl Widget for CallRow {
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if let Some(data) = scope.data.get::<ViewData>() {
+            if view_changed(&mut self.last_view, data) { self.show(cx, data); }
+            if !self.view.child(id!(content)).visible() { return DrawStep::done() }
+        }
+        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
+            if step.widget_uid() != self.view.widget(cx, ids!(peer_list)).widget_uid() { return Err(step) }
+            for chip in &self.peer_chips { chip.draw_all(cx, scope); }
+        }
+        DrawStep::done()
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.last_view.is_some() && !self.view.child(id!(content)).visible() { return }
+        if self.view.visible() { button_events(&mut self.view, cx, event, scope); }
+    }
+}
 
 // The same UI-thread level is shared by both layouts. A meter tick never asks
 // the app to rebuild its call snapshot or redraw the chat.
@@ -216,7 +261,7 @@ fn accessible_button(cx: &mut Cx, b: &ButtonRef, label: &str) {
 pub fn opening_uids(cx: &Cx, root: &WidgetRef) -> Vec<WidgetUid> {
     // PortalList is a lookup scope. Name the list in ChatConversation to include its
     // instantiated CallLine rows while retaining the widget tree's cached lookups.
-    let mut uids: Vec<_> = root.widgets(cx, &[ids!(call_start), ids!(call_back), ids!(call_answer), ids!(call_unmute),
+    let mut uids: Vec<_> = root.widgets(cx, &[ids!(call_start), ids!(call_join), ids!(call_back), ids!(call_answer), ids!(call_unmute),
         ids!(call_microphone), ids!(call_transcribe), ids!(call_transcribe_yes), ids!(transcript.list.call_back),
         ids!(compact_live), ids!(transcript_send), ids!(transcript_cancel), ids!(call_share), ids!(watch), ids!(choices), ids!(let_control)])
         .iter().map(|w| w.widget_uid()).collect();
@@ -232,15 +277,44 @@ impl CallRowRef {
         CallRow::show_transcription(cx, &self.child(id!(content)), view, &TranscribeShown::Off, "");
         CallRow::show_content(cx, &self.child(id!(content)), view, talking,
             &PickerShown::read(devices, DeviceKind::Input), &PickerShown::read(devices, DeviceKind::Output), None);
+        if let Some(mut row) = self.borrow_mut() { row.bind_peers(cx, view, None); }
     }
 }
 
 impl CallRow {
-    fn show(&self, cx: &mut Cx, data: &ViewData) {
+    fn show(&mut self, cx: &mut Cx, data: &ViewData) {
         let shown = &data.call;
         Self::show_transcription(cx, &self.view.child(id!(content)), &shown.view, &shown.transcribe, &shown.transcript_town);
         Self::show_content(cx, &self.view.child(id!(content)), &shown.view, shown.talking, &shown.input, &shown.output, shown.echo_cancel_notice.as_deref());
         Self::show_share(cx, &self.view.child(id!(content)), shown);
+        self.bind_peers(cx, &shown.view, Some(data));
+    }
+
+    fn bind_peers(&mut self, cx: &mut Cx, view: &CallView, data: Option<&ViewData>) {
+        let multi = view.phase == Phase::Live && view.participants.len() >= 2;
+        if !multi && self.peer_chips.is_empty() { return }
+        let list = self.view.flat_list(cx, ids!(peer_list));
+        let Some(mut list) = list.borrow_mut() else { return };
+        let before = list.items.len();
+        self.peer_chips.clear();
+        if multi {
+            let palette = data.map(|d| d.seat_palette).filter(|p| *p != SeatPalette::default())
+                .unwrap_or_else(|| SeatPalette::from_cx(cx));
+            let members = data.filter(|d| view.town.is_none_or(|t| d.tree.snapshot().town == Some(t))).map(|d| &d.members);
+            for p in &view.participants {
+                let id = LiveId::from_bytes(LiveId::SEED, &p.peer, 0, p.peer.len(), 0);
+                let Some(chip) = list.item(cx, id, id!(PeerChip)) else { continue };
+                let badge = chip.widget(cx, ids!(badge));
+                badge.label(cx, ids!(initial)).set_text(cx, &crate::view::peer_initial(&p.name));
+                paint_peer_badge(cx, &badge, members.and_then(|m| m.seat_tone_for_device(&p.peer)), &palette);
+                chip.label(cx, ids!(name)).set_text(cx, &p.name);
+                chip.widget(cx, ids!(muted)).set_visible(cx, p.muted);
+                chip.widget(cx, ids!(transcribing)).set_visible(cx, p.transcribing);
+                self.peer_chips.push(chip);
+            }
+        }
+        list.items.retain_visible();
+        if list.items.len() != before { cx.widget_tree_mark_dirty(list.widget_uid()); }
     }
 
     fn show_content(cx: &mut Cx, body: &WidgetRef, view: &CallView, talking: Talking, input: &PickerShown, output: &PickerShown, echo_cancel_notice: Option<&str>) {
@@ -257,6 +331,9 @@ impl CallRow {
         mic.show(cx, DeviceKind::Input, show_mic, input);
         speaker.show(cx, DeviceKind::Output, show_speaker, output);
         body.widget(cx, ids!(devices)).set_visible(cx, show_mic || show_speaker);
+        let multi = live && view.participants.len() >= 2;
+        body.widget(cx, ids!(peer_roster)).set_visible(cx, multi);
+        body.widget(cx, ids!(people_gap)).set_visible(cx, multi);
         if view.phase == Phase::Idle { return }
 
         let heading = body.label(cx, ids!(title));
@@ -264,10 +341,14 @@ impl CallRow {
         if !live { heading.set_text(cx, &title(view)); }
         body.widget(cx, ids!(people)).set_visible(cx, live);
         if live {
-            body.label(cx, ids!(peer_badge.initial)).set_text(cx, &crate::view::peer_initial(&view.peer_name));
-            body.label(cx, ids!(peer_name)).set_text(cx, &view.peer_name);
+            body.widget(cx, ids!(peer_badge)).set_visible(cx, !multi);
+            body.widget(cx, ids!(peer_name)).set_visible(cx, !multi);
+            if !multi {
+                body.label(cx, ids!(peer_badge.initial)).set_text(cx, &crate::view::peer_initial(&view.peer_name));
+                body.label(cx, ids!(peer_name)).set_text(cx, &view.peer_name);
+            }
             body.widget(cx, ids!(you_talking)).set_visible(cx, talking.you && !view.muted && !view.unmuting);
-            body.widget(cx, ids!(peer_talking)).set_visible(cx, talking.peer && !view.peer_muted);
+            body.widget(cx, ids!(peer_talking)).set_visible(cx, !multi && talking.peer && !view.peer_muted);
             body.label(cx, ids!(duration)).set_text(cx, &duration(view.duration_secs));
         }
         button(cx, body, ids!(cancel), calling, Press::Cancel);
@@ -278,8 +359,8 @@ impl CallRow {
         unmute.set_enabled(cx, live && view.muted && !view.unmuting);
         button(cx, body, ids!(hang_up), live, Press::HangUp);
         let peer_muted = body.label(cx, ids!(peer_muted));
-        peer_muted.set_visible(cx, live && view.peer_muted);
-        if live && view.peer_muted {
+        peer_muted.set_visible(cx, live && !multi && view.peer_muted);
+        if live && !multi && view.peer_muted {
             peer_muted.set_text(cx, &format!("{} muted", view.peer_name));
         }
 
@@ -323,9 +404,6 @@ impl CallRow {
         let yes = button(cx, body, ids!(call_transcribe_yes), prompt, Press::Transcribe);
         yes.set_enabled(cx, prompt && available);
         button(cx, body, ids!(call_not_me), prompt, Press::NotMe);
-        if prompt {
-            body.label(cx, ids!(question)).set_text(cx, &format!("{} is transcribing. Transcribe you too?", view.peer_name));
-        }
         let mut lines = Vec::new();
         if live {
             match status {
@@ -334,7 +412,19 @@ impl CallRow {
                 TranscribeShown::Unavailable(reason) => lines.push(reason.clone()),
                 TranscribeShown::Off => {}
             }
-            if view.peer_transcribing && !prompt { lines.push(format!("{} is transcribing", view.peer_name)); }
+            let names: Vec<_> = view.participants.iter().filter(|p| p.transcribing).map(|p| p.name.as_str()).collect();
+            let transcribing = match names.as_slice() {
+                [] if view.participants.is_empty() && (view.peer_transcribing || prompt) => Some(format!("{} is transcribing", view.peer_name)),
+                [] => None,
+                [one] => Some(format!("{one} is transcribing")),
+                _ => Some(format!("{} are transcribing", names.join(", "))),
+            };
+            if prompt {
+                let question = transcribing.map_or_else(|| "Transcribe you too?".into(), |line| format!("{line}. Transcribe you too?"));
+                body.label(cx, ids!(question)).set_text(cx, &question);
+            } else if let Some(line) = transcribing {
+                lines.push(line);
+            }
         }
         let label = body.label(cx, ids!(transcription));
         label.set_visible(cx, !lines.is_empty());
@@ -348,7 +438,8 @@ impl CallRow {
         let voice = shown.view.phase != Phase::Idle;
         let share_picker = share.choices.is_some() && !share.capture.picking;
         body.set_visible(cx, voice || share_picker || share.problem.is_some() || share.closed_notice.is_some());
-        show_share_controls(cx, body, shown, shown.view.phase == Phase::Live);
+        let menu = show_share_controls(cx, body, shown, shown.view.phase == Phase::Live);
+        menu.set_enabled(cx, menu.visible() && shown.can_share);
         let closed = body.label(cx, ids!(closed_notice));
         closed.set_visible(cx, share.closed_notice.is_some());
         if let Some(notice) = &share.closed_notice { closed.set_text(cx, notice); }
@@ -358,9 +449,9 @@ impl CallRow {
 impl ProjectHeader {
     fn show(&self, cx: &mut Cx, data: &ViewData) {
         let share = show_share_controls(cx, &self.view.child(id!(content)), &data.call, true);
-        share.set_enabled(cx, share.visible() && data.call.linked);
+        share.set_enabled(cx, share.visible() && data.call.can_share);
         if share.visible() {
-            if data.call.linked {
+            if data.call.can_share {
                 accessible_button(cx, &share, "Share");
             } else {
                 let reason = disconnected_label(sole_peer(&data.members));
@@ -397,19 +488,59 @@ impl CallButtonRef {
     pub fn show(&self, cx: &mut Cx, peer_name: &str, linked: bool, call_on: bool) {
         self.set_visible(cx, !call_on);
         let name = (linked || !peer_name.is_empty()).then_some(peer_name);
-        CallButton::show_content(cx, &self.child(id!(content)), name, linked, !call_on);
+        let body = self.child(id!(content));
+        show_join_button(cx, &body, None);
+        CallButton::show_content(cx, &body, name, linked, !call_on);
+    }
+}
+
+fn active_call(data: &ViewData) -> Option<&ActiveTownCall> {
+    data.active_town_call.as_ref().filter(|c| data.call.view.phase == Phase::Idle
+        && data.tree.snapshot().town.is_none_or(|t| t == c.town))
+}
+
+fn show_join_button(cx: &mut Cx, body: &WidgetRef, active: Option<&ActiveTownCall>) {
+    let join = body.button(cx, ids!(call_join));
+    let tip = body.tip(cx, ids!(join_tip));
+    join.set_visible(cx, active.is_some());
+    tip.set_visible(cx, active.is_some());
+    join.set_enabled(cx, active.is_some_and(|c| c.can_join));
+    let Some(c) = active else {
+        join.set_action_data(());
+        tip.set_text("");
+        return
+    };
+    join.set_action_data(CallAction::Press(Press::JoinCall(c.session, c.town, c.scope)));
+    join.set_text(cx, if c.can_join { "Join call" } else { "Call in progress" });
+    let label = if !c.can_join { "No one in the call is connected yet".into() }
+        else if c.participants.is_empty() { "Join call".into() }
+        else { format!("Join call with {}", c.participants.join(", ")) };
+    tip.set_text(&label);
+    accessible_button(cx, &join, &label);
+}
+
+impl JoinCallButton {
+    fn show(&self, cx: &mut Cx, data: &ViewData) {
+        let body = self.view.child(id!(content));
+        let active = active_call(data);
+        body.set_visible(cx, active.is_some());
+        show_join_button(cx, &body, active);
     }
 }
 
 impl CallButton {
     fn show(&self, cx: &mut Cx, data: &ViewData) {
         let shown = &data.call;
-        let name = if shown.linked {
+        let name = if shown.can_call {
             (!shown.view.peer_name.is_empty()).then_some(shown.view.peer_name.as_str())
         } else {
             sole_peer(&data.members)
         };
-        Self::show_content(cx, &self.view.child(id!(content)), name, shown.linked, shown.view.phase == Phase::Idle);
+        let body = self.view.child(id!(content));
+        let active = active_call(data);
+        Self::show_content(cx, &body, name, shown.can_call, shown.view.phase == Phase::Idle && active.is_none());
+        if active.is_some() { body.set_visible(cx, true); }
+        show_join_button(cx, &body, active);
     }
 
     fn show_content(cx: &mut Cx, body: &WidgetRef, peer_name: Option<&str>, linked: bool, visible: bool) {
@@ -437,10 +568,15 @@ impl CallEntryRowRef {
         sent.set_visible(cx, !call.sent.is_empty());
         if !call.sent.is_empty() { sent.set_text(cx, &call.sent); }
         self.widget(cx, ids!(controls)).set_visible(cx, call.call_back.is_some() || call.count > 0);
-        let back = button(cx, self, ids!(call_back), call.call_back.is_some(), Press::Call);
+        let back = self.button(cx, ids!(call_back));
+        back.set_visible(cx, call.call_back.is_some());
         if let Some(callback) = &call.call_back {
+            back.set_action_data(CallAction::Press(Press::CallSeat(callback.seat)));
             back.set_enabled(cx, callback.enabled);
             accessible_button(cx, &back, &format!("Call {} back", callback.peer));
+        } else {
+            back.set_enabled(cx, false);
+            back.set_action_data(());
         }
         let toggle = self.button(cx, ids!(transcript_toggle));
         toggle.set_visible(cx, call.count > 0);
@@ -642,6 +778,93 @@ mod tests {
             is_default, has_failed: false, channel_count: 1 }
     }
 
+    #[test]
+    fn multiparty_call_roster_shows_each_peer_and_join_call_switches_button() {
+        use crate::call::{CallScope, ParticipantShown};
+        use crate::view::{MemberId, MemberSeat, Presence, SeatDevice, SeatTone};
+        let mut pool = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+        let cx = &mut *pool;
+        let ui = cx.with_vm(|vm| {
+            let val = script_eval!(vm, { use mod.widgets.* View{flow: Down
+                header := CallButton{} home := JoinCallButton{} live_call := LiveCallPage{}
+            } });
+            WidgetRef::script_from_value(vm, val)
+        });
+        let mut data = ViewData::default();
+        data.seat_palette = SeatPalette::from_cx(cx);
+        let view = std::sync::Arc::make_mut(&mut data.call.view);
+        view.phase = Phase::Live;
+        view.transcribe_prompt = true;
+        for (i, name) in ["Ana", "Ben", "Kit"].into_iter().enumerate() {
+            let key = [i as u8 + 1; 65];
+            view.participants.push(ParticipantShown { peer: key, name: name.into(), muted: i == 1, transcribing: i == 2 });
+            data.members.seats.push(MemberSeat { id: MemberId::Seat([i as u8; 32]), seat: Seat::Peer, name: name.into(),
+                tone: Some(SeatTone(i as u8)), presence: Presence::Away, status: String::new(), live: None,
+                devices: vec![SeatDevice { key, name: name.into(), presence: Presence::Away, status: String::new(), is_me: false }] });
+        }
+        let size = dvec2(279., 480.);
+        let pass = DrawPass::new(cx);
+        pass.set_size(cx, size);
+        let mut list = DrawList2d::new(cx);
+        let mut draw = |cx: &mut Cx, data: &mut ViewData| {
+            let event = DrawEvent::default();
+            let mut draw = cx_draw::CxDraw::new(cx, &event);
+            let mut frame = Cx2d::new(&mut draw);
+            frame.begin_pass(&pass, None);
+            list.begin_always(&mut frame);
+            frame.begin_root_turtle(size, Layout::flow_down());
+            ui.draw_all(&mut frame, &mut Scope::with_data(data));
+            frame.end_pass_sized_turtle();
+            list.end(&mut frame);
+            frame.end_pass(&pass);
+        };
+        draw(cx, &mut data);
+        let page = ui.call_row(cx, ids!(live_call));
+        assert!(page.widget(cx, ids!(peer_roster)).visible());
+        assert_eq!(page.label(cx, ids!(question)).text(), "Kit is transcribing. Transcribe you too?");
+        {
+            let row = page.borrow().unwrap();
+            assert_eq!(row.peer_chips.len(), 3);
+            for (i, chip) in row.peer_chips.iter().enumerate() {
+                assert_eq!(chip.label(cx, ids!(name)).text(), ["Ana", "Ben", "Kit"][i]);
+                assert_eq!(chip.widget(cx, ids!(muted)).visible(), i == 1);
+                assert_eq!(chip.widget(cx, ids!(transcribing)).visible(), i == 2);
+                assert_eq!(crate::lists::badge_colors(cx, &chip.widget(cx, ids!(badge))).0, data.seat_palette.seats[i]);
+                let rect = chip.area().rect(cx);
+                assert!(rect.size.x > 0. && rect.pos.x >= 0. && rect.pos.x + rect.size.x <= size.x + 0.01, "chip {i}: {rect:?}");
+            }
+        }
+        data.call.view = Default::default();
+        let mut active = ActiveTownCall { session: [6; 16], town: [7; 32], scope: CallScope::Town,
+            participants: vec!["Ana".into(), "Ben".into()], can_join: true };
+        let buttons = [ids!(header.call_join), ids!(home.call_join)].map(|p| ui.widget(cx, p));
+        for can_join in [true, false, true] {
+            active.can_join = can_join;
+            data.set_active_town_call(Some(active.clone()));
+            draw(cx, &mut data);
+            assert!(!ui.widget(cx, ids!(header.call_start)).visible());
+            for button in &buttons {
+                assert!(button.visible());
+                assert_eq!(button.disabled(cx), !can_join);
+                assert_eq!(button.text(), if can_join { "Join call" } else { "Call in progress" });
+                let mut node = a11y_tree::Node::default();
+                button.borrow::<Button>().unwrap().semantics(cx, &mut node);
+                assert_eq!(node.name, if can_join { "Join call with Ana, Ben" } else { "No one in the call is connected yet" });
+                if can_join {
+                    assert_eq!(activate(cx, &ui, button, a11y_tree::Actions::PRESS, a11y_tree::ActionArg::None),
+                        [(button.widget_uid(), CallAction::Press(Press::JoinCall(active.session, active.town, active.scope)))]);
+                }
+            }
+            active.session[0] += 1;
+        }
+        data.set_active_town_call(None);
+        draw(cx, &mut data);
+        for b in buttons {
+            assert!(!b.visible() && b.action_data().as_ref().is_some_and(|a| a.is::<()>()), "a hidden Join forgets the session");
+        }
+        assert!(ui.widget(cx, ids!(header.call_start)).visible());
+    }
+
     fn activate(cx: &mut Cx, ui: &WidgetRef, target: &WidgetRef, action: a11y_tree::Actions, arg: a11y_tree::ActionArg)
         -> Vec<(WidgetUid, CallAction)> {
         let event = Event::A11yAction(a11y_tree::ActionRequest {
@@ -708,7 +931,7 @@ mod tests {
         let mut flow = CallFlow::default();
         let now = Now::default();
         let mut effects = Vec::new();
-        flow.linked([1; 65], "Anna", now, &mut effects);
+        flow.set_open_town(Some(([9; 32], vec![([1; 65], "Anna".into())])), &mut effects);
         header.show(cx, &flow.view().peer_name, true, false);
         let mut target = ui_checks::UiCheckTarget::new(cx);
         let size = dvec2(279., 600.);
@@ -742,16 +965,23 @@ mod tests {
         }));
         assert_eq!(press, Some(Press::Call));
         assert_eq!(shown_tip(cx), "", "press takes the visible tip down immediately");
-        // The other header or accessibility can start the call while this tip is still raised.
+        // An accessibility press takes the tip down the way a click does.
         dispatch(cx, Event::ClearHover);
         dispatch(cx, hover());
         assert_eq!(shown_tip(cx), "Call Anna");
         let call = header.widget(cx, ids!(call_start));
-        let actions = activate(cx, &ui, &call, a11y_tree::Actions::PRESS, a11y_tree::ActionArg::None);
-        assert_eq!(actions, [(call.widget_uid(), CallAction::Press(Press::Call))]);
+        let (press, dismissed) = dispatch(cx, Event::A11yAction(a11y_tree::ActionRequest {
+            req: 0, node: a11y_tree::NodeId::widget(call.widget_uid().0), action: a11y_tree::Actions::PRESS, arg: a11y_tree::ActionArg::None,
+        }));
+        assert_eq!(press, Some(Press::Call));
+        assert!(dismissed && shown_tip(cx).is_empty(), "an accessibility press takes the call button's tip down");
+        // The other header can start the call while this tip is still raised.
+        dispatch(cx, Event::ClearHover);
+        dispatch(cx, hover());
+        assert_eq!(shown_tip(cx), "Call Anna");
         flow.press(Press::Call, now, &mut effects);
-        let answer = Message::Answer { call_id: flow.session().unwrap(), secret: [3; 32], ext: Default::default() };
-        flow.message(&answer.encode(), now, &mut effects);
+        let answer = Message::Answer { call_id: flow.session().unwrap(), secret: [3; 32], ext: crate::call::AnswerExt { town: Some([9; 32]), ..Default::default() } };
+        flow.receive([1; 65], &answer.encode(), now, &mut effects);
         assert_eq!(flow.view().phase, Phase::Live);
         let actions = cx.capture_actions(|cx| header.show(cx, &flow.view().peer_name, true, true));
         ui.handle_event(cx, &Event::Actions(actions), &mut Scope::empty());
@@ -784,8 +1014,8 @@ mod tests {
         });
         // Changing the scoped snapshot is sufficient to bind the page's controls.
         let mut scoped = ViewData::default();
-        scoped.members.seats.push(crate::view::MemberSeat { id: crate::view::MemberId::Computer([2; 65]),
-            seat: Seat::Peer, name: "Anna".into(), presence: crate::view::Presence::Away, status: String::new() });
+        scoped.members.seats.push(crate::view::MemberSeat { id: crate::view::MemberId::Seat([2; 32]), devices: Vec::new(), live: None,
+            seat: Seat::Peer, tone: None, name: "Anna".into(), presence: crate::view::Presence::Away, status: String::new() });
         std::sync::Arc::make_mut(&mut scoped.call.view).peer_name = "Anna".into();
         let pane = dvec2(279., 600.);
         let pass = DrawPass::new(cx);
@@ -794,6 +1024,8 @@ mod tests {
         for (linked, phase) in [(false, Phase::Idle), (true, Phase::Idle), (true, Phase::Calling), (true, Phase::Ringing),
                                 (true, Phase::Live), (false, Phase::Idle)] {
             scoped.call.linked = linked;
+            scoped.call.can_call = linked;
+            scoped.call.can_share = linked;
             if scoped.call.view.phase != phase {
                 std::sync::Arc::make_mut(&mut scoped.call.view).phase = phase;
             }
@@ -1020,11 +1252,14 @@ mod tests {
         assert!(!header.visible());
         let mut missed = crate::view::CallLine { id: crate::view::TranscriptId([0; 32], [1; 16]),
             words: "Missed call from Ana".into(), time: "09:42".into(),
-            call_back: Some(crate::view::CallBack { peer: "Ana".into(), enabled: true }), count: 0, transcript: None, sent: String::new(), jobs: Vec::new() };
+            call_back: Some(crate::view::CallBack { seat: [9; 32], peer: "Ana".into(), enabled: true }), count: 0, transcript: None, sent: String::new(), jobs: Vec::new() };
         line.show(cx, &missed);
         assert_eq!(line.label(cx, ids!(line)).text(), "Missed call from Ana", "the row uses the session summary");
         assert_eq!(line.label(cx, ids!(head.when)).text(), "09:42", "the row draws the anchor time in its header");
         assert!(line.widget(cx, ids!(call_back)).visible(), "a missed call offers a return call");
+        let back = line.widget(cx, ids!(call_back));
+        assert_eq!(activate(cx, &ui, &back, A::PRESS, ActionArg::None),
+            [(back.widget_uid(), CallAction::Press(Press::CallSeat([9; 32])))], "Call back dispatches to the opener's seat");
         let dot = ui.live_dot(cx, ids!(dot));
         dot.show(cx, true);
         assert!(dot.visible());
@@ -1034,7 +1269,7 @@ mod tests {
         let item = ui.portal_list(cx, ids!(transcript.list)).item(cx, 0, id!(CallLine));
         let mut expected = [item.widget(cx, ids!(call_back)), call, ui.widget(cx, ids!(card.call_start)), answer, row.widget(cx, ids!(call_unmute)),
             mic, row.widget(cx, ids!(call_transcribe)), row.widget(cx, ids!(call_transcribe_yes)), line.widget(cx, ids!(call_back)),
-            row.widget(cx, ids!(call_share)),
+            row.widget(cx, ids!(call_share)), ui.widget(cx, ids!(header.call_join)), ui.widget(cx, ids!(card.call_join)),
             ui.widget(cx, ids!(live_share.watch)), row.widget(cx, ids!(choices)), ui.widget(cx, ids!(live_share.let_control))].map(|w| w.widget_uid().0);
         expected.sort_unstable();
         let mut actual: Vec<_> = opening_uids(cx, &ui).into_iter().map(|u| u.0).collect();
@@ -1042,6 +1277,7 @@ mod tests {
         assert_eq!(actual, expected, "each opening control across both placements has its own UID");
         missed.call_back = None;
         line.show(cx, &missed);
+        assert!(back.action_data().as_ref().is_some_and(|data| data.downcast_ref::<()>().is_some()), "the hidden callback forgets its target");
         assert!(!line.widget(cx, ids!(call_back)).visible(), "a connected callback hides the old button on a reused row");
     }
 }

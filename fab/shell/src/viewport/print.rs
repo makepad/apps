@@ -186,7 +186,7 @@ script_mod! {
     mod.draw.DrawFabPath = mod.std.set_type_default() do #(DrawFabPath::script_shader(vm)){
         alpha_blend: false
         depth_write: true
-        backface_culling: true
+        cull_mode: @Back
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -1301,7 +1301,7 @@ script_mod! {
     // it shows.
     mod.draw.DrawFabFar = mod.std.set_type_default() do #(DrawFabFar::script_shader(vm)){
         ..mod.draw.DrawFabPath
-        backface_culling: false
+        cull_mode: @None
         geom: vertex_buffer(mod.fab_print_geom.FabVertex, mod.fab_print_geom.FabQuadGeom)
         // The outline's corners across the eye's rays (`e`, rising): the top and the bottom
         // one, or the right and the left one where they reach further (as `shade` takes them).
@@ -1436,12 +1436,12 @@ script_mod! {
     // never join the retained beads' draw call.
     mod.draw.DrawFabHead = mod.std.set_type_default() do #(DrawFabHead::script_shader(vm)){
         ..mod.draw.DrawFabPath
-        backface_culling: false
+        cull_mode: @None
         geom: vertex_buffer(mod.fab_print_geom.FabVertex, mod.fab_print_geom.FabHeadGeom)
     }
     mod.draw.DrawFabHeadAux = mod.std.set_type_default() do #(DrawFabHeadAux::script_shader(vm)){
         ..mod.draw.DrawFabPathAux
-        backface_culling: false
+        cull_mode: @None
         geom: vertex_buffer(mod.fab_print_geom.FabVertex, mod.fab_print_geom.FabHeadGeom)
     }
 }

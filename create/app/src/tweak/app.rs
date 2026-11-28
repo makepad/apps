@@ -84,7 +84,7 @@ pub(super) fn design(request: &Request, owner_window: Option<WindowId>) -> Optio
     Some((window, DesignOp::Design { verb, args }))
 }
 
-fn read_rect(window: usize, coords: &[Value]) -> Result<Rect, &'static str> {
+pub(super) fn read_rect(window: usize, coords: &[Value]) -> Result<Rect, &'static str> {
     let [x, y, w, h] = coords else { return Err("invalid pick rect") };
     let number = |v: &Value| match v {
         Value::Int(n) => Ok(*n as f64), Value::F64(n) => Ok(*n), _ => Err("invalid pick coordinate"),
@@ -155,7 +155,7 @@ pub(super) fn valid_theme(v: &Value) -> bool {
     super::theme::ThemeSnapshot::from_value(v).is_some()
 }
 
-pub(super) fn patch_cached_theme(snapshot: &mut String, deltas: &std::collections::HashMap<String, String>) {
+pub(super) fn patch_cached_theme(snapshot: &mut String, deltas: &std::collections::BTreeMap<String, String>) {
     let Ok(Value::Obj(mut fields)) = super::parse_json(snapshot) else { return };
     for (field, value) in &mut fields {
         let Value::Arr(items) = value else { continue };
@@ -169,7 +169,7 @@ pub(super) fn patch_cached_theme(snapshot: &mut String, deltas: &std::collection
             "edits" => {
                 items.retain(|e| e.as_arr().and_then(|a| a.first()).and_then(Value::as_str).is_none_or(|k| !deltas.contains_key(k)));
                 items.extend(deltas.iter().map(|(name, new)| {
-                    let literal = new.strip_prefix('#').map_or_else(|| new.clone(), |c| format!("#x{}", c.to_ascii_uppercase()));
+                    let literal = super::theme::scalar(new).map_or_else(|| new.clone(), super::theme::literal);
                     Value::Arr(vec![json::s(name), json::s(literal)])
                 }));
             }
@@ -236,4 +236,9 @@ pub(super) fn applied(v: &Value, prop: &str) -> Result<(String, String), String>
         })
     };
     Ok((change("old")?, change("new")?))
+}
+
+pub(super) fn applied_rect(v: &Value) -> Option<Rect> {
+    let rect = read_rect(window_index(v)?, v.get("rect")?.as_arr()?).ok()?;
+    (rect.w > 0. && rect.h > 0.).then_some(rect)
 }

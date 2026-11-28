@@ -35,6 +35,7 @@ pub mod queue;
 pub mod share;
 pub mod sync;
 pub mod tlv;
+pub mod trust;
 
 /// Lower-case hex of `bytes` (event ids in tool input and output).
 pub fn hex(bytes: &[u8]) -> String {

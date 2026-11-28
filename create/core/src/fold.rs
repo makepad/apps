@@ -19,7 +19,7 @@ pub use crate::entity::{backlinks, links_from, project_entities, Entity, FieldSt
 use crate::doc::{attr, checkbox, BreakRef, DocState, TaskEffects, TextOp};
 use crate::entity::{field, kind};
 use crate::event::{Actor, Chat, ChatAgent, Content, DeclineWhy, Event, Id, Key, LeaveWhy, Member,
-    Failure, JobId, Service, SessionId, SessionMode, SessionOp, Value, Via};
+    normalize_copy_refs, CopySource, Failure, JobId, Service, SessionId, SessionMode, SessionOp, Value, Via};
 use crate::key::PublicKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +28,51 @@ use std::sync::Arc;
 pub struct Profile {
     pub name: String,
     pub colour: u32,
+    pub writer: Id,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TownPolicy {
+    #[default]
+    Members,
+    /// A visible founder-critical policy has a frontier value this build cannot read.
+    Unreadable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordMeta {
+    pub author: PublicKey,
+    pub actor: Actor,
+    pub via: Via,
+    pub kind: u16,
+    pub void: bool,
+    pub readable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceRecord {
+    Request { job: JobId, session: SessionId },
+    Done { job: JobId },
+    Failed { job: JobId },
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DerivedTaskMeta {
+    pub task: Id,
+    pub creator: Id,
+    pub doc: Id,
+    pub at: BreakRef,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceJobMeta {
+    pub session: SessionId,
+    pub project: Option<Id>,
+    pub requester: PublicKey,
+    pub provider: PublicKey,
+    pub request: Id,
+    pub report_writer: Option<Id>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,8 +97,11 @@ impl ChatMsg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
     pub owner: PublicKey,
+    /// Immutable backend/provider label from `AgentAdded` (e.g. "Claude Code").
     pub name: String,
     pub kind: String,
+    /// Human-chosen display name from the latest valid `AgentRenamed`, or `None` if unset or cleared.
+    pub custom_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,13 +110,13 @@ pub enum Entry { Chat(Id), Session(SessionId), Clip(Id), Member(Id) }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Session {
     pub open: Option<Opened>,
-    joins: Vec<(PublicKey, Id)>,
-    leaves: Vec<(PublicKey, Option<u32>, LeaveWhy)>,
-    declines: Vec<(PublicKey, DeclineWhy)>,
+    pub(crate) joins: Vec<(PublicKey, Id)>,
+    pub(crate) leaves: Vec<(PublicKey, Id, Option<u32>, LeaveWhy)>,
+    pub(crate) declines: Vec<(PublicKey, Id, DeclineWhy)>,
     shared: Vec<TranscriptShare>,
     // (at_ms, author, event, line index). A line takes at least 28 bytes on the wire and a
     // message is under 4 GiB, so an event's line index always fits a u32.
-    said: Vec<(u32, PublicKey, Id, u32)>,
+    pub(crate) said: Vec<(u32, PublicKey, Id, u32)>,
 }
 
 /// A person's signed transcript send, naming its recipient and opening request.
@@ -85,6 +133,7 @@ pub struct Opened {
     pub opener: PublicKey,
     pub mode: SessionMode,
     pub to: Vec<Id>,
+    pub town_wide: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,12 +150,16 @@ pub struct Said<'a> {
 pub enum Seen { Opener, Rung, Other }
 
 impl Opened {
-    fn seen(&self, opener_seat: Option<Id>, seat: Option<Id>) -> Seen {
+    pub(crate) fn seen(&self, opener_seat: Option<Id>, seat: Option<Id>) -> Seen {
         match seat {
             Some(_) if seat == opener_seat => Seen::Opener,
-            Some(id) if self.to.is_empty() || self.to.contains(&id) => Seen::Rung,
+            Some(id) if self.to.contains(&id) => Seen::Rung,
             _ => Seen::Other,
         }
+    }
+
+    pub(crate) fn admits(&self, opener_seat: Option<Id>, seat: Option<Id>) -> bool {
+        seat.is_some() && (self.town_wide || self.seen(opener_seat, seat) != Seen::Other)
     }
 }
 
@@ -124,10 +177,11 @@ pub struct SessionSummary {
     pub opener_seat: Option<Id>,
     pub mode: SessionMode,
     pub rung: Vec<Id>,
+    pub town_wide: bool,
     pub viewer: Seen,
     pub outcome: Outcome,
     pub lines: usize,
-    /// The opener left, or every participant did: the session reads in the past tense.
+    /// Every participant has departed (or, for a share, the sharer left): the session reads in the past tense.
     pub ended: bool,
 }
 
@@ -180,6 +234,41 @@ pub struct FinalBoundary {
     pub evidence: Vec<Id>,
 }
 
+impl FinalBoundary {
+    pub fn closure(&self) -> Option<FinalClosure> {
+        FinalClosure::from_evidence(&self.evidence)
+    }
+}
+
+/// Proof of a completed final exchange: one counted removal or two distinct fork siblings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FinalClosure {
+    Removal(Id),
+    Fork([Id; 2]),
+}
+
+impl FinalClosure {
+    pub fn fork(a: Id, b: Id) -> Option<Self> {
+        if a == b { return None }
+        Some(Self::Fork(if a < b { [a, b] } else { [b, a] }))
+    }
+
+    pub fn from_evidence(ids: &[Id]) -> Option<Self> {
+        match *ids {
+            [id] => Some(Self::Removal(id)),
+            [a, b] => Self::fork(a, b),
+            _ => None,
+        }
+    }
+
+    pub fn normalized(self) -> Option<Self> {
+        match self {
+            Self::Removal(_) => Some(self),
+            Self::Fork([a, b]) => Self::fork(a, b),
+        }
+    }
+}
+
 const FORKED: &str = "forked its history";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,8 +278,10 @@ enum Reading { Full, SkippedTag, Unknown, UnknownCritical }
 // signed bytes, independent of arrival order, membership decisions and board replay.
 fn reading(event: &Event, content: Option<&Content>) -> Reading {
     match (event.content(), content) {
-        (_, Some(Content::Town { policy, .. })) if *policy != GROUP_POLICY => Reading::UnknownCritical,
-        (Some(bytes), Some(content)) if content.encode() != bytes => Reading::SkippedTag,
+        (_, Some(Content::Town { policy, tier })) if *policy != GROUP_POLICY || *tier != 0 => Reading::UnknownCritical,
+        (Some(bytes), Some(content)) if content.encode() != bytes => {
+            if event.header.critical { Reading::UnknownCritical } else { Reading::SkippedTag }
+        }
         (_, Some(_)) => Reading::Full,
         _ if event.redacted() && !event.header.has_unknown_extensions() => Reading::Full,
         _ if event.header.critical => Reading::UnknownCritical,
@@ -202,6 +293,7 @@ fn reading(event: &Event, content: Option<&Content>) -> Reading {
 struct Record {
     order: Order,
     kind: u16,
+    critical: bool,
     parents: Vec<Id>,
     // Powers of two along the highest-parent chain accelerate ordinary typing histories.
     jumps: Vec<Id>,
@@ -248,6 +340,7 @@ struct Offer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Seat {
+    role: u8,
     devices: BTreeSet<PublicKey>,
     invite_parent: Option<Id>,
     first_device: PublicKey,
@@ -359,8 +452,8 @@ impl Seats {
     fn apply(&mut self, r: &Record, records: &BTreeMap<Id, Arc<Record>>) -> Result<(), &'static str> {
         let (height, author, id) = r.order;
         match &r.content {
-            Some(Content::Town { policy: GROUP_POLICY, .. }) => {
-                self.seats.insert(id, Seat { devices: BTreeSet::from([author]), invite_parent: None, first_device: author });
+            Some(Content::Town { policy: GROUP_POLICY, tier: 0 }) => {
+                self.seats.insert(id, Seat { role: 0, devices: BTreeSet::from([author]), invite_parent: None, first_device: author });
                 self.admitted.insert(author, Admission { seat: id, grant: id, height });
             }
             Some(Content::Town { .. }) => {}
@@ -377,7 +470,7 @@ impl Seats {
             Some(Content::Member(Member::Invite { subject, role })) => {
                 let parent = self.active_seat(&author).ok_or("not an active member")?;
                 if *role != 0 { return Err("unknown member role") }
-                self.seats.insert(id, Seat { devices: BTreeSet::new(), invite_parent: Some(parent), first_device: *subject });
+                self.seats.insert(id, Seat { role: *role, devices: BTreeSet::new(), invite_parent: Some(parent), first_device: *subject });
                 self.offers.insert(id, Offer { seat: id, subject: *subject });
             }
             Some(Content::Member(Member::AddDevice { seat, device })) => {
@@ -488,27 +581,37 @@ pub struct State {
     /// Verified events excluded from the projection, with the reason for each exclusion.
     pub void_events: HashMap<Id, &'static str>,
     pub unknown_policy: Option<u16>,
+    pub town_policy: TownPolicy,
+    // Maximal policy writes, keyed by signing event and town entity.
+    policy_writes: BTreeMap<(Id, Id), Value>,
+    copied_from: BTreeMap<(Id, Id, Key), Vec<CopySource>>,
     pub docs: BTreeMap<Id, DocState>,
     records: BTreeMap<Id, Arc<Record>>,
+    unreadable_session_facts: BTreeSet<Id>,
     // Keep the least child id as a deterministic representative. All children stay in records.
     own_children: BTreeMap<(PublicKey, ForkPoint), Id>,
     latest_height: HashMap<PublicKey, u64>,
     order: Vec<Order>,
     entity_writes: BTreeMap<Id, BTreeSet<Order>>,
+    // Non-void critical founder-seat Entity/Set records writing field::POLICY, per entity.
+    policy_sets: BTreeMap<Id, BTreeSet<Order>>,
     pending: BTreeMap<Id, Event>,
     children: BTreeMap<Id, BTreeSet<Id>>,
     scopes: BTreeMap<Id, Id>,
     timelines: BTreeMap<Id, Timeline>,
     undo_children: BTreeMap<Id, BTreeSet<Order>>,
-    tick_writes: BTreeMap<Id, BTreeMap<Id, Value>>,
+    tick_writes: BTreeMap<Id, BTreeMap<Id, (Value, BreakRef, Id)>>,
     statuses: BTreeMap<Id, BTreeMap<Order, Value>>,
     possible_links: BTreeMap<Id, BTreeSet<Id>>,
     linked_docs: BTreeMap<Id, BTreeSet<Id>>,
     conversions: BTreeMap<Id, (Id, BreakRef, Id)>,
+    derived_task_creators: BTreeMap<Id, Id>,
     numbers: BTreeMap<PublicKey, u64>,
     groups: BTreeMap<Id, Replaced>,
     cleared: BTreeMap<(Id, Key), Id>,
     pub profiles: BTreeMap<PublicKey, Profile>,
+    // Includes unreadable and void records that cannot appear in the displayed profiles.
+    latest_profiles: BTreeMap<PublicKey, (bool, Order, Id)>,
     /// In the canonical order.
     pub chat: Vec<ChatMsg>,
     pub sessions: BTreeMap<SessionId, Session>,
@@ -701,7 +804,7 @@ impl State {
         }
         let structurally_void = crate::event::structurally_void(h.kind, h.actor);
         let record = Arc::new(Record {
-            order, kind: h.kind, jumps, parents: h.parents.clone(), actor: h.actor, via: h.via, wall_ms: h.wall_ms,
+            order, kind: h.kind, critical: h.critical, jumps, parents: h.parents.clone(), actor: h.actor, via: h.via, wall_ms: h.wall_ms,
             structurally_void,
             control: !structurally_void && matches!(h.kind, crate::event::kind::MEMBER | crate::event::kind::TOWN),
             erased_chat: h.kind == crate::event::kind::CHAT && h.kind_version == 1 && event.redacted() && !h.has_unknown_extensions(),
@@ -709,6 +812,9 @@ impl State {
         });
         let latest = self.latest_height.entry(h.author).or_default();
         *latest = (*latest).max(height);
+        if record.content.is_none() && matches!(h.kind, crate::event::kind::SAID | crate::event::kind::SESSION) {
+            self.unreadable_session_facts.insert(event.id);
+        }
         self.records.insert(event.id, record.clone());
         if self.order.last().is_none_or(|last| *last < order) {
             self.order.push(order);
@@ -733,6 +839,24 @@ impl State {
                 for change in changes { self.entity_writes.entry(change.entity).or_default().insert(order); }
             }
             _ => {}
+        }
+        if record.critical && self.founder_seat().is_some_and(|s| self.seat_of(&order.1) == Some(s)) {
+            match &record.content {
+                Some(Content::Entity { kind, project: None, derive: None, fields, .. })
+                    if *kind == kind::TOWN
+                        && fields.iter().any(|(f, v)| *f == field::POLICY && field::POLICY.accepts(v)) =>
+                {
+                    self.policy_sets.entry(order.2).or_default().insert(order);
+                }
+                Some(Content::Set { changes, .. }) => {
+                    for change in changes {
+                        if change.field == field::POLICY && field::POLICY.accepts(&change.value) {
+                            self.policy_sets.entry(change.entity).or_default().insert(order);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         match &record.content {
             Some(Content::Entity { derive: Some((doc, at)), .. }) => {
@@ -806,6 +930,763 @@ impl State {
         })
     }
 
+    pub fn founder_seat(&self) -> Option<Id> {
+        self.membership.seats.seats.iter().find_map(|(&id, s)| s.invite_parent.is_none().then_some(id))
+    }
+
+    pub fn is_intake(&self, key: &PublicKey) -> bool {
+        self.seat_of(key).and_then(|id| self.membership.seats.seats.get(&id)).is_some_and(|s| s.role != 0)
+    }
+
+    pub fn record_meta(&self, id: &Id) -> Option<RecordMeta> {
+        self.records.get(id).map(|r| RecordMeta { author: r.order.1, actor: r.actor, via: r.via,
+            kind: r.kind, void: self.void_events.contains_key(id), readable: r.content.is_some() })
+    }
+
+    /// Identifies a folded `kind::SERVICE` record's variant and job/session by event id (`O(log N)` lookup).
+    /// Returns `None` if the event is missing, not `kind::SERVICE`, or has no decoded content (redacted/undecodable).
+    pub fn service_record(&self, id: &Id) -> Option<ServiceRecord> {
+        match self.records.get(id)?.content.as_ref()? {
+            Content::Request { job, session, .. } => Some(ServiceRecord::Request { job: *job, session: *session }),
+            Content::Done { job, .. } => Some(ServiceRecord::Done { job: *job }),
+            Content::Failed { job, .. } => Some(ServiceRecord::Failed { job: *job }),
+            Content::Provides { .. } | Content::Taken { .. } | Content::Shared { .. } => Some(ServiceRecord::Other),
+            _ => None,
+        }
+    }
+
+    /// Derived-task metadata by creation event or task id, each in O(log C) for C conversions.
+    pub fn derived_task_meta(&self, id: &Id) -> Option<DerivedTaskMeta> {
+        let creator = if self.conversions.contains_key(id) { *id } else { *self.derived_task_creators.get(id)? };
+        let &(doc, at, task) = self.conversions.get(&creator)?;
+        Some(DerivedTaskMeta { task, creator, doc, at })
+    }
+
+    /// The fields as signed on creation, including their original order.
+    pub fn created_entity_fields(&self, id: &Id) -> Option<&[(Key, Value)]> {
+        let creator = self.derived_task_creators.get(id).unwrap_or(id);
+        if self.void_events.contains_key(creator) { return None }
+        match self.records.get(creator)?.content.as_ref()? {
+            Content::Entity { fields, .. } => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// Most recent signed profile, preferring a non-void event even if its body is unreadable.
+    pub fn latest_profile_event(&self, key: &PublicKey) -> Option<Id> {
+        self.latest_profiles.get(key).map(|&(_, _, id)| id)
+    }
+
+    /// True if a non-void body-redacted or undecodable `SAID` or `SESSION` record lies in
+    /// `request`'s causal past without lying in `session`'s `Open` causal past.
+    pub fn has_unreadable_session_fact_before(&self, session: &SessionId, request: Id) -> bool {
+        if self.unreadable_session_facts.is_empty() { return false }
+        let Some(req) = self.records.get(&request) else { return false };
+        let Some(open) = self.session(session).and_then(|s| s.open.as_ref())
+            .and_then(|o| self.records.get(&o.anchor)) else { return false };
+        if !in_past(&self.records, req, open.order.2) { return false }
+        self.unreadable_session_facts.iter().any(|&id| {
+            !self.void_events.contains_key(&id)
+                && in_past(&self.records, req, id)
+                && !in_past(&self.records, open, id)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_seat_role_for_test(&mut self, seat: &Id, role: u8) {
+        if let Some(entry) = self.membership.seats.seats.get_mut(seat) {
+            entry.role = role;
+        }
+    }
+
+    pub fn copied_from(&self, writer: Id, entity: Id, field: &Key) -> &[CopySource] {
+        self.copied_from.get(&(writer, entity, field.clone())).map_or(&[], Vec::as_slice)
+    }
+
+    /// Last event to write or restore the currently cleared field.
+    pub fn cleared_field_writer(&self, id: &Id, field: &Key) -> Option<Id> {
+        self.cleared.get(&(*id, field.clone())).copied()
+    }
+
+    /// Writer of the state restored by this undo, if the undo took effect on this field.
+    pub fn field_undo_prev(&self, undo: &Id, entity: &Id, field: &Key) -> Option<Id> {
+        let Content::Undo { of } = self.records.get(undo)?.content.as_ref()? else { return None };
+        // Undoing creation writes a new tombstone.
+        if matches!(self.records.get(of)?.content, Some(Content::Entity { .. })) { return None }
+        let key = (*entity, field.clone());
+        if !self.groups.get(undo)?.contains_key(&key) { return None }
+        self.groups.get(of)?.get(&key)?.as_ref().map(|f| f.writer)
+    }
+
+    /// Whether the target is in the strict causal past of the given record.
+    pub fn record_before(&self, before: &Id, target: &Id) -> bool {
+        self.records.get(before).is_some_and(|rec| in_past(&self.records, rec, *target))
+    }
+
+    /// Extends `ops` with the transitive closure of `undo_children` strictly forward in canonical
+    /// order `< before_order`, starting from `pending`, filtering each undo with `allow`.
+    fn close_undo_ops(
+        &self,
+        ops: &mut BTreeSet<Order>,
+        mut pending: Vec<Order>,
+        before_order: Order,
+        mut allow: impl FnMut(&Record) -> bool,
+    ) {
+        use std::ops::Bound;
+        while let Some(target) = pending.pop() {
+            if let Some(undos) = self.undo_children.get(&target.2) {
+                for &u_order in undos.range((Bound::Excluded(target), Bound::Excluded(before_order))) {
+                    let u_rec = &self.records[&u_order.2];
+                    if allow(u_rec) && ops.insert(u_order) {
+                        pending.push(u_order);
+                    }
+                }
+            }
+        }
+    }
+
+    /// All non-void critical founder-seat records that can write or undo `(town, field::POLICY)`
+    /// in `[town_order, before_order)` in canonical order.
+    fn policy_ops_before(&self, town: Id, before_order: Order) -> BTreeSet<Order> {
+        use std::ops::Bound;
+        let Some(sets) = self.policy_sets.get(&town) else { return BTreeSet::new() };
+        let Some(town_order) = self.records.get(&town).map(|r| r.order) else { return BTreeSet::new() };
+        if town_order >= before_order { return BTreeSet::new() }
+        let mut ops: BTreeSet<Order> = sets
+            .range((Bound::Included(town_order), Bound::Excluded(before_order)))
+            .copied()
+            .collect();
+        if ops.is_empty() { return ops }
+        let founder = self.founder_seat();
+        // Creation undo (`Undo { of: town }`) only touches `DELETED`, never `POLICY`.
+        let pending: Vec<Order> = ops.iter().copied().filter(|o| o.2 != town).collect();
+        self.close_undo_ops(&mut ops, pending, before_order, |u_rec| {
+            u_rec.critical && founder.is_some_and(|s| self.seat_of(&u_rec.order.1) == Some(s))
+        });
+        ops
+    }
+
+    fn resolve_doc_op_at(doc: &DocState, event: Id, at: BreakRef) -> BreakRef {
+        match at {
+            BreakRef::Inserted(index) => BreakRef::Char(crate::doc::CharId { event, index }),
+            at => doc.canonical(at),
+        }
+    }
+
+    /// True iff `fold(Past(past_rec))` and `fold(H)` assign identical `classify` (void vs non-void,
+    /// `seat_of`, `founder_seat`) to every board/doc event in `Past(past_rec)` ordered `< before_order`.
+    fn membership_clean_for_past(&self, past_rec: &Record, before_order: Order) -> bool {
+        if self.void_events.contains_key(&past_rec.order.2) {
+            return false;
+        }
+        for &id in self.void_events.keys() {
+            let Some(r) = self.records.get(&id) else { return false };
+            if r.structurally_void { continue }
+            if !in_past(&self.records, past_rec, id) { continue }
+            if r.control { return false }
+            if r.order < before_order && matches!(
+                r.content,
+                Some(Content::Entity { .. } | Content::Set { .. } | Content::Undo { .. } | Content::Text { .. })
+                    | None
+            ) {
+                return false;
+            }
+        }
+        let has_in_past_removal = self.membership.removals.iter().any(|(&id, res)| {
+            *res == Ok(Removal::Counted) && in_past(&self.records, past_rec, id)
+        });
+        for &(height, op) in &self.membership.controls {
+            if height > before_order.0 { break }
+            let MembershipOp::Event(_, id) = op else { continue };
+            let Some(r) = self.records.get(&id) else { return false };
+            if r.order >= before_order || in_past(&self.records, past_rec, id) { continue }
+            match &r.content {
+                Some(Content::Town { .. }) => return false,
+                Some(Content::Member(Member::Accept { .. })) if has_in_past_removal => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// True iff `ev_order` (when in `Past(past_rec)` and `Content::Text`) has no
+    /// `TextOp::Attr(TASK, Value::Id(t))` whose target `t` existed in `fold(H)` before `ev_order`
+    /// without being created in `Past(past_rec)` before `ev_order` (`doc.rs:385-387`).
+    fn text_event_links_valid_in_past(&self, past_rec: &Record, ev_order: Order) -> bool {
+        if !in_past(&self.records, past_rec, ev_order.2) { return true }
+        let Some(Content::Text { ops, .. }) = self.records[&ev_order.2].content.as_ref() else { return true };
+        for op in ops {
+            if let TextOp::Attr { attr: attr::TASK, value: Value::Id(task), .. } = op {
+                if self.statuses.get(task).and_then(|w| w.range(..ev_order).next_back()).is_some()
+                    && !self.entity_created_in_past_before(past_rec, ev_order, task)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn doc_links_valid_in_past(&self, past_rec: &Record, up_to: Order, inclusive: bool, doc: &Id) -> bool {
+        if !self.possible_links.contains_key(doc) { return true }
+        let Some(timeline) = self.timelines.get(doc) else { return true };
+        let end = timeline.events.partition_point(|o| if inclusive { *o <= up_to } else { *o < up_to });
+        timeline.events[..end].iter().all(|&ev_order| self.text_event_links_valid_in_past(past_rec, ev_order))
+    }
+
+    /// True iff every in-past `Content::Text` event on `doc` strictly below `before_order` whose
+    /// `TextOp::Attr(TASK, Value::Id(t))` passed `status(t).is_some()` in `fold(H)` also sees
+    /// `t` created in `Past(past_rec)` before that event (`doc.rs:385-387`).
+    fn doc_links_valid_in_past_before(&self, past_rec: &Record, before_order: Order, doc: &Id) -> bool {
+        self.doc_links_valid_in_past(past_rec, before_order, false, doc)
+    }
+
+    /// Inclusive variant of `doc_links_valid_in_past_before` (`<= through_order`), covering the
+    /// queried event's own burst when `through_order` is on `doc`'s timeline.
+    fn doc_links_valid_in_past_through(&self, past_rec: &Record, through_order: Order, doc: &Id) -> bool {
+        self.doc_links_valid_in_past(past_rec, through_order, true, doc)
+    }
+
+    /// True iff `entity` (plus its ancestor `project` chain and, if derived, its `doc` and doc link
+    /// validity) was created in `Past(past_rec)` strictly before `before_order`, with no concurrent
+    /// duplicate derived-task creation below `before_order`.
+    fn entity_created_in_past_before(&self, past_rec: &Record, before_order: Order, entity: &Id) -> bool {
+        let mut cur = *entity;
+        let mut limit = before_order;
+        let mut seen = BTreeSet::new();
+        while seen.insert(cur) {
+            let Some(ent) = self.entities.get(&cur) else { return false };
+            let derived = self.derived_task_meta(&cur);
+            let creator = derived.map_or(cur, |d| d.creator);
+            if !in_past(&self.records, past_rec, creator) { return false }
+            let Some(c_rec) = self.records.get(&creator) else { return false };
+            if c_rec.order >= limit { return false }
+            if let Some(d) = derived {
+                if self.entity_writes.get(&cur).is_some_and(|ws| {
+                    ws.range(..limit).any(|o| {
+                        !in_past(&self.records, past_rec, o.2)
+                            && matches!(self.records[&o.2].content, Some(Content::Entity { derive: Some(_), .. }))
+                    })
+                }) {
+                    return false;
+                }
+                if !self.entity_created_in_past_before(past_rec, c_rec.order, &d.doc) { return false }
+                if !self.doc_links_valid_in_past_before(past_rec, c_rec.order, &d.doc) { return false }
+            }
+            match ent.project {
+                Some(p) => { cur = p; limit = c_rec.order; }
+                None => return true,
+            }
+        }
+        false
+    }
+
+    /// All non-void events ordered `< before_order` that can directly write or undo `(doc, at, attr)`.
+    fn doc_attr_ops_before(
+        &self,
+        doc: &Id,
+        doc_state: &DocState,
+        at: BreakRef,
+        attr: u16,
+        before_order: Order,
+    ) -> BTreeSet<Order> {
+        let at = doc_state.canonical(at);
+        let mut ops = BTreeSet::new();
+        let Some(timeline) = self.timelines.get(doc) else { return ops };
+        let end = timeline.events.partition_point(|o| *o < before_order);
+        for &ev_order in &timeline.events[..end] {
+            let ev_id = ev_order.2;
+            let touches = match self.records[&ev_id].content.as_ref() {
+                Some(Content::Text { ops: text_ops, .. }) => text_ops.iter().any(|op| match op {
+                    TextOp::Attr { at: op_at, attr: k, .. } if *k == attr => {
+                        Self::resolve_doc_op_at(doc_state, ev_id, *op_at) == at
+                    }
+                    TextOp::Attr { at: op_at, attr: attr::TASK, value: Value::Null }
+                        if attr == attr::CHECKBOX =>
+                    {
+                        Self::resolve_doc_op_at(doc_state, ev_id, *op_at) == at
+                    }
+                    _ => false,
+                }),
+                Some(Content::Entity { derive: Some((d, d_at)), .. }) if attr == attr::TASK && d == doc => {
+                    doc_state.delimiter(*d_at).map(|m| doc_state.canonical(m)) == Some(at)
+                }
+                _ => false,
+            };
+            if touches { ops.insert(ev_order); }
+        }
+        let seeds: Vec<Order> = ops.iter().copied().collect();
+        self.close_undo_ops(&mut ops, seeds, before_order, |_| true);
+        ops
+    }
+
+    /// For `task`, collects across every doc in `possible_links` containing `task`:
+    /// - candidate `Content::Text` tick events ordered `< before_order` (at `>= first_link[at]`);
+    /// - every `(doc, at)` that links to `task` at some order `< before_order`.
+    fn task_link_blocks_and_ticks_before(
+        &self,
+        task: &Id,
+        before_order: Order,
+    ) -> (Vec<Order>, Vec<(Id, BreakRef)>) {
+        let mut ticks = Vec::new();
+        let mut link_blocks = Vec::new();
+        for (&doc, tasks) in &self.possible_links {
+            if !tasks.contains(task) { continue }
+            let (Some(timeline), Some(doc_state)) = (self.timelines.get(&doc), self.docs.get(&doc)) else {
+                continue;
+            };
+            let end = timeline.events.partition_point(|o| *o < before_order);
+            let mut first_link: BTreeMap<BreakRef, Order> = BTreeMap::new();
+            for &ev_order in &timeline.events[..end] {
+                let ev_id = ev_order.2;
+                match self.records[&ev_id].content.as_ref() {
+                    Some(Content::Entity { derive: Some((_, d_at)), .. }) => {
+                        if crate::entity::derived_task(doc, *d_at) == *task {
+                            if let Some(m) = doc_state.delimiter(*d_at) {
+                                first_link.entry(doc_state.canonical(m)).or_insert(ev_order);
+                            }
+                        }
+                    }
+                    Some(Content::Text { ops, .. }) => {
+                        for op in ops {
+                            if let TextOp::Attr { at: op_at, attr: attr::TASK, value: Value::Id(t) } = op {
+                                if t == task {
+                                    let at = Self::resolve_doc_op_at(doc_state, ev_id, *op_at);
+                                    first_link.entry(at).or_insert(ev_order);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if first_link.is_empty() { continue }
+            for &at in first_link.keys() {
+                link_blocks.push((doc, at));
+            }
+            for &ev_order in &timeline.events[..end] {
+                let ev_id = ev_order.2;
+                let Some(Content::Text { ops, .. }) = self.records[&ev_id].content.as_ref() else { continue };
+                let is_tick = ops.iter().any(|op| {
+                    let TextOp::Attr { at: op_at, attr: attr::CHECKBOX, value: Value::Text(s) } = op else {
+                        return false;
+                    };
+                    if !matches!(s.as_str(), "done" | "review" | "open") { return false }
+                    let at = Self::resolve_doc_op_at(doc_state, ev_id, *op_at);
+                    first_link.get(&at).is_some_and(|&lo| ev_order >= lo)
+                });
+                if is_tick { ticks.push(ev_order); }
+            }
+        }
+        (ticks, link_blocks)
+    }
+
+    /// All non-void events ordered `< before_order` that can directly write or undo `(ent, field)`.
+    fn field_self_ops_before(
+        &self,
+        ent: &Entity,
+        field: &Key,
+        before_order: Order,
+        extra_direct: &[Order],
+    ) -> BTreeSet<Order> {
+        use std::ops::Bound;
+        let mut ops = BTreeSet::new();
+        if *field == field::POLICY {
+            if ent.kind == kind::TOWN && ent.project.is_none() {
+                return self.policy_ops_before(ent.id, before_order);
+            }
+            return ops;
+        }
+        let creator = self.derived_task_meta(&ent.id).map_or(ent.id, |d| d.creator);
+        let Some(creator_order) = self.records.get(&creator).map(|r| r.order) else { return ops };
+        if creator_order >= before_order { return ops }
+        let issue_owner = (ent.kind == kind::ISSUE && (*field == field::TEXT || *field == field::DELETED))
+            .then(|| self.seat_of(&ent.author));
+        let static_permits = |author: &PublicKey| -> bool {
+            issue_owner.is_none_or(|owner| owner.is_some() && self.seat_of(author) == owner)
+        };
+        let mut undo_seeds = Vec::new();
+        if let Some(writes) = self.entity_writes.get(&ent.id) {
+            for &w_order in writes.range((Bound::Included(creator_order), Bound::Excluded(before_order))) {
+                let rec = &self.records[&w_order.2];
+                match &rec.content {
+                    Some(Content::Entity { fields, .. }) => {
+                        let writes_field = fields.iter().any(|(f, v)| f == field && field.accepts(v));
+                        if writes_field { ops.insert(w_order); }
+                        // Creation `Undo { of: entity }` only writes `field::DELETED`.
+                        if *field == field::DELETED { undo_seeds.push(w_order); }
+                    }
+                    Some(Content::Set { changes, .. }) => {
+                        if !static_permits(&w_order.1) { continue }
+                        let touches = changes.iter().any(|c| {
+                            c.entity == ent.id
+                                && c.field == *field
+                                && field.accepts(&c.value)
+                                && !(ent.kind == kind::ISSUE
+                                    && *field == field::STATUS
+                                    && !matches!(&c.value, Value::Text(s) if matches!(s.as_str(), "open" | "resolved")))
+                        });
+                        if touches {
+                            ops.insert(w_order);
+                            undo_seeds.push(w_order);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for &tick in extra_direct {
+            if tick >= creator_order && tick < before_order && ops.insert(tick) {
+                undo_seeds.push(tick);
+            }
+        }
+        self.close_undo_ops(&mut ops, undo_seeds, before_order, |u_rec| static_permits(&u_rec.order.1));
+        ops
+    }
+
+    /// Returns `(self_ops, dep_ops)` for `(ent, field)` below `before_order`, or `Err(())` if a
+    /// linked doc fails `doc_links_valid_in_past_before`.
+    fn field_ops_with_deps_before(
+        &self,
+        past_rec: &Record,
+        ent: &Entity,
+        field: &Key,
+        before_order: Order,
+        include_derived_activity: bool,
+    ) -> Result<(BTreeSet<Order>, BTreeSet<Order>), ()> {
+        use std::ops::Bound;
+        let mut extra_ticks = Vec::new();
+        let mut link_blocks = Vec::new();
+        if ent.kind == kind::TASK && *field == field::STATUS {
+            (extra_ticks, link_blocks) = self.task_link_blocks_and_ticks_before(&ent.id, before_order);
+        }
+        let self_ops = self.field_self_ops_before(ent, field, before_order, &extra_ticks);
+        let mut dep_ops = self_ops.clone();
+
+        if field::geometry(field) {
+            dep_ops.extend(self.field_self_ops_before(ent, &field::LOCKED, before_order, &[]));
+        }
+        if ent.kind == kind::TOWN
+            && ent.project.is_none()
+            && (*field == field::DELETED || *field == field::ARCHIVED)
+        {
+            dep_ops.extend(self.policy_ops_before(ent.id, before_order));
+        }
+        if !link_blocks.is_empty() {
+            let mut checked_docs = BTreeSet::new();
+            for (doc, at) in link_blocks {
+                if checked_docs.insert(doc) && !self.doc_links_valid_in_past_before(past_rec, before_order, &doc) {
+                    return Err(());
+                }
+                if let Some(doc_state) = self.docs.get(&doc) {
+                    dep_ops.extend(self.doc_attr_ops_before(&doc, doc_state, at, attr::TASK, before_order));
+                }
+            }
+        }
+        if include_derived_activity && *field == field::DELETED {
+            if let Some(&creator) = self.derived_task_creators.get(&ent.id) {
+                if let (Some(c_rec), Some(undos)) = (self.records.get(&creator), self.undo_children.get(&creator)) {
+                    if let Some(&u_max) = undos
+                        .range((Bound::Excluded(c_rec.order), Bound::Excluded(before_order)))
+                        .next_back()
+                    {
+                        let mut other_fields = BTreeSet::from([field::STATUS]);
+                        if let Some(writes) = self.entity_writes.get(&ent.id) {
+                            for &w_order in writes.range((Bound::Excluded(c_rec.order), Bound::Excluded(u_max))) {
+                                if let Some(Content::Set { changes, .. }) = self.records[&w_order.2].content.as_ref() {
+                                    for c in changes {
+                                        if c.entity == ent.id && c.field != field::DELETED {
+                                            other_fields.insert(c.field.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for other_field in other_fields {
+                            let (_, sub_deps) = self.field_ops_with_deps_before(
+                                past_rec, ent, &other_field, u_max, false,
+                            )?;
+                            dep_ops.extend(sub_deps);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((self_ops, dep_ops))
+    }
+
+    /// Two-phase non-interference check on `(self_ops, dep_ops)` for `(past_rec, lo_order, before_order)`:
+    /// - Phase 1 (`..lo_order`): no concurrent op in `dep_ops` strictly below `lo_order`.
+    /// - Phase 2 (`(lo_order, before_order)`): either no concurrent op in `dep_ops` (Way 2A),
+    ///   or no in-past op in `self_ops` (Way 2B).
+    fn check_non_interference(
+        &self,
+        past_rec: &Record,
+        lo_order: Option<Order>,
+        before_order: Order,
+        self_ops: &BTreeSet<Order>,
+        dep_ops: &BTreeSet<Order>,
+    ) -> bool {
+        use std::ops::Bound;
+        if let Some(lo) = lo_order {
+            if dep_ops.range(..lo).any(|o| !in_past(&self.records, past_rec, o.2)) {
+                return false;
+            }
+        }
+        let tail = match lo_order {
+            Some(lo) => (Bound::Excluded(lo), Bound::Excluded(before_order)),
+            None => (Bound::Unbounded, Bound::Excluded(before_order)),
+        };
+        let concurrent_in_tail = dep_ops.range(tail).any(|o| !in_past(&self.records, past_rec, o.2));
+        if concurrent_in_tail && self_ops.range(tail).any(|o| in_past(&self.records, past_rec, o.2)) {
+            return false;
+        }
+        true
+    }
+
+    fn field_writer_in_past_before(
+        &self,
+        past_rec: &Record,
+        before_order: Order,
+        entity: &Id,
+        field: &Key,
+    ) -> Result<Option<Id>, ()> {
+        if !self.membership_clean_for_past(past_rec, before_order)
+            || !self.entity_created_in_past_before(past_rec, before_order, entity)
+        {
+            return Err(());
+        }
+        let ent = self.entities.get(entity).ok_or(())?;
+        let key = (*entity, field.clone());
+        let mut cur = ent.fields.get(field).map(|f| f.writer)
+            .or_else(|| self.cleared.get(&key).copied());
+        let mut found = None;
+        while let Some(writer) = cur {
+            if in_past(&self.records, past_rec, writer)
+                && self.records.get(&writer).is_some_and(|r| r.order < before_order)
+            {
+                found = Some(writer);
+                break;
+            }
+            cur = self.groups.get(&writer)
+                .and_then(|g| g.get(&key))
+                .and_then(|prior| prior.as_ref().map(|f| f.writer));
+        }
+        let lo_order = found.and_then(|w| self.records.get(&w).map(|r| r.order));
+        let (self_ops, dep_ops) = self.field_ops_with_deps_before(past_rec, ent, field, before_order, true)?;
+        if !self.check_non_interference(past_rec, lo_order, before_order, &self_ops, &dep_ops) {
+            return Err(());
+        }
+        Ok(found)
+    }
+
+    /// Certified effective writer of `(entity, field)` in `fold(Past(before))` under Two-Phase
+    /// Non-Interference: returns `Ok(Some(w))` or `Ok(None)` only when `fold(Past(before))` is
+    /// guaranteed identical to `fold(H)` on `(entity, field)` and its undo chain, else `Err(())`.
+    pub fn field_writer_before(&self, before: &Id, entity: &Id, field: &Key) -> Result<Option<Id>, ()> {
+        let rec = self.records.get(before).ok_or(())?;
+        self.field_writer_in_past_before(rec, rec.order, entity, field)
+    }
+
+    /// True iff `claimed` is certified as the exact effective writer of `(entity, field)` in
+    /// `fold(Past(copy_event))`.
+    pub fn verify_field_writer_at(&self, copy_event: &Id, entity: &Id, field: &Key, claimed: &Id) -> bool {
+        self.field_writer_before(copy_event, entity, field) == Ok(Some(*claimed))
+    }
+
+    /// True iff `sw` is certified as the exact effective writer of `(task, STATUS)` at `at_event`
+    /// inside `fold(Past(past_of))` (allowing `sw == task_creator` when `STATUS` was cleanly untouched).
+    pub fn verify_task_status_at_in_past(&self, past_of: &Id, at_event: &Id, task: &Id, sw: &Id) -> bool {
+        let (Some(past_rec), Some(at_rec)) = (self.records.get(past_of), self.records.get(at_event)) else {
+            return false;
+        };
+        if !in_past(&self.records, past_rec, *at_event) || self.void_events.contains_key(at_event) {
+            return false;
+        }
+        if let Some(doc) = self.scopes.get(at_event) {
+            if !self.entity_created_in_past_before(past_rec, at_rec.order, doc)
+                || !self.doc_links_valid_in_past_through(past_rec, at_rec.order, doc)
+            {
+                return false;
+            }
+        }
+        let task_creator = self.derived_task_meta(task).map_or(*task, |d| d.creator);
+        match self.field_writer_in_past_before(past_rec, at_rec.order, task, &field::STATUS) {
+            Ok(Some(w)) => w == *sw,
+            Ok(None) => *sw == task_creator
+                && in_past(&self.records, past_rec, *sw)
+                && self.records.get(sw).is_some_and(|r| r.order < at_rec.order),
+            Err(()) => false,
+        }
+    }
+
+    /// Previous writer event restored by `undo` on document block attribute `(doc, at, attr)`.
+    pub fn doc_attr_undo_prev(&self, doc: &Id, undo: &Id, at: BreakRef, attr: u16) -> Option<Id> {
+        let Some(Content::Undo { of }) = self.records.get(undo)?.content.as_ref() else { return None };
+        self.docs.get(doc)?.attr_undo_prev(undo, of, at, attr)
+    }
+
+    /// `(doc, at, link_writer)` of the `attr::TASK` link that routed tick `event` onto `(task, STATUS)`.
+    pub fn tick_link_source(&self, event: &Id, task: &Id) -> Option<(Id, BreakRef, Id)> {
+        let &(_, at, link_writer) = self.tick_writes.get(event)?.get(task)?;
+        let doc = *self.scopes.get(event)?;
+        Some((doc, at, link_writer))
+    }
+
+    fn doc_attr_state_in_past_before(
+        &self,
+        past_rec: &Record,
+        before_order: Order,
+        doc: &Id,
+        at: BreakRef,
+        attr: u16,
+    ) -> Result<Option<(Id, Value, Option<crate::doc::CheckboxSource>)>, ()> {
+        if !self.membership_clean_for_past(past_rec, before_order)
+            || !self.entity_created_in_past_before(past_rec, before_order, doc)
+            || !self.doc_links_valid_in_past_before(past_rec, before_order, doc)
+        {
+            return Err(());
+        }
+        let doc_state = self.docs.get(doc).ok_or(())?;
+        let at = doc_state.canonical(at);
+        match at {
+            BreakRef::Root => {}
+            BreakRef::Char(ch) => {
+                if !in_past(&self.records, past_rec, ch.event)
+                    || !self.records.get(&ch.event).is_some_and(|r| r.order < before_order)
+                {
+                    return Err(());
+                }
+            }
+            BreakRef::Inserted(_) => return Err(()),
+        }
+        let found = doc_state.attr_state_before(at, attr, |id| {
+            in_past(&self.records, past_rec, id)
+                && self.records.get(&id).is_some_and(|r| r.order < before_order)
+        });
+        let lo_order = found.as_ref().and_then(|(w, _, _)| self.records.get(w).map(|r| r.order));
+        let self_ops = self.doc_attr_ops_before(doc, doc_state, at, attr, before_order);
+        let mut dep_ops = self_ops.clone();
+        if attr == attr::CHECKBOX {
+            let task_ops = self.doc_attr_ops_before(doc, doc_state, at, attr::TASK, before_order);
+            dep_ops.extend(task_ops.iter().copied());
+            let max_unlink = self_ops.iter().rev().copied().find(|o| {
+                matches!(self.records[&o.2].content.as_ref(), Some(Content::Text { ops, .. })
+                    if ops.iter().any(|op| matches!(op,
+                        TextOp::Attr { at: op_at, attr: attr::TASK, value: Value::Null }
+                            if Self::resolve_doc_op_at(doc_state, o.2, *op_at) == at
+                    )))
+            });
+            if let Some(u_max) = max_unlink {
+                let mut linked_tasks = BTreeSet::new();
+                for &t_order in task_ops.range(..=u_max) {
+                    match self.records[&t_order.2].content.as_ref() {
+                        Some(Content::Entity { derive: Some((_, d_at)), .. }) => {
+                            linked_tasks.insert(crate::entity::derived_task(*doc, *d_at));
+                        }
+                        Some(Content::Text { ops, .. }) => {
+                            for op in ops {
+                                if let TextOp::Attr { at: op_at, attr: attr::TASK, value: Value::Id(t) } = op {
+                                    if Self::resolve_doc_op_at(doc_state, t_order.2, *op_at) == at {
+                                        linked_tasks.insert(*t);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for task_id in linked_tasks {
+                    if let Some(task_ent) = self.entities.get(&task_id) {
+                        let (_, status_deps) = self.field_ops_with_deps_before(
+                            past_rec, task_ent, &field::STATUS, u_max, false,
+                        )?;
+                        dep_ops.extend(status_deps);
+                    }
+                }
+            }
+        }
+        if !self.check_non_interference(past_rec, lo_order, before_order, &self_ops, &dep_ops) {
+            return Err(());
+        }
+        Ok(found)
+    }
+
+    /// Certified `(writer, value, checkbox_source)` of `(doc, at, attr)` in `fold(Past(before))`
+    /// under Two-Phase Non-Interference; returns `Err(())` whenever certification is conservative.
+    pub fn doc_attr_state_before(
+        &self,
+        before: &Id,
+        doc: &Id,
+        at: BreakRef,
+        attr: u16,
+    ) -> Result<Option<(Id, Value, Option<crate::doc::CheckboxSource>)>, ()> {
+        let rec = self.records.get(before).ok_or(())?;
+        self.doc_attr_state_in_past_before(rec, rec.order, doc, at, attr)
+    }
+
+    /// True iff `link_writer` is certified as the exact effective writer of
+    /// `(doc, at, attr::TASK) == Value::Id(task)` at `at_event` inside `fold(Past(past_of))`.
+    pub fn verify_doc_task_link_at_in_past(
+        &self,
+        past_of: &Id,
+        at_event: &Id,
+        doc: &Id,
+        at: BreakRef,
+        task: &Id,
+        link_writer: &Id,
+    ) -> bool {
+        let (Some(past_rec), Some(at_rec)) = (self.records.get(past_of), self.records.get(at_event)) else {
+            return false;
+        };
+        if !in_past(&self.records, past_rec, *at_event) || self.void_events.contains_key(at_event) {
+            return false;
+        }
+        if link_writer == at_event {
+            let Some(doc_state) = self.docs.get(doc) else { return false };
+            let canon = doc_state.canonical(at);
+            let links_task = matches!(
+                at_rec.content.as_ref(),
+                Some(Content::Text { doc: ev_doc, ops })
+                    if ev_doc == doc
+                        && ops.iter().any(|op| matches!(
+                            op,
+                            TextOp::Attr { at: op_at, attr: attr::TASK, value: Value::Id(t) }
+                                if t == task && Self::resolve_doc_op_at(doc_state, *at_event, *op_at) == canon
+                        ))
+            );
+            return links_task
+                && doc_state.attr_written_by(at_event, canon, attr::TASK)
+                && self.membership_clean_for_past(past_rec, at_rec.order)
+                && self.entity_created_in_past_before(past_rec, at_rec.order, task)
+                && self.entity_created_in_past_before(past_rec, at_rec.order, doc)
+                && self.doc_links_valid_in_past_through(past_rec, at_rec.order, doc);
+        }
+        if !self.text_event_links_valid_in_past(past_rec, at_rec.order) {
+            return false;
+        }
+        match self.doc_attr_state_in_past_before(past_rec, at_rec.order, doc, at, attr::TASK) {
+            Ok(Some((w, Value::Id(t), _))) => w == *link_writer && t == *task,
+            _ => false,
+        }
+    }
+
+    /// True iff `event` belongs to `doc`'s timeline (`scopes[event] == doc`) and lies in `before`'s causal past.
+    pub fn doc_event_before(&self, before: &Id, doc: &Id, event: &Id) -> bool {
+        let Some(rec) = self.records.get(before) else { return false };
+        self.scopes.get(event) == Some(doc) && in_past(&self.records, rec, *event)
+    }
+
+    /// `(session, is_open)` for a readable folded `kind::SESSION` or `kind::SAID` record.
+    pub fn session_fact_meta(&self, id: &Id) -> Option<(SessionId, bool)> {
+        match self.records.get(id)?.content.as_ref()? {
+            Content::Session(SessionOp::Open { session, .. }) => Some((*session, true)),
+            Content::Session(SessionOp::Join { session } | SessionOp::Leave { session, .. } | SessionOp::Decline { session, .. }) => Some((*session, false)),
+            Content::Said { session, .. } => Some((*session, false)),
+            _ => None,
+        }
+    }
+
     /// An admitted seat stays in the history when its device leaves.
     pub fn seat_of(&self, device: &PublicKey) -> Option<Id> {
         self.membership.seats.admitted.get(device).map(|a| a.seat)
@@ -848,32 +1729,53 @@ impl State {
         jobs
     }
 
-    fn service_job(&self, job: JobId, session: &SessionId) -> Option<Job> {
-        let mut records: Vec<_> = self.services.histories.get(&job)?.iter().map(|id| &self.records[id]).collect();
+    // Resolve the request and its provider's causal reports once for both readers.
+    fn service_job_history(&self, job: &JobId) -> Option<(&Record, Option<&Record>)> {
+        let mut records = self.services.histories.get(job)?.iter()
+            .map(|id| self.records.get(id).map(Arc::as_ref)).collect::<Option<Vec<_>>>()?;
         records.sort_unstable_by_key(|rec| rec.order);
         let mut history = records.into_iter();
-        let (call, mut result) = history.find_map(|rec| {
-            let Content::Request { session: call, service, provider, project, .. } = rec.content.as_ref()? else { return None };
-            self.session(call)?.open.as_ref()?;
-            Some((call, Job { job, service: *service, requester: rec.order.1, provider: *provider, project: *project,
-                request: rec.order.2, state: JobState::Asked }))
+        let (request, provider) = history.find_map(|rec| {
+            let Content::Request { session, provider, .. } = rec.content.as_ref()? else { return None };
+            self.session(session)?.open.as_ref()?;
+            Some((rec, *provider))
         })?;
-        if call != session { return None }
+        let mut report = None;
         for rec in history {
-            if rec.order.1 != result.provider { continue }
-            match &rec.content {
-                Some(Content::Taken { .. }) if result.state == JobState::Asked && in_past(&self.records, rec, result.request) =>
-                    result.state = JobState::Working,
-                Some(Content::Done { text, .. }) if in_past(&self.records, rec, result.request) => {
-                    result.state = JobState::Done(text.clone()); break
-                }
-                Some(Content::Failed { why, .. }) if in_past(&self.records, rec, result.request) => {
-                    result.state = JobState::Failed(why.clone()); break
+            if rec.order.1 != provider { continue }
+            match rec.content {
+                Some(Content::Taken { .. }) if report.is_none() && in_past(&self.records, rec, request.order.2) => report = Some(rec),
+                Some(Content::Done { .. } | Content::Failed { .. }) if in_past(&self.records, rec, request.order.2) => {
+                    report = Some(rec);
+                    break
                 }
                 _ => {}
             }
         }
-        Some(result)
+        Some((request, report))
+    }
+
+    fn service_job(&self, job: JobId, session: &SessionId) -> Option<Job> {
+        let (request, report) = self.service_job_history(&job)?;
+        let Content::Request { session: call, service, project, provider, .. } = request.content.as_ref()? else { return None };
+        if call != session { return None }
+        let state = match report.and_then(|r| r.content.as_ref()) {
+            Some(Content::Taken { .. }) => JobState::Working,
+            Some(Content::Done { text, .. }) => JobState::Done(text.clone()),
+            Some(Content::Failed { why, .. }) => JobState::Failed(why.clone()),
+            _ => JobState::Asked,
+        };
+        Some(Job { job, service: *service, requester: request.order.1, provider: *provider,
+            project: *project, request: request.order.2, state })
+    }
+
+    pub fn service_job_meta(&self, job: &JobId) -> Option<ServiceJobMeta> {
+        let (request, report) = self.service_job_history(job)?;
+        let Content::Request { session, project, provider, .. } = request.content.as_ref()? else { return None };
+        let report_writer = report.filter(|r| matches!(r.content, Some(Content::Done { .. } | Content::Failed { .. })))
+            .map(|r| r.order.2);
+        Some(ServiceJobMeta { session: *session, project: *project, requester: request.order.1,
+            provider: *provider, request: request.order.2, report_writer })
     }
 
     pub fn session(&self, id: &SessionId) -> Option<&Session> {
@@ -891,9 +1793,38 @@ impl State {
 
     pub fn active_participants(&self, id: &SessionId) -> Vec<PublicKey> {
         let Some(session) = self.session(id) else { return Vec::new() };
-        if self.session_summary(id, None).is_none_or(|summary| summary.ended) { return Vec::new() }
-        let left: HashSet<_> = session.leaves.iter().map(|(device, _, _)| device).collect();
-        self.participants(id).into_iter().filter(|device| !left.contains(device)).collect()
+        let Some(open) = &session.open else { return Vec::new() };
+        if matches!(open.mode, SessionMode::Share { .. }) && session.leaves.iter().any(|(d, ..)| *d == open.opener) {
+            return Vec::new()
+        }
+        let participants = self.participants(id);
+        let left = self.session_departed(session, open, &participants.iter().copied().collect());
+        participants.into_iter().filter(|device| !left.contains(device)).collect()
+    }
+
+    fn session_departed(&self, session: &Session, open: &Opened, participants: &HashSet<PublicKey>) -> HashSet<PublicKey> {
+        let mut last_enter = HashMap::new();
+        if let Some(order) = self.order_of(&open.anchor) {
+            last_enter.insert(open.opener, order);
+        }
+        for &(device, join) in &session.joins {
+            if participants.contains(&device) {
+                if let Some(order) = self.order_of(&join) {
+                    last_enter.entry(device).and_modify(|cur| *cur = (*cur).max(order)).or_insert(order);
+                }
+            }
+        }
+        let mut last_leave: HashMap<PublicKey, Order> = HashMap::new();
+        for &(device, leave, _, _) in &session.leaves {
+            if participants.contains(&device) {
+                if let Some(order) = self.order_of(&leave) {
+                    last_leave.entry(device).and_modify(|cur| *cur = (*cur).max(order)).or_insert(order);
+                }
+            }
+        }
+        last_leave.into_iter()
+            .filter(|(device, leave)| last_enter.get(device).is_none_or(|enter| leave > enter))
+            .map(|(device, _)| device).collect()
     }
 
     fn participants_before(&self, id: &SessionId, counted: impl Fn(&Id) -> bool) -> Vec<PublicKey> {
@@ -903,7 +1834,7 @@ impl State {
         let mut seen = HashSet::from([open.opener]);
         let mut devices = vec![open.opener];
         for &(device, join) in &session.joins {
-            if counted(&join) && seen.insert(device) && open.seen(opener_seat, self.seat_of(&device)) != Seen::Other {
+            if counted(&join) && seen.insert(device) && open.admits(opener_seat, self.seat_of(&device)) {
                 devices.push(device);
             }
         }
@@ -972,20 +1903,15 @@ impl State {
         let participants: HashSet<_> = self.participants(id).into_iter().collect();
         let answered: BTreeSet<_> = participants.iter().filter_map(|d| self.seat_of(d))
             .filter(|s| Some(*s) != opener_seat).collect();
-        let mut left = HashSet::new();
-        let mut secs = None;
-        for (device, duration, _) in &session.leaves {
-            if participants.contains(device) {
-                left.insert(*device);
-                secs = secs.max(*duration);
-            }
-        }
+        let left = self.session_departed(session, open, &participants);
+        let secs = session.leaves.iter().filter(|(device, ..)| participants.contains(device))
+            .filter_map(|(_, _, duration, _)| *duration).max();
         let outcome = if !answered.is_empty() {
             Outcome::Answered { seats: answered.into_iter().collect(), secs }
         } else {
             let mut declined = BTreeSet::new();
             let mut busy = true;
-            for (device, why) in &session.declines {
+            for (device, _, why) in &session.declines {
                 if let Some(seat) = self.seat_of(device) {
                     if open.seen(opener_seat, Some(seat)) != Seen::Other {
                         declined.insert(seat);
@@ -1000,10 +1926,11 @@ impl State {
             } else { Outcome::Pending }
         };
         let lines = session.said.iter().filter(|(_, device, _, _)| participants.contains(device)).count();
-        let ended = (matches!(open.mode, SessionMode::Share { .. }) && left.contains(&open.opener))
+        let opener_left = session.leaves.iter().any(|(d, ..)| *d == open.opener);
+        let ended = (matches!(open.mode, SessionMode::Share { .. }) && opener_left)
             || left.len() == participants.len();
         Some(SessionSummary { opener: open.opener, opener_seat, mode: open.mode.clone(),
-            rung: open.to.clone(), viewer: open.seen(opener_seat, viewer_seat), outcome, lines, ended })
+            rung: open.to.clone(), town_wide: open.town_wide, viewer: open.seen(opener_seat, viewer_seat), outcome, lines, ended })
     }
 
     fn task_in(&self, project: Option<Id>, id: &Id) -> Result<&Entity, String> {
@@ -1052,13 +1979,24 @@ impl State {
     /// Visible entities matching a query, including the one live survivor of a task merge cycle.
     pub fn visible_entities<'a>(&'a self, mut include: impl FnMut(&Entity) -> bool + 'a) -> impl Iterator<Item = &'a Entity> {
         let mut paths = HashMap::new();
-        self.entities.values().filter(move |&e| {
-            if !include(e) { return false }
-            if e.kind == kind::TASK && matches!(e.value(field::MERGED_INTO), Some(Value::Id(_))) {
-                return self.follow_task(e, &mut paths).is_ok_and(|survivor| survivor.id == e.id)
-            }
-            !e.flag(field::DELETED) && !e.flag(field::ARCHIVED)
-        })
+        self.entities.values().filter(move |&e| include(e) && self.live_entity(e, &mut paths))
+    }
+
+    fn live_entity<'a>(&'a self, e: &'a Entity, paths: &mut HashMap<Id, TaskPath<'a>>) -> bool {
+        if e.kind == kind::TASK && matches!(e.value(field::MERGED_INTO), Some(Value::Id(_))) {
+            return self.follow_task(e, paths).is_ok_and(|survivor| survivor.id == e.id)
+        }
+        !e.flag(field::DELETED) && !e.flag(field::ARCHIVED)
+    }
+
+    pub fn entity_is_visible(&self, id: &Id) -> bool {
+        self.entities.get(id).is_some_and(|e| self.live_entity(e, &mut HashMap::new())
+            && e.project.is_none_or(|p| self.entities.get(&p).is_some_and(|proj|
+                !proj.flag(field::DELETED) && !proj.flag(field::ARCHIVED))))
+    }
+
+    pub fn doc_is_visible(&self, doc: &Id) -> bool {
+        self.docs.contains_key(doc) && self.entity_is_visible(doc)
     }
 
     pub fn active_members(&self) -> impl Iterator<Item = PublicKey> + '_ {
@@ -1205,6 +2143,47 @@ impl State {
         removal.map(|(at, id)| FinalBoundary { at, evidence: vec![id] })
     }
 
+    /// Earliest local arrival boundary per device. The earlier of two devices' entries
+    /// is the boundary returned by `final_boundary` for that pair.
+    pub fn device_final_boundaries(&self, log: &crate::log::Log) -> BTreeMap<PublicKey, (usize, FinalClosure)> {
+        let mut out: BTreeMap<PublicKey, (usize, FinalClosure)> = BTreeMap::new();
+        for (&id, decision) in &self.membership.removals {
+            if *decision != Ok(Removal::Counted) { continue }
+            let Some(Content::Member(Member::Remove { device, .. })) =
+                self.records.get(&id).and_then(|r| r.content.as_ref())
+            else { continue };
+            let Some(pos) = log.position(&id) else { continue };
+            if out.get(device).is_none_or(|&(old_pos, _)| pos < old_pos) {
+                out.insert(*device, (pos, FinalClosure::Removal(id)));
+            }
+        }
+        if !self.membership.forks.is_empty() {
+            let mut pending: HashSet<_> = self.membership.forks.keys().copied().collect();
+            let mut seen: HashMap<(PublicKey, ForkPoint), Id> = HashMap::new();
+            for (at, event) in log.events().iter().enumerate() {
+                if pending.is_empty() { break }
+                let author = event.header.author;
+                if !pending.contains(&author) { continue }
+                if out.get(&author).is_some_and(|&(rem_pos, _)| at >= rem_pos) {
+                    pending.remove(&author);
+                    continue;
+                }
+                if let Some(record) = self.records.get(&event.id) {
+                    let (_, parent) = self.own_predecessor(author, &record.parents);
+                    if let Some(&first) = seen.get(&(author, parent)) {
+                        if let Some(closure) = FinalClosure::fork(first, event.id) {
+                            out.insert(author, (at, closure));
+                        }
+                        pending.remove(&author);
+                    } else {
+                        seen.insert((author, parent), event.id);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// First counted removal or complete fork proof for either participant in local arrival order.
     pub fn first_removal(&self, log: &crate::log::Log, a: &PublicKey, b: &PublicKey) -> Option<usize> {
         self.final_boundary(log, a, b).map(|boundary| boundary.at)
@@ -1221,6 +2200,11 @@ impl State {
             _ if r.control => self.membership.reasons.get(&id).copied(),
             _ => self.membership.ordinary(r),
         };
+        if r.kind == crate::event::kind::PROFILE {
+            let candidate = (reason.is_none(), r.order, id);
+            let latest = self.latest_profiles.entry(r.order.1).or_insert(candidate);
+            if candidate > *latest { *latest = candidate; }
+        }
         if let Some(reason) = reason {
             self.void_events.insert(id, reason);
             return false
@@ -1269,8 +2253,10 @@ impl State {
 
     fn rebuild_indexes(&mut self) {
         self.void_events.clear();
+        self.latest_profiles.clear();
         self.retracted.clear();
         self.entity_writes.clear();
+        self.policy_sets.clear();
         self.possible_links.clear();
         self.undo_children.clear();
         for i in 0..self.order.len() {
@@ -1439,7 +2425,7 @@ impl State {
         for index in from..timeline.events.len() {
             let record = &self.records[&timeline.events[index].2];
             let id = record.order.2;
-            let status = |task| self.statuses.get(&task).and_then(|writes| writes.range(..record.order).next_back()).map(|(_, v)| v.clone());
+            let status = |task| self.statuses.get(&task).and_then(|writes| writes.range(..record.order).next_back()).map(|(order, v)| (v.clone(), order.2));
             let effects = match &record.content {
                 Some(Content::Text { ops, .. }) => {
                     let mut checked = BTreeMap::new();
@@ -1449,7 +2435,7 @@ impl State {
                     if let Some(&(_, at, task)) = self.conversions.get(&id) {
                         let initial = self.statuses.get(&task).and_then(|w| w.get(&record.order)).cloned().unwrap_or(Value::Null);
                         state.apply_event(id, &[TextOp::Attr { at, attr: attr::TASK, value: Value::Id(task) }], |_| true,
-                            record.actor, |_| Some(initial.clone()))
+                            record.actor, |_| Some((initial.clone(), id)))
                     } else { TaskEffects::default() }
                 }
                 Some(Content::Undo { of }) => { state.undo(id, *of); TaskEffects::default() }
@@ -1481,8 +2467,8 @@ impl State {
     fn apply_ticks(&mut self, rec: &Record, position: u64) {
         if let Some(writes) = self.tick_writes.get(&rec.order.2).cloned() {
             let mut replaced = Replaced::new();
-            for (task, value) in writes {
-                let prior = self.write(task, field::STATUS, value, rec.order.2, position);
+            for (task, (value, _, _)) in writes {
+                let prior = self.write(task, field::STATUS, value, rec.order.2, rec.order.2, position);
                 replaced.insert((task, field::STATUS), prior);
             }
             self.groups.insert(rec.order.2, replaced);
@@ -1510,8 +2496,10 @@ impl State {
             !group.is_empty()
         });
         self.cleared.retain(|(id, _), _| !tasks.contains(id));
+        self.copied_from.retain(|(_, entity, _), _| !tasks.contains(entity));
         for id in &tasks {
             self.entities.remove(id);
+            self.derived_task_creators.remove(id);
             self.statuses.remove(id);
             self.linked_docs.remove(id);
         }
@@ -1571,6 +2559,9 @@ impl State {
 
     fn rebuild_board(&mut self) {
         self.entities.clear();
+        self.policy_writes.clear();
+        self.town_policy = TownPolicy::Members;
+        self.copied_from.clear();
         self.invalid_keys.clear();
         self.profiles.clear();
         self.chat.clear();
@@ -1586,6 +2577,7 @@ impl State {
         self.cleared.clear();
         self.task_numbers.clear();
         self.conversions.clear();
+        self.derived_task_creators.clear();
         self.statuses.clear();
         self.linked_docs.clear();
         self.tick_writes.clear();
@@ -1613,7 +2605,7 @@ impl State {
         }
     }
 
-    fn write(&mut self, id: Id, field: Key, value: Value, writer: Id, position: u64) -> Option<FieldState> {
+    fn write(&mut self, id: Id, field: Key, value: Value, writer: Id, origin: Id, position: u64) -> Option<FieldState> {
         let entity = self.entities.get_mut(&id)?;
         if entity.kind == kind::TASK && field == field::STATUS {
             self.statuses.entry(id).or_default().insert(self.records[&writer].order, value.clone());
@@ -1624,16 +2616,43 @@ impl State {
             }
         }
         let clear = value == Value::Null;
-        let prior = entity.write(field.clone(), value, writer, position);
+        let refresh_visibility = entity.kind == kind::TOWN && (field == field::DELETED || field == field::ARCHIVED);
+        let policy = (field == field::POLICY).then(|| value.clone());
+        let prior = entity.write(field.clone(), value, writer, origin, position);
         let cleared = self.cleared.remove(&(id, field.clone()));
         if clear {
             entity.fields.remove(&field);
             self.cleared.insert((id, field), writer);
         }
-        prior.or_else(|| cleared.map(|writer| FieldState { writer, value: Value::Null }))
+        if let Some(value) = policy {
+            let rec = self.records[&writer].clone();
+            self.record_policy_write(&rec, id, value);
+        } else if refresh_visibility {
+            self.refresh_town_policy();
+        }
+        prior.or_else(|| cleared.map(|writer| FieldState { writer, origin: writer, value: Value::Null }))
     }
 
-    fn permits_field(&self, entity: &Entity, field: &Key, author: &PublicKey) -> bool {
+    fn record_policy_write(&mut self, rec: &Record, entity: Id, value: Value) {
+        self.policy_writes.retain(|&(event, ent), _| ent != entity || !in_past(&self.records, rec, event));
+        if value != Value::Null { self.policy_writes.insert((rec.order.2, entity), value); }
+        self.refresh_town_policy();
+    }
+
+    fn refresh_town_policy(&mut self) {
+        let unreadable = self.policy_writes.iter().any(|((_, entity), value)| {
+            *value != Value::Int(1) && self.entities.get(entity).is_some_and(|e|
+                e.kind == kind::TOWN && e.project.is_none() && !e.flag(field::DELETED) && !e.flag(field::ARCHIVED))
+        });
+        self.town_policy = if unreadable { TownPolicy::Unreadable } else { TownPolicy::Members };
+    }
+
+    fn permits_field(&self, entity: &Entity, field: &Key, author: &PublicKey, critical: bool) -> bool {
+        let town = entity.kind == kind::TOWN && entity.project.is_none();
+        if *field == field::POLICY || (town && (*field == field::DELETED || *field == field::ARCHIVED)
+            && (entity.fields.contains_key(&field::POLICY) || self.policy_writes.keys().any(|(_, ent)| *ent == entity.id))) {
+            return town && critical && self.founder_seat().is_some_and(|s| self.seat_of(author) == Some(s))
+        }
         entity.kind != kind::ISSUE || (*field != field::TEXT && *field != field::DELETED)
             || self.seat_of(author).is_some_and(|seat| Some(seat) == self.seat_of(&entity.author))
     }
@@ -1648,14 +2667,23 @@ impl State {
         let (_, author, id) = rec.order;
         match &rec.content {
             Some(Content::Profile { name, colour }) => {
-                self.profiles.insert(author, Profile { name: name.clone(), colour: *colour });
+                self.profiles.insert(author, Profile { name: name.clone(), colour: *colour, writer: id });
             }
             Some(Content::AgentAdded { name, kind }) => {
-                self.agents.insert(id, Agent { owner: author, name: name.clone(), kind: kind.clone() });
+                self.agents.insert(id, Agent { owner: author, name: name.clone(), kind: kind.clone(), custom_name: None });
             }
             Some(Content::AgentRemoved { agent }) => {
                 if self.agents.get(agent).is_some_and(|a| a.owner == author) {
                     self.agents.remove(agent);
+                }
+            }
+            Some(Content::AgentRenamed { agent, name }) => {
+                let Some(a) = self.agents.get(agent) else { return };
+                if a.owner != author && !self.seat_of(&a.owner).is_some_and(|seat| self.seat_of(&author) == Some(seat)) {
+                    return
+                }
+                if let Some(a) = self.agents.get_mut(agent) {
+                    a.custom_name = (!name.trim().is_empty()).then(|| name.clone());
                 }
             }
             Some(Content::Chat(chat) | Content::AgentChat { chat, .. }) => {
@@ -1688,16 +2716,16 @@ impl State {
             Some(Content::Session(op)) => {
                 if only.is_some() { return }
                 match op {
-                    SessionOp::Open { session, mode, to } => {
+                    SessionOp::Open { session, mode, to, town_wide } => {
                         let open = &mut self.sessions.entry(*session).or_default().open;
                         if open.is_none() {
-                            *open = Some(Opened { anchor: id, opener: author, mode: mode.clone(), to: to.clone() });
+                            *open = Some(Opened { anchor: id, opener: author, mode: mode.clone(), to: to.clone(), town_wide: *town_wide });
                             self.timeline.push(Entry::Session(*session));
                         }
                     }
                     SessionOp::Join { session } => self.sessions.entry(*session).or_default().joins.push((author, id)),
-                    SessionOp::Leave { session, secs, why } => self.sessions.entry(*session).or_default().leaves.push((author, *secs, *why)),
-                    SessionOp::Decline { session, why } => self.sessions.entry(*session).or_default().declines.push((author, *why)),
+                    SessionOp::Leave { session, secs, why } => self.sessions.entry(*session).or_default().leaves.push((author, id, *secs, *why)),
+                    SessionOp::Decline { session, why } => self.sessions.entry(*session).or_default().declines.push((author, id, *why)),
                 }
             }
             Some(Content::Provides { .. }) => {
@@ -1721,7 +2749,7 @@ impl State {
                 let said = &mut self.sessions.entry(*session).or_default().said;
                 said.extend(lines.iter().zip(0u32..).map(|(line, i)| (line.at_ms, author, id, i)));
             }
-            Some(Content::Entity { kind, project, derive, fields }) => {
+            Some(Content::Entity { kind, project, derive, fields, copied_from }) => {
                 if matches!(kind, Key::Name(s) if !crate::literal::is_identifier(s)) { return }
                 let target = derive.map(|(doc, at)| crate::entity::derived_task(doc, at)).unwrap_or(id);
                 if only.is_some_and(|ids| !ids.contains(&target)) { return }
@@ -1733,6 +2761,7 @@ impl State {
                     let task = crate::entity::derived_task(*doc, *at);
                     if self.entities.contains_key(&task) { return }
                     self.conversions.insert(id, (*doc, marker, task));
+                    self.derived_task_creators.insert(task, id);
                     task
                 } else { id };
                 self.entities.insert(entity_id, Entity {
@@ -1742,7 +2771,17 @@ impl State {
                 if only.is_none() && derive.is_none() && *kind == kind::CLIP { self.timeline.push(Entry::Clip(entity_id)); }
                 if *kind == kind::TASK { self.statuses.entry(entity_id).or_default().insert(rec.order, Value::Null); }
                 for (field, value) in fields {
-                    if self.accepts_write(field, value, &author) { self.write(entity_id, field.clone(), value.clone(), id, position); }
+                    if self.accepts_write(field, value, &author) && self.permits_field(&self.entities[&entity_id], field, &author, rec.critical) {
+                        self.write(entity_id, field.clone(), value.clone(), id, id, position);
+                    }
+                }
+                let mut refs = copied_from.clone();
+                normalize_copy_refs(&mut refs);
+                for r in refs {
+                    if r.target_entity.is_none() && (self.entities[&entity_id].fields.contains_key(&r.target_field)
+                        || self.cleared.contains_key(&(entity_id, r.target_field.clone()))) {
+                        self.copied_from.insert((id, entity_id, r.target_field), r.sources);
+                    }
                 }
                 if *kind == kind::TASK && only.is_none() {
                     let number = self.numbers.entry(author).or_default();
@@ -1751,20 +2790,29 @@ impl State {
                 }
                 if *kind == kind::DOC { self.docs.entry(id).or_insert_with(|| DocState::new(id)); }
             }
-            Some(Content::Set { changes, .. }) => {
+            Some(Content::Set { changes, copied_from, .. }) => {
                 let mut replaced = Replaced::new();
                 for change in changes {
                     if !self.accepts_write(&change.field, &change.value, &author) { continue }
                     if only.is_some_and(|ids| !ids.contains(&change.entity)) { continue }
                     let Some(entity) = self.entities.get(&change.entity) else { continue };
-                    if !self.permits_field(entity, &change.field, &author) { continue }
+                    if !self.permits_field(entity, &change.field, &author, rec.critical) { continue }
                     if entity.kind == kind::ISSUE && change.field == field::STATUS
                         && !matches!(&change.value, Value::Text(s) if matches!(s.as_str(), "open" | "resolved")) { continue }
                     if field::geometry(&change.field) && entity.flag(field::LOCKED) {
                         continue;
                     }
-                    let prior = self.write(change.entity, change.field.clone(), change.value.clone(), id, position);
+                    let prior = self.write(change.entity, change.field.clone(), change.value.clone(), id, id, position);
                     replaced.entry((change.entity, change.field.clone())).or_insert(prior);
+                }
+                let mut refs = copied_from.clone();
+                normalize_copy_refs(&mut refs);
+                for r in refs {
+                    if let Some(ent) = r.target_entity {
+                        if replaced.contains_key(&(ent, r.target_field.clone())) {
+                            self.copied_from.insert((id, ent, r.target_field), r.sources);
+                        }
+                    }
                 }
                 if !replaced.is_empty() { self.groups.entry(id).or_default().extend(replaced); }
             }
@@ -1774,7 +2822,7 @@ impl State {
                     if only.is_some_and(|ids| !ids.contains(&task)) { return }
                     let entity = &self.entities[&task];
                     if entity.created == entity.last_activity {
-                        let prior = self.write(task, field::DELETED, Value::Bool(true), id, position);
+                        let prior = self.write(task, field::DELETED, Value::Bool(true), id, id, position);
                         self.groups.insert(id, [((task, field::DELETED), prior)].into());
                     }
                     return
@@ -1783,8 +2831,8 @@ impl State {
                 // Later edits, the other person's included, stay in the fields and return with it.
                 if matches!(self.records[of].content, Some(Content::Entity { derive: None, .. })) {
                     if only.is_some_and(|ids| !ids.contains(of)) || !self.entities.contains_key(of) { return }
-                    if !self.permits_field(&self.entities[of], &field::DELETED, &author) { return }
-                    let prior = self.write(*of, field::DELETED, Value::Bool(true), id, position);
+                    if !self.permits_field(&self.entities[of], &field::DELETED, &author, rec.critical) { return }
+                    let prior = self.write(*of, field::DELETED, Value::Bool(true), id, id, position);
                     self.groups.insert(id, [((*of, field::DELETED), prior)].into());
                     return
                 }
@@ -1792,12 +2840,13 @@ impl State {
                 let mut replaced = Replaced::new();
                 for ((entity, field), before) in target {
                     if only.is_some_and(|ids| !ids.contains(&entity)) { continue }
-                    if self.entities.get(&entity).is_some_and(|e| !self.permits_field(e, &field, &author)) { continue }
+                    if self.entities.get(&entity).is_some_and(|e| !self.permits_field(e, &field, &author, rec.critical)) { continue }
                     let writer = self.entities[&entity].fields.get(&field).map(|f| f.writer)
                         .or_else(|| self.cleared.get(&(entity, field.clone())).copied());
                     if writer == Some(*of) {
+                        let origin = before.as_ref().map_or(id, |f| f.origin);
                         let value = before.map_or(Value::Null, |f| f.value);
-                        let prior = self.write(entity, field.clone(), value, id, position);
+                        let prior = self.write(entity, field.clone(), value, id, origin, position);
                         replaced.insert((entity, field), prior);
                     }
                 }
@@ -1921,14 +2970,20 @@ pub(crate) mod cache {
 }
 
 use cache::Cached;
-cache::fields!(Profile { name, colour });
+impl Cached for TownPolicy {
+    fn save(&self, out: &mut Vec<u8>) { out.push(u8::from(*self == Self::Unreadable)); }
+    fn load(input: &mut &[u8]) -> Option<Self> {
+        match u8::load(input)? { 0 => Some(Self::Members), 1 => Some(Self::Unreadable), _ => None }
+    }
+}
+cache::fields!(Profile { name, colour, writer });
 cache::fields!(ChatMsg { id, author, actor, via, wall_ms, chat, author_agent, to_agent });
-cache::fields!(Agent { owner, name, kind });
+cache::fields!(Agent { owner, name, kind, custom_name });
 cache::fields!(Timeline { events, checkpoints });
 cache::fields!(Session { open, joins, leaves, declines, said, shared });
 cache::fields!(TranscriptShare { author, agent, line });
 cache::fields!(ServiceFacts { offers, sessions, histories });
-cache::fields!(Opened { anchor, opener, mode, to });
+cache::fields!(Opened { anchor, opener, mode, to, town_wide });
 impl Cached for ForkPoint {
     fn save(&self, out: &mut Vec<u8>) {
         match self {
@@ -1963,7 +3018,7 @@ impl Cached for Entry {
 }
 
 // Older checkpoints can contain generic field writes for issues received before this kind was known.
-const CACHE_VERSION: &[u8] = b"shared fold cache v18\0";
+const CACHE_VERSION: &[u8] = b"shared fold cache v23\0";
 
 fn prefix_hash(events: &[Event]) -> Id {
     let mut hash = makepad_network::digest::Sha256::new();
@@ -1991,6 +3046,10 @@ impl State {
     /// Hash the canonical document history on demand. A late insert can leave the
     /// last event unchanged, and an undo can restore identical visible Markdown.
     pub fn doc_revision(&self, doc: Id) -> Option<String> {
+        self.doc_revision_bytes(doc).map(|bytes| crate::hex(&bytes))
+    }
+
+    pub fn doc_revision_bytes(&self, doc: Id) -> Option<[u8; 16]> {
         let state = self.docs.get(&doc)?;
         let mut hash = makepad_network::digest::Sha256::new();
         hash.update(&doc);
@@ -2016,7 +3075,7 @@ impl State {
                 for order in writes.keys() { hash.update(&order.2); }
             }
         }
-        Some(crate::hex(&hash.finalise()[..16]))
+        Some(hash.finalise()[..16].try_into().unwrap())
     }
 
     /// Save the projections and undo evidence. Graph metadata comes from verified headers on open.
@@ -2026,7 +3085,8 @@ impl State {
         prefix_hash(events).save(&mut out);
         macro_rules! save { ($($field:ident),*) => { $(self.$field.save(&mut out);)* }; }
         save!(docs, scopes, timelines, tick_writes, statuses, linked_docs, conversions, numbers,
-            groups, cleared, profiles, chat, sessions, services, timeline, agents, entities, task_numbers, unknown, unknown_critical, partial, invalid_keys);
+            groups, cleared, profiles, chat, sessions, services, timeline, agents, entities, task_numbers, unknown, unknown_critical, partial, invalid_keys,
+            town_policy, policy_writes, copied_from);
         self.own_children.save(&mut out);
         self.membership.forks.save(&mut out);
         let digest = makepad_network::digest::sha256_hash(&out);
@@ -2045,7 +3105,9 @@ impl State {
         let mut state = State::default();
         macro_rules! load { ($($field:ident),*) => { $(state.$field = Cached::load(&mut input)?;)* }; }
         load!(docs, scopes, timelines, tick_writes, statuses, linked_docs, conversions, numbers,
-            groups, cleared, profiles, chat, sessions, services, timeline, agents, entities, task_numbers, unknown, unknown_critical, partial, invalid_keys);
+            groups, cleared, profiles, chat, sessions, services, timeline, agents, entities, task_numbers, unknown, unknown_critical, partial, invalid_keys,
+            town_policy, policy_writes, copied_from);
+        state.derived_task_creators = state.conversions.iter().map(|(&creator, &(_, _, task))| (task, creator)).collect();
         let own_children = BTreeMap::load(&mut input)?;
         let forks = BTreeMap::load(&mut input)?;
         if !input.is_empty() { return None }
@@ -2125,11 +3187,11 @@ pub(crate) mod tests {
         }
 
         fn entity(&mut self, kind: u16, project: Option<Id>, fields: Vec<(Key, Value)>) -> Id {
-            self.add(0, Actor::Human, Content::Entity { kind: Key::Number(kind), project, derive: None, fields }, None)
+            self.add(0, Actor::Human, Content::Entity { copied_from: vec![], kind: Key::Number(kind), project, derive: None, fields }, None)
         }
 
         fn set(&mut self, changes: Vec<Change>) -> Id {
-            self.add(0, Actor::Human, Content::Set { changes, label: None }, None)
+            self.add(0, Actor::Human, Content::Set { copied_from: vec![], changes, label: None }, None)
         }
 
         fn undo(&mut self, of: Id) -> Id {
@@ -2221,14 +3283,884 @@ pub(crate) mod tests {
     }
 
     fn task(project: Id, title: &str) -> Content {
-        Content::Entity { kind: Key::Number(kind::TASK), derive: None, project: Some(project), fields: vec![(field::TITLE, Value::Text(title.into()))] }
+        Content::Entity { copied_from: vec![], kind: Key::Number(kind::TASK), derive: None, project: Some(project), fields: vec![(field::TITLE, Value::Text(title.into()))] }
     }
 
     fn merge_task(from: Id, into: Id) -> Content {
-        Content::Set { label: None, changes: vec![
+        Content::Set { copied_from: vec![], label: None, changes: vec![
             change(from, field::DELETED, Value::Bool(true)),
             change(from, field::MERGED_INTO, Value::Id(into)),
         ] }
+    }
+
+    #[test]
+    fn t2_core_facts_provenance_policy_and_checkpoint_roundtrip() {
+        use crate::doc::CharId;
+        use crate::event::{self, CopyRef, FieldWriter, TAG_COPIED_FROM};
+
+        fn entity(kind: u16, project: Option<Id>, fields: Vec<(Key, Value)>) -> Content {
+            Content::Entity { kind: Key::Number(kind), project, fields, derive: None, copied_from: vec![] }
+        }
+        fn set(changes: Vec<Change>) -> Content {
+            Content::Set { changes, label: None, copied_from: vec![] }
+        }
+        fn copies(content: &mut Content) -> &mut Vec<CopyRef> {
+            match content {
+                Content::Entity { copied_from, .. } | Content::Set { copied_from, .. } => copied_from,
+                _ => unreachable!(),
+            }
+        }
+        fn signed(m: &mut Maker, who: usize, critical: bool, content: &Content, mut parents: Vec<Id>, extra: &[u8]) -> Id {
+            if let Some(prev) = m.events.iter().rev().find(|e| e.header.author == m.keys[who].public()) {
+                parents.push(prev.id);
+            }
+            parents.sort_unstable();
+            parents.dedup();
+            let mut bytes = content.encode();
+            bytes.extend_from_slice(extra);
+            let draft = Draft { kind: content.kind(), kind_version: content.version(), critical, actor: Actor::Human,
+                via: Via::Ui, wall_ms: 0, parents, content: &bytes };
+            m.salt = m.salt.wrapping_add(1);
+            let event = Event::create(&m.keys[who], m.town, draft, [m.salt; 16]).unwrap();
+            let id = event.id;
+            m.events.push(event);
+            id
+        }
+        fn append(m: &mut Maker, who: usize, critical: bool, content: Content) -> Id {
+            let parent = m.events.last().unwrap().id;
+            signed(m, who, critical, &content, vec![parent], &[])
+        }
+
+        fn policy_town() -> (Maker, Id) {
+            let mut m = Maker::fresh(GROUP_POLICY, 3, false);
+            let ben = m.invite(0, 1);
+            m.accept(1, ben, None);
+            let device = m.vouch(0, m.events[0].id, 2, None);
+            m.accept(2, device, None);
+            let town = m.entity(kind::TOWN, None, vec![(field::ARCHIVED, Value::Bool(false))]);
+            (m, town)
+        }
+        fn policy(town: Id, n: i64) -> Content { set(vec![change(town, field::POLICY, Value::Int(n))]) }
+        fn archive(town: Id, flag: bool) -> Content { set(vec![change(town, field::ARCHIVED, Value::Bool(flag))]) }
+        fn archive_copy(town: Id, writer: Id, archived: bool) -> Content {
+            Content::Entity { kind: Key::Number(kind::TASK), project: None, derive: None,
+                fields: vec![(field::ARCHIVED, Value::Bool(archived))],
+                copied_from: vec![CopyRef { target_entity: None, target_field: field::ARCHIVED,
+                    sources: vec![CopySource::EntityField { entity: town, field: field::ARCHIVED, writer }] }] }
+        }
+        fn projections(events: &[Event]) -> [State; 2] {
+            let live = checked_fold(events);
+            let restored = State::restore(events, &live.checkpoint(events)).unwrap();
+            assert_eq!(restored, live, "restore reproduces the complete live projection");
+            [live, restored]
+        }
+        fn field_copy(source: Id, field: Key, writer: Id, value: Value) -> Content {
+            let mut copy = entity(kind::TASK, None, vec![(field.clone(), value)]);
+            copies(&mut copy).push(CopyRef { target_entity: None, target_field: field.clone(),
+                sources: vec![CopySource::EntityField { entity: source, field, writer }] });
+            copy
+        }
+        fn concurrent_title_before_a_direct_overwrite_withholds_the_copy() {
+            let mut m = Maker::new();
+            let task = m.entity(kind::TASK, None, vec![]);
+            let rename = |s: &str| set(vec![change(task, field::TITLE, Value::Text(s.into()))]);
+            append(&mut m, 1, false, rename("Ben"));
+            let parallel = m.events.pop().unwrap();
+            append(&mut m, 0, false, chat("Lu", false, None));
+            let writer = append(&mut m, 0, false, rename("Ana"));
+            let copy = append(&mut m, 0, false, field_copy(task, field::TITLE, writer, Value::Text("Ana".into())));
+            for state in projections(&m.events) {
+                assert_eq!(state.field_writer_before(&copy, &task, &field::TITLE), Ok(Some(writer)));
+            }
+            m.events.push(parallel);
+            for state in projections(&m.events) {
+                assert_eq!(state.entities[&task].fields[&field::TITLE].writer, writer);
+                assert!(state.field_writer_before(&copy, &task, &field::TITLE).is_err(),
+                    "a concurrent TITLE below a direct overwrite leaves its prefix uncertified");
+            }
+        }
+        fn checkbox_burst_depends_on_task_creation_at_another_block() {
+            let mut m = Maker::new();
+            let doc = m.entity(kind::DOC, None, vec![]);
+            let root = BreakRef::Root;
+            let text = |ops| Content::Text { doc, ops };
+            let line = append(&mut m, 0, false, text(vec![TextOp::Insert { anchor: root, text: "\n".into() }]));
+            let other = BreakRef::Char(CharId { event: line, index: 0 });
+            let task = append(&mut m, 1, false, entity(kind::TASK, None, vec![]));
+            let parallel = m.events.pop().unwrap();
+            append(&mut m, 0, false, chat("Lu", false, None));
+            let base = m.events.len();
+            let burst = append(&mut m, 0, false, text(vec![
+                TextOp::Attr { at: root, attr: attr::CHECKBOX, value: Value::Text("done".into()) },
+                TextOp::Attr { at: other, attr: attr::TASK, value: Value::Id(task) },
+            ]));
+            let copy = append(&mut m, 0, false, chat("Kit", false, None));
+            for state in projections(&m.events) {
+                assert_eq!(state.doc_attr_state_before(&copy, &doc, root, attr::CHECKBOX), Ok(None));
+            }
+            m.events.push(parallel.clone());
+            for state in projections(&m.events) {
+                assert_eq!(state.docs[&doc].attribute_writer(root, attr::CHECKBOX), Some(burst));
+                assert!(state.doc_attr_state_before(&copy, &doc, root, attr::CHECKBOX).is_err(),
+                    "a link to a concurrently created task changes the validity of the whole checkbox burst");
+            }
+
+            // Same-event link burst: fails closed when `task` is concurrent, certifies when in-past.
+            for in_past_task in [false, true] {
+                m.events.truncate(base);
+                if in_past_task { m.events.push(parallel.clone()); }
+                let known = m.entity(kind::TASK, None, vec![]);
+                let burst = append(&mut m, 0, false, text(vec![
+                    TextOp::Attr { at: root, attr: attr::TASK, value: Value::Id(known) },
+                    TextOp::Attr { at: root, attr: attr::CHECKBOX, value: Value::Text("done".into()) },
+                    TextOp::Attr { at: root, attr: attr::TASK, value: Value::Null },
+                    TextOp::Attr { at: other, attr: attr::TASK, value: Value::Id(task) },
+                ]));
+                let copy = append(&mut m, 0, false, chat("Kit", false, None));
+                if !in_past_task {
+                    for state in projections(&m.events) {
+                        assert_eq!(state.docs[&doc].attribute_writer(root, attr::TASK), None);
+                        assert_eq!(state.tick_link_source(&burst, &known), None);
+                    }
+                    m.events.push(parallel.clone());
+                }
+                let certified = projections(&m.events).map(|state| {
+                    let (source_doc, at, writer) = state.tick_link_source(&burst, &known).unwrap();
+                    assert_eq!((source_doc, at, writer), (doc, root, burst));
+                    assert_eq!(state.doc_attr_state_before(&copy, &doc, root, attr::CHECKBOX).is_ok(), in_past_task);
+                    state.verify_doc_task_link_at_in_past(&copy, &burst, &source_doc, at, &known, &writer)
+                });
+                assert_eq!(certified, [in_past_task; 2],
+                    "a same-event link requires its whole burst to be valid in the copy's past");
+            }
+
+            // Unlink burst with a prior link: both link and status helpers enforce the unlink burst's own validity.
+            for in_past_task in [false, true] {
+                m.events.truncate(base);
+                if in_past_task { m.events.push(parallel.clone()); }
+                let known = m.entity(kind::TASK, None, vec![(field::STATUS, Value::Text("done".into()))]);
+                let link = append(&mut m, 0, false, text(vec![
+                    TextOp::Attr { at: root, attr: attr::TASK, value: Value::Id(known) },
+                ]));
+                let unlink = append(&mut m, 0, false, text(vec![
+                    TextOp::Attr { at: root, attr: attr::TASK, value: Value::Null },
+                    TextOp::Attr { at: other, attr: attr::TASK, value: Value::Id(task) },
+                ]));
+                let copy = append(&mut m, 0, false, chat("Kit", false, None));
+                if !in_past_task { m.events.push(parallel.clone()); }
+                let certified = projections(&m.events).map(|state| (
+                    state.verify_doc_task_link_at_in_past(&copy, &unlink, &doc, root, &known, &link),
+                    state.verify_task_status_at_in_past(&copy, &unlink, &known, &known),
+                ));
+                assert_eq!(certified, [(in_past_task, in_past_task); 2],
+                    "an unlink burst's own task-link validity gates both link and status certification");
+            }
+        }
+        fn cutoff_after_copy_withholds_a_voided_title() {
+            let mut m = Maker::fresh(GROUP_POLICY, 2, false);
+            let seat = m.invite(0, 1);
+            let accept = m.accept(1, seat, None);
+            let title = |s: &str| Value::Text(s.into());
+            let task = m.entity(kind::TASK, None, vec![(field::TITLE, title("v1"))]);
+            let edited = append(&mut m, 1, false, set(vec![change(task, field::TITLE, title("v2"))]));
+            let copy = append(&mut m, 0, false, field_copy(task, field::TITLE, task, title("v1")));
+            let base = m.events.len();
+            for last in [edited, accept] {
+                m.events.truncate(base);
+                m.remove(0, seat, 1, last, None);
+                for state in projections(&m.events) {
+                    assert_eq!(state.void_events.contains_key(&edited), last == accept);
+                    let writer = state.field_writer_before(&copy, &task, &field::TITLE);
+                    let verifies_creation = state.verify_field_writer_at(&copy, &task, &field::TITLE, &task);
+                    if last == edited {
+                        assert_eq!(writer, Ok(Some(edited)));
+                        assert!(!verifies_creation);
+                    } else {
+                        assert_eq!((writer.is_err(), verifies_creation), (true, false),
+                            "voiding an edit after a copy cannot certify the older TITLE");
+                    }
+                }
+            }
+        }
+        fn concurrent_lock_changes_withhold_geometry() {
+            let mut withheld = Vec::new();
+            for initially_locked in [true, false] {
+                let mut m = Maker::new();
+                let card = m.entity(kind::SHAPE, None, vec![(field::X, Value::Int(0)),
+                    (field::LOCKED, Value::Bool(initially_locked))]);
+                let lock = |value| set(vec![change(card, field::LOCKED, Value::Bool(value))]);
+                append(&mut m, 1, false, lock(!initially_locked));
+                let parallel = m.events.pop().unwrap();
+                append(&mut m, 0, false, chat("Lu", false, None));
+                if !initially_locked {
+                    let locked = append(&mut m, 0, false, lock(true));
+                    append(&mut m, 0, false, Content::Undo { of: locked });
+                }
+                let moved = append(&mut m, 0, false, set(vec![change(card, field::X, Value::Int(100))]));
+                let (writer, value) = if initially_locked { (card, 0) } else { (moved, 100) };
+                let copy = append(&mut m, 0, false, field_copy(card, field::X, writer, Value::Int(value)));
+                for state in projections(&m.events) {
+                    assert_eq!(state.field_writer_before(&copy, &card, &field::X), Ok(Some(writer)));
+                }
+                m.events.push(parallel);
+                for state in projections(&m.events) {
+                    assert_eq!(state.entities[&card].fields[&field::X].writer, if initially_locked { moved } else { card });
+                    withheld.push(state.field_writer_before(&copy, &card, &field::X).is_err());
+                }
+            }
+            assert_eq!(withheld, [true; 4], "both the concurrent unlock and the lock behind an in-past undo withhold X");
+        }
+        fn pruned_concurrent_policy_suppressing_town_write_fails_closed() {
+            for creation_undo in [false, true] {
+                let (mut m, town) = policy_town();
+                let prior = append(&mut m, 0, false, archive(town, false));
+                let concurrent = signed(&mut m, 2, true, &policy(town, 1), vec![prior], &[]);
+                let pad = signed(&mut m, 0, false, &chat("Lu", false, None), vec![prior], &[]);
+                let request = if creation_undo { Content::Undo { of: town } } else { archive(town, true) };
+                let suppressed = signed(&mut m, 1, false, &request, vec![pad], &[]);
+                let copy = append(&mut m, 0, false, archive_copy(town, prior, false));
+                let base = m.events.len();
+                for later in [None, Some(policy(town, 1)), Some(Content::Undo { of: concurrent })] {
+                    m.events.truncate(base);
+                    if let Some(op) = &later { append(&mut m, 2, true, op.clone()); }
+                    for state in projections(&m.events) {
+                        assert!(!state.record_before(&copy, &concurrent));
+                        assert!(state.record_before(&copy, &suppressed));
+                        assert!(!state.groups.contains_key(&suppressed));
+                        assert_eq!(state.entities[&town].fields[&field::ARCHIVED].writer, prior);
+                        if later.is_some() { assert!(!state.policy_writes.contains_key(&(concurrent, town))); }
+                        if matches!(later, Some(Content::Undo { .. })) { assert!(state.policy_writes.is_empty()); }
+                        let field = if creation_undo { field::DELETED } else { field::ARCHIVED };
+                        assert!(state.field_writer_before(&copy, &town, &field).is_err(),
+                            "a suppressed town write stays ambiguous after its concurrent policy is pruned");
+                        assert!(!state.verify_field_writer_at(&copy, &town, &field, &prior));
+                        assert!(!state.verify_field_writer_at(&copy, &town, &field, &suppressed));
+                    }
+                }
+            }
+        }
+        fn policy_clear_then_set_enforces_exact_window() {
+            for parallel in [false, true] {
+                let (mut m, town) = policy_town();
+                let first = append(&mut m, 0, false, archive(town, true));
+                let writer = append(&mut m, 0, false, Content::Undo { of: first });
+                let p1 = append(&mut m, 0, true, policy(town, 1));
+                let clear = append(&mut m, 0, true, Content::Undo { of: p1 });
+                if parallel { signed(&mut m, 2, false, &archive(town, false), vec![clear], &[]); }
+                let pad = signed(&mut m, 0, false, &chat("Lu", false, None), vec![clear], &[]);
+                let ben = signed(&mut m, 1, false, &Content::Undo { of: writer }, vec![pad], &[]);
+                if parallel {
+                    let copy = append(&mut m, 0, false, archive_copy(town, writer, false));
+                    for reset in [false, true] {
+                        if reset { append(&mut m, 0, true, policy(town, 1)); }
+                        for state in projections(&m.events) {
+                            assert!(!state.groups.contains_key(&ben));
+                            assert!(state.field_writer_before(&copy, &town, &field::ARCHIVED).is_err(),
+                                "the competing write preempted an authorized undo inside the clear window");
+                            assert!(!state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &writer));
+                        }
+                    }
+                } else {
+                    let p2 = append(&mut m, 0, true, policy(town, 1));
+                    let denied = append(&mut m, 1, false, Content::Undo { of: ben });
+                    let copy = append(&mut m, 0, false, archive_copy(town, ben, true));
+                    for later in [None, Some(Content::Undo { of: p2 }), Some(policy(town, 1))] {
+                        if let Some(op) = later { append(&mut m, 0, true, op); }
+                        for state in projections(&m.events) {
+                            assert!(state.groups.contains_key(&ben) && !state.groups.contains_key(&denied));
+                            assert!(state.field_writer_before(&copy, &town, &field::ARCHIVED) == Ok(Some(ben)),
+                                "the copy keeps the undo authorized between the clear and re-set");
+                            assert!(state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &ben));
+                        }
+                    }
+                }
+            }
+        }
+        fn policy_undo_redo_and_concurrent_policy_undo_races() {
+            let (mut m, town1) = policy_town();
+            let w1 = append(&mut m, 0, false, archive(town1, false));
+            append(&mut m, 0, true, policy(town1, 1));
+            let second = append(&mut m, 0, true, policy(town1, 2));
+            append(&mut m, 0, true, Content::Undo { of: second });
+            let denied1 = append(&mut m, 1, false, Content::Undo { of: w1 });
+            let copy1 = append(&mut m, 0, false, archive_copy(town1, w1, false));
+
+            let town2 = m.entity(kind::TOWN, None, vec![]);
+            let w2 = append(&mut m, 0, false, archive(town2, false));
+            let initial = append(&mut m, 0, true, policy(town2, 1));
+            let clear = append(&mut m, 0, true, Content::Undo { of: initial });
+            let redo = append(&mut m, 0, true, Content::Undo { of: clear });
+            let denied2 = append(&mut m, 1, false, Content::Undo { of: w2 });
+            let copy2 = append(&mut m, 0, false, archive_copy(town2, w2, false));
+
+            let town3 = append(&mut m, 0, true, entity(kind::TOWN, None,
+                vec![(field::POLICY, Value::Int(1)), (field::ARCHIVED, Value::Bool(false))]));
+            let write = append(&mut m, 0, true, archive(town3, true));
+            let w3 = append(&mut m, 0, true, Content::Undo { of: write });
+            let hide = append(&mut m, 0, true, Content::Undo { of: town3 });
+            append(&mut m, 0, true, Content::Undo { of: hide });
+            let denied3 = append(&mut m, 1, false, Content::Undo { of: w3 });
+            let copy3 = append(&mut m, 0, false, archive_copy(town3, w3, false));
+            for later in [false, true] {
+                if later {
+                    append(&mut m, 0, true, Content::Undo { of: redo });
+                    append(&mut m, 0, true, policy(town3, 1));
+                }
+                for state in projections(&m.events) {
+                    for (town, writer, denied, copy) in [(town1, w1, denied1, copy1), (town2, w2, denied2, copy2),
+                        (town3, w3, denied3, copy3)] {
+                        assert!(!state.groups.contains_key(&denied));
+                        assert!(state.field_writer_before(&copy, &town, &field::ARCHIVED) == Ok(Some(writer)),
+                            "an active restored or creation policy still denies the historical undo");
+                        assert!(state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &writer));
+                    }
+                }
+            }
+            for concurrent_clear in [false, true] {
+                let (mut m, town) = policy_town();
+                let writer = append(&mut m, 0, false, archive(town, false));
+                let p1 = append(&mut m, 0, true, policy(town, 1));
+                let op = if concurrent_clear { Content::Undo { of: p1 } } else { policy(town, 1) };
+                let concurrent = signed(&mut m, 2, true, &op, vec![p1], &[]);
+                let pad = signed(&mut m, 0, false, &chat("Lu", false, None), vec![p1], &[]);
+                let parent = if concurrent_clear { pad } else { append(&mut m, 0, true, Content::Undo { of: p1 }) };
+                let ben = signed(&mut m, 1, false, &archive(town, true), vec![parent], &[]);
+                let copy = append(&mut m, 0, false, archive_copy(town, if concurrent_clear { writer } else { ben }, !concurrent_clear));
+                for state in projections(&m.events) {
+                    assert!(!state.record_before(&copy, &concurrent));
+                    assert_eq!(state.groups.contains_key(&ben), concurrent_clear);
+                    if !concurrent_clear { assert!(!state.groups.contains_key(&parent)); }
+                    assert_eq!(state.entities[&town].fields[&field::ARCHIVED].writer, if concurrent_clear { ben } else { writer });
+                    assert!(state.field_writer_before(&copy, &town, &field::ARCHIVED).is_err(),
+                        "a concurrent change to the policy undo window invalidates the copy");
+                    assert!(!state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &writer));
+                    assert!(!state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &ben));
+                }
+            }
+        }
+        fn unlink_checkbox_source_survives_undo_late_tick_and_restore() {
+            use crate::doc::{CheckboxSource, CopiedStatus};
+            // Compare a tick's actual destination on the writer's branch with its
+            // destination after another device's parallel link edit arrives.
+            let mut certified_routed_tick = Vec::new();
+            for linked_on_branch in [true, false] {
+                let mut m = Maker::town(GROUP_POLICY, 3);
+                let task = m.entity(kind::TASK, None, vec![(field::STATUS, Value::Text("done".into()))]);
+                let routing_doc = m.entity(kind::DOC, None, vec![]);
+                let notes = m.entity(kind::DOC, None, vec![]);
+                let attr = |doc, attr, value| Content::Text { doc, ops: vec![TextOp::Attr { at: BreakRef::Root, attr, value }] };
+                let mut status_writer = task;
+                for who in [1, 0] {
+                    let overwrite = append(&mut m, 0, false, set(vec![change(task, field::STATUS, Value::Text("review".into()))]));
+                    status_writer = append(&mut m, who, false, Content::Undo { of: overwrite });
+                }
+                append(&mut m, 0, false, attr(notes, attr::TASK, Value::Id(task)));
+                if !linked_on_branch {
+                    let base = m.events.len();
+                    let root = BreakRef::Root;
+                    let tick = append(&mut m, 0, false, Content::Text { doc: routing_doc, ops: vec![
+                        TextOp::Attr { at: root, attr: attr::TASK, value: Value::Id(task) },
+                        TextOp::Attr { at: root, attr: attr::CHECKBOX, value: Value::Text("open".into()) },
+                    ] });
+                    let unlink = append(&mut m, 0, false, attr(notes, attr::TASK, Value::Null));
+                    let before = append(&mut m, 0, false, chat("Lu", false, None));
+                    for state in projections(&m.events) {
+                        assert!(state.verify_task_status_at_in_past(&before, &unlink, &task, &tick),
+                            "a tick routed by its own in-past link is certified");
+                    }
+                    m.events.truncate(base);
+                }
+                if linked_on_branch { append(&mut m, 0, false, attr(routing_doc, attr::TASK, Value::Id(task))); }
+                let link = if linked_on_branch { Value::Null } else { Value::Id(task) };
+                append(&mut m, 2, false, attr(routing_doc, attr::TASK, link));
+                let concurrent = m.events.pop().unwrap();
+                append(&mut m, 0, false, chat("Kit", false, None));
+                let tick = append(&mut m, 0, false, attr(routing_doc, attr::CHECKBOX, Value::Text("open".into())));
+                let unlink = append(&mut m, 0, false, attr(notes, attr::TASK, Value::Null));
+                let before = append(&mut m, 0, false, chat("Lu", false, None));
+                let writer_on_branch = if linked_on_branch { tick } else { status_writer };
+                for state in projections(&m.events) {
+                    assert_eq!(state.entities[&task].fields[&field::STATUS].writer, writer_on_branch);
+                    assert_eq!(state.field_writer_before(&before, &task, &field::STATUS), Ok(Some(writer_on_branch)));
+                    assert!(state.verify_task_status_at_in_past(&before, &unlink, &task, &writer_on_branch));
+                }
+                m.events.push(concurrent.clone());
+                for state in projections(&m.events) {
+                    assert!(!state.record_before(&before, &concurrent.id));
+                    assert!(state.record_before(&before, &tick));
+                    let merged_writer = if linked_on_branch { status_writer } else { tick };
+                    assert_eq!(state.entities[&task].fields[&field::STATUS].writer, merged_writer);
+                    certified_routed_tick.push(state.verify_task_status_at_in_past(&before, &unlink, &task, &merged_writer));
+                    if !linked_on_branch {
+                        assert_eq!((state.verify_task_status_at_in_past(&before, &unlink, &task, &tick),
+                            state.verify_task_status_at_in_past(&before, &unlink, &task, &status_writer)), (false, false),
+                            "a concurrent routing link withholds both the tick and the prior status writer");
+                    }
+                }
+            }
+            assert_eq!(certified_routed_tick, [false; 4],
+                "a concurrent link change cannot certify a different task status writer at unlink");
+            let mut m = Maker::new();
+            let doc = m.entity(kind::DOC, None, vec![]);
+            let root = BreakRef::Root;
+            let alias = BreakRef::Char(DocState::new(doc).root_id());
+            let text = |s: &str| Value::Text(s.into());
+            let task = m.entity(kind::TASK, None, vec![(field::STATUS, text("done"))]);
+            let other = m.entity(kind::TASK, None, vec![(field::STATUS, text("open"))]);
+            let link = |task| TextOp::Attr { at: root, attr: attr::TASK, value: Value::Id(task) };
+            let tick = |s: &str| TextOp::Attr { at: root, attr: attr::CHECKBOX, value: text(s) };
+            let unlink = || TextOp::Attr { at: root, attr: attr::TASK, value: Value::Null };
+            let burst = |ops| Content::Text { doc, ops };
+            append(&mut m, 0, false, burst(vec![link(task)]));
+            let mut status_writer = task;
+            let mut link_writer = task;
+            for who in [1, 0] {
+                let status = append(&mut m, 0, false, set(vec![change(task, field::STATUS, text("open"))]));
+                status_writer = append(&mut m, who, false, Content::Undo { of: status });
+                let select = append(&mut m, 0, false, burst(vec![link(other)]));
+                link_writer = append(&mut m, who, false, Content::Undo { of: select });
+            }
+            let base = m.events.len();
+            for same_event in [false, true] {
+                m.events.truncate(base);
+                let ops = if same_event { vec![tick("done"), unlink()] } else { vec![unlink()] };
+                let unlinked = append(&mut m, 0, false, burst(ops));
+                append(&mut m, 0, false, burst(vec![TextOp::Attr { at: root, attr: attr::TASK, value: text("Lu") }]));
+                let mut checkbox_writer = unlinked;
+                for who in [1, 0] {
+                    let overwrite = append(&mut m, 0, false, burst(vec![tick("open")]));
+                    checkbox_writer = append(&mut m, who, false, Content::Undo { of: overwrite });
+                }
+                for state in projections(&m.events) {
+                    let block = &state.docs[&doc];
+                    let copied = if same_event { CopiedStatus::SameEventTick { at: root, link_writer } }
+                        else { CopiedStatus::TaskStatus(status_writer) };
+                    let source = CheckboxSource { task, link_writer, status: Some(copied) };
+                    for at in [root, alias] {
+                        assert_eq!(block.attribute(at, attr::CHECKBOX), Some(&text("done")),
+                            "both root keys read the checkbox restored from the unlink");
+                        assert_eq!(block.attribute_writer(at, attr::CHECKBOX), Some(checkbox_writer));
+                        assert_eq!(block.block_checkbox_source(at), Some(source));
+                        assert_eq!(state.doc_attr_state_before(&unlinked, &doc, at, attr::TASK),
+                            Ok(Some((link_writer, Value::Id(task), None))));
+                    }
+                    assert_eq!(state.tick_link_source(&unlinked, &task), same_event.then_some((doc, root, link_writer)));
+                    assert_eq!(state.entities[&task].fields[&field::STATUS].writer, if same_event { unlinked } else { status_writer });
+                    assert!(state.record_before(&unlinked, &link_writer));
+                }
+                append(&mut m, 0, false, burst(vec![link(task)]));
+                for state in projections(&m.events) {
+                    assert!(state.docs[&doc].block_checkbox_source(root).is_none(), "a live link reads the task again");
+                }
+            }
+        }
+        fn field_and_doc_attr_undo_chains_survive_late_arrival_and_restore() {
+            let mut m = Maker::new();
+            let task = m.entity(kind::TASK, None, vec![]);
+            let doc = m.entity(kind::DOC, None, vec![]);
+            let alias = BreakRef::Char(DocState::new(doc).root_id());
+            let write_attr = |value| Content::Text { doc, ops: vec![TextOp::Attr { at: alias, attr: attr::KIND, value }] };
+            for value in [Value::Text("Lu".into()), Value::Null] {
+                let mut f = append(&mut m, 0, false, set(vec![change(task, field::TEXT, value.clone())]));
+                let mut a = append(&mut m, 0, false, write_attr(value.clone()));
+                let mut hops = Vec::new();
+                for who in [1, 0] {
+                    let prior = (f, a);
+                    let overwrite = append(&mut m, 0, false, set(vec![change(task, field::TEXT, Value::Text("Kit".into()))]));
+                    f = append(&mut m, who, false, Content::Undo { of: overwrite });
+                    let overwrite = append(&mut m, 0, false, write_attr(Value::Text("heading1".into())));
+                    a = append(&mut m, who, false, Content::Undo { of: overwrite });
+                    hops.push((f, a, prior));
+                }
+                let before = append(&mut m, 0, false, chat("Ana", false, None));
+                for state in projections(&m.events) {
+                    assert_eq!(state.field_writer_before(&before, &task, &field::TEXT), Ok(Some(f)));
+                    for &(undo, attr_undo, (prev, prev_attr)) in &hops {
+                        assert_eq!(state.field_undo_prev(&undo, &task, &field::TEXT), Some(prev));
+                        assert_eq!(state.doc_attr_undo_prev(&doc, &attr_undo, alias, attr::KIND), Some(prev_attr));
+                    }
+                    if value == Value::Null { assert_eq!(state.cleared_field_writer(&task, &field::TEXT), Some(f)); }
+                    for at in [BreakRef::Root, alias] {
+                        assert_eq!(state.doc_attr_state_before(&before, &doc, at, attr::KIND), Ok(Some((a, value.clone(), None))));
+                        assert_eq!(state.docs[&doc].attribute_writer(at, attr::KIND), Some(a),
+                            "both root keys preserve the last document undo writer, including explicit clears");
+                    }
+                }
+            }
+        }
+        unlink_checkbox_source_survives_undo_late_tick_and_restore();
+        concurrent_title_before_a_direct_overwrite_withholds_the_copy();
+        checkbox_burst_depends_on_task_creation_at_another_block();
+        cutoff_after_copy_withholds_a_voided_title();
+        concurrent_lock_changes_withhold_geometry();
+        field_and_doc_attr_undo_chains_survive_late_arrival_and_restore();
+        policy_undo_redo_and_concurrent_policy_undo_races();
+        policy_clear_then_set_enforces_exact_window();
+        pruned_concurrent_policy_suppressing_town_write_fails_closed();
+
+        // An undo can be in the copy's past without being allowed to change its source field.
+        // Exercise creation, issue ownership and the policy in force at the time of the undo.
+        fn policy_refresh_after_copy_keeps_historical_undo_denied() {
+            let mut history = Maker::new();
+            let task = history.entity(kind::TASK, None, vec![(field::TITLE, Value::Text("Lu".into()))]);
+            let hide = append(&mut history, 0, false, Content::Undo { of: task });
+            append(&mut history, 1, false, Content::Undo { of: hide });
+            let issue = history.entity(kind::ISSUE, None, vec![]);
+            let text = history.set(vec![change(issue, field::TEXT, Value::Text("Kit".into()))]);
+            append(&mut history, 1, false, Content::Undo { of: text });
+
+            let town = history.entity(kind::TOWN, None, vec![(field::ARCHIVED, Value::Bool(false))]);
+            let archive = || set(vec![change(town, field::ARCHIVED, Value::Bool(true))]);
+            let first = append(&mut history, 0, false, archive());
+            append(&mut history, 1, false, Content::Undo { of: first });
+            let second = append(&mut history, 0, false, archive());
+            let writer = append(&mut history, 0, false, Content::Undo { of: second });
+            let members_policy = || set(vec![change(town, field::POLICY, Value::Int(1))]);
+            append(&mut history, 0, true, members_policy());
+            let denied = append(&mut history, 1, false, Content::Undo { of: writer });
+            let copy = append(&mut history, 0, false, Content::Entity {
+                kind: Key::Number(kind::TASK), project: None, derive: None,
+                fields: vec![(field::ARCHIVED, Value::Bool(false))],
+                copied_from: vec![CopyRef { target_entity: None, target_field: field::ARCHIVED,
+                    sources: vec![CopySource::EntityField { entity: town, field: field::ARCHIVED, writer }] }],
+            });
+            let mut verified = Vec::new();
+            for refresh in [false, true] {
+                if refresh { append(&mut history, 0, true, members_policy()); }
+                for state in projections(&history.events) {
+                    assert!(state.verify_field_writer_at(&copy, &task, &field::TITLE, &task),
+                        "resurrection preserves the creation TITLE");
+                    assert!(state.verify_field_writer_at(&copy, &issue, &field::TEXT, &text),
+                        "Ben could not undo Ana's ISSUE.TEXT");
+                    assert!(state.record_before(&copy, &denied) && !state.groups.contains_key(&denied));
+                    assert_eq!(state.entities[&town].fields[&field::ARCHIVED].writer, writer);
+                    verified.push(state.verify_field_writer_at(&copy, &town, &field::ARCHIVED, &writer));
+                    assert!(state.field_writer_before(&copy, &town, &field::ARCHIVED) == Ok(Some(writer)),
+                        "the archived writer is stable after a policy refresh");
+                }
+            }
+            assert_eq!(verified, [true; 4], "refreshing POLICY after a copy preserves its historical undo permission");
+        }
+        policy_refresh_after_copy_keeps_historical_undo_denied();
+
+        let mut m = Maker::fresh(GROUP_POLICY, 3, false);
+        let genesis = m.events[0].id;
+        let founder = m.keys[0].public();
+        let ben = m.keys[1].public();
+        let seat = m.invite(0, 1);
+        m.accept(1, seat, None);
+        let device = m.vouch(0, genesis, 2, None);
+        m.accept(2, device, None);
+
+        // The signed order is independent of canonicalization for the index.
+        let record = CopySource::Record(genesis);
+        let doc_line = |events| CopySource::DocLine { doc: genesis, events };
+        let field_source = |field| CopySource::EntityField { entity: seat, field, writer: genesis };
+        let sources = vec![CopySource::SharePeer { peer: ben }, doc_line(vec![]), record.clone(),
+            field_source(Key::Name("colour".into())), field_source(field::TITLE), doc_line(vec![seat, genesis, seat])];
+        let reference = |target_entity, target_field, sources| CopyRef { target_entity, target_field, sources };
+        let at = CharId { event: genesis, index: 0 };
+        for (base, version, target) in [
+            (entity(kind::TASK, None, vec![]), 1, None),
+            (Content::Entity { kind: Key::Number(kind::TASK), project: None, derive: Some((genesis, at)),
+                fields: vec![], copied_from: vec![] }, 2, None),
+            (Content::Entity { kind: Key::Name("Card".into()), project: None, derive: None,
+                fields: vec![], copied_from: vec![] }, 3, None),
+            (set(vec![change(seat, field::TEXT, Value::Null)]), 1, Some(seat)),
+            (set(vec![change(seat, Key::Name("colour".into()), Value::Literal("red".into()))]), 2, Some(seat)),
+        ] {
+            let mut content = base.clone();
+            copies(&mut content).push(reference(target, field::TITLE, sources.clone()));
+            copies(&mut content).push(reference(target, field::TEXT, vec![record.clone()]));
+            assert_eq!(content.version(), version);
+            let bytes = content.encode();
+            let decoded = Content::decode(content.kind(), version, &bytes).unwrap();
+            assert_eq!(decoded, content);
+            assert_eq!(decoded.encode(), bytes);
+            let stripped = event::fields(&bytes).unwrap().into_iter().filter(|f| f.0 != TAG_COPIED_FROM)
+                .fold(FieldWriter::default(), |w, (tag, data)| w.bytes(tag, data)).finish();
+            assert_eq!(stripped, base.encode());
+            if version == 3 || (target.is_some() && version == 2) {
+                let shape = |c: &Content| Event::create(&m.keys[0], m.town, Draft { kind: c.kind(), kind_version: version,
+                    critical: false, actor: Actor::Human, via: Via::Ui, wall_ms: 0, parents: vec![genesis], content: &c.encode() },
+                    [0; 16]).unwrap().header.shape.unwrap();
+                assert_eq!(shape(&content), shape(&base));
+            }
+            copies(&mut content)[0].target_field = Key::Name("colour".into());
+            assert_eq!(content.version(), if target.is_some() { 2 } else { 3 });
+            assert_eq!(Content::decode(content.kind(), content.version(), &content.encode()), Some(content));
+        }
+        let mut refs = vec![reference(Some(seat), field::TEXT, vec![record.clone()]),
+            reference(None, field::TITLE, vec![doc_line(vec![seat, genesis, seat]), record.clone()]),
+            reference(None, field::TITLE, vec![record.clone(), doc_line(vec![])]),
+            reference(None, field::Z, vec![])];
+        normalize_copy_refs(&mut refs);
+        let mut sorted = vec![genesis, seat];
+        sorted.sort_unstable();
+        assert_eq!(refs, [reference(None, field::TITLE, vec![record.clone(), doc_line(vec![]), doc_line(sorted)]),
+            reference(Some(seat), field::TEXT, vec![record.clone()])]);
+
+        for is_set in [false, true] {
+            let base = if is_set { set(vec![]) } else { entity(kind::TASK, None, vec![]) };
+            let target = || if is_set { FieldWriter::default().bytes(1, &seat) } else { FieldWriter::default() };
+            let number = || target().bytes(2, &[1, 0]);
+            let source = |kind, id: &[u8]| FieldWriter::default().bytes(1, &[kind]).bytes(2, id);
+            let valid = source(1, &genesis).finish();
+            let wrong_target = if is_set { FieldWriter::default() } else { FieldWriter::default().bytes(1, &seat) };
+            let mut bad_refs = vec![wrong_target.bytes(2, &[1, 0]).bytes(4, &valid).finish(), number().finish(),
+                number().text(3, "name").bytes(4, &valid).finish(), number().bytes(2, &[1, 0]).bytes(4, &valid).finish(),
+                target().bytes(2, &[1]).bytes(4, &valid).finish(), target().bytes(3, &[0xff]).bytes(4, &valid).finish(),
+                target().text(3, "name").text(3, "again").bytes(4, &valid).finish()];
+            if is_set { bad_refs.push(number().bytes(1, &seat).bytes(4, &valid).finish()); }
+            for invalid in [
+                source(5, &genesis), source(1, &genesis).bytes(1, &[1]), source(1, &genesis).bytes(2, &seat),
+                source(1, &genesis).bytes(6, &seat), source(2, &seat).bytes(5, &genesis),
+                source(2, &seat).bytes(3, &[1, 0]).text(4, "name").bytes(5, &genesis),
+                source(2, &seat).bytes(3, &[1, 0]).bytes(3, &[1, 0]).bytes(5, &genesis),
+                source(2, &seat).text(4, "name").text(4, "name").bytes(5, &genesis),
+                source(2, &seat).text(4, "name").bytes(5, &genesis).bytes(5, &seat),
+                source(2, &seat).text(4, "name").bytes(5, &genesis).bytes(6, &seat),
+                source(3, &seat).bytes(6, &[1]), source(3, &seat).bytes(5, &genesis),
+                source(4, &[4; 64]), source(4, &[3; 65]), source(4, &ben).bytes(6, &seat),
+            ] { bad_refs.push(number().bytes(4, &invalid.finish()).finish()); }
+            for version in [1, if is_set { 2 } else { 3 }] {
+                let decode = |r: &[u8]| Content::decode(base.kind(), version,
+                    &[base.encode(), FieldWriter::default().bytes(TAG_COPIED_FROM, r).finish()].concat());
+                for r in &bad_refs { assert_eq!(decode(r), None, "malformed copy for kind {} v{version}", base.kind()); }
+                assert_eq!(decode(&target().text(3, "name").bytes(4, &valid).finish()).is_some(), version != 1);
+                let future = number().bytes(4, &source(1, &genesis).bytes(7, b"future").finish()).bytes(5, b"future").finish();
+                assert!(decode(&future).is_some(), "unknown higher tags remain skippable");
+            }
+        }
+        assert_eq!(Content::decode(event::kind::INTAKE, 1, &[]), None);
+        for key in [field::GH_REPO, field::GH_STATE, field::GH_FOLDER, field::GH_FILTER] {
+            assert!(key.accepts(&Value::Text("open".into())) && key.accepts(&Value::Null) && !key.accepts(&Value::Int(1)));
+        }
+        assert!(field::GH_NUMBER.accepts(&Value::Int(1)) && field::GH_NUMBER.accepts(&Value::Null)
+            && !field::GH_NUMBER.accepts(&Value::Text("1".into())));
+        assert!(field::POLICY.accepts(&Value::Int(2)) && !field::POLICY.accepts(&Value::Null));
+        for key in [field::GH_TITLE, field::GH_BODY, field::COPIED_FROM] {
+            for value in [Value::Null, Value::Int(1), Value::Text("title".into())] { assert!(!key.accepts(&value)); }
+        }
+
+        // Entity and document undo chains retain the author of each restored live value.
+        let project = m.entity(kind::PROJECT, None, vec![]);
+        let doc = m.entity(kind::DOC, Some(project), vec![]);
+        let mut create = entity(kind::TASK, Some(project), vec![(field::TITLE, Value::Text("first".into())),
+            (field::PROPOSED, Value::Bool(true)), (field::GH_BODY, Value::Text("reserved".into()))]);
+        *copies(&mut create) = vec![reference(None, field::TITLE, vec![record.clone(), record.clone()]),
+            reference(None, field::GH_BODY, vec![record.clone()]), reference(None, field::Z, vec![record.clone()])];
+        let task = m.add(0, Actor::Human, create, None);
+        let mut edit = set(vec![change(task, field::TITLE, Value::Text("second".into())),
+            change(task, field::POLICY, Value::Int(2))]);
+        *copies(&mut edit) = vec![reference(Some(task), field::TITLE, vec![field_source(field::TITLE)]),
+            reference(Some(task), field::POLICY, vec![record.clone()]), reference(Some(seat), field::TITLE, vec![record.clone()])];
+        let b = m.add(1, Actor::Human, edit, None);
+        let check_title = |m: &Maker, writer, origin, title: &str| {
+            assert_eq!(fold(&m.events).entities[&task].fields[&field::TITLE],
+                FieldState { value: Value::Text(title.into()), writer, origin });
+        };
+        let undo = m.undo(b);
+        check_title(&m, undo, task, "first");
+        let redo = m.undo(undo);
+        check_title(&m, redo, b, "second");
+        let clear = m.set(vec![change(task, field::TITLE, Value::Null)]);
+        let undo_clear = m.undo(clear);
+        check_title(&m, undo_clear, b, "second");
+        let redo_clear = m.undo(undo_clear);
+        assert_eq!(fold(&m.events).entities[&task].value(field::TITLE), None);
+        let restore = m.undo(redo_clear);
+        check_title(&m, restore, b, "second");
+
+        let root = BreakRef::Root;
+        let attribute = |attr, value| TextOp::Attr { at: root, attr, value };
+        let burst = |ops| Content::Text { doc, ops };
+        let first = m.add(0, Actor::Human, burst(vec![TextOp::Insert { anchor: root, text: "aa\n".into() },
+            attribute(attr::KIND, Value::Int(1)), attribute(attr::CHECKBOX, Value::Text("open".into()))]), None);
+        let second = m.add(1, Actor::Human, burst(vec![TextOp::Insert { anchor: root, text: "bb".into() },
+            attribute(attr::KIND, Value::Int(2))]), None);
+        let check_attr = |m: &Maker, writer, origin| {
+            let state = fold(&m.events);
+            assert_eq!(state.docs[&doc].attribute_writer(root, attr::KIND), Some(writer));
+            assert_eq!(state.docs[&doc].attribute_origin(root, attr::KIND), origin);
+        };
+        let undo = m.undo(second);
+        check_attr(&m, undo, Some(first));
+        let redo = m.undo(undo);
+        check_attr(&m, redo, Some(second));
+        let clear = m.add(0, Actor::Human, burst(vec![attribute(attr::KIND, Value::Null)]), None);
+        let undo = m.undo(clear);
+        check_attr(&m, undo, Some(second));
+        let redo = m.undo(undo);
+        check_attr(&m, redo, None);
+        let restored = m.undo(redo);
+        check_attr(&m, restored, Some(second));
+        let state = fold(&m.events);
+        let mut origins = vec![first, second];
+        origins.sort_unstable();
+        let line = &state.docs[&doc];
+        assert_eq!(line.block_attr_origins(root), origins);
+        assert_eq!(line.block_run_events(root), Some(origins));
+        let newline = CharId { event: first, index: 2 };
+        assert_eq!(line.block_run_events(BreakRef::Char(newline)), Some(vec![]));
+        assert_eq!(line.block_run_events(BreakRef::Char(CharId { event: first, index: 0 })), None);
+        m.add(1, Actor::Human, burst(vec![TextOp::Delete { from: newline, to: newline }]), None);
+        assert_eq!(fold(&m.events).docs[&doc].block_run_events(BreakRef::Char(newline)), None);
+
+        assert_eq!(state.copied_from(task, task, &field::TITLE), [record.clone()]);
+        assert_eq!(state.copied_from(b, task, &field::TITLE), [field_source(field::TITLE)]);
+        for (writer, entity, key) in [(task, task, field::GH_BODY), (task, task, field::Z),
+            (b, task, field::POLICY), (b, seat, field::TITLE)] {
+            assert!(state.copied_from(writer, entity, &key).is_empty());
+        }
+
+        // Seat, profile, visibility and service facts come from the signed fold.
+        let profile = |name: &str| Content::Profile { name: name.into(), colour: 1 };
+        m.add(0, Actor::Human, profile("Ana"), None);
+        let latest = m.add(0, Actor::Human, profile("Lu"), None);
+        let void = m.add(1, Actor::Ai, profile("Kit"), None);
+        let state = fold(&m.events);
+        assert_eq!(state.profiles[&founder].writer, latest);
+        assert_eq!(state.founder_seat(), Some(genesis));
+        assert!(!state.is_intake(&ben) && !state.is_intake(&[0; 65]));
+        let mut intake = state.clone();
+        intake.membership.seats.seats.get_mut(&seat).unwrap().role = 1;
+        assert!(intake.is_intake(&ben));
+        assert_eq!(state.record_meta(&void), Some(RecordMeta { author: ben, actor: Actor::Ai, via: Via::Ui,
+            kind: event::kind::PROFILE, void: true, readable: true }));
+        assert_eq!(state.record_meta(&latest), Some(RecordMeta { author: founder, actor: Actor::Human, via: Via::Ui,
+            kind: event::kind::PROFILE, void: false, readable: true }));
+        assert_eq!(state.record_meta(&[0; 32]), None);
+        assert!(state.entity_is_visible(&task) && state.doc_is_visible(&doc));
+        assert!(!state.doc_is_visible(&task) && !state.entity_is_visible(&[0; 32]));
+        let hide = m.set(vec![change(project, field::DELETED, Value::Bool(true))]);
+        let state = fold(&m.events);
+        assert!(!state.entity_is_visible(&task) && !state.doc_is_visible(&doc));
+        m.undo(hide);
+        let alias = m.entity(kind::TASK, Some(project), vec![]);
+        m.add(0, Actor::Human, merge_task(task, alias), None);
+        m.add(1, Actor::Human, merge_task(alias, task), None);
+        let state = fold(&m.events);
+        assert!(state.entity_is_visible(&task) && !state.entity_is_visible(&alias));
+
+        let session = [3; 16];
+        m.add(0, Actor::Human, Content::Session(SessionOp::Open { session, to: vec![], town_wide: true, mode: SessionMode::Call { video: false } }), None);
+        for (job, failed) in [([1; 16], false), ([2; 16], true)] {
+            let request = m.add(0, Actor::Human, Content::Request { job, session, service: Service::Tasks,
+                project: Some(project), provider: ben }, None);
+            let expected = ServiceJobMeta { session, project: Some(project), requester: founder, provider: ben,
+                request, report_writer: None };
+            assert_eq!(fold(&m.events).service_job_meta(&job), Some(expected));
+            m.add(1, Actor::Human, Content::Taken { job }, None);
+            assert_eq!(fold(&m.events).service_job_meta(&job), Some(expected));
+            let done = Content::Done { job, text: "complete".into() };
+            let report = m.add(1, Actor::Human, if failed { Content::Failed { job, why: Failure::Interrupted } } else { done.clone() }, None);
+            m.add(1, Actor::Human, done, None);
+            assert_eq!(fold(&m.events).service_job_meta(&job), Some(ServiceJobMeta { report_writer: Some(report), ..expected }));
+        }
+
+        // Skipped signed bytes on a critical event, and unsupported town tiers, close the gate.
+        let extra = FieldWriter::default().bytes(63, &[1]).finish();
+        let parent = m.events.last().unwrap().id;
+        let partial = signed(&mut m, 0, false, &chat("partial", false, None), vec![parent], &extra);
+        let critical = signed(&mut m, 0, true, &chat("critical", false, None), vec![partial], &extra);
+        let state = fold(&m.events);
+        assert_eq!(state.partial, [partial]);
+        assert_eq!(state.unknown_critical, [critical]);
+        let mut header = m.events[0].header.clone();
+        let body = [vec![0; 16], Content::Town { policy: GROUP_POLICY, tier: 1 }.encode()].concat();
+        header.body_hash = makepad_network::digest::sha256_hash(&body);
+        let bytes = header.encode();
+        let town = Event::genesis_town(&bytes);
+        let sig = m.keys[0].sign(crate::key::Domain::Event, &[town.as_slice(), &bytes].concat()).unwrap();
+        let future = Event::from_parts(town, bytes, body, sig).unwrap();
+        let id = future.id;
+        let state = fold(&[future]);
+        assert_eq!(state.unknown_critical, [id]);
+        assert_eq!((state.founder_seat(), state.seat_of(&founder)), (None, None));
+
+        // POLICY and policy-entity visibility require a critical write by the founder seat.
+        let policy = |town, value| set(vec![change(town, field::POLICY, Value::Int(value))]);
+        for (who, critical, kind, scope) in [
+            (1, false, kind::TOWN, None), (1, true, kind::TOWN, None), (0, false, kind::TOWN, None),
+            (0, true, kind::PROJECT, None), (0, true, kind::TOWN, Some(project)),
+        ] {
+            let e = append(&mut m, who, critical, entity(kind, scope, vec![(field::POLICY, Value::Int(2))]));
+            append(&mut m, who, critical, policy(e, 2));
+            let state = fold(&m.events);
+            assert_eq!(state.entities[&e].value(field::POLICY), None);
+            assert!(state.policy_writes.is_empty());
+            assert_eq!(state.town_policy, TownPolicy::Members);
+        }
+        let town = append(&mut m, 0, true, entity(kind::TOWN, None, vec![(field::POLICY, Value::Int(1))]));
+        assert_eq!(fold(&m.events).policy_writes.get(&(town, town)), Some(&Value::Int(1)));
+        let deny = append(&mut m, 0, true, policy(town, 2));
+        for (who, critical) in [(0, false), (1, true), (1, false)] {
+            append(&mut m, who, critical, set(vec![change(town, field::ARCHIVED, Value::Bool(true)),
+                change(town, field::DELETED, Value::Bool(true))]));
+            append(&mut m, who, critical, Content::Undo { of: deny });
+            append(&mut m, who, critical, Content::Undo { of: town });
+        }
+        let state = fold(&m.events);
+        assert!(state.entity_is_visible(&town));
+        assert_eq!(state.town_policy, TownPolicy::Unreadable);
+        let undo = append(&mut m, 2, true, Content::Undo { of: deny });
+        let state = fold(&m.events);
+        assert_eq!(state.entities[&town].fields[&field::POLICY],
+            FieldState { value: Value::Int(1), writer: undo, origin: town });
+        assert_eq!(state.town_policy, TownPolicy::Members);
+
+        // The Members write sorts last at equal height, but cannot supersede an unseen sibling.
+        let restrictive = signed(&mut m, 0, true, &policy(town, 2), vec![undo], &[]);
+        let members = signed(&mut m, 2, true, &policy(town, 1), vec![undo], &[]);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.entities[&town].value(field::POLICY), Some(&Value::Int(1)));
+        assert_eq!(state.policy_writes, [((restrictive, town), Value::Int(2)), ((members, town), Value::Int(1))].into());
+        assert_eq!(state.town_policy, TownPolicy::Unreadable);
+        let resolve = signed(&mut m, 0, true, &policy(town, 1), vec![members, restrictive], &[]);
+        let state = fold(&m.events);
+        assert_eq!(state.policy_writes, [((resolve, town), Value::Int(1))].into());
+        assert_eq!(state.town_policy, TownPolicy::Members);
+        append(&mut m, 0, true, policy(town, 2));
+        let hide = append(&mut m, 0, true, set(vec![change(town, field::DELETED, Value::Bool(true))]));
+        assert_eq!(fold(&m.events).town_policy, TownPolicy::Members);
+        append(&mut m, 0, true, Content::Undo { of: hide });
+        assert_eq!(fold(&m.events).town_policy, TownPolicy::Unreadable);
+
+        // Deliver a linked checkbox edit after the concurrent unlink. Partial task replay
+        // must recover the same provenance under the derived task id as a full board replay.
+        let marker = DocState::new(doc).root_id();
+        let derived = crate::entity::derived_task(doc, marker);
+        let source = CopySource::DocLine { doc, events: vec![first, second] };
+        let convert = m.add(0, Actor::Human, Content::Entity { kind: Key::Number(kind::TASK), project: Some(project),
+            derive: Some((doc, marker)), fields: vec![(field::TITLE, Value::Text("line".into()))],
+            copied_from: vec![reference(None, field::TITLE, vec![source])] }, None);
+        let mut update = set(vec![change(derived, field::TEXT, Value::Text("copied".into()))]);
+        copies(&mut update).push(reference(Some(derived), field::TEXT, vec![record.clone()]));
+        let update = m.add(0, Actor::Human, update, None);
+        let tick = m.add(0, Actor::Human, burst(vec![attribute(attr::CHECKBOX, Value::Text("done".into()))]), Some(vec![update]));
+        m.add(1, Actor::Human, burst(vec![attribute(attr::TASK, Value::Null)]), Some(vec![update]));
+        let state = checked_fold(&m.events);
+        let mut late = State::default();
+        for e in m.events.iter().filter(|e| e.id != tick) { late.receive(e); }
+        late.receive(m.events.iter().find(|e| e.id == tick).unwrap());
+        assert_eq!(late, state);
+        let mut events = vec![first, second];
+        events.sort_unstable();
+        assert_eq!(state.copied_from(convert, derived, &field::TITLE), [CopySource::DocLine { doc, events }]);
+        assert!(state.copied_from(convert, convert, &field::TITLE).is_empty());
+        assert_eq!(state.copied_from(update, derived, &field::TEXT), [record]);
+        let restored = State::restore(&m.events, &state.checkpoint(&m.events)).unwrap();
+        for projection in [&state, &late, &restored] {
+            let expected: BTreeMap<_, _> = projection.conversions.iter()
+                .map(|(&creator, &(_, _, task))| (task, creator)).collect();
+            assert_eq!(projection.derived_task_creators, expected,
+                "derived_task_index_matches_conversions_across_replay_and_restore");
+            let meta = Some(DerivedTaskMeta { doc, task: derived, creator: convert, at: BreakRef::Root });
+            assert_eq!(projection.derived_task_meta(&derived), meta, "task id resolves the signed conversion");
+            assert_eq!(projection.derived_task_meta(&convert), meta, "creator id resolves the same conversion");
+        }
+        assert_eq!(restored, state, "the checkpoint round trip preserves the entire projection");
     }
 
     #[test]
@@ -2293,7 +4225,7 @@ pub(crate) mod tests {
         let provider = m.keys[1].public();
         let session = [2; 16];
         let other = [3; 16];
-        let ring = |session| Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: false }, to: vec![] });
+        let ring = |session| Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: false }, to: vec![], town_wide: true });
         let anchor = m.add(0, human, ring(session), None);
         let job = [9; 16];
         let project = Some([4; 32]);
@@ -2380,6 +4312,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn group_call_rejoin_restores_active_participant_and_keeps_call_open() {
+        let mut m = Maker::town(2, 3);
+        let mut state = fold(&m.events);
+        let (a, b, c) = (m.keys[0].public(), m.keys[1].public(), m.keys[2].public());
+        let to = vec![state.seat_of(&b).unwrap(), state.seat_of(&c).unwrap()];
+        let call = [1; 16];
+        let share = [2; 16];
+        let leave = |session| SessionOp::Leave { session, secs: None, why: LeaveWhy::Ended };
+        let join = |session| SessionOp::Join { session };
+        let add = |m: &mut Maker, state: &mut State, who, op| {
+            m.add(who, Actor::Human, Content::Session(op), None);
+            state.receive(m.events.last().unwrap());
+        };
+        add(&mut m, &mut state, 0, SessionOp::Open { session: call, mode: SessionMode::Call { video: false }, to: to.clone(), town_wide: true });
+        for (who, op) in [(1, join(call)), (2, join(call)), (0, leave(call)), (0, join(call)),
+            (1, leave(call)), (1, join(call)), (2, leave(call))] {
+            add(&mut m, &mut state, who, op);
+        }
+        assert!(!state.session_summary(&call, None).unwrap().ended, "two rejoined callers keep the call live");
+        assert_eq!(state.active_participants(&call), [a, b], "the last enter or leave of each device decides presence");
+        assert_eq!(State::restore(&m.events, &state.checkpoint(&m.events)), Some(state.clone()), "a live rejoined call survives a checkpoint");
+        for who in [0, 1] { add(&mut m, &mut state, who, leave(call)); }
+        assert!(state.session_summary(&call, None).unwrap().ended, "the final departures end the rejoined call");
+        assert!(state.active_participants(&call).is_empty(), "the ended call has no active participant");
+        assert_eq!(State::restore(&m.events, &state.checkpoint(&m.events)), Some(state.clone()), "the final leaves survive a checkpoint");
+
+        add(&mut m, &mut state, 0, SessionOp::Open { session: share, mode: SessionMode::Share { title: "Drawing".into() }, to, town_wide: true });
+        for (who, op) in [(1, join(share)), (0, leave(share)), (0, join(share))] { add(&mut m, &mut state, who, op); }
+        assert!(state.session_summary(&share, None).unwrap().ended, "rejoining cannot restart a share after the sharer left");
+        assert!(state.active_participants(&share).is_empty(), "an ended share stays empty after a rejoin");
+    }
+
+    #[test]
     fn group_call_stays_open_when_opener_leaves_with_two_remaining() {
         let mut m = Maker::town(2, 3);
         let mut state = fold(&m.events);
@@ -2393,7 +4358,7 @@ pub(crate) mod tests {
             state.receive(m.events.last().unwrap());
         };
         for (session, mode) in [(call, SessionMode::Call { video: false }), (share, SessionMode::Share { title: "Drawing".into() })] {
-            add(&mut state, 0, SessionOp::Open { session, mode, to: to.clone() });
+            add(&mut state, 0, SessionOp::Open { session, mode, to: to.clone(), town_wide: true });
             for who in [1, 2] { add(&mut state, who, SessionOp::Join { session }); }
             add(&mut state, 0, SessionOp::Leave { session, secs: None, why: LeaveWhy::Ended });
         }
@@ -2406,6 +4371,62 @@ pub(crate) mod tests {
             assert_eq!(state.session_summary(&call, None).unwrap().ended, remaining.is_empty(), "the call ends on the last departure");
             assert_eq!(state.active_participants(&call), remaining, "each departure removes that caller");
         }
+    }
+
+    #[test]
+    fn town_wide_open_admits_post_open_member_without_missed_call() {
+        let mut m = Maker::fresh(2, 3, false);
+        let (ana, kit) = (m.keys[0].public(), m.keys[2].public());
+        let ana_seat = m.events[0].id;
+        let ada_seat = m.invite(0, 1);
+        m.accept(1, ada_seat, None);
+        let (wide, card, old_wide, empty_untagged) = ([1; 16], [2; 16], [3; 16], [4; 16]);
+        let leave = |session| Content::Session(SessionOp::Leave { session, secs: None, why: LeaveWhy::Ended });
+        for (session, to, town_wide) in [
+            (wide, vec![ada_seat], true), (card, vec![ada_seat], false),
+            (old_wide, vec![ada_seat], true), (empty_untagged, vec![], false),
+        ] {
+            m.add(0, Actor::Human, Content::Session(SessionOp::Open {
+                session, mode: SessionMode::Call { video: false }, to, town_wide,
+            }), None);
+        }
+        m.add(0, Actor::Human, leave(old_wide), None);
+        let kit_seat = m.invite(0, 2);
+        m.accept(2, kit_seat, None);
+        for (who, session) in [(2, wide), (2, card), (1, empty_untagged), (2, empty_untagged)] {
+            m.add(who, Actor::Human, Content::Session(SessionOp::Join { session }), None);
+            m.add(who, Actor::Human, Content::Said { session, lines: vec![
+                crate::event::SaidLine { at_ms: 0, dur_ms: 1, text: "hello".into() },
+            ] }, None);
+            if session == empty_untagged {
+                m.add(who, Actor::Human, Content::Session(SessionOp::Decline { session, why: DeclineWhy::Declined }), None);
+            }
+        }
+        let state = checked_fold(&m.events);
+        for (session, town_wide) in [(wide, true), (card, false), (old_wide, true)] {
+            let summary = state.session_summary(&session, Some(kit_seat)).unwrap();
+            assert_eq!((summary.town_wide, summary.viewer), (town_wide, Seen::Other),
+                "the signed scope survives and Kit was never rung on {session:?}");
+        }
+        assert_eq!(state.participants(&wide), [ana, kit], "a new member can join a town-wide call");
+        assert_eq!(state.said(&wide).iter().map(|line| (line.author, line.text)).collect::<Vec<_>>(),
+            [(kit, "hello")], "the new participant's transcript is counted");
+        assert_eq!(state.participants(&card), [ana], "Kit cannot join the card call");
+        assert!(state.said(&card).is_empty(), "Kit cannot add a line to the card call");
+        assert_eq!(state.session_summary(&old_wide, Some(kit_seat)).unwrap().outcome, Outcome::Unanswered,
+            "the earlier town-wide call ended unanswered");
+        assert_eq!(state.participants(&empty_untagged), [ana], "an untagged empty audience admits only the opener");
+        assert!(state.said(&empty_untagged).is_empty(), "neither uninvited member's lines count");
+        for (seat, role) in [(ana_seat, Seen::Opener), (ada_seat, Seen::Other), (kit_seat, Seen::Other)] {
+            let summary = state.session_summary(&empty_untagged, Some(seat)).unwrap();
+            assert_eq!((summary.viewer, summary.town_wide, summary.outcome), (role, false, Outcome::Pending),
+                "an untagged empty audience rings nobody and counts neither decline");
+        }
+        assert_eq!(State::restore(&m.events, &state.checkpoint(&m.events)), Some(state),
+            "a checkpoint restores the signed scopes and folded sessions");
+        m.add(0, Actor::Human, leave(empty_untagged), None);
+        assert_eq!(fold(&m.events).session_summary(&empty_untagged, Some(kit_seat)).unwrap().outcome,
+            Outcome::Unanswered, "only the opener's departure ends the untagged call");
     }
 
     #[test]
@@ -2425,7 +4446,7 @@ pub(crate) mod tests {
         let first_chat = m.add(0, human, chat("before", false, None), None);
         let inputs = fold(&m.events).agent_inputs;
         let call = [1; 16];
-        let ring = |session| Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: true }, to: vec![callee] });
+        let ring = |session| Content::Session(SessionOp::Open { session, mode: SessionMode::Call { video: true }, to: vec![callee], town_wide: false });
         let join = |session| Content::Session(SessionOp::Join { session });
         let leave = |session, secs| Content::Session(SessionOp::Leave { session, secs, why: LeaveWhy::Ended });
         let decline = |session, why| Content::Session(SessionOp::Decline { session, why });
@@ -2443,7 +4464,7 @@ pub(crate) mod tests {
         let anchor = m.add(0, Actor::Ai, ring(call), Some(vec![early]));
         let open_index = m.events.len() - 1;
         let other = m.add(2, human, Content::Session(SessionOp::Open { session: call,
-            mode: SessionMode::Share { title: "other".into() }, to: vec![] }), Some(vec![early]));
+            mode: SessionMode::Share { title: "other".into() }, to: vec![], town_wide: true }), Some(vec![early]));
         let mut reversed = orphan;
         reversed.receive(&m.events[open_index + 1]);
         assert_eq!(reversed.sessions[&call].open.as_ref().unwrap().anchor, other, "first arrival can be the later open");
@@ -2486,7 +4507,7 @@ pub(crate) mod tests {
         m.add(2, human, decline(missed, DeclineWhy::Declined), None);
         m.add(0, human, leave(missed, None), None);
         m.add(0, human, Content::Session(SessionOp::Open { session: pending,
-            mode: SessionMode::Share { title: "Canvas".into() }, to: vec![] }), None);
+            mode: SessionMode::Share { title: "Canvas".into() }, to: vec![], town_wide: true }), None);
 
         let cut = m.add(1, human, said(vec![line(5, "after cutoff")]), None);
         let prefix = m.events.len();
@@ -2520,15 +4541,20 @@ pub(crate) mod tests {
                 (busy, Outcome::Declined { seats: vec![callee], busy: true }), (missed, Outcome::Unanswered),
             ] {
                 assert_eq!(state.session_summary(&id, Some(viewer)), Some(SessionSummary { opener: a, opener_seat: Some(caller),
-                    mode: SessionMode::Call { video: true }, rung: vec![callee], viewer: seen, outcome,
+                    mode: SessionMode::Call { video: true }, rung: vec![callee], town_wide: false, viewer: seen, outcome,
                     lines: if id == call { 3 } else { 0 }, ended: id != busy }), "each seat reads its own role and the same signed facts for {id:?}");
             }
             let share = state.session_summary(&pending, Some(viewer)).unwrap();
-            let broadcast_role = if viewer == caller { Seen::Opener } else { Seen::Rung };
-            assert_eq!((share.viewer, share.outcome, share.ended), (broadcast_role, Outcome::Pending, false),
-                "a broadcast waits, rings every other seat and is live until its opener leaves");
+            let role = if viewer == caller { Seen::Opener } else { Seen::Other };
+            assert_eq!((share.viewer, share.town_wide, share.outcome, share.ended), (role, true, Outcome::Pending, false),
+                "an empty audience rings nobody and the town-wide share stays live");
+            assert!(state.sessions[&pending].open.as_ref().unwrap().admits(Some(caller), Some(viewer)),
+                "every seated viewer is admitted to the town-wide share");
         }
         assert_eq!(state.session_summary(&pending, None).unwrap().viewer, Seen::Other, "broadcast requires a viewer seat");
+
+        assert!(!state.sessions[&pending].open.as_ref().unwrap().admits(Some(caller), None),
+            "an unseated viewer cannot join the town-wide share");
 
         for (session, prior_chats) in [([6; 16], 0), ([7; 16], 64)] {
             // Maker adds the signer's previous event as a parent, making this a linear history.
@@ -2577,7 +4603,7 @@ pub(crate) mod tests {
         let id = m.add(0, Actor::Human, content, None);
         let state = fold(&m.events);
         assert_eq!(state.entities[&id].kind, kind::STICKY);
-        assert_eq!(state.entities[&id].fields[&field::TITLE], FieldState { value: Value::Text("old".into()), writer: id });
+        assert_eq!(state.entities[&id].fields[&field::TITLE], FieldState { value: Value::Text("old".into()), writer: id, origin: id });
         assert!(m.events.last().unwrap().header.shape.is_none());
     }
 
@@ -2586,7 +4612,7 @@ pub(crate) mod tests {
         let mut m = Maker::new();
         let dash = Key::Name("dash".into());
         let lit = |s: &str| Value::Literal(s.into());
-        let item = m.add(0, Actor::Human, Content::Entity { kind: Key::Name("Sticky".into()), project: None,
+        let item = m.add(0, Actor::Human, Content::Entity { copied_from: vec![], kind: Key::Name("Sticky".into()), project: None,
             derive: None, fields: vec![(dash.clone(), lit("[4  2]"))] }, None);
         let bad = m.set(vec![change(item, dash.clone(), lit("1 2")),
             change(item, Key::Name("not-a-name".into()), lit("3")),
@@ -2605,11 +4631,11 @@ pub(crate) mod tests {
         assert_eq!(state.entities[&item].value(dash.clone()), Some(&lit("Diagram{}")));
         let undo = m.undo(group);
         let state = fold(&m.events);
-        assert_eq!(state.entities[&item].fields[&dash], FieldState { writer: undo, value: lit("[4  2]") });
+        assert_eq!(state.entities[&item].fields[&dash], FieldState { writer: undo, origin: item, value: lit("[4  2]") });
         assert_eq!(state.entities[&item].value(field::X), None);
         let ordered = m.entity(kind::TASK, None, vec![(field::ORDER, Value::Int(2)), (field::Z, Value::Key(vec![2]))]);
         assert_eq!(fold(&m.events).invalid_keys, [m.keys[0].public()].into(), "creation records its own author");
-        m.add(1, Actor::Human, Content::Set { changes: vec![change(ordered, field::ORDER, Value::Key(vec![9, 1])),
+        m.add(1, Actor::Human, Content::Set { copied_from: vec![], changes: vec![change(ordered, field::ORDER, Value::Key(vec![9, 1])),
             change(ordered, field::Z, Value::Null)], label: None }, None);
         let state = fold(&m.events);
         assert_eq!(state.invalid_keys, [m.keys[0].public(), m.keys[1].public()].into(), "a refused Set records its author too");
@@ -2626,14 +4652,14 @@ pub(crate) mod tests {
         let mut m = Maker::new();
         let a = m.entity(kind::STICKY, None, vec![]);
         let changes = vec![change(a, field::X, Value::Int(1)), change(a, field::Y, Value::Int(1))];
-        let group = m.add(0, Actor::Human, Content::Set { changes, label: None }, Some(vec![a]));
+        let group = m.add(0, Actor::Human, Content::Set { copied_from: vec![], changes, label: None }, Some(vec![a]));
         let changes = vec![change(a, field::X, Value::Int(2))];
-        let peer = m.add(1, Actor::Human, Content::Set { changes, label: None }, Some(vec![a]));
+        let peer = m.add(1, Actor::Human, Content::Set { copied_from: vec![], changes, label: None }, Some(vec![a]));
         m.undo(group);
         let after = fold(&m.events);
         m.events.reverse();
         assert_eq!(fold(&m.events), after, "concurrent writes converge when arrivals reverse");
-        assert_eq!(after.entities[&a].fields[&field::X], FieldState { value: Value::Int(2), writer: peer }, "the later concurrent writer keeps X");
+        assert_eq!(after.entities[&a].fields[&field::X], FieldState { value: Value::Int(2), writer: peer, origin: peer }, "the later concurrent writer keeps X");
         assert_eq!(after.entities[&a].value(field::Y), None, "the group's uncontested Y is undone");
     }
 
@@ -2646,7 +4672,7 @@ pub(crate) mod tests {
         let redo = m.undo(undo);
         let after = fold(&m.events);
         assert_eq!(after.entities[&id].value(field::TITLE), None, "redo clears the restored title again");
-        assert_eq!(after.entities[&id].fields[&field::X], FieldState { value: Value::Int(0), writer: redo }, "redo can write where undo restored absence");
+        assert_eq!(after.entities[&id].fields[&field::X], FieldState { value: Value::Int(0), writer: redo, origin: group }, "redo can write where undo restored absence");
         let unmake = m.undo(id);
         assert!(fold(&m.events).entities[&id].flag(field::DELETED), "undoing a creation tombstones what it made");
         m.undo(unmake);
@@ -2728,7 +4754,7 @@ pub(crate) mod tests {
         let doc = m.entity(kind::DOC, None, vec![]);
         let at = DocState::new(doc).root_id();
         let first_task = m.entity(kind::TASK, None, vec![]);
-        let convert = |title: &str| Content::Entity { kind: Key::Number(kind::TASK), project: None, derive: Some((doc, at)),
+        let convert = |title: &str| Content::Entity { copied_from: vec![], kind: Key::Number(kind::TASK), project: None, derive: Some((doc, at)),
             fields: vec![(field::TITLE, Value::Text(title.into()))] };
         let first = m.add(0, Actor::Human, convert("first"), Some(vec![first_task]));
         m.add(1, Actor::Ai, convert("second"), Some(vec![first_task]));
@@ -2755,7 +4781,7 @@ pub(crate) mod tests {
         let root = DocState::new(doc).root_id();
         let task = crate::entity::derived_task(doc, root);
         let attr = |attr, value| TextOp::Attr { at: BreakRef::Root, attr, value };
-        let conversion = m.add(0, Actor::Human, Content::Entity { kind: Key::Number(kind::TASK), project: None,
+        let conversion = m.add(0, Actor::Human, Content::Entity { copied_from: vec![], kind: Key::Number(kind::TASK), project: None,
             derive: Some((doc, root)), fields: vec![] }, Some(vec![doc]));
         let tick = m.add(0, Actor::Ai, Content::Text { doc, ops: vec![
             attr(attr::CHECKBOX, Value::Text("done".into())),
@@ -2899,7 +4925,7 @@ pub(crate) mod tests {
         let state = fold(&m.events);
         assert_eq!(state.entities.len(), 1, "unknown edit targets do not invent entities");
         assert_eq!(state.entities[&id].kind, u16::MAX, "an unfamiliar entity retains its kind");
-        assert_eq!(state.entities[&id].fields[&Key::Number(65000)], FieldState { value: Value::Int(2), writer: group }, "an unfamiliar field retains its value and writer");
+        assert_eq!(state.entities[&id].fields[&Key::Number(65000)], FieldState { value: Value::Int(2), writer: group, origin: group }, "an unfamiliar field retains its value and writer");
         assert!(project_entities(&state, None, Some(kind::TASK)).is_empty(), "a future entity has no task semantics");
         assert_eq!(state.unknown, vec![unknown_id], "an unknown event is kept aside");
         assert_eq!(m.events.last().unwrap().content(), Some(&b"future bytes"[..]), "uninterpreted bytes stay intact");
@@ -2927,7 +4953,7 @@ pub(crate) mod tests {
         let founder = m.events[0].id;
         let grant = m.events[1].id;
         // The fold shows a task only inside a project it knows, so the admitted device makes its own.
-        let project = m.add(1, Actor::Human, Content::Entity { kind: Key::Number(kind::PROJECT), project: None, derive: None, fields: vec![] }, None);
+        let project = m.add(1, Actor::Human, Content::Entity { copied_from: vec![], kind: Key::Number(kind::PROJECT), project: None, derive: None, fields: vec![] }, None);
         let task = m.add(1, Actor::Human, task(project, "withdrawn"), None);
         let mut live = checked_fold(&m.events);
         assert!(live.entities.contains_key(&task), "the admitted device's work is initially visible");
@@ -3008,7 +5034,7 @@ pub(crate) mod tests {
     fn agents_belong_to_the_signer_and_cannot_grant_membership() {
         let mut m = Maker::town(2, 2);
         let subject = DeviceKey::generate().unwrap().public();
-        m.add(0, Actor::Human, Content::Profile { name: "Ana".into(), colour: 3 }, None);
+        let profile = m.add(0, Actor::Human, Content::Profile { name: "Ana".into(), colour: 3 }, None);
         let rename = m.add(0, Actor::Ai, Content::Profile { name: "Ben".into(), colour: 0 }, None);
         let invite = m.add(0, Actor::Ai, Content::Member(Member::Invite { subject, role: 0 }), None);
         let agent = m.add(0, Actor::Human, Content::AgentAdded { name: "Assistant".into(), kind: "session".into() }, None);
@@ -3020,7 +5046,7 @@ pub(crate) mod tests {
         let reply = m.add(0, Actor::Ai, named(ChatAgent::Author(agent)), None);
         let state = checked_fold(&m.events);
         assert!(state.void_events.contains_key(&rename), "a profile signed on behalf of an AI is void");
-        assert_eq!(state.profiles[&m.keys[0].public()], Profile { name: "Ana".into(), colour: 3 },
+        assert_eq!(state.profiles[&m.keys[0].public()], Profile { name: "Ana".into(), colour: 3, writer: profile },
             "an AI cannot change its person's name or colour");
         assert!(state.void_events.contains_key(&invite) && state.invitation(&subject).is_none());
         assert_eq!(state.agents[&agent].owner, m.keys[0].public(), "the next human event survives; only its signer owns the agent");
@@ -3038,6 +5064,59 @@ pub(crate) mod tests {
         assert_eq!((line.actor, line.to_agent, line.chat.text.as_str()), (Actor::Human, None, "hi"));
         assert_eq!(state.mentions(&agent), &[mention], "only the earlier verified mention wakes the agent");
         assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn an_agent_rename_belongs_to_its_owner_seat() {
+        let mut m = Maker::fresh(GROUP_POLICY, 3, false);
+        let ana_seat = m.events[0].id;
+        let grant = m.vouch(0, ana_seat, 1, None);
+        m.accept(1, grant, None);
+        let invite = m.invite(0, 2);
+        m.accept(2, invite, None);
+
+        let agent = m.add(0, Actor::Human, Content::AgentAdded { name: "Claude Code".into(), kind: "session".into() }, None);
+        let rename = |name: &str| Content::AgentRenamed { agent, name: name.into() };
+        let first = m.add(0, Actor::Human, rename("Aster"), None);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name.as_deref(), Some("Aster"), "the owner can set a display name");
+        assert_eq!(state.agents[&agent].name, "Claude Code", "renaming preserves the backend label");
+
+        // Both devices saw Aster. Device 0 sorts first at this height, but arrives last.
+        m.add(1, Actor::Human, rename("Fern"), Some(vec![first]));
+        m.add(0, Actor::Human, rename("Briar"), Some(vec![first]));
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name.as_deref(), Some("Fern"), "the owner's second device wins the same-height author tie");
+        let mut received = State::default();
+        for event in &m.events { received.receive(event); }
+        assert_eq!(received.agents[&agent].custom_name.as_deref(), Some("Fern"), "late delivery of Briar preserves the canonical winner");
+
+        m.add(2, Actor::Human, rename("Mallory"), None);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name.as_deref(), Some("Fern"), "another seat cannot rename the owner's AI");
+
+        let ai_rename = m.add(0, Actor::Ai, rename("Eve"), None);
+        let state = checked_fold(&m.events);
+        assert!(state.void_events.contains_key(&ai_rename), "an AI-signed rename is void");
+        assert_eq!(state.agents[&agent].custom_name.as_deref(), Some("Fern"), "an AI cannot change its own display name");
+
+        m.add(0, Actor::Human, rename(""), None);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name, None, "an empty name clears the display name");
+
+        m.add(0, Actor::Human, rename("Nora"), None);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name.as_deref(), Some("Nora"), "the owner can set a new name after clearing it");
+        assert_eq!(State::restore(&m.events, &state.checkpoint(&m.events)), Some(state), "a checkpoint keeps the custom name");
+
+        m.add(0, Actor::Human, rename("  "), None);
+        let state = checked_fold(&m.events);
+        assert_eq!(state.agents[&agent].custom_name, None, "a whitespace-only name clears the display name");
+
+        m.add(0, Actor::Human, Content::AgentRemoved { agent }, None);
+        m.add(0, Actor::Human, rename("Kit"), None);
+        let state = checked_fold(&m.events);
+        assert!(!state.agents.contains_key(&agent), "renaming a removed AI leaves it absent");
     }
 
     #[test]
@@ -3924,6 +6003,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn device_final_boundaries_matches_final_boundary_for_removals_forks_and_voids() {
+        use crate::{home::Home, log::{tests::temp_dir, Log}};
+        let dir = temp_dir("device-final-boundaries-home");
+        let home = Home::open(&dir).unwrap();
+        let mut m = Maker::fresh(2, 5, false);
+        let (ana, ben, kit, lu, eve) =
+            (m.keys[0].public(), m.keys[1].public(), m.keys[2].public(), m.keys[3].public(), m.keys[4].public());
+        let kit_offer = m.invite(0, 2);
+        let kit_accept = m.accept(2, kit_offer, None);
+        let eve_offer = m.invite(0, 4);
+        m.accept(4, eve_offer, None);
+        let ben_offer = m.invite(4, 1);
+        let ben_accept = m.accept(1, ben_offer, None);
+        let r1 = m.remove(4, ben_offer, 1, ben_accept, None);
+        let kit_branch = |m: &mut Maker, text| m.write_with_parents(2, Actor::Human, chat(text, false, None), vec![kit_accept]);
+        let c1 = kit_branch(&mut m, "one");
+        let c2 = kit_branch(&mut m, "two");
+        kit_branch(&mut m, "three");
+        m.remove(0, kit_offer, 2, kit_accept, None);
+        let lu_offer = m.invite(0, 3);
+        let lu_branch = |m: &mut Maker| m.write_with_parents(3, Actor::Human,
+            Content::Member(Member::Accept { entry: lu_offer }), vec![lu_offer]);
+        let a1 = lu_branch(&mut m);
+        let a2 = lu_branch(&mut m);
+        let mut log = Log::found(&home.town_log_path(&m.town), m.events[0].clone()).unwrap();
+        log.append_all(m.events[1..].to_vec()).unwrap();
+        let mut state = fold(log.events());
+        let check_pairs = |state: &State, log: &Log| {
+            let boundaries = state.device_final_boundaries(log);
+            for x in [ana, ben, kit, lu, eve] {
+                for y in [ana, ben, kit, lu, eve] {
+                    let earlier = [boundaries.get(&x), boundaries.get(&y)].into_iter().flatten().copied().min_by_key(|b| b.0);
+                    let direct = state.final_boundary(log, &x, &y).and_then(|b| Some((b.at, b.closure()?)));
+                    assert_eq!(earlier, direct, "cached position and closure equal the direct boundary for every ordered pair");
+                }
+            }
+            boundaries
+        };
+        let before = check_pairs(&state, &log);
+        assert_eq!(before, BTreeMap::from([
+            (ben, (log.position(&r1).unwrap(), FinalClosure::Removal(r1))),
+            (kit, (log.position(&c2).unwrap(), FinalClosure::fork(c1, c2).unwrap())),
+            (lu, (log.position(&a2).unwrap(), FinalClosure::fork(a1, a2).unwrap())),
+        ]), "the cache distinguishes a removal, Kit's first sibling pair, and Lu's start fork");
+        let sibling = m.write_with_parents(4, Actor::Human, chat("another copy", false, None), vec![ben_offer]);
+        let event = m.events.last().unwrap();
+        log.append(event.clone()).unwrap();
+        state.receive(event);
+        let after = check_pairs(&state, &log);
+        assert!(state.active_member(&ben) && !after.contains_key(&ben), "voiding the removal reinstates Ben and drops his boundary");
+        assert_eq!(after.get(&eve), Some(&(log.position(&sibling).unwrap(), FinalClosure::fork(r1, sibling).unwrap())),
+            "Eve's fork becomes her own boundary");
+        assert_eq!(State::restore(log.events(), &state.checkpoint(log.events())), Some(state),
+            "the restored checkpoint reproduces the fold after reinstatement");
+        drop((log, home));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn final_boundary_and_standing_cover_start_forks_and_exclude_strangers() {
         use crate::log::{tests::temp_dir, Log};
 
@@ -4136,7 +6274,7 @@ pub(crate) mod tests {
         let link = m.entity(kind::LINK, Some(project), vec![(field::FROM, Value::Id(my_issue)), (field::TO, Value::Id(peer_issue))]);
         for who in 0..2 {
             let changes = vec![change(my_issue, field::X, Value::Int(who as i64))];
-            m.add(who, Actor::Human, Content::Set { changes, label: None }, Some(vec![my_issue]));
+            m.add(who, Actor::Human, Content::Set { copied_from: vec![], changes, label: None }, Some(vec![my_issue]));
         }
         let mut seed = 7u64;
         for _ in 0..12 {

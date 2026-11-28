@@ -1404,7 +1404,7 @@ fn model_save_at_quit(gone: bool) {
         }
     }));
     if gone { cx.use_closed_task_pool(); }
-    let mut host = ModelHost::start(&cx, false);
+    let mut host = ModelHost::start_in(&cx, false, &crate::dirs::FabDirs::system());
     let root = temp();
     let dir = root.join("plate/journal");
     let plate = Plate::testing(&dir, "model.fab.splash", &Default::default());

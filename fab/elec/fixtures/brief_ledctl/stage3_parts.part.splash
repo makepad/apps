@@ -1,0 +1,136 @@
+// Local reference parts and second sources. The fixture price book uses these ordering keys.
+// USB-C power: receptacle and two 5K1 pull-downs. Regulator: 3V3 LDO and two 1uF capacitors.
+// MCU: 20-pin controller, SWD header, bypass and reset capacitors, and boot resistor.
+// Indicators: eight green LEDs and 220R resistors. Button: tactile switch and 10K pull-up.
+use mod.std.*
+let e = mod.elec
+let f = e.f
+
+e.define("USB-C power", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-USB-C" "alt.1.mpn": "ALT-USB-C"}
+    kind: @connector
+    symbol: f.ic_symbol("USB-C", {
+        right: [["VBUS", @power_out], ["CC1", @passive], ["CC2", @passive]]
+        bottom: [["GND", @power_out], ["SHIELD", @passive]]
+    })
+    footprint: f.footprint({
+        pads: [
+            f.smd("B12", [-2.7mm, 2.025mm], [0.8mm, 1.2mm]),
+            f.smd("B9", [-1.5mm, 2.025mm], [0.7mm, 1.2mm]),
+            f.smd("A5", [-0.5mm, 2.025mm], [0.7mm, 1.2mm]),
+            f.smd("B5", [0.5mm, 2.025mm], [0.7mm, 1.2mm]),
+            f.smd("A9", [1.5mm, 2.025mm], [0.7mm, 1.2mm]),
+            f.smd("A12", [2.7mm, 2.025mm], [0.8mm, 1.2mm]),
+            f.thru("S1", [-4.32mm, 1.775mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [4.32mm, 1.775mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [-4.32mm, -2.025mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [4.32mm, -2.025mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm])
+        ]
+        body: [[-4.47mm, -4.625mm], [4.47mm, 2.175mm]]
+        mount: @smd
+        text: 1mm
+        graphics: []
+    })
+    // the mouth on the -Y edge, centred in the 3.16 mm shell: a plug goes in along +Y and its
+    // overmould needs 6.6 mm in front of the mouth
+    body: {height: 3.16mm ports: [{
+        kind: @plug profile: {rect: [[-4.47mm, -1.58mm], [4.47mm, 1.58mm]] r: 1.55mm}
+        at: [0mm, -4.625mm, 1.58mm] dir: [0, -1, 0] reach: 6.6mm margin: 0.3mm
+    }]}
+    pads: {VBUS: ["A9", "B9"] CC1: "A5" CC2: "B5" GND: ["A12", "B12"] SHIELD: "S1"}
+    limits: {VBUS: {volts: 5V current: 1.5A}}
+    prefix: "J"
+})
+
+e.define("LDO 3V3", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-3V3-600" "alt.1.mpn": "ALT-3V3-600"}
+    kind: @regulator
+    symbol: ic_symbol("LDO_3V3", {left: [["VIN" @power_in] ["EN" @in]] right: [["VOUT" @power_out]]
+                                  bottom: [["GND" @power_in]] top: [["NC" @no_connect]]})
+    footprint: sot23({pins: 5})
+    body: {height: 1.1mm package: @sop}
+    pads: {VIN: 1 GND: 2 EN: 3 NC: 4 VOUT: 5}
+    limits: {VIN: {volts: [2.5V 6V]} VOUT: {volts: [3.3V 3.3V] current: 600mA}}
+})
+
+e.define("MCU 20", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-MCU-20" "alt.1.mpn": "ALT-MCU-20"}
+    kind: @mcu
+    symbol: ic_symbol("MCU_20", {
+        left: [["VDD" @power_in] ["VSS" @power_in] ["NRST" @in] ["BOOT0" @in] ["PA13" @bidi] ["PA14" @bidi]]
+        right: [["PA0" @bidi] ["PA1" @bidi] ["PA2" @bidi] ["PA3" @bidi] ["PA4" @bidi] ["PA5" @bidi]
+                ["PA6" @bidi] ["PA7" @bidi] ["PA8" @bidi] ["PA9" @bidi] ["PA10" @bidi] ["PB6" @bidi]
+                ["PB7" @bidi] ["PC14" @bidi]]
+    })
+    footprint: tssop({pins: 20 pitch: 0.65mm body: [6.5mm 4.4mm] span: 6.4mm lead: [0.3mm 0.6mm]})
+    body: {height: 1.2mm}
+    pads: {PB7: 1 PC14: 2 NRST: 3 VDD: 4 VSS: 5 PA0: 6 PA1: 7 PA2: 8 PA3: 9 PA4: 10
+           PA5: 11 PA6: 12 PA7: 13 PA8: 14 PA9: 15 PA10: 16 BOOT0: 17 PA13: 18 PA14: 19 PB6: 20}
+    limits: {VDD: {volts: [2.0V 3.6V]} io: {volts: [-0.3V 3.6V] current: 15mA}}
+})
+
+e.define("Mode switch", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-TACT" "alt.1.mpn": "ALT-TACT"}
+    kind: @switch
+    symbol: f.two_terminal([["A", @passive], ["B", @passive]])
+    footprint: f.footprint({
+        pads: [
+            f.smd("1", [-3.0mm, 1.85mm], [1.55mm, 1.05mm]),
+            f.smd("2", [3.0mm, 1.85mm], [1.55mm, 1.05mm]),
+            f.smd("3", [-3.0mm, -1.85mm], [1.55mm, 1.05mm]),
+            f.smd("4", [3.0mm, -1.85mm], [1.55mm, 1.05mm])
+        ]
+        body: [[-2.55mm, -2.55mm], [2.55mm, 2.55mm]]
+        mount: @smd
+        text: 1mm
+        graphics: []
+    })
+    // its plunger on top, 2.5 mm across; a finger or a case's press pin pushes it down 0.25 mm
+    // to switch. It stands 0.3 mm out of the housing, as measured on a supplier's model of a
+    // 5.1 mm low-profile tactile switch (housing top 1.25 mm, plunger top 1.55 mm).
+    body: {height: 1.5mm ports: [{kind: @press profile: {circle: 1.25mm} at: [0mm, 0mm, 1.5mm] dir: [0, 0, 1] reach: 10mm margin: 0.75mm travel: 0.25mm stand: 0.3mm}]}
+    pads: {A: [1, 2] B: [3, 4]}
+    prefix: "SW"
+})
+
+e.define("SWD 5", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-SWD-5" "alt.1.mpn": "ALT-SWD-5"}
+    kind: @connector prefix: "J"
+    symbol: f.ic_symbol("SWD", {left: [["VCC" @passive] ["SWDIO" @passive] ["SWCLK" @passive] ["NRST" @passive] ["GND" @passive]]})
+    footprint: f.footprint({mount: @thru text: 1mm body: [[-0.635mm, -0.635mm] [0.635mm 5.715mm]]
+        pads: for i in 0..5 { f.thru(f.int(i+1), [0mm, i * 1.27mm], 1mm, 0.64mm) }})
+    pads: {VCC: 1 SWDIO: 2 SWCLK: 3 NRST: 4 GND: 5}
+})
+
+let lands = fn(x, size, body) {
+    return f.footprint({mount: @smd text: 0.6mm body: body pads: [
+        f.smd("1", [-x, 0mm], size) f.smd("2", [x, 0mm], size)
+    ]})
+}
+let sm = lands(0.48mm, [0.56mm 0.62mm], [[-0.5mm, -0.25mm] [0.5mm 0.25mm]])
+let med = lands(0.8mm, [0.9mm 0.95mm], [[-0.8mm, -0.4mm] [0.8mm 0.4mm]])
+let picked_chip = fn(name, kind, prefix, fp, sources) {
+    e.define(name, {kind: kind prefix: prefix approved: true lifecycle: @active fields: sources
+        symbol: f.two_terminal([["1" @passive] ["2" @passive]]) footprint: fp pads: [["1" "1"] ["2" "2"]]})
+}
+picked_chip("5K1", @resistor, "R", sm, {mpn: "REF-5K1" "alt.1.mpn": "ALT-5K1"})
+picked_chip("10K", @resistor, "R", sm, {mpn: "REF-10K" "alt.1.mpn": "ALT-10K"})
+picked_chip("220R", @resistor, "R", sm, {mpn: "REF-220R" "alt.1.mpn": "ALT-220R"})
+picked_chip("100nF", @capacitor, "C", sm, {mpn: "REF-100nF" "alt.1.mpn": "ALT-100nF"})
+picked_chip("1uF", @capacitor, "C", med, {mpn: "REF-1uF" "alt.1.mpn": "ALT-1uF"})
+picked_chip("4u7", @capacitor, "C", med, {mpn: "REF-4u7" "alt.1.mpn": "ALT-4u7"})
+
+e.define("Green LED", {
+    approved: true lifecycle: @active
+    fields: {mpn: "REF-LED-0603-G" "alt.1.mpn": "ALT-LED-0603-G"}
+    kind: @led prefix: "D"
+    symbol: f.two_terminal([["A" @passive] ["K" @passive]])
+    footprint: med pads: {K: 1 A: 2}
+    body: {height: 0.6mm ports: [mod.std.top_port(@light, 0.6mm, 0.5mm, 0.2mm, 10mm)]}
+    emitter: {angle: 120deg light: @green flux_per_a: 15}
+})

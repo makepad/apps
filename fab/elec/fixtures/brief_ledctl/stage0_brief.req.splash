@@ -1,0 +1,1 @@
+brief("USB-C powered 8-LED controller board, 2 layers, max 60 x 40 mm. 5 V USB-C input regulated down to 3.3 V (at least 300 mA budget), 20-pin MCU with SWD header, 8 green indicator LEDs at ~5 mA each, and 1 tactile mode button. Must be ERC clean, DRC clean, and fully routed. Keep silkscreen labels clean and readable.")

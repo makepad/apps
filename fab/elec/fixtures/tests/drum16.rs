@@ -543,6 +543,12 @@ fn the_whole_board_is_placed_and_routed_with_no_finding() {
         assert!(!results.erc.iter().any(|v| v.kind == CheckKind::PowerNotDriven && v.items.contains(&item)),
             "ERC recognizes the USB supply on {name}");
     }
+    let block_findings: Vec<_> = results.erc.iter().filter(|v| {
+        matches!(v.kind, CheckKind::VoltageDomain | CheckKind::RailBudget | CheckKind::OpenPort)
+            || matches!(v.kind, CheckKind::PinConflict | CheckKind::PowerNotDriven)
+                && v.items.iter().any(|s| matches!(s, Sel::Block(..)))
+    }).collect();
+    assert!(block_findings.is_empty(), "drum16 units must be free of block-check findings: {block_findings:#?}");
     let drc = &results.boards.iter().find(|b| b.unit == unit.id).expect("the board's results").drc;
     assert!(drc.is_empty(), "the routed board has no finding at all, an unrouted net included: {drc:#?}");
     let sources = fab_elec_fixtures::docs("drum16").expect("drum16 is a stock project");

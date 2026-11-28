@@ -144,6 +144,18 @@ impl ViewData {
         pressed
     }
 
+    pub fn sync_jump_latest(&self, cx: &mut Cx, conversation: &WidgetRef) {
+        let count = self.tree.snapshot().town.map_or(0, |town| self.chat_read.open_unread(town).count);
+        let show = self.chat_visible() && !self.chat_read.at_live_tail() && count > 0;
+        let jump = conversation.widget(cx, ids!(jump_latest));
+        if jump.visible() != show { jump.set_visible(cx, show); }
+        if show {
+            let button = jump.button(cx, ids!(jump_latest_btn));
+            let text = format!("{count} new ↓");
+            if button.text() != text { button.set_text(cx, &text); }
+        }
+    }
+
     /// Whether the current pane layout shows the open town's chat.
     pub fn chat_visible(&self) -> bool {
         let narrow = self.narrow();
@@ -198,16 +210,21 @@ impl ViewData {
             tab.button(cx, ids!(press)).set_open_with(cx, self.pane == shown, Animate::No);
         }
         let hidden = !self.chat_visible();
-        if !hidden && self.chat_read.open_at_tail {
+        if !hidden && self.chat_read.at_live_tail() {
             match self.tree.snapshot().town {
                 Some(open) => {
-                    let newest = self.chat_read.open_unread(open).newest;
-                    self.chat_read.mark_open_read(open, newest);
+                    if let Some(unread) = self.chat_read.counts.get(&open).copied() {
+                        self.chat_read.mark_open_seen(open, unread.newest);
+                    }
                 }
                 None => self.chat_read.mark_unscoped_read(self.newest_message()),
             }
         }
         if self.tree.set_unread(&self.chat_read.counts) { ui.widget(cx, ids!(tree)).redraw(cx); }
+        let conversation = self.conversation(cx, ui);
+        let list = conversation.portal_list(cx, ids!(transcript.list));
+        self.sync_jump_latest(cx, &conversation);
+        self.sync_pending_approval(cx, &conversation, &list);
         let unread = hidden && self.chat_unread();
         ui.widget(cx, ids!(chat_dot)).set_visible(cx, narrow && unread);
         ui.widget(cx, ids!(edge_dot)).set_visible(cx, folded && unread);
@@ -305,7 +322,7 @@ mod tests {
         let pass = DrawPass::new(cx);
         pass.set_size(cx, size);
         let mut list = DrawList2d::new(cx);
-        let event = DrawEvent::default();
+        let event = std::mem::take(&mut cx.new_draw_event);
         let mut draw = CxDraw::new(cx, &event);
         let mut frame = Cx2d::new(&mut draw);
         frame.begin_pass(&pass, None);
@@ -322,8 +339,8 @@ mod tests {
         for (seat, name, text, addressed) in [(Seat::Peer, "Ben", "Hello", false),
             (Seat::You, "You", "ai hi this working?", true), (Seat::Peer, "Ben asked their AI", "ai hi this working?", true)] {
             data.workspace.rows.push(crate::view::ChatRow::Message(Message {
-                id: [data.workspace.rows.len() as u8 + 10; 32], quote: None, traces: vec![], seat, name: name.into(), time: "13:04".into(), text: text.into(),
-                addressed, unheard: false, mention: addressed, deletable: false,
+                id: [data.workspace.rows.len() as u8 + 10; 32], quote: None, traces: vec![], seat, tone: None, name: name.into(), time: "13:04".into(), text: text.into(),
+                addressed, unheard: false, mention: addressed, mentions_you: false, deletable: false,
             }));
         }
         let binding = makepad_town_core::queue::Credential { town: [1; 32], check: [2; 32] };
@@ -334,8 +351,8 @@ mod tests {
         }
         data.workspace.rows.push(crate::view::ChatRow::Message(Message {
             id: line, quote: None, traces: vec![crate::view::TraceRow::read(&traces.rows(&line)[0], 11_000, &Default::default(), false)],
-            seat: Seat::You, name: "You".into(), time: "13:04".into(), text: "make slides".into(),
-            addressed: true, unheard: false, mention: false, deletable: false,
+            seat: Seat::You, tone: None, name: "You".into(), time: "13:04".into(), text: "make slides".into(),
+            addressed: true, unheard: false, mention: false, mentions_you: false, deletable: false,
         }));
     }
 
@@ -409,6 +426,16 @@ mod tests {
         let shared = ada.open_id();
         let towns = bob.towns();
         let own = towns.iter().find(|t| t.id != shared).unwrap().id;
+        let seed = ada.post_chat_draft("Already here", None, None, None).unwrap();
+        crate::model::tests::exchange(&mut ada, &mut bob);
+        bob.open_town(shared).unwrap();
+        data.tree.set(Vec::new(), bob.town_tree());
+        data.show_panes(cx, &ui);
+        assert!(!data.chat_read.towns.contains_key(&shared), "an unlisted town with no count stays unseeded");
+        data.chat_read.sync_counts(&bob, &[shared], true);
+        assert_eq!(data.chat_read.towns[&shared].seen, Some(seed), "the newly listed town seeds at its tip");
+        assert_eq!(data.chat_read.open_unread(shared).count, 0);
+
         bob.open_town(own).unwrap();
         data.chat_read.seed_loaded(&bob);
         for draft in ["The draft is up", "Ready for review", "@Bob please check"] {
@@ -443,6 +470,17 @@ mod tests {
         assert_eq!(call.label(cx, ids!(name)).text(), "Call with Ada · 0:01");
         assert!(cx.new_draw_event.draw_list_will_redraw(cx, call_list));
         assert!(!cx.new_draw_event.draw_list_will_redraw(cx, town_list), "a clock tick leaves the town's drawing intact");
+        let first_unread = data.chat_read.open_unread(shared).first_unread.unwrap();
+        bob.open_town(shared).unwrap();
+        data.tree.set(bob.towns(), bob.town_tree());
+        data.show_panes(cx, &ui);
+        draw(cx, &ui, &mut data, size);
+        assert_eq!(data.chat_read.open_unread(shared).count, 0);
+        assert_eq!(data.chat_read.towns[&shared].divider_before, Some(first_unread));
+        let index = data.tree.lines.iter().position(|l| l.node == crate::lists::Node::Town(shared)).unwrap();
+        assert!(!tree.get_item(index).unwrap().1.view(cx, ids!(unread_badge)).visible(),
+            "opening the unread town at the tail removes its badge and keeps its divider");
+
         let rail = rail.borrow().unwrap();
         let chat = chat.borrow().unwrap();
         assert_eq!(rail.area_a().rect(cx).size.x, 193., "left rail restores its width");
@@ -628,8 +666,8 @@ mod tests {
         data.show_pane(Pane::Places);
         assert!(!data.chat_unread(), "nothing new yet");
         let peer_message = |id| crate::view::ChatRow::Message(Message {
-            id, quote: None, traces: vec![], seat: Seat::Peer, name: "Kit".into(), time: "13:05".into(), text: "new".into(),
-            addressed: false, unheard: false, mention: false, deletable: false,
+            id, quote: None, traces: vec![], seat: Seat::Peer, tone: None, name: "Kit".into(), time: "13:05".into(), text: "new".into(),
+            addressed: false, unheard: false, mention: false, mentions_you: false, deletable: false,
         });
         data.workspace.rows.push(peer_message([99; 32]));
         data.show_panes(cx, &ui);
@@ -638,15 +676,20 @@ mod tests {
         data.show_panes(cx, &ui);
         assert!(!ui.widget(cx, ids!(chat_dot)).visible(), "opening Chat clears it");
 
-        use crate::call::{CallAction, CallController, CallEnv, Message as Signal, Press, SharePanelSize};
+        use crate::call::{CallAction, CallController, CallEnv, Message as Signal, Press, ShareOfferExt, SharePanelSize};
         use crate::lists::SharePopout;
         use makepad_call::driver::{std_spawn, VoiceSource};
+        use makepad_town_core::share::hello::MediaCaps;
         let mut call = CallController::default();
         call.configure(CallEnv { files: Default::default(), signal: std::sync::Arc::new(|| {}), voice: VoiceSource::Synthetic { tone_hz: 700. },
             devices_path: Default::default(), spawn: std_spawn(), jobs: std_spawn() });
         let port = call.link_up(cx, [1; 65], [2; 65], "Kit").unwrap();
+        let town = [9; 32];
+        call.set_open_town(Some((town, vec![([2; 65], "Kit".into())])));
+        call.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
         let session = [5; 16];
-        port.messages_in.try_send(Signal::Share { session, title: "Drawing".into(), w: 1600., h: 999., ext: Default::default() }.encode()).unwrap();
+        port.messages_in.try_send(Signal::Share { session, title: "Drawing".into(), w: 1600., h: 999.,
+            ext: ShareOfferExt { town: Some(town), ..Default::default() } }.encode()).unwrap();
         call.poll(cx);
         let share_page = Page::Live(Live::Share(session));
         let edge = ui.widget(cx, ids!(chat_edge));

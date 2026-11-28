@@ -1,5 +1,5 @@
 //! Virtual row templates and bindings. Only the mounted PortalList items own widgets.
-use super::{TreeAction, TreeLine};
+use super::{DropIndicator, TreeAction, TreeLine};
 use makepad_widgets::*;
 
 pub(in crate::tweak) fn tree_list_value(vm: &mut ScriptVm, row: ScriptValue) -> ScriptValue {
@@ -30,8 +30,20 @@ pub(in crate::tweak) fn tree_list_value(vm: &mut ScriptVm, row: ScriptValue) -> 
                     draw_bg +: {
                         even: instance(0.0)
                         selected: instance(0.0)
+                        drop_mode: instance(0.0)
+                        drop_line: uniform(theme.color_primary)
+                        drop_veil: uniform(theme.color_drag_target_preview)
                         pixel: fn() {
-                            return fab.color_panel_sub.mix(fab.color_area, self.even).mix(fab.color_selection_bg, self.selected)
+                            let base = fab.color_panel_sub.mix(fab.color_area, self.even).mix(fab.color_selection_bg, self.selected)
+                            let p = self.pos * self.rect_size
+                            let edge = self.rect_size - p
+                            if self.drop_mode == 1.0 && p.y < 2.0 { return self.drop_line }
+                            if self.drop_mode == 2.0 && edge.y <= 2.0 { return self.drop_line }
+                            if self.drop_mode == 3.0 {
+                                if min(min(p.x, edge.x), min(p.y, edge.y)) < 1.5 { return self.drop_line }
+                                return vec4(mix(base.rgb, self.drop_veil.rgb, min(self.drop_veil.a, 0.25)), base.a)
+                            }
+                            return base
                         }
                     }
                     indent := Indent{}
@@ -65,10 +77,14 @@ impl TreeLine {
         match self { Self::Node { .. } => id!(TreeRow), Self::Pager { .. } => id!(TreePagerRow), Self::Info { .. } => id!(TreeInfoRow) }
     }
 
-    pub(in crate::tweak) fn draw_tree(&self, cx: &mut Cx, row: &View) {
+    pub(in crate::tweak) fn draw_tree(&self, cx: &mut Cx, row: &View, draggable: bool) {
         let depth = match self {
-            Self::Node { depth, label, dim, has_children, expanded, selected, even, seats, .. } => {
+            Self::Node { depth, label, dim, has_children, expanded, selected, even, seats, drop, .. } => {
                 if let Some(mut face) = row.view(cx, ids!(tree_face)).borrow_mut() {
+                    face.cursor = draggable.then_some(MouseCursor::Hand);
+                    let mode = match drop { None => 0., Some(DropIndicator::Before) => 1.,
+                        Some(DropIndicator::After) => 2., Some(DropIndicator::Inside) => 3. };
+                    face.draw_bg.set_dyn_instance(cx, id!(drop_mode), &[mode]);
                     face.draw_bg.set_dyn_instance(cx, id!(even), &[u8::from(*even) as f32]);
                     face.draw_bg.set_dyn_instance(cx, id!(selected), &[u8::from(*selected) as f32]);
                 }
@@ -107,11 +123,11 @@ impl TreeLine {
     pub(in crate::tweak) fn handle_tree_actions(&self, cx: &Cx, item: &WidgetRef, actions: &Actions, filtering: bool) -> Option<TreeAction> {
         match self {
             Self::Node { path, has_children: true, expanded, .. } if !filtering && item.button(cx, ids!(twisty)).clicked(actions) => {
-                Some(if *expanded { TreeAction::Collapse(path.clone()) } else { TreeAction::Expand { path: path.clone(), offset: 0 } })
+                Some(if *expanded { TreeAction::Collapse(path.to_string()) } else { TreeAction::Expand { path: path.to_string(), offset: 0 } })
             }
-            Self::Node { path, .. } if item.button(cx, ids!(select_btn)).clicked(actions) => Some(TreeAction::Select(path.clone())),
+            Self::Node { path, .. } if item.button(cx, ids!(select_btn)).clicked(actions) => Some(TreeAction::Select(path.to_string())),
             Self::Pager { parent, offset, is_search, .. } if item.button(cx, ids!(tree_page)).clicked(actions) => {
-                Some(if *is_search { TreeAction::LoadMoreMatches(*offset) } else { TreeAction::Expand { path: parent.clone(), offset: *offset } })
+                Some(if *is_search { TreeAction::LoadMoreMatches(*offset) } else { TreeAction::Expand { path: parent.to_string(), offset: *offset } })
             }
             _ => None,
         }

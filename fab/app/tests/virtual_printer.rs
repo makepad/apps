@@ -194,6 +194,34 @@ fn prepare_two_spools(app: &TestApp) -> Locator {
     app.locator(Selector::role(Role::Button).name("Start print")).wait_visible()
 }
 
+/// Both printers share the preset and its pressure advance, but each owns its flow measurement.
+fn seed_calibration(config: &mut TestConfig, home: &std::path::Path, p: &str, q: &str) {
+    use fab_calibrate::{results::names, Results};
+    let dir = home.join("calibration");
+    for (owner, flow) in [(p, 0.910), (q, 1.070)] {
+        let mut results = Results::new(owner, simulated_profiles::FILAMENT);
+        results.values.insert(names::FLOW_RATIO.into(), flow);
+        results.save_owner_in(&dir).unwrap();
+    }
+    let mut preset = Results::new(simulated_profiles::MACHINE, simulated_profiles::FILAMENT);
+    preset.values.insert(names::PRESSURE_ADVANCE.into(), 0.035);
+    preset.save_in(&dir).unwrap();
+    config.env.insert("FAB_CALIBRATION_DIR".into(), dir.display().to_string());
+}
+
+fn check_package_calibration(bytes: &[u8], owner: &str, flow: &str) {
+    let mut file = std::io::Cursor::new(bytes);
+    let zip = makepad_zip_file::zip_read_central_directory(&mut file).unwrap();
+    let entry = zip.file_headers.iter().find(|e| e.file_name == "Metadata/project_settings.config")
+        .expect("project settings in the printed package").extract(&mut file).unwrap();
+    let settings = makepad_strict_json::parse(&entry).unwrap();
+    for (key, expected) in [("filament_flow_ratio", flow), ("pressure_advance", "0.0350")] {
+        let values: Vec<_> = settings.get(key).and_then(Value::as_arr).unwrap().iter()
+            .map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(values, [expected, expected], "{owner}: both filaments carry the effective {key} in the printed package");
+    }
+}
+
 #[test]
 fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
     use fab::print::jobs::{self, JobState};
@@ -202,6 +230,7 @@ fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let dir = std::env::temp_dir().join(format!("fab-twin-{}-{nonce}", std::process::id()));
     simulated_profiles::install(&dir);
+    seed_calibration(&mut config, &dir, "printer:Simulated printer", "printer:Other printer");
     let plate = two_colour_plate(&dir, 40, SMALL_BLOCK);
     let sim = dir.join("reports.jsonl");
     std::fs::write(&sim, format!("@capture-upload\n@upload 0\n@read-wait 5\n{TWO_SPOOLS}\n")).unwrap();
@@ -218,6 +247,8 @@ fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
         let (real, _) = jobs::read_all(&dir_jobs).pop().expect("committed simulated real job");
         assert!(!real.virtual_printer);
         assert!(sent.starts_with(b"PK"));
+        check_package_calibration(&sent, "Simulated printer", "0.910");
+        assert!(!sent.windows(5).any(|w| w == b"1.070"), "the upload contains none of the other printer's flow");
         let before = entries(&app);
         assert!(before.get("mqtt").and_then(Value::as_u64).unwrap() > 0, "real interval reached MQTT CONNECT");
 
@@ -266,10 +297,79 @@ fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
     result.unwrap();
 }
 
+fn add_configured_twin(saved: &mut makepad_fab_settings::virtual_printer::Saved, config: &str, twin_name: &str, model: &str) {
+    use makepad_fab_settings::virtual_printer::Source;
+    let mut twin = saved.printers.iter().find(|p| p.name == "dual-nozzle").unwrap().clone();
+    twin.name = twin_name.into();
+    twin.title = format!("{} (virtual)", simulated_profiles::MACHINE);
+    twin.source = Source::Twin { preset: simulated_profiles::MACHINE.into(), model: model.into(), source: Some(format!("printer:{config}")) };
+    twin.configured_for = Some(config.into());
+    for slot in &mut twin.slots {
+        slot.colour = match slot.tray.as_str() { "A1" => Some(0xF4F4F0), "B1" => Some(0x161616), _ => None };
+        slot.material = slot.colour.map(|_| "PLA".into());
+    }
+    saved.disconnected.insert(config.into());
+    saved.printers.push(twin);
+}
+
+#[test]
+fn same_preset_configured_printers_use_their_own_calibrations() {
+    use fab::print::jobs;
+    use makepad_fab_settings::virtual_printer::{self, Saved};
+    let test = "same_preset_configured_printers_use_their_own_calibrations";
+    let mut config = TestConfig::current_package(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"), test).unwrap();
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("fab-owner-calibration-{}-{nonce}", std::process::id()));
+    simulated_profiles::install(&dir);
+    let printers = dir.join(".makepad/fab/printers");
+    std::fs::create_dir_all(&printers).unwrap();
+    let mut saved = Saved::default();
+    for (name, twin_name) in [("P", "twin-p"), ("Q", "twin-q")] {
+        std::fs::write(printers.join(format!("{name}.conf")), "").unwrap();
+        add_configured_twin(&mut saved, name, twin_name, &simulated_profiles::model());
+    }
+    let prefs = dir.join(".makepad/fab/virtual_printers.txt");
+    saved.picked = Some("printer:P".into());
+    virtual_printer::save_to(&prefs, &saved).unwrap();
+    seed_calibration(&mut config, &dir, "printer:P", "printer:Q");
+    let plate = two_colour_plate(&dir, 40, SMALL_BLOCK);
+    config.app_args = vec!["--open".into(), plate.display().to_string()];
+    config.env.insert("MAKEPAD_TEST_HOME".into(), dir.display().to_string());
+    let result = run_with_config(config, |app| {
+        workspace_row::press(&app, "Monitor");
+        let jobs_dir = dir.join(".makepad/fab/jobs");
+        let print_on = |id: &str, flow: &str, count: usize| {
+            prepare_two_spools(&app).press();
+            app.wait_until(|| {
+                let visible = std::fs::read_dir(&jobs_dir).into_iter().flatten().flatten().filter(|e|
+                    !e.file_name().to_string_lossy().starts_with('.') && e.path().join("job.txt").is_file()).count();
+                (visible != count).then(|| format!("waiting for {id}'s committed package"))
+            });
+            let (meta, _) = jobs::read_all(&jobs_dir).into_iter()
+                .find(|(meta, _)| meta.printer.as_deref() == Some(id)).expect("job committed to the selected printer");
+            assert!(meta.virtual_printer, "{id} printed through its configured virtual link");
+            assert_eq!(meta.machine_preset, simulated_profiles::MACHINE, "{id} uses the shared preset");
+            let bytes = jobs::read_package(&jobs_dir, &meta.id).unwrap();
+            check_package_calibration(&bytes, id, flow);
+            bytes
+        };
+        let p = print_on("printer:P", "0.910", 1);
+        scroll_to_printer_item(&app, Selector::role(Role::DisclosureButton).name("Q (Virtual)"), true).expand();
+        let use_q = scroll_to_printer_item(&app, Selector::role(Role::Button).name("Use this printer"), true);
+        app.locator(Selector::path(use_q.snapshot().node.path)).press();
+        app.wait_until(|| (virtual_printer::load_from(&prefs).unwrap().picked.as_deref() != Some("printer:Q"))
+            .then(|| "waiting for the target to switch to Q".into()));
+        let q = print_on("printer:Q", "1.070", 2);
+        assert!(p != q, "same-preset printers with different flow measurements must produce different packages");
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+    result.unwrap();
+}
+
 #[test]
 fn configured_printer_starts_disconnected_and_only_connects_on_request() {
     use fab::print::jobs::{self, JobState};
-    use makepad_fab_settings::virtual_printer::{self, Saved, Source};
+    use makepad_fab_settings::virtual_printer::{self, Saved};
 
     const CONFIG: &str = "Simulated printer";
     let test = "configured_printer_starts_disconnected_and_only_connects_on_request";
@@ -279,19 +379,9 @@ fn configured_printer_starts_disconnected_and_only_connects_on_request() {
     simulated_profiles::install(&dir);
     let model = simulated_profiles::model();
     let mut saved = Saved::default();
-    let mut twin = saved.printers.iter().find(|p| p.name == "dual-nozzle").unwrap().clone();
-    twin.name = "configured-twin".into();
-    twin.title = format!("{} (virtual)", simulated_profiles::MACHINE);
-    twin.source = Source::Twin { preset: simulated_profiles::MACHINE.into(), model: model.clone(), source: Some(format!("printer:{CONFIG}")) };
-    twin.configured_for = Some(CONFIG.into());
-    for slot in &mut twin.slots {
-        slot.colour = match slot.tray.as_str() { "A1" => Some(0xF4F4F0), "B1" => Some(0x161616), _ => None };
-        slot.material = slot.colour.map(|_| "PLA".into());
-    }
+    add_configured_twin(&mut saved, CONFIG, "configured-twin", &model);
     let destination = format!("printer:{CONFIG}");
     saved.picked = Some(destination.clone());
-    saved.disconnected.insert(CONFIG.into());
-    saved.printers.push(twin);
     let prefs = dir.join(".makepad/fab/virtual_printers.txt");
     virtual_printer::save_to(&prefs, &saved).unwrap();
     let plate = two_colour_plate(&dir, 40, SMALL_BLOCK);

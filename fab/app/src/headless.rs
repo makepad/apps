@@ -523,6 +523,36 @@ let device = load({v: rail})
     }
 
     #[test]
+    fn headless_req_passes_erc_clean_after_filled_schematic() {
+        let dir = std::env::temp_dir().join(format!("fab-filled-schematic-{}", std::process::id()));
+        let path = dir.join("device.fab.splash");
+        let docs = project::elec_dir(&path);
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(&path, "use mod.fab.*\n").unwrap();
+        fs::write(docs.join("device.req.splash"), r#"require("ERC clean", checks(@erc).errors, {max: 0})
+require("All placed", board.unplaced, {max: 0})"#).unwrap();
+        fs::write(docs.join("device.blocks.splash"), r#"let e = mod.elec
+let load = e.block({name: "Load" ports: {a: e.port(@passive) b: e.port(@passive)} build: fn(p, o) {
+    let r = e.r(1kohm, p.a, p.b, {package: "0402"})
+    let c = e.c(1uF, p.a, p.b, {package: "0603"})
+}})"#).unwrap();
+        fs::write(docs.join("device.ckt.splash"), r#"use mod.project.*
+let e = mod.elec
+let signal = e.net({name: "SENSE"})
+let gnd = e.net({name: "GND" kind: @ground})
+let input = load({a: signal b: gnd})"#).unwrap();
+        let (code, stdout, stderr) = command(&path, &["--check", "--req", "--json"]);
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(code, 1, "the unplaced parts must keep the headless gate open: {stdout} {stderr}");
+        let stages = json_lines(&stdout);
+        let rows = stages.iter().find_map(|s| s.get("requirements").and_then(Value::as_arr)).expect("the gate must report its requirements");
+        let verdict = |name| rows.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(name))
+            .and_then(|r| r.get("verdict")).and_then(Value::as_str);
+        assert_eq!(verdict("ERC clean"), Some("pass"), "the filled schematic must pass ERC before layout");
+        assert_eq!(verdict("All placed"), Some("fail"), "the schematic proposal must leave placement for the board stage");
+    }
+
+    #[test]
     fn saved_plate_reports_its_committed_findings_without_writing() {
         struct Scratch(PathBuf);
         impl Drop for Scratch {

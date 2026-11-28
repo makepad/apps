@@ -146,7 +146,17 @@ script_mod! {
         View{
             width: Fit height: Fit flow: Right spacing: 3.5 align: Align{y: 0.5}
             padding: Inset{left: 3 top: 3 bottom: 3}
-            badge := SeatIcons{}
+            View{
+                width: 20 height: 20 flow: Overlay
+                badge := SeatIcons{}
+                View{
+                    width: Fill height: Fill align: Align{x: 1.0 y: 1.0}
+                    live_mark := RoundedView{
+                        visible: false width: 7 height: 7
+                        draw_bg +: {color: palette.accent border_radius: 3.5 border_color: palette.bg border_size: 1}
+                    }
+                }
+            }
             dot := StatusDot{}
             name := RailText{
                 width: Fit{max: FitBound.Rel{base: Base.Full factor: 0.4}} padding: Inset{right: 9}
@@ -198,7 +208,10 @@ script_mod! {
                     width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center}
                     spacing: 4 distribute: Distribute.SpaceBetween
                     home_title := TitleInput{width: Fill max_width: FitBound.Rel{base: Base.Parent factor: 0.75} a11y: {label: "Town name"}}
-                    call_share := PanelButton{visible: false enabled: false height: 26 text: "Share an app"}
+                    View{width: Fit height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                        home_join_call := JoinCallButton{}
+                        call_share := PanelButton{visible: false enabled: false height: 26 text: "Share an app"}
+                    }
                 }
                 choices := ShareChoices{visible: false}
                 share_problem := BodyNote{visible: false width: Fill}
@@ -207,6 +220,7 @@ script_mod! {
         town_notice := TownNotice{}
         home_members := mod.widgets.HomeMembersBase{
             width: Fill height: Fit
+            live_call_color: palette.accent live_share_color: palette.good
             list := FlatList{
                 width: Fill height: Fit{max: FitBound.Rel{base: Base.Full factor: 0.35}}
                 flow: Right{wrap: true row_align: RowAlign.Center} spacing: 8
@@ -236,17 +250,48 @@ script_mod! {
         share_note := BodyNote{visible: false}
         share_cancel := PanelButton{visible: false text: "Withdraw offer"}
         member_card := View{
-            visible: false width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center} spacing: 6
-            member_name := RailText{}
-            computer_label := PanelInput{visible: false width: Fill{max: 160} empty_text: "Your name" a11y: {label: "Your name"}}
-            member_status := BodyNote{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
-            hub_model := BodyNote{visible: false width: Fit max_lines: 1 text_overflow: Ellipsis}
-            device_link := PanelButton{visible: false text: "Connect"}
-            hub_offer := PanelButton{visible: false text: "Offer my AI Hub to this town"}
-            remove_ai := PanelButton{visible: false text: "Remove"}
-            remove_member := PanelButton{visible: false text: "Remove"}
-            removing_line := BodyNote{visible: false width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
-            undo_remove := PanelButton{visible: false text: "Undo"}
+            visible: false width: Fill height: Fit flow: Down spacing: 4
+            member_head := View{
+                width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center} spacing: 6
+                member_badge := SeatIcons{}
+                member_name := RailText{}
+                computer_label := PanelInput{visible: false width: Fill{max: 160} empty_text: "Your name" a11y: {label: "Your name"}}
+                ai_name_input := PanelInput{visible: false width: Fill{max: 160} empty_text: "Your AI" a11y: {label: "AI name"}}
+                ai_backend := BodyNote{visible: false width: Fit}
+                member_status := BodyNote{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+                hub_model := BodyNote{visible: false width: Fit max_lines: 1 text_overflow: Ellipsis}
+                member_watch := PanelButton{visible: false text: "Watch"}
+                member_open_call := PanelButton{visible: false text: "Open call"}
+                member_call := PanelButton{visible: false text: "Call"}
+                device_link := PanelButton{visible: false text: "Connect"}
+                hub_offer := PanelButton{visible: false text: "Offer my AI Hub to this town"}
+                remove_ai := PanelButton{visible: false text: "Remove"}
+                remove_member := PanelButton{visible: false text: "Remove"}
+                removing_line := BodyNote{visible: false width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+                undo_remove := PanelButton{visible: false text: "Undo"}
+            }
+            seat_devices := mod.widgets.SeatDevicesBase{
+                visible: false width: Fill height: Fit padding: Inset{left: 12}
+                list := FlatList{
+                    width: Fill height: Fit flow: Down spacing: 4
+                    scroll_bars +: {show_scroll_y: false}
+                    Device := View{
+                        width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center} spacing: 6
+                        device_dot := StatusDot{}
+                        device_name := RailText{}
+                        device_status := BodyNote{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+                        device_connect := PanelButton{visible: false text: "Connect"}
+                        device_remove := PanelButton{visible: false text: "Remove"}
+                    }
+                }
+            }
+            cascade_prompt := View{
+                visible: false width: Fill height: Fit flow: Right{wrap: true row_align: RowAlign.Center} spacing: 6
+                cascade_question := BodyNote{width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}}
+                cascade_all := PanelButton{}
+                cascade_only := PanelButton{}
+                cascade_cancel := PanelButton{text: "Cancel"}
+            }
         }
         home_removed := RemovedNote{}
         home_grid := TileGrid{}

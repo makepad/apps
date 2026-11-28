@@ -40,8 +40,10 @@ makepad-platform-video = { path = "../../../../platform/video" }
 jpeg-encoder = { path = "../../../../libs/jpeg-encoder" }
 makepad-canvas = { path = "../../../../libs/canvas" }
 makepad-widgets = { path = "../../../../widgets", default-features = false, features = ["glass", "rich_text", "media", "fab", "pickers"] }
+makepad-widgets-sheets = { path = "../../../../widgets/sheets" }
 makepad-widgets-tweaker = { path = "../../../../widgets/families/tweaker", optional = true }
 makepad-code-editor = { path = "../../../../code_editor" }
+makepad-git = { path = "../../../../libs/git" }
 makepad-markdown-editor = { path = "../../../../widgets/families/markdown_editor" }
 makepad-ai-services = { path = "../../../../libs/ai/services" }
 makepad-remote = { path = "../../../../libs/remote" }

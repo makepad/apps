@@ -28,7 +28,7 @@ use crate::api::*;
 use crate::api::PaneId;
 use crate::params::AreaKind;
 use crate::ui::keymap::{self, ShortcutId as Key};
-use crate::print::panel::slice_status;
+use crate::print::panel::{export_failure, slice_status, stage_failure};
 use crate::print::timeline::{layer_span, shown_top_layer};
 use crate::print::{format_time, PrintAction, SliceStatus};
 use crate::ui::parts::active_part;
@@ -127,8 +127,11 @@ script_mod! {
         icon_walk: Walk{width: 18 height: 18}
         label_walk: Walk{width: Fit height: Fit margin: Inset{top: 6}}
         draw_text +: {
-            color: fab.color_text
-            color_active: fab.color_text_on_accent
+            color: fab.color_toggle_ink
+            color_hover: fab.color_toggle_label_hover
+            color_down: fab.color_toggle_label_down
+            color_focus: fab.color_toggle_ink
+            color_active: fab.color_toggle_ink_active
             text_style: theme.font_regular{font_size: fab.font_size_small}
         }
     }
@@ -310,6 +313,7 @@ script_mod! {
                             // on the panels' ground, so its sections sit on their own colour
                             draw_bg +: { color: fab.color_editor }
                             part := mod.widgets.FabPartPanel{
+                                is_sidebar: true
                                 show_bg: false
                                 height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
                                 editor_bar +: {
@@ -563,15 +567,6 @@ script_mod! {
                 height: Fill
                 flow: Down
                 Filler{}
-                // Why the plate does not slice, in every workspace with the model.
-                slice_failed := Float{
-                    visible: false
-                    width: Fit
-                    height: Fit
-                    margin: Inset{left: 10 bottom: 6}
-                    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
-                    slice_failed_text := mod.widgets.FabLabel{ text: "" a11y: {label: "Why the plate does not slice"} }
-                }
                 // The part shows as it was at a step of its build (the Steps editor's marker).
                 step_shown := Float{
                     visible: false
@@ -710,7 +705,7 @@ script_mod! {
                                 info := View{
                                     width: Fill height: Fit flow: Down spacing: 3
                                     layer_label := mod.widgets.FabLabel{ width: Fill text: "" }
-                                    now := mod.widgets.FabLabelSmall{ width: Fill text: "" draw_text +: { color: fab.color_text_muted } }
+                                    now := mod.widgets.FabLabelSmall{ width: Fill text: "" draw_text +: { color: fab.color_text_dim } }
                                 }
                             }
                         }
@@ -767,6 +762,17 @@ script_mod! {
             jobs := mod.widgets.FabJobList{ width: 620 }
         }
 
+        failure_layer := View{
+            visible: false width: Fill height: Fill flow: Down align: Align{y: 1.0}
+            slice_failed := Float{
+                width: Fit
+                height: Fit
+                margin: Inset{left: 10 bottom: 6}
+                padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+                slice_failed_text := mod.widgets.FabLabel{ text: "" }
+            }
+        }
+
         // ---- always ----
         render_row := View{
             width: Fill
@@ -821,8 +827,11 @@ script_mod! {
                             a11y: {label: "Tests"}
                             draw_icon +: { svg: crate_resource("self://resources/icons/cut_box.svg") }
                             draw_text +: {
-                                color: fab.color_text
-                                color_active: fab.color_text_on_accent
+                                color: fab.color_toggle_ink
+                                color_hover: fab.color_toggle_label_hover
+                                color_down: fab.color_toggle_label_down
+                                color_focus: fab.color_toggle_ink
+                                color_active: fab.color_toggle_ink_active
                                 text_style: theme.font_regular{font_size: fab.font_size_ui}
                             }
                         }
@@ -1039,7 +1048,7 @@ struct StageDrawKeys {
     /// The three slice tips and toggles and this pane's orthographic toggle.
     /// The plate's mode label, Test prints' toolbar group and its sidebar (the mode, the
     /// sidebar open in the lead pane, a part picked, the print's revision for the totals).
-    tests: Option<(Option<PlateMode>, bool, bool, bool, u64)>,
+    tests: Option<(Option<PlateMode>, bool, bool, bool, bool, u64)>,
     /// Design's Part sidebar: offered in this view, a part picked, opened, over a slice.
     part_side: Option<(bool, bool, bool, bool)>,
     /// The colours' warning mark beside View options (why they differ from the print's).
@@ -1735,7 +1744,8 @@ impl FabStage {
         // a volume over the part under the click (or picked; none, it is off); from a slice
         // another workspace shows, it goes back to Design's to make it
         let settings = MenuItem::new(live_id!(ctx_settings_here), crate::ui::code::SETTINGS_HERE).enabled_if(over_part || has);
-        let test_cube = MenuItem::new(live_id!(ctx_test_cube), "Test cube").enabled_if(over_part || has);
+        let test_cube = MenuItem::new(live_id!(ctx_test_cube), "Test cube").enabled_if(
+            state.steps.shown.is_none() && (over_part || crate::ui::test_prints::target_part(state, None).is_some()));
         // the feature under the click: a volume that follows it
         let override_feature = feature.map(|f| MenuItem::new(live_id!(ctx_override_feature), &format!("Override settings: {}", f.split_once('/').map_or(f, |(_, n)| n))));
         if state.slice_blocks_edits() {
@@ -1936,7 +1946,10 @@ pub fn apply(state: &mut AppState, action: &StageAction) {
             state.ui.invert_wheel = *on;
             crate::view_prefs::save_invert_wheel(*on);
         }
-        StageAction::PartSidebar(on) => state.ui.part_sidebar = *on,
+        StageAction::PartSidebar(on) => {
+            state.ui.part_sidebar = *on;
+            if *on { state.ui.tests_sidebar = false; }
+        }
         // (the Plate view under the pointer opens its pie: `FabStage::pie_event`)
         StageAction::ViewPie => {}
         StageAction::PaintRadius(r) => state.ui.paint_radius = r.clamp(crate::tools::paint::MIN_RADIUS, crate::tools::paint::MAX_RADIUS),
@@ -2063,13 +2076,6 @@ impl Widget for FabStage {
                 }
                 _ => {}
             }
-        }
-        // the tests sidebar's sections: their hover, and a swipe across them folding them all
-        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover)
-            && self.view.view(cx, ids!(model_ui.tests_side)).visible()
-        {
-            let heads = self.view.widget(cx, ids!(tests_side.tests)).borrow::<crate::ui::test_prints::FabTestSections>().map(|t| t.headers()).unwrap_or_default();
-            crate::ui::widgets::section_headers(cx, event, &heads);
         }
         if let Some(state) = scope.data.get_mut::<AppState>() {
             match event {
@@ -2390,11 +2396,17 @@ impl Widget for FabStage {
                 if !state.print.test_mode {
                     cx.action(PrintAction::TestMode(true));
                 }
+                if state.test_prints.is_empty() && !state.ui.tests_sidebar {
+                    cx.action(StageAction::TestsSidebar(true));
+                }
             } else if let Some(mode) = [PlateMode::Design, PlateMode::Mechanics, PlateMode::Monitor].into_iter().find(|m| pick.0 == live_id!(fab_plate_mode).0 ^ (*m as u64 + 1)) {
                 cx.action(ShellAction::SetPlateMode(mode));
                 // every other mode prints the whole plate
                 if state.print.test_mode {
                     cx.action(PrintAction::TestMode(false));
+                    if state.test_prints.is_empty() && state.ui.tests_sidebar {
+                        cx.action(StageAction::TestsSidebar(false));
+                    }
                 }
             }
         }
@@ -2622,7 +2634,10 @@ impl Widget for FabStage {
             // The plate's mode in its flyout (Test prints: Design with the ticked tests alone), and
             // Test prints' toolbar group and sidebar of tests
             let tests_mode = design && p.test_mode;
-            let tests_key = (plate_mode, tests_mode, state.ui.tests_sidebar && lead, active_part(state).is_some(), p.revision);
+            let show_tests_ui = design && (p.test_mode || !state.test_prints.is_empty());
+            let tests_shown = show_tests_ui && state.ui.tests_sidebar && lead;
+            let has_part = show_tests_ui && state.steps.shown.is_none() && crate::ui::test_prints::target_part(state, None).is_some();
+            let tests_key = (plate_mode, tests_mode, show_tests_ui, tests_shown, has_part, p.revision);
             if self.draw_keys.tests != Some(tests_key) {
                 self.draw_keys.tests = Some(tests_key);
                 let name = match plate_mode {
@@ -2632,10 +2647,9 @@ impl Widget for FabStage {
                     _ => "Design",
                 };
                 v.widget(cx, ids!(render_row.plate_mode.label)).set_text(cx, name);
-                v.widget(cx, ids!(render_row.tests_rule)).set_visible(cx, tests_mode);
-                v.widget(cx, ids!(render_row.tests_group)).set_visible(cx, tests_mode);
-                v.radio_button(cx, ids!(render_row.tests_toggle)).set_active(cx, tests_key.2, Animate::No);
-                let has_part = tests_key.3;
+                v.widget(cx, ids!(render_row.tests_rule)).set_visible(cx, show_tests_ui);
+                v.widget(cx, ids!(render_row.tests_group)).set_visible(cx, show_tests_ui);
+                v.radio_button(cx, ids!(render_row.tests_toggle)).set_active(cx, tests_shown, Animate::No);
                 v.widget(cx, ids!(render_row.add_test)).set_disabled(cx, !has_part);
                 v.widget(cx, ids!(tests_side.side_add)).set_disabled(cx, !has_part);
                 for tip in [ids!(render_row.add_test_tip), ids!(tests_side.side_add_tip)] {
@@ -2643,7 +2657,15 @@ impl Widget for FabStage {
                         tip.text = if has_part { crate::ui::test_prints::ADD_TIP } else { SELECT_A_PART }.to_string();
                     }
                 }
-                v.view(cx, ids!(model_ui.tests_side)).set_visible(cx, tests_mode && tests_key.2);
+                let sidebar = v.view(cx, ids!(model_ui.tests_side));
+                if sidebar.visible() && !tests_shown {
+                    // The overlay is leaving the plate. Its pending or visible tip goes with it.
+                    cx.clear_all_hovers();
+                }
+                sidebar.set_visible(cx, tests_shown);
+                let totals = crate::ui::test_prints::totals(state);
+                v.label(cx, ids!(tests_side.tests_totals)).set_visible(cx, totals.is_some());
+                v.label(cx, ids!(tests_side.tests_totals)).set_text(cx, totals.as_deref().unwrap_or(""));
             }
             // Design's Part sidebar: in the lead view of Design (not its test prints, whose tests
             // take that side) while a part is picked and the view is wide enough, left of a
@@ -2686,9 +2708,6 @@ impl Widget for FabStage {
             }
             if open {
                 Self::sync_options(cx, &self.view, self.pane, state);
-                let totals = crate::ui::test_prints::totals(state);
-                v.label(cx, ids!(tests_side.tests_totals)).set_visible(cx, totals.is_some());
-                v.label(cx, ids!(tests_side.tests_totals)).set_text(cx, totals.as_deref().unwrap_or(""));
             }
             // Filament colours' toggle and the notice beside it.
             let colours = state.view.colours;
@@ -2878,10 +2897,11 @@ impl Widget for FabStage {
             let print_key = (p.revision, state.plate.revision, plate_mode, slice, checking, lead);
             if self.print_revision != Some(print_key) {
                 self.print_revision = Some(print_key);
-                let failed = v.view(cx, ids!(model_ui.bottom.slice_failed));
-                failed.set_visible(cx, lead && matches!(p.status, SliceStatus::Failed(_)));
-                if matches!(p.status, SliceStatus::Failed(_)) {
-                    failed.label(cx, ids!(slice_failed_text)).set_text(cx, &slice_status(p).0);
+                let failed = v.view(cx, ids!(failure_layer));
+                let fail = (!slice && lead).then(|| stage_failure(p)).flatten();
+                failed.set_visible(cx, fail.is_some());
+                if let Some(text) = fail {
+                    failed.label(cx, ids!(slice_failed.slice_failed_text)).set_text(cx, &text);
                 }
 
                 let has_job_card = crate::print::job_card::job_view(p, Cx::time_now()).is_some();
@@ -2931,7 +2951,9 @@ impl Widget for FabStage {
                     let (status, progress) = slice_status(p);
                     let running = matches!(p.status, SliceStatus::Running { .. });
                     let mut checking: Option<f32> = None;
-                    let chip = if held {
+                    let chip = if let Some(err) = export_failure(p) {
+                        Some(err)
+                    } else if held {
                         // The plate's slice is not this view's business.
                         None
                     } else if let Some(r) = p.resin_shown() {

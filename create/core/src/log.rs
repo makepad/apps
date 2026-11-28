@@ -319,7 +319,7 @@ pub(crate) mod tests {
         let key = DeviceKey::generate().unwrap();
         let (town, genesis) = Event::found(&key, 2, 0, 0, [0; 16]).unwrap();
         let mut log = Log::found(&path, genesis.clone()).unwrap();
-        let content = Content::Entity { kind: Key::Name("FutureCard".into()), project: None, derive: None, fields: vec![] };
+        let content = Content::Entity { copied_from: vec![], kind: Key::Name("FutureCard".into()), project: None, derive: None, fields: vec![] };
         let mut ids = Vec::new();
         for (flags, tail) in [(0x80, false), (0, true), (0x80, true)] {
             let base = Event::create(&key, town, Draft { kind: content.kind(), kind_version: content.version(), critical: false,

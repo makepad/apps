@@ -337,7 +337,10 @@ mod tests {
         assert_eq!(row.widget(&cx, ids!(line)).text(), "Recording App · Details · 1:05", "the clock ticks on Home");
 
         let port = ctl.link_up(&mut *cx, [1; 65], [2; 65], "Peer").unwrap();
-        port.messages_in.try_send(Message::Ring { call_id: [9; 16], secret: [3; 32], video: false, ext: Default::default() }.encode()).unwrap();
+        ctl.set_open_town(Some((start_town, vec![([2; 65], "Peer".into())])));
+        use makepad_town_core::share::hello::MediaCaps;
+        ctl.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
+        port.messages_in.try_send(Message::Ring { call_id: [9; 16], secret: [3; 32], video: false, ext: crate::call::RingExt { town: Some(start_town), ..Default::default() } }.encode()).unwrap();
         ctl.poll(&mut *cx);
         assert!(ctl.call_actions(&mut *cx, CallAction::Press(Press::Answer)));
         choose(&mut ctl, &mut cx, &mut rig.app, Press::Share(ShareChoice::Menu));

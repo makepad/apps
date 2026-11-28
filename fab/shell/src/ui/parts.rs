@@ -380,7 +380,7 @@ script_mod! {
     let ToolIcon = mod.widgets.FabIconButton{
         width: 24
         height: 22
-        draw_icon +: {color: fab.color_text_dim}
+        draw_icon +: {color: fab.color_flat_ink_dim}
     }
 
     let EyeIcon = ToolIcon{}
@@ -505,7 +505,7 @@ script_mod! {
                     }
                     // the dimensions, quieter than the name
                     size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                        draw_text +: { color: fab.color_text_dim row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
                     }
                 }
                 // The engine that builds the part (Exact, Field, Mesh) as a pill; its tip says what
@@ -525,11 +525,11 @@ script_mod! {
                                 let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
                                 let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
                                 sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
-                                sdf.fill(theme.prop_field)
+                                sdf.fill(fab.color_field)
                                 return sdf.result
                             }
                         }
-                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_muted } }
+                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_dim } }
                     }
                 }
                 // The part's colour, its edges on device pixels, with its nozzle's letter, left of the eye;
@@ -607,7 +607,7 @@ script_mod! {
         width: Fill height: 44
         draw_chip: mod.draw.DrawFabChip{}
         draw_text: mod.draw.DrawText{
-            color: fab.color_text_muted
+            color: fab.color_text_dim
             text_style: theme.font_regular{ font_size: fab.font_size_small - 1.0 }
         }
     }
@@ -617,7 +617,7 @@ script_mod! {
         width: Fill height: 44
         draw_chip: mod.draw.DrawFabChip{}
         draw_text: mod.draw.DrawText{
-            color: fab.color_text_muted
+            color: fab.color_text_dim
             text_style: theme.font_regular{ font_size: fab.font_size_small - 1.0 }
         }
     }
@@ -2132,6 +2132,8 @@ impl Widget for FabPatternDial {
 pub struct FabPartPanel {
     #[deref]
     view: View,
+    #[live]
+    is_sidebar: bool,
     #[rust]
     position_shown: Option<(usize, u64, PositionAnchor, Pose)>,
     #[rust]
@@ -2190,7 +2192,14 @@ impl Widget for FabPartPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if !self.view.visible() { return; }
+        let active = scope.data.get::<AppState>().is_none_or(|state| {
+            if self.is_sidebar {
+                !held_events::in_hidden_subtree(cx) && state.ui.part_side_shown
+            } else {
+                state.ui.on_screen(crate::ui::editors::Editor::Part)
+            }
+        });
+        if !active { return; }
         if let Event::Actions(actions) = event {
             if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
                 self.view.redraw(cx);
@@ -2211,10 +2220,6 @@ impl Widget for FabPartPanel {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        if !state.ui.on_screen(crate::ui::editors::Editor::Part) && !state.ui.part_side_shown {
-            // off screen: none of its controls can be pressed
-            return;
-        }
         let Some(index) = active_part(state) else { return };
         let p = &state.plate.parts[index];
         let object = &p.object;

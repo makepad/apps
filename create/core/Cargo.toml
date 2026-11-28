@@ -14,3 +14,4 @@ test-hooks = []
 
 [dependencies]
 makepad-network = { path = "../../../../platform/network" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }

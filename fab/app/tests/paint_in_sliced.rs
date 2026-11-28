@@ -1,19 +1,22 @@
-//! The brush in Sliced, in a real window, one boot on one small vase: each stroke of the same
-//! colour reaches the slice and only the layers it paints are planned again; Export after it
-//! writes the new paint; an undo takes it out of both.
+//! Painted toolpaths reach the exported file through the palette and a virtual printer's Jobs
+//! tab. A local write failure stays visible on the plate and preserves the slice.
 
 #[path = "common/render_mode.rs"]
 mod render_mode;
 mod common;
+#[path = "common/export_print.rs"]
+mod export_print;
+#[path = "common/simulated_profiles.rs"]
+mod simulated_profiles;
 #[path = "common/wait.rs"]
 mod idle_wait;
 use idle_wait::wait_poll;
 
 use makepad_script::syntax;
 use makepad_strict_json::Value;
-use makepad_test::{makepad_test, KeyCode, KeyModifiers, Role, Selector, TestApp};
+use makepad_test::{makepad_test, run_with_config, TestConfig, KeyCode, KeyModifiers, Role, Selector, TestApp};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const VASE: &str = include_str!("../resources/vase.cad.splash");
@@ -120,30 +123,28 @@ fn follow(app: &TestApp, from: u64) -> Reslice {
     r
 }
 
-/// Scroll the Job panel to its foot, where Export sits under the plate's colours (Parameters
-/// shares the column, and the colours can push Export below the fold).
-fn job_to_foot(app: &TestApp) {
-    let panel = app.locator(Selector::role(Role::TabPanel).name("Job")).wait_visible().snapshot().bounds;
-    let bar = app.widget_snapshot().nodes().into_iter().find(|n| {
-        let (x, y) = n.bounds.center();
-        n.role == Role::ScrollBar && n.visible() && panel.contains(x, y)
-    });
-    if let Some((bar, range)) = bar.and_then(|b| Some((b.id.short(), b.range?))) {
-        app.locator(Selector::raw(format!("id={bar}"))).set_value(range.max);
-    }
+/// Read the output named by this editor's status once this export has written it.
+fn written(app: &TestApp, panel: &str, status: Selector, asked: SystemTime) -> PathBuf {
+    let bounds = app.locator(Selector::role(Role::TabPanel).name(panel)).wait_visible().snapshot().bounds;
+    let status = app.locator(status);
+    wait(app, "the export's fresh path in the editor status", || {
+        let label = status.try_snapshot().ok()?;
+        let (x, y) = label.bounds.center();
+        if !bounds.contains(x, y) { return None; }
+        let (_, path) = label.name.split_once("Wrote ")?;
+        let path = PathBuf::from(path.trim());
+        std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|m| m >= asked).then_some(path)
+    })
 }
 
-/// Export on the Job tab, once its file is written: the printed G-code's extrusion per tool.
-fn export(app: &TestApp) -> BTreeMap<u32, f64> {
-    app.locator(Selector::role(Role::Tab).name("Job")).click();
-    job_to_foot(app);
+fn palette_export(app: &TestApp) -> BTreeMap<u32, f64> {
     let asked = SystemTime::now();
-    app.locator(Selector::id("export")).wait_visible().click();
-    let wrote = wait(app, "Export to write the plate", || {
-        app.widget_snapshot().nodes().iter().filter(|n| n.visible()).find_map(|n| n.node.name.split_once(" Wrote ").map(|(_, p)| PathBuf::from(p.trim())))
-            .filter(|p| std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|m| m >= asked))
-    });
-    let bytes = std::fs::read(&wrote).expect("the exported file");
+    export_print::request(app);
+    extrusion(&written(app, "Slice", Selector::raw("path=body.none name~=Wrote"), asked))
+}
+
+fn extrusion(wrote: &Path) -> BTreeMap<u32, f64> {
+    let bytes = std::fs::read(wrote).expect("the exported file");
     let mut zip = std::io::Cursor::new(bytes);
     let dir = makepad_zip_file::zip_read_central_directory(&mut zip).expect("a package");
     let entry = dir.file_headers.iter().find(|f| f.file_name.ends_with(".gcode")).expect("the package's G-code");
@@ -163,43 +164,50 @@ fn export(app: &TestApp) -> BTreeMap<u32, f64> {
     by_tool
 }
 
-#[makepad_test]
-fn a_stroke_in_sliced_reslices_around_the_brush_and_export_writes_it(app: TestApp) {
+fn sliced_vase(app: &TestApp, x: u32, y: u32) {
     app.locator(Selector::role(Role::Window)).wait_visible();
-    wait(&app, "the fab tools", || call(&app, "inspect", "{}").ok());
-    let batch = format!(r#"{{"request_id":"vase","expected":"{}","script":"vase.cad.splash","source":{}}}"#, head(&app), Value::Str(VASE.to_string()).to_json());
-    let h = head_of(&call(&app, "script", &batch).expect("script"));
-    let edits = Value::Str("color(\"Teal\", rgb: #x2a9d8f)\nplace(\"vase\", object: \"vase\", at: [175mm 160mm], name: \"Vase\", color: \"Teal\")".to_string()).to_json();
-    call(&app, "place", &format!(r#"{{"request_id":"place","expected":"{h}","edits":{edits}}}"#)).expect("place");
-    wait(&app, "the part", || (common::slice_state(&app) == "Off").then_some(()));
-    wait(&app, "the field part drawn", || app.log_since(0).map(|t| t.lines).unwrap_or_default().iter().any(|l| l.contains("drawn by the engine")).then_some(()));
+    wait(app, "the fab tools", || call(app, "inspect", "{}").ok());
+    let batch = format!(r#"{{"request_id":"vase","expected":"{}","script":"vase.cad.splash","source":{}}}"#, head(app), Value::Str(VASE.to_string()).to_json());
+    let h = head_of(&call(app, "script", &batch).expect("script"));
+    let edits = Value::Str(format!("color(\"Teal\", rgb: #x2a9d8f)\nplace(\"vase\", object: \"vase\", at: [{x}mm {y}mm], name: \"Vase\", color: \"Teal\")")).to_json();
+    call(app, "place", &format!(r#"{{"request_id":"place","expected":"{h}","edits":{edits}}}"#)).expect("place");
+    wait(app, "the part", || (common::slice_state(app) == "Off").then_some(()));
+    wait(app, "the field part drawn", || app.log_since(0).map(|t| t.lines).unwrap_or_default().iter().any(|l| l.contains("drawn by the engine")).then_some(()));
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name("Vase")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    render_mode::pick(&app, "Sliced");
-    wait(&app, "the first slice", || (common::slice_state(&app) == "Sliced").then_some(()));
-    app.locator(Selector::id("t_paint")).click();
+    render_mode::pick(app, "Sliced");
+    wait(app, "the first slice", || (common::slice_state(app) == "Sliced").then_some(()));
+}
 
-    let from = seq(&app);
-    let h = head(&app);
-    stroke(&app, 0.45);
-    wait(&app, "the first stroke", || (head(&app) != h).then_some(()));
-    let first = follow(&app, from);
+fn paint(app: &TestApp, row: f64) -> Reslice {
+    let from = seq(app);
+    let before = head(app);
+    stroke(app, row);
+    wait(app, "the brush stroke", || (head(app) != before).then_some(()));
+    follow(app, from)
+}
+
+fn painted(by: &BTreeMap<u32, f64>) -> f64 {
+    by.iter().skip(1).map(|(_, e)| *e).sum()
+}
+
+#[makepad_test]
+fn a_stroke_in_sliced_reslices_around_the_brush_and_export_writes_it(app: TestApp) {
+    sliced_vase(&app, 175, 160);
+    app.locator(Selector::id("t_paint")).click();
+    let first = paint(&app, 0.45);
     println!("[paint-in-sliced] stroke 1: {first:?}");
     assert!(first.whole.is_some(), "the first stroke never reached the slice");
-    let one = export(&app);
+    let one = palette_export(&app);
     println!("[paint-in-sliced] export after stroke 1: {one:?}");
 
     // The same colour again: the script already reads the strokes file, so nothing but the
     // strokes file's records changes.
-    let from = seq(&app);
-    let h = head(&app);
-    stroke(&app, 0.55);
-    wait(&app, "the second stroke", || (head(&app) != h).then_some(()));
-    let second = follow(&app, from);
+    let second = paint(&app, 0.55);
     println!("[paint-in-sliced] stroke 2: {second:?}");
-    let two = export(&app);
+    let two = palette_export(&app);
     println!("[paint-in-sliced] export after stroke 2: {two:?}");
 
     // Undone, in the view and the file alike.
@@ -208,15 +216,92 @@ fn a_stroke_in_sliced_reslices_around_the_brush_and_export_writes_it(app: TestAp
     app.press_key_with_modifiers(KeyCode::KeyZ, primary);
     let undone = follow(&app, from);
     println!("[paint-in-sliced] undo: {undone:?}");
-    let three = export(&app);
+    let three = palette_export(&app);
     println!("[paint-in-sliced] export after the undo: {three:?}");
 
     assert!(second.whole.is_some(), "a stroke of the same colour never reached the slice");
     assert!(second.traced == 0 && second.planned > 0, "a stroke plans its layers and traces nothing: {second:?}");
     assert!(one.len() > 1, "the first stroke prints in a second tool: {one:?}");
-    let painted = |by: &BTreeMap<u32, f64>| by.iter().skip(1).map(|(_, e)| *e).sum::<f64>();
     assert!(painted(&two) > painted(&one) + 1.0, "Export wrote no paint of the second stroke: {one:?} then {two:?}");
     assert!((painted(&three) - painted(&one)).abs() < 0.01, "Export after the undo: {one:?} then {three:?}");
+}
+
+fn isolated_config(test: &str) -> (TestConfig, PathBuf) {
+    let mut config = TestConfig::current_package(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"), test).unwrap();
+    let nonce = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("fab-{test}-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    config.env.insert("MAKEPAD_TEST_HOME".into(), dir.display().to_string());
+    (config, dir)
+}
+
+fn jobs_export(app: &TestApp) -> BTreeMap<u32, f64> {
+    app.locator(Selector::role(Role::Tab).name("Printers")).press();
+    app.locator(Selector::id("jobs_tab")).wait_visible().press();
+    let panel = app.locator(Selector::role(Role::TabPanel).name("Printers")).wait_visible().snapshot().bounds;
+    let button = app.locator(Selector::id("export"));
+    app.wait_until(|| {
+        if button.try_snapshot().is_ok() { return None; }
+        let (x, y) = panel.center();
+        app.scroll_at(x.into(), y.into(), 0.0, f64::from(panel.h) * 0.5, None);
+        Some("scrolling to Export in the active printer's Slice section".into())
+    });
+    assert!(button.snapshot().path.split('.').any(|s| s == "jobs_active"), "Export belongs to the active printer");
+    let asked = SystemTime::now();
+    button.press();
+    extrusion(&written(app, "Printers", Selector::path("status_row.status"), asked))
+}
+
+#[test]
+fn export_from_virtual_twin_jobs_tab_writes_painted_gcode() {
+    use makepad_fab_settings::virtual_printer::{self, Saved, Source};
+    let (config, dir) = isolated_config("export_from_virtual_twin_jobs_tab_writes_painted_gcode");
+    simulated_profiles::install(&dir);
+    let mut saved = Saved::default();
+    let twin = saved.printers.iter_mut().find(|p| p.name == "dual-nozzle").unwrap();
+    twin.source = Source::Twin { preset: simulated_profiles::MACHINE.into(), model: simulated_profiles::model(), source: None };
+    // Load the vase's teal and the brush's red on separate heads so each has its own spool.
+    for slot in &mut twin.slots {
+        slot.colour = match slot.tray.as_str() { "A1" => Some(0x2a9d8f), "B1" => Some(0xe73f3f), _ => None };
+        slot.material = slot.colour.map(|_| "PLA".into());
+    }
+    saved.picked = Some(format!("virtual:{}", twin.name));
+    virtual_printer::save_to(&dir.join(".makepad/fab/virtual_printers.txt"), &saved).unwrap();
+    let result = run_with_config(config, |app| {
+        // This twin's bed is 100 mm square.
+        sliced_vase(&app, 50, 50);
+        app.locator(Selector::id("t_paint")).click();
+        paint(&app, 0.45);
+        let one = jobs_export(&app);
+        assert!(one.len() > 1, "the twin's first export prints in two tools: {one:?}");
+        paint(&app, 0.55);
+        let two = jobs_export(&app);
+        assert!(painted(&two) > painted(&one) + 1.0, "the twin exported the second stroke: {one:?} then {two:?}");
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn palette_export_failure_shows_in_normal_without_slice_editor() {
+    let (config, dir) = isolated_config("palette_export_failure_shows_in_normal_without_slice_editor");
+    let documents = dir.join("Documents");
+    std::fs::create_dir(&documents).unwrap();
+    let blocked = documents.join("Fab");
+    std::fs::write(&blocked, b"").unwrap();
+    let result = run_with_config(config, |app| {
+        sliced_vase(&app, 175, 160);
+        render_mode::pick(&app, "Normal");
+        app.locator(Selector::role(Role::Tab).name("Slice")).wait_hidden();
+        export_print::request(&app);
+        let failure = app.locator(Selector::raw("path=slice_failed_text name~=\"Export failed:\"")).wait_visible().snapshot();
+        let path = blocked.join("vase.gcode.3mf");
+        let why = std::fs::metadata(&path).unwrap_err();
+        assert_eq!(failure.name, format!("Export failed: {}: {why}", path.display()), "the strip gives only the local file and write error");
+        assert_eq!(common::slice_state(&app), "Sliced", "a failed export preserves the slice");
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+    result.unwrap();
 }
 
 /// The app main thread's CPU budget per wait; the runtime also detects idle hangs.

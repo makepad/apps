@@ -103,6 +103,8 @@ class Gl {
         fields(m.depth_target,'attached texture_id','depth_target.');u(f32(m.depth_target.clear_depth),'depth_target.clear_depth');break;
       case 'FromWasmBeginRenderCanvas':
         this.frame.passes++;u(14,'kind');colors(m.clear_color);u(f32(m.clear_depth),'clear_depth');break;
+      case 'FromWasmUploadUniformStream':
+        this.uniform_stream=Buffer.from(bytes(m.data,1));break;
       case 'FromWasmDrawCall':
         if(this.pending.has(m.shader_id))break;
         if(this.waiting.has(m.shader_id)) {
@@ -110,9 +112,11 @@ class Gl {
           host.first_draw_this_frame=true;this.waiting.delete(m.shader_id);done(1,1);
         }
         this.frame.draw_calls++;u(15,'kind');
-        fields(m,'vao_id shader_id index_width depth_write alpha_blend blend_max backface_culling reset_draw_uniforms');
-        for(const key of ['pass_uniforms','draw_list_uniforms','draw_call_uniforms','user_uniforms','live_uniforms','const_table']) {
-          const b=bytes(m[key],4);u(b.length,`${key}.length`);h.bytes(b,key);
+        fields(m,'vao_id shader_id index_width depth_write alpha_blend blend_max cull_mode');
+        // each block's bytes in the repaint's uniform stream
+        for(const key of ['pass_uniforms','draw_list_uniforms','draw_call_uniforms','user_uniforms','live_uniforms']) {
+          const s=this.uniform_stream||Buffer.alloc(0),r=m[key];
+          const b=s.subarray(Math.min(r.off,s.length),Math.min(r.off+r.len,s.length));u(b.length,`${key}.length`);h.bytes(b,key);
         }
         m.custom_uniforms.forEach((c,i)=>{h.str(c.block_name,`custom_uniforms[${i}].block_name`);h.bytes(bytes(c.data,1),`custom_uniforms[${i}].data`);});
         m.textures.forEach((v,i)=>u(v==null?0xffffffffffffffffn:v,`textures[${i}]`));break;

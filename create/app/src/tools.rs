@@ -5,17 +5,24 @@
 //! Every function of the window is an [`Action`](crate::model::Action), and [`ACTIONS`] pairs each
 //! with its tool, so a button and its tool are one implementation (AI parity; a test holds it).
 
+use crate::ai_out::{SafeToolError, TownToolResult};
 use crate::ai_trace::{Ink, Phase, Traces};
 use crate::board::page::Cursor;
 use crate::call::{ai::CallTool, CallShown, CallView};
 use crate::model::{app_rows_page, id_arg, wall_ms, Action, ItemStyle, Model, Town, RestackTo, StepAt};
-use crate::tweak::{widget_name, RequestId, Seat, Session};
-use makepad_ai_services::wire::{Risk, ServiceManifest, ToolDef, ToolResult};
+use crate::tweak::design::tools::{self as design_tools, DesignPhase};
+use crate::tweak::{widget_name, Notice, Request as ShareRequest, RequestId, Seat, Session, ThemeInstall, ThemeOp};
+use crate::tweak::theme::{self, builder, lab, store, ThemeMixerCache, ThemeSection, ThemeSnapshot};
+use makepad_widgets::theme_tokens::{Appearance, WeightMode};
+use makepad_ai_services::wire::MAX_RESULT_BYTES;
+use std::path::Path;
+use makepad_ai_services::wire::{Risk, ServiceManifest, ToolDef, ToolOutcome, ToolResult};
 use makepad_town_core::doc::{BreakRef, CharId};
 use makepad_town_core::entity::{field, Entity};
 use makepad_town_core::event::{Change, Id, Key, SessionId, TownId, Value as FieldValue};
 use makepad_town_core::{fold::State, hex, parse_id};
 use makepad_town_core::queue::Credential;
+use makepad_town_core::trust::{AiJson, AiOut, AiTextBuilder, Gate, Withheld};
 use makepad_strict_json::{self as json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,15 +34,18 @@ pub fn filter_call_shown(shown: &CallShown, call_town: Option<TownId>,
     let share = &mut filtered.share;
     Arc::make_mut(&mut share.offers).retain(|offer| belongs(&offer.session));
     share.watching = share.watching.filter(belongs);
-    share.peer_watching = share.peer_watching.filter(belongs);
+    if share.watching.is_none() { share.watching_sharer = None; }
+    share.watchers = share.own_offers().flat_map(|o| o.watchers.iter().cloned())
+        .collect::<std::collections::BTreeMap<_, _>>().into_iter().collect();
     share.control_session = share.control_session.filter(belongs);
     if share.control_session.is_none() {
-        share.control = Default::default();
-    } else {
-        share.control.asking = share.control.asking.filter(belongs);
-        share.control.requested = share.control.requested.filter(belongs);
-        share.control.allowed = share.control.allowed.filter(belongs);
+        share.control.active = None;
+        share.control.holder = None;
+        share.control.notice = None;
     }
+    share.control.asking = share.control.asking.filter(belongs);
+    share.control.allowed = share.control.allowed.filter(belongs);
+    share.control.requests.retain(|(s, ..)| belongs(s));
     if recording_town != Some(caller_town) {
         share.capture.recording = None;
         share.capture.line = None;
@@ -45,10 +55,7 @@ pub fn filter_call_shown(shown: &CallShown, call_town: Option<TownId>,
     share.problem = None;
     if call_town != Some(caller_town) {
         filtered.echo_cancel_notice = None;
-        let peer_name = if share.control.active.is_some() && share.own_offers().any(|o| Some(o.session) == share.control_session) {
-            shown.view.peer_name.clone()
-        } else { String::new() };
-        filtered.view = Arc::new(CallView { peer_name, ..Default::default() });
+        filtered.view = Arc::new(CallView::default());
         filtered.transcribe = Default::default();
         filtered.transcript_town.clear();
         filtered.mic_open = false;
@@ -70,12 +77,6 @@ pub fn check_call_tool_town(tool: CallTool, shown: &CallShown, call_town: Option
         CallTool::RecordingStop => shown.share.capture.recording.is_some() && recording_town != Some(caller_town),
     };
     if refuse { Err("Active call belongs to another town.") } else { Ok(()) }
-}
-
-pub fn call_state_with_message(shown: &CallShown, now: std::time::Instant, message: &str) -> String {
-    let mut state = json::parse(crate::call::ai::state(shown, now).as_bytes()).expect("serialized call state");
-    if let Value::Obj(fields) = &mut state { fields.push(("message".into(), json::s(message))); }
-    state.to_json()
 }
 
 /// Held calls are process-local. Their credentials, cursors and pending lines survive the process.
@@ -105,16 +106,15 @@ impl AgentWaits {
         let Some(agent) = msg.to_agent else { return };
         let Some(activity) = model.agent_activity(agent) else { return };
         let at = if msg.author == model.me() { msg.wall_ms } else { (self.clock)() };
-        self.traces.offer(activity.binding, agent, &model.agent_label(&model.state.agents[&agent].owner), line, msg.wall_ms, at);
+        self.traces.offer(activity.binding, agent, &model.agent_short_label(agent), line, msg.wall_ms, at);
     }
 
     pub fn joined(&mut self, model: &mut Model) {
         let Some(offers) = model.joined_offers.take() else { return };
         let now = (self.clock)();
         self.traces.close_ended(|old, id| old.town == offers.binding.town && id == offers.agent && old != offers.binding);
-        let name = model.agent_label(&model.me());
         for (line, sent) in offers.lines {
-            self.traces.offer(offers.binding, offers.agent, &name, line, sent, now);
+            self.traces.offer(offers.binding, offers.agent, &offers.name, line, sent, now);
         }
     }
 
@@ -149,20 +149,19 @@ impl AgentWaits {
 
     pub fn is_empty(&self) -> bool { self.held.is_empty() }
 
-    pub fn wait(&mut self, model: &mut crate::model::Model, call: &str, binding: Credential, after: Option<Id>) -> Vec<ToolResult> {
-        let name = model.agent_label(&model.me());
-        let answer = match model.agent_wait_with_receipt(binding, after, true, |agent, acknowledged, ids| {
+    pub fn wait(&mut self, model: &mut crate::model::Model, call: &str, binding: Credential, after: Option<Id>) -> Vec<TownToolResult> {
+        let answer = match model.agent_wait_with_receipt(binding, after, true, |agent, name, acknowledged, ids| {
             if acknowledged { self.traces.acknowledge(binding, ids); }
-            self.traces.pickup(binding, agent, &name, ids, (self.clock)());
+            self.traces.pickup(binding, agent, name, ids, (self.clock)());
         }) {
             Ok(answer) => answer,
-            Err(why) => return vec![ToolResult::refused(call, why)],
+            Err(why) => return vec![TownToolResult::refused(call, SafeToolError::formatted_ids_only(why))],
         };
         let mut results = Vec::new();
         if let Some(old) = self.held.remove(&binding) {
-            results.push(ToolResult::refused(old.call, "Another wait took over this binding."));
+            results.push(TownToolResult::refused(old.call, SafeToolError::static_msg("Another wait took over this binding.")));
         }
-        if let Some(page) = answer { results.push(ToolResult::ok(call, page, "addressed messages")); }
+        if let Some(page) = answer { results.push(TownToolResult::text(call, page, "addressed messages")); }
         else { self.held.insert(binding, Held { call: call.into(), checked: model.agent_stamp(binding.town) }); }
         results
     }
@@ -173,18 +172,17 @@ impl AgentWaits {
         self.held.len() != count
     }
 
-    pub fn deliver(&mut self, model: &mut crate::model::Model, changed: Option<Id>) -> Vec<ToolResult> {
+    pub fn deliver(&mut self, model: &mut crate::model::Model, changed: Option<Id>) -> Vec<TownToolResult> {
         let mut results = Vec::new();
         self.reconcile(model);
         self.held.retain(|&binding, held| {
             let stamp = model.agent_stamp(binding.town);
             if held.checked == stamp && changed != Some(binding.town) { return true }
-            let name = model.agent_label(&model.me());
-            match model.agent_wait_with_receipt(binding, None, false, |agent, _, ids|
-                self.traces.pickup(binding, agent, &name, ids, (self.clock)())) {
+            match model.agent_wait_with_receipt(binding, None, false, |agent, name, _, ids|
+                self.traces.pickup(binding, agent, name, ids, (self.clock)())) {
                 Ok(None) => { held.checked = model.agent_stamp(binding.town); return true }
-                Ok(Some(page)) => results.push(ToolResult::ok(&held.call, page, "addressed messages")),
-                Err(why) => results.push(ToolResult::refused(&held.call, why)),
+                Ok(Some(page)) => results.push(TownToolResult::text(&held.call, page, "addressed messages")),
+                Err(why) => results.push(TownToolResult::refused(&held.call, SafeToolError::formatted_ids_only(why))),
             }
             false
         });
@@ -230,6 +228,7 @@ impl Activity {
                     named(&format!("added {kind}"), style.text.as_deref().unwrap_or_default())
                 }
                 Action::AddBoard { title, .. } => named("added board", title),
+                Action::PinFrom { .. } => "pinned media to board".into(),
                 Action::AddTask { title, .. } => named("added task", title),
                 Action::EditTask { task, .. } => named("edited task", title(task)),
                 Action::SetTaskStatus { status, .. } => format!("set task status to {status}"),
@@ -237,7 +236,7 @@ impl Activity {
                 Action::MergeTasks { .. } => "merged tasks".into(),
                 Action::SessionOpen { .. } | Action::SessionJoin { .. } | Action::SessionLeave { .. }
                 | Action::SessionDecline { .. } | Action::Said { .. } | Action::Shared { .. }
-                | Action::PostClip { .. } | Action::Provide { .. } | Action::RequestSummary { .. } | Action::RequestTaskUpdate { .. }
+                | Action::PostClip { .. } | Action::PinMedia { .. } | Action::Provide { .. } | Action::RequestSummary { .. } | Action::RequestTaskUpdate { .. }
                 | Action::AcceptProposed { .. } | Action::DismissProposed { .. }
                 | Action::AddApp { .. } | Action::RecordAppEdit { .. } => return None, // Local flows have no tool.
                 Action::AddProject { title } => named("added project", title),
@@ -264,14 +263,24 @@ impl Activity {
         Some(Self::Text(text))
     }
 
-    pub fn record(self, waits: &mut AgentWaits, binding: Credential, model: &Model, event: Option<Id>, tool: &str, result: &ToolResult) {
-        if result.outcome != makepad_ai_services::wire::ToolOutcome::Ok {
-            waits.warn(binding, tool, &result.text);
+    pub fn record(self, waits: &mut AgentWaits, binding: Credential, model: &Model, event: Option<Id>, tool: &str, result: &TownToolResult) {
+        self.record_fields(waits, binding, model, event, tool, result.outcome(), result.note(), result.error_text().unwrap_or_default());
+    }
+
+    /// Activity for doc_read and tasks_list while those readers still return wire replies.
+    pub fn record_deferred_read(self, waits: &mut AgentWaits, binding: Credential, model: &Model, tool: &str, result: &ToolResult) {
+        self.record_fields(waits, binding, model, None, tool, result.outcome, &result.note, &result.text);
+    }
+
+    fn record_fields(self, waits: &mut AgentWaits, binding: Credential, model: &Model, event: Option<Id>,
+        tool: &str, outcome: ToolOutcome, note: &str, error: &str) {
+        if !outcome.is_ok() {
+            waits.warn(binding, tool, error);
             return
         }
         let text = match self {
             Self::Text(text) => text,
-            Self::Call => result.note.clone(),
+            Self::Call => note.to_owned(),
             Self::AddedStep(board) => model.loaded_town(binding.town).and_then(|town|
                 crate::board::tree::steps(&town.state, board).iter().position(|e| Some(e.id) == event))
                 .map_or_else(|| "added a step".into(), |at| format!("added step {}", at + 1)),
@@ -291,17 +300,18 @@ impl Activity {
 }
 
 /// Actions reserved for local UI flows, with no tool reader.
-pub const FLOW_ONLY: [&str; 11] = ["session_open", "session_join", "session_leave", "session_decline", "said", "post_clip", "provide", "request_summary",
+pub const FLOW_ONLY: [&str; 12] = ["session_open", "session_join", "session_leave", "session_decline", "said", "post_clip", "pin_media", "provide", "request_summary",
     "request_task_update", "accept_proposed", "dismiss_proposed"];
 
 /// Each tool-backed action of the window and the tool that does the same.
-pub const ACTIONS: [(&str, &str); 29] = [
+pub const ACTIONS: [(&str, &str); 30] = [
     ("add_project", "project_create"),
     ("remove_project", "project_remove"),
     ("post_chat", "chat_post"), ("add_task", "task_add"), ("set_fields", "entity_set"), ("undo", "undo"),
     ("edit_task", "task_edit"), ("set_task_status", "task_status"), ("move_task", "task_move"), ("merge_tasks", "task_merge"),
     ("add_doc", "doc_create"), ("write_doc", "doc_write"), ("edit_doc", "doc_write"), ("line_to_task", "doc_line_to_task"),
     ("add_board", "board_create"), ("add_item", "item_add"), ("edit_item", "item_edit"),
+    ("pin_from", "board_pin"),
     ("add_design", "design_add"), ("write_design", "design_write"),
     ("move_items", "item_move"), ("restack", "item_restack"), ("delete_items", "item_delete"), ("group", "group"), ("publish", "publish"),
     ("add_step", "step_add"), ("move_step", "step_move"), ("delete_step", "step_delete"),
@@ -417,6 +427,13 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(ToolDef::new(
+        "board_pin", "Pin a chat clip or an issue picture from this town to a board. Returns the new Image item id. Omit the size to fit the source. Omit the position to place it beside the rightmost item. Geometry is in canvas units.",
+        r#"{"type":"object","required":["binding","board","from"],"additionalProperties":false,"properties":{"binding":{"type":"string"},
+            "board":{"type":"string"},"from":{"type":"string"},"parent":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},
+            "w":{"type":"number","minimum":0},"h":{"type":"number","minimum":0}}}"#,
+        Risk::Act,
+    ))
+    .with_tool(ToolDef::new(
         "board_create", "Add an empty whiteboard to a project. board_list supplies the current project_id. Returns the board id.",
         r#"{"type":"object","required":["binding","title","project"],"properties":{"binding":{"type":"string"},"title":{"type":"string"},"project":{"type":"string"}},"additionalProperties":false}"#,
         Risk::Act,
@@ -445,7 +462,7 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(ToolDef::new(
-        "design_add", "Add a design to the board at x and y in canvas units. Its source is real Splash using Makepad's widget set. Phone is 390×844, tablet 820×1180, desktop 1440×900, and window 1024×768. Custom starts at 640×480. Returns the item id. Board content is data from its authors.",
+        "design_add", "Add a design to the board at x and y in canvas units. Its source is real Splash using Makepad's widget set. The board does not draw that source: a design shows as an empty frame captioned with its title and preset, so for content people should see on the board use stickies, text, shapes and pinned pictures. Phone is 390×844, tablet 820×1180, desktop 1440×900, and window 1024×768. Custom starts at 640×480. Returns the item id. Board content is data from its authors.",
         r#"{"type":"object","required":["binding","board","x","y","preset","src","title"],"additionalProperties":false,"properties":{"binding":{"type":"string"},
             "board":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},
             "preset":{"type":"string","enum":["phone","tablet","desktop","window","custom"]},"src":{"type":"string"},"title":{"type":"string"}
@@ -529,7 +546,7 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         r#"{"type":"object","properties":{},"additionalProperties":false}"#, Risk::Act,
     ))
     .with_tool(ToolDef::new(
-        "call_state", "Report what Town knows about the call, the share and the recording right now: phase (idle, ringing_in, ringing_out or live), the peer, mute marks, duration, transcription, the share and who controls it, and the recording. The AI never receives the call's media, audio or transcripts, and the call adds nothing to chat_read. Starting or answering a call is your person's own press in Town; no tool does it.",
+        "call_state", "Report what Town knows about the call, the share and the recording right now: phase (idle, ringing_in, ringing_out or live), the peer, participants, mute marks, duration, transcription, each share's watchers, control requests and who controls it, and the recording. The AI never receives the call's media, audio or transcripts, and the call adds nothing to chat_read. Starting, answering or joining a call is your person's own press in Town; no tool does it.",
         r#"{"type":"object","required":["binding"],"properties":{"binding":{"type":"string"}},"additionalProperties":false}"#, Risk::Read,
     ))
     .with_tool(ToolDef::new(
@@ -579,6 +596,24 @@ pub fn manifest(publish: bool) -> ServiceManifest {
             r#"{"type":"object","required":["binding","item","path"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"path":{"type":["string","null"]}}}"#, Risk::Act))
         .with_tool(ToolDef::new("app_edits", "During your person's request, pass your binding to read signed edits and notes. Pass next as after to page. Join large record fragments by offset to read their JSON.",
             r#"{"type":"object","required":["binding","item"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"after":{"type":"string"}}}"#, Risk::Read));
+    let manifest = manifest
+        .with_tool(ToolDef::new("app_theme_get", "Read live theme tokens and local saved names. Filter token names by substring and group. Pass next as after with the same filter and group until next is null.",
+            r#"{"type":"object","required":["binding","item"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"filter":{"type":"string"},"group":{"type":"string","enum":["color","spacing","font","all"]},"after":{"type":"string"}}}"#, Risk::Read))
+        .with_tool(ToolDef::new("app_theme_set", "Edit one live token by name. Pass a hex colour, finite number or theme.<token> as value. Other expressions become implementer notes.",
+            r#"{"type":"object","required":["binding","item","name","value"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"}}}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_install", "Install one preset by base or sheet ID, or one saved theme by its local name.",
+            r#"{"type":"object","required":["binding","item"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"preset":{"type":"string"},"saved":{"type":"string"}},"oneOf":[{"required":["preset"]},{"required":["saved"]}]}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_save", "Save the live theme in your person’s store. Set replace to true to overwrite the named theme.",
+            r#"{"type":"object","required":["binding","item","name"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"name":{"type":"string"},"replace":{"type":"boolean"}}}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_delete", "Delete a named theme from your person’s store. The shared app keeps its current theme.",
+            r#"{"type":"object","required":["binding","name"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"name":{"type":"string"}}}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_mix", "Install a live mix. Supply nonnegative weights for themes of one appearance, or surprise=true with an optional integer seed. Relative mode totals 100.",
+            r#"{"type":"object","required":["binding","item"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"appearance":{"type":"string","enum":["dark","light"]},"mode":{"type":"string","enum":["absolute","relative"]},"weights":{"type":"object","additionalProperties":{"type":"number","minimum":0}},"surprise":{"type":"boolean"},"seed":{"type":"integer","minimum":0,"maximum":9223372036854775807}},"oneOf":[{"required":["weights"]},{"required":["surprise"]}]}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_build", "Build and install a theme. Choose 1–4 hex colours or grow a favourite by harmony and mood. Roll with an optional seed, using explicit settings as locks. Saturation, lightness and text tint are percentages. Font size is 6–30, font contrast 0–8, text contrast 4.5–21, spacing 2–20 and roundness 0–20.",
+            r#"{"type":"object","required":["binding","item"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"item":{"type":"string"},"dark":{"type":"boolean"},"color_count":{"type":"integer","minimum":1,"maximum":4},"palette":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"string"}},"favourite":{"type":"string"},"harmony":{"type":"string","enum":["house","single","analogous","complementary","split","triadic"]},"mood":{"type":"string","enum":["plain","muted","pastel","deep"]},"roll":{"type":"boolean"},"seed":{"type":"integer","minimum":0,"maximum":9223372036854775807},"seed_slot":{"type":"string","enum":["primary","secondary","tertiary","surface"]},"follow_surface":{"type":"boolean"},"saturation":{"type":"number","minimum":0,"maximum":100},"lightness":{"type":"number","minimum":0,"maximum":100},"font_size":{"type":"number","minimum":6,"maximum":30},"font_contrast":{"type":"number","minimum":0,"maximum":8},"text_contrast":{"type":"number","minimum":4.5,"maximum":21},"text_color":{"type":["string","null"],"enum":["primary","secondary","tertiary","surface",null]},"text_tint":{"type":"number","minimum":0,"maximum":100},"spacing":{"type":"number","minimum":2,"maximum":20},"roundness":{"type":"number","minimum":0,"maximum":20}}}"#, Risk::Act))
+        .with_tool(ToolDef::new("app_theme_palettes", "Browse palettes for a hex colour and a chosen seed slot at 1–4 colours. Adjust fits colours to the pick. Page by offset and limit (1–48, default 24). Pass shown to app_theme_build as palette.",
+            r#"{"type":"object","required":["binding","color"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"color":{"type":"string"},"color_count":{"type":"integer","minimum":1,"maximum":4},"seed_slot":{"type":"string","enum":["primary","secondary","tertiary","surface"]},"dark":{"type":"boolean"},"adjust":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":48}}}"#, Risk::Read));
+    let manifest = design_tools::register(manifest);
     if !publish { return manifest }
     manifest.with_tool(ToolDef::new(
         "publish_media", "List your local media for a publish draft. Returns store entry IDs, names and byte sizes.",
@@ -591,8 +626,280 @@ pub fn manifest(publish: bool) -> ServiceManifest {
 
 enum AppTool {
     List { after: Option<AppCursor> },
+    Theme { item: Id, op: ThemeCall },
+    Delete(String),
+    Palettes(PaletteQuery),
     Live { item: Id, request: crate::tweak::Request },
     Edits { item: Id, after: Option<(Id, usize)> },
+}
+
+#[derive(Clone, Copy)]
+enum ThemePageSection { Sheets, Saved, Edits, Tokens }
+
+impl ThemePageSection {
+    const ALL: [Self; 4] = [Self::Sheets, Self::Saved, Self::Edits, Self::Tokens];
+
+    fn name(self) -> &'static str {
+        match self { Self::Sheets => "sheets", Self::Saved => "saved", Self::Edits => "edits", Self::Tokens => "tokens" }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ThemeCursor { section: ThemePageSection, index: usize }
+
+impl ThemeCursor {
+    fn parse(text: &str) -> Option<Self> {
+        let (key, digits) = text.split_once(':')?;
+        let section = ThemePageSection::ALL.into_iter().find(|s| s.name() == key)?;
+        if !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 1 && digits.starts_with('0') { return None }
+        Some(Self { section, index: digits.parse().ok()? })
+    }
+
+    fn advance(self, lengths: &[usize; 4]) -> Option<Self> {
+        let mut index = self.index;
+        for section in ThemePageSection::ALL.into_iter().skip(self.section as usize) {
+            if index < lengths[section as usize] { return Some(Self { section, index }) }
+            index = 0;
+        }
+        None
+    }
+
+    fn encode(self) -> String { format!("{}:{}", self.section.name(), self.index) }
+}
+
+struct ThemeQuery {
+    group: Option<ThemeSection>,
+    filter: String,
+    after: Option<ThemeCursor>,
+}
+
+struct PaletteQuery {
+    color: u32, count: usize, slot: builder::SeedSlot, dark: bool, adjust: bool, offset: usize, limit: usize,
+}
+
+enum ThemeCall {
+    Get(ThemeQuery),
+    Set { name: String, value: String },
+    Preset(String),
+    Saved(String),
+    Save { name: String, replace: bool },
+    Mix { appearance: Option<Appearance>, mode: WeightMode, weights: Option<Vec<(String, f64)>>, seed: Option<u64> },
+    Build(builder::BuildSpec),
+}
+
+pub(crate) fn optional<T>(args: &Value, key: &str, parse: impl FnOnce(&Value) -> Option<T>) -> Result<Option<T>, String> {
+    args.get(key).map(|v| parse(v).ok_or_else(|| format!("invalid {key}"))).transpose()
+}
+
+fn parse_theme_call(name: &str, args: &Value) -> Result<AppTool, String> {
+    use builder::{parse_hex_rgb, parse_seed_slot, BuildPalette, BuildSpec, SeedSlot};
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("expected text for {key}"));
+    let flag = |key| optional(args, key, Value::as_bool);
+    let integer = |key| optional(args, key, Value::as_u64);
+    let slot = |key| optional(args, key, |v| parse_seed_slot(v.as_str()?));
+    let count = || optional(args, "color_count", |v| usize::try_from(v.as_u64()?).ok().filter(|c| (1..=4).contains(c)));
+    if name == "app_theme_delete" {
+        only_keys(args, &["binding", "name"])?;
+        let name = text("name")?;
+        store::validate_name(&name).map_err(|e| e.to_string())?;
+        return Ok(AppTool::Delete(name))
+    }
+    if name == "app_theme_palettes" {
+        only_keys(args, &["binding","color","color_count","seed_slot","dark","adjust","offset","limit"])?;
+        let color = parse_hex_rgb(&text("color")?).ok_or("invalid hex color")?;
+        let count = count()?.unwrap_or(4);
+        let slot = slot("seed_slot")?.unwrap_or(SeedSlot::Primary);
+        if !slot.chosen_at(count) { return Err("seed_slot is unavailable for this color_count".into()) }
+        let offset = usize::try_from(integer("offset")?.unwrap_or(0)).map_err(|_| "invalid offset")?;
+        let limit = integer("limit")?.unwrap_or(24);
+        if !(1..=48).contains(&limit) { return Err("limit must be 1 through 48".into()) }
+        return Ok(AppTool::Palettes(PaletteQuery { color, count, slot, dark: flag("dark")?.unwrap_or(true),
+            adjust: flag("adjust")?.unwrap_or(true), offset, limit: limit as usize }))
+    }
+    let item = required_id(args.get("item"), "item")?;
+    let op = match name {
+        "app_theme_get" => {
+            only_keys(args, &["binding","item","filter","group","after"])?;
+            let group = optional(args, "group", |v| Some(match v.as_str()? {
+                "all" => None, "color" => Some(ThemeSection::Color), "font" => Some(ThemeSection::Font),
+                "spacing" => Some(ThemeSection::Spacing), _ => return None,
+            }))?.flatten();
+            ThemeCall::Get(ThemeQuery { group, filter: optional(args, "filter", |v| Some(v.as_str()?.to_ascii_lowercase()))?.unwrap_or_default(),
+                after: args.get("after").map(|v| v.as_str().and_then(ThemeCursor::parse)
+                    .ok_or("invalid app_theme_get cursor; pass next from app_theme_get")).transpose()? })
+        }
+        "app_theme_set" => { only_keys(args, &["binding","item","name","value"])?;
+            ThemeCall::Set { name: text("name")?, value: text("value")? } }
+        "app_theme_install" => {
+            only_keys(args, &["binding","item","preset","saved"])?;
+            match (args.get("preset"), args.get("saved")) {
+                (Some(_), None) => ThemeCall::Preset(text("preset")?),
+                (None, Some(_)) => ThemeCall::Saved(text("saved")?),
+                _ => return Err("supply exactly one of preset or saved".into()),
+            }
+        }
+        "app_theme_save" => { only_keys(args, &["binding","item","name","replace"])?;
+            let raw = text("name")?;
+            let name = store::normalize_name(&raw).ok_or_else(|| store::StoreError::InvalidName(raw).to_string())?;
+            if store::is_builtin(&name) { return Err(store::StoreError::Builtin(name).to_string()) }
+            ThemeCall::Save { name, replace: flag("replace")?.unwrap_or(false) } }
+        "app_theme_mix" => {
+            only_keys(args, &["binding","item","appearance","mode","weights","surprise","seed"])?;
+            let appearance = optional(args, "appearance", |v| match v.as_str()? {
+                "dark" => Some(Appearance::Dark), "light" => Some(Appearance::Light), _ => None })?;
+            let mode = optional(args, "mode", |v| match v.as_str()? {
+                "absolute" => Some(WeightMode::Absolute), "relative" => Some(WeightMode::Relative), _ => None })?.unwrap_or(WeightMode::Relative);
+            let seed = integer("seed")?;
+            let weights = match (args.get("weights"), flag("surprise")?) {
+                (Some(Value::Obj(entries)), None) if seed.is_none() => {
+                    let weights = entries.iter().map(|(name, v)| {
+                        let w = match v { Value::Int(i) => *i as f64, Value::F64(f) => *f, _ => return Err("expected a numeric weight") };
+                        Ok((name.clone(), w))
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    lab::MixSpec::Weights(weights.clone()).appearance(appearance)?;
+                    Some(weights)
+                }
+                (None, Some(true)) => None,
+                _ => return Err("supply weights or surprise=true, with seed only for surprise".into()),
+            };
+            ThemeCall::Mix { appearance, mode, weights, seed }
+        }
+        "app_theme_build" => {
+            only_keys(args, &["binding","item","dark","color_count","palette","favourite","harmony","mood","roll","seed",
+                "seed_slot","follow_surface","saturation","lightness","font_size","font_contrast","text_contrast","text_color",
+                "text_tint","spacing","roundness"])?;
+            let palette = match (args.get("palette"), args.get("favourite")) {
+                (Some(_), Some(_)) => return Err("palette and favourite are mutually exclusive".into()),
+                (_, None) if args.get("harmony").is_some() || args.get("mood").is_some() => return Err("harmony and mood require favourite".into()),
+                (Some(array), None) => {
+                    let colors = array.as_arr().filter(|a| (1..=4).contains(&a.len())).ok_or("palette needs 1 through 4 colours")?
+                        .iter().map(|v| v.as_str().and_then(parse_hex_rgb).ok_or("invalid palette colour")).collect::<Result<_, _>>()?;
+                    BuildPalette::Explicit { colors }
+                }
+                (None, Some(v)) => BuildPalette::Grown { favourite: v.as_str().and_then(parse_hex_rgb).ok_or("invalid favourite colour")?,
+                    harmony: optional(args, "harmony", |v| builder::parse_harmony(v.as_str()?))?.unwrap_or_default(),
+                    mood: optional(args, "mood", |v| builder::parse_mood(v.as_str()?))?.flatten() },
+                _ => BuildPalette::House,
+            };
+            let n = |key| args.get(key).map(|_| number(args, key)).transpose();
+            ThemeCall::Build(BuildSpec { palette, dark: flag("dark")?, color_count: count()?, roll: flag("roll")?.unwrap_or(false),
+                seed: integer("seed")?, seed_slot: slot("seed_slot")?, follow_surface: flag("follow_surface")?,
+                saturation: n("saturation")?, lightness: n("lightness")?, font_size: n("font_size")?, font_contrast: n("font_contrast")?,
+                text_contrast: n("text_contrast")?, text_color: if args.get("text_color") == Some(&Value::Null) { Some(None) }
+                    else { slot("text_color")?.map(Some) }, text_tint: n("text_tint")?, spacing: n("spacing")?, roundness: n("roundness")? })
+        }
+        _ => return Err("unknown theme tool".into()),
+    };
+    Ok(AppTool::Theme { item, op })
+}
+
+fn theme_get_page(snap: &ThemeSnapshot, query: ThemeQuery, ctx: &ThemeToolContext<'_>, share: SessionId, item: Id) -> Result<Value, String> {
+    let tokens: Vec<_> = snap.ordered_tokens().filter(|t| query.group.is_none_or(|g| g == ThemeSnapshot::token_section(t))
+        && (query.filter.is_empty() || t.name.to_ascii_lowercase().contains(&query.filter))).collect();
+    let (saved, error) = match store::list_in(ctx.themes_dir) {
+        Ok(names) => (names, None),
+        Err(e) => (vec![], Some(e.to_string())),
+    };
+    let worn = ctx.active_worn.as_ref().filter(|(s,i,_)| (*s,*i) == (share,item)).map(|(_,_,s)| s);
+    let mut header = vec![("base",json::s(&snap.base)), ("sheet",snap.sheet.as_ref().map_or(Value::Null,json::s)),
+        ("label",json::s(snap.label())), ("worn",worn.map_or(Value::Null,json::s)), ("has_mix",Value::Bool(snap.has_mix)),
+        ("has_pins",Value::Bool(snap.has_pins)), ("bases",Value::Arr(makepad_widgets::BaseTheme::ALL.iter().map(|b| json::s(b.id())).collect())),
+        ("total_sheets",Value::Int(snap.sheets.len() as i64)), ("total_saved",Value::Int(saved.len() as i64)),
+        ("total_edits",Value::Int(snap.edits.len() as i64)), ("total_tokens",Value::Int(tokens.len() as i64))];
+    if let Some(err) = error { header.push(("store_error", json::s(err))); }
+    let mut rows: [Vec<Value>; 4] = Default::default();
+    let assemble = |rows: [Vec<Value>;4], next: Option<ThemeCursor>| {
+        let mut fields = header.clone();
+        fields.extend(ThemePageSection::ALL.into_iter().zip(rows).map(|(s, list)| (s.name(), Value::Arr(list))));
+        fields.push(("next", next.map_or(Value::Null, |c| json::s(c.encode()))));
+        json::obj(fields)
+    };
+    let mut bytes = assemble(Default::default(), None).to_json().len();
+    if bytes > MAX_RESULT_BYTES { return Err(format!("theme snapshot header exceeds the {MAX_RESULT_BYTES}-byte tool result limit")) }
+    bytes -= 4; // Reserve the exact serialized cursor, or null, after each accepted row.
+    let lengths = [snap.sheets.len(), saved.len(), snap.edits.len(), tokens.len()];
+    let mut pos = query.after.unwrap_or(ThemeCursor { section: ThemePageSection::Sheets, index: 0 }).advance(&lengths);
+    let mut emitted = false;
+    let catalogue: std::collections::HashSet<_> = makepad_widgets::theme_tokens::BlendTheme::all().into_iter()
+        .filter_map(|t| if let makepad_widgets::theme_tokens::BlendTheme::Sheet(id) = t { Some(id) } else { None }).collect();
+    while let Some(cursor) = pos {
+        let index = cursor.index;
+        let row = match cursor.section {
+            ThemePageSection::Sheets => {
+                let s = &snap.sheets[index];
+                json::obj(vec![("id",json::s(&s.id)), ("label",json::s(&s.label)), ("base",json::s(&s.base)),
+                    ("appearance",json::s(if s.dark { "dark" } else { "light" })), ("mixable",Value::Bool(catalogue.contains(s.id.as_str())))])
+            }
+            ThemePageSection::Saved => json::s(&saved[index]),
+            ThemePageSection::Edits => { let (k,v) = &snap.edits[index]; Value::Arr(vec![json::s(k), json::s(v)]) }
+            ThemePageSection::Tokens => { let t = tokens[index]; json::obj(vec![("name",json::s(&t.name)),("value",json::s(&t.value)),("site",json::s(&t.site))]) }
+        };
+        let out = &mut rows[cursor.section as usize];
+        let delta = row.to_json().len() + usize::from(!out.is_empty());
+        let next = ThemeCursor { index: index + 1, ..cursor }.advance(&lengths);
+        let next_bytes = next.map_or(4, |c| c.section.name().len() + 3 + c.index.checked_ilog10().unwrap_or(0) as usize + 1);
+        if bytes + delta + next_bytes > MAX_RESULT_BYTES {
+            if !emitted { return Err(format!("theme snapshot entry {} exceeds the {MAX_RESULT_BYTES}-byte tool result limit",cursor.encode())) }
+            break
+        }
+        out.push(row);
+        emitted = true;
+        bytes += delta;
+        pos = next;
+    }
+    Ok(assemble(rows, pos))
+}
+
+fn colors_json(colors: impl IntoIterator<Item = u32>) -> Value {
+    Value::Arr(colors.into_iter().map(|c| json::s(format!("#{c:08x}"))).collect())
+}
+
+fn palettes_page(dir: &Path, query: PaletteQuery) -> String {
+    let (own, skipped) = store::read_palettes_in(dir);
+    let schemes = if query.adjust { builder::Schemes::RoundThePick } else { builder::Schemes::AsWritten };
+    let suggestions = builder::all_suggestions_for(query.count, query.slot, query.color, query.dark, &own, schemes);
+    let mut page = json::obj(vec![("color", json::s(format!("#{:08x}", query.color))), ("seed_slot", json::s(builder::seed_slot_name(query.slot))),
+        ("color_count", Value::Int(query.count as i64)), ("adjust", Value::Bool(query.adjust)), ("skipped_own_lines", Value::Int(skipped as i64)),
+        ("total", Value::Int(suggestions.len() as i64)), ("offset", Value::Int(query.offset as i64))]);
+    let Value::Obj(fields) = &mut page else { unreachable!() };
+    let mut bytes = page_envelope_size(fields, suggestions.len());
+    let mut palettes = vec![];
+    for s in suggestions.iter().skip(query.offset).take(query.limit) {
+        let entry = json::obj(vec![("label", json::s(&s.label)), ("harmony", s.harmony.map_or(Value::Null, |h| json::s(builder::harmony_name(h)))),
+            ("mood", s.mood.map_or(Value::Null, |m| json::s(m.label()))), ("colors", colors_json(s.colors)), ("shown", colors_json(s.shown()))]);
+        bytes += entry.to_json().len() + 1;
+        if bytes > MAX_RESULT_BYTES { break }
+        palettes.push(entry);
+    }
+    let next = query.offset + palettes.len();
+    fields.push(("next_offset".into(), if next < suggestions.len() { Value::Int(next as i64) } else { Value::Null }));
+    fields.push(("palettes".into(), Value::Arr(palettes)));
+    page.to_json()
+}
+
+fn page_envelope_size(fields: &[(String, Value)], total: usize) -> usize {
+    Value::Obj(fields.to_vec()).to_json().len() + r#","next_offset":,"palettes":[]"#.len() + total.to_string().len().max(4)
+}
+
+fn reading_json(r: &lab::Readability) -> Value {
+    json::obj(vec![("summary", json::s(r.to_string())), ("measured", Value::Int(r.measured as i64)), ("margin", Value::F64(r.margin)),
+        ("tightest", json::s(&r.tightest)), ("failures", Value::Arr(r.failures.iter().map(json::s).collect()))])
+}
+
+fn build_reply(result: builder::ThemeBuildResult) -> (ThemeInstall, Value) {
+    use builder::BuildRow::*;
+    let built = result.built;
+    let p = &built.params;
+    let slot = |s: Option<builder::SeedSlot>| s.map_or(Value::Null, |s| json::s(builder::seed_slot_name(s)));
+    let mut fields = vec![("installed", json::s("built")), ("scheme", json::s(built.scheme.theme_name())),
+        ("color_count", Value::Int(p.color_count as i64)), ("palette", colors_json(p.palette())),
+        ("seed_slot", slot(Some(p.seed_slot))), ("text_color", slot(p.text_color)), ("crowding", slot(built.crowding)),
+        ("readability", reading_json(&built.readability))];
+    for (key, row) in [("saturation", Saturation), ("lightness", Lightness), ("font_size", FontSize), ("font_contrast", FontContrast),
+        ("text_contrast", TextContrast), ("text_tint", TextTint), ("spacing", Spacing), ("roundness", Roundness)] {
+        fields.push((key, Value::F64(row.shown(p))));
+    }
+    (result.install, json::obj(fields))
 }
 
 struct AppCursor { id: Id, offset: usize, revision: Option<Id> }
@@ -621,7 +928,8 @@ pub struct AppToolCall<'a> {
 
 /// Keep the binding available even if the request arguments are refused.
 pub fn app_tool<'a>(name: &'a str, args: &str) -> Option<Result<AppToolCall<'a>, String>> {
-    if !matches!(name, "app_list" | "app_look" | "app_pick" | "app_props" | "app_set" | "app_select" | "app_edits") { return None }
+    if !matches!(name, "app_list" | "app_look" | "app_pick" | "app_props" | "app_set" | "app_select" | "app_edits"
+        | "app_theme_get" | "app_theme_set" | "app_theme_install" | "app_theme_save" | "app_theme_delete" | "app_theme_mix" | "app_theme_build" | "app_theme_palettes") && !design_tools::recognizes(name) { return None }
     Some((|| {
         let args = crate::tweak::parse_json(args).map_err(|why| format!("arguments: {why}"))?;
         Ok(AppToolCall { name, binding: credential(&args, "binding")?, args })
@@ -636,7 +944,11 @@ impl AppToolCall<'_> {
             only_keys(args, &["binding", "after"])?;
             return Ok(AppTool::List { after: app_cursor(args, true)? })
         }
+        if self.name.starts_with("app_theme_") { return parse_theme_call(self.name, args) }
         let item = required_id(args.get("item"), "item")?;
+        if self.name.starts_with("app_design_") {
+            return Ok(AppTool::Live { item, request: design_tools::parse(self.name, args)? })
+        }
         let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("expected text for {key}"));
         let request = match self.name {
             "app_look" => { only_keys(args, &["binding", "item"])?; Request::Look }
@@ -714,9 +1026,98 @@ fn app_request_text(request: &crate::tweak::Request, title: &str) -> String {
         Request::Select(Some(path)) => format!("showing {}", widget_name(path)),
         Request::Select(None) => "clearing its selection".into(),
         Request::Look => activity(),
+        Request::Design(r) => format!("design {} in {title}", DesignPhase::for_request(r).label()),
         Request::AskEdit | Request::LookDone { .. } => unreachable!("internal requests have no app tool"),
     }
 }
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ThemeToolEffect {
+    Saved { share: SessionId, item: Id, saved: store::SavedTheme },
+    Deleted(String),
+    InstalledSaved { share: SessionId, item: Id, saved: store::SavedTheme },
+}
+
+pub(crate) struct ThemeToolContext<'a> {
+    pub themes_dir: &'a Path,
+    pub mixer_cache: &'a mut ThemeMixerCache,
+    pub active_worn: Option<(SessionId, Id, String)>,
+}
+
+struct MixQuery { appearance: Option<Appearance>, mode: WeightMode, spec: lab::MixSpec }
+
+enum ThemePhase {
+    Get(ThemeQuery),
+    Save { name: String, replace: bool },
+    Preset(String),
+    Saved(store::SavedTheme),
+    Mix(MixQuery),
+    Set,
+    Install { fields: Value, saved: Option<store::SavedTheme> },
+}
+
+impl ThemePhase {
+    fn install(p: theme::PendingInstall) -> (ThemeOp, Self) {
+        let spec = p.install;
+        let saved = p.meta.saved;
+        let fields = json::obj(vec![("installed", json::s(&spec.label)), ("base", json::s(&spec.base)),
+            ("sheet", spec.sheet.as_ref().map_or(Value::Null, json::s)),
+            ("saved", saved.as_ref().map_or(Value::Null, |s| json::s(&s.name)))]);
+        (ThemeOp::Install(spec), Self::Install { fields, saved })
+    }
+}
+
+struct WaitingMix {
+    held: HeldAppCall, share: SessionId, item: Id, agent: Id, snap: ThemeSnapshot, query: MixQuery,
+}
+
+fn mix_install(cache: &Arc<makepad_widgets::theme_tokens::BlendCache>, snap: &ThemeSnapshot, query: MixQuery)
+    -> Result<(ThemeOp, ThemePhase), String> {
+    let mix = lab::ThemeMix::apply_spec(cache.clone(), snap, query.appearance, query.mode, query.spec)?;
+    let weights = mix.weights.into_iter().map(|(id,w,share)| json::obj(vec![("theme",json::s(id)),
+        ("weight",Value::F64(w)), ("share",Value::F64(share))])).collect();
+    let mode = match mix.mode { WeightMode::Absolute => "absolute", WeightMode::Relative => "relative" };
+    let fields = json::obj(vec![("installed", json::s("mix")), ("mode",json::s(mode)),
+        ("appearance", json::s(mix.appearance.label().to_ascii_lowercase())), ("weights",Value::Arr(weights)),
+        ("readability",reading_json(&mix.readability))]);
+    Ok((ThemeOp::Install(mix.install), ThemePhase::Install { fields, saved: None }))
+}
+
+enum ThemeAnswer {
+    Complete(Value, String, Option<ThemeToolEffect>),
+    Install(ThemeOp, ThemePhase),
+    Wait(ThemeSnapshot, MixQuery),
+    Failed(String),
+}
+
+fn snapshot_answer(phase: ThemePhase, snap: ThemeSnapshot, ctx: ThemeToolContext<'_>, share: SessionId, item: Id)
+    -> Result<ThemeAnswer, String> {
+    let (op, phase) = match phase {
+        ThemePhase::Get(q) => return Ok(match theme_get_page(&snap, q, &ctx, share, item) {
+            Ok(page) => ThemeAnswer::Complete(page, "read theme".into(), None),
+            Err(why) => ThemeAnswer::Failed(why),
+        }),
+        ThemePhase::Save { name, replace } => {
+            let saved = theme::snapshot_for_save(&snap, &name).map_err(|e| e.to_string())?;
+            let exists = store::exists_in(ctx.themes_dir, &name);
+            if replace { store::save_replacing_in(ctx.themes_dir, &saved) } else { store::save_in(ctx.themes_dir, &saved) }.map_err(|e| e.to_string())?;
+            let body = json::obj(vec![("name", json::s(&name)), ("base", json::s(saved.base.theme_name())),
+                ("sheet", saved.sheet.as_ref().map_or(Value::Null, json::s)), ("tokens", Value::Int(saved.overrides.len() as i64)),
+                ("replaced", Value::Bool(exists))]);
+            return Ok(ThemeAnswer::Complete(body, format!("saved theme {name}"), Some(ThemeToolEffect::Saved { share, item, saved })))
+        }
+        ThemePhase::Preset(id) => ThemePhase::install(theme::resolve_preset(&snap, &id)?),
+        ThemePhase::Saved(saved) => ThemePhase::install(theme::PendingInstall::saved(saved, &snap.sheets)),
+        ThemePhase::Mix(q) => match &ctx.mixer_cache.ready {
+            Some(cache) => mix_install(cache, &snap, q)?,
+            None => return Ok(ThemeAnswer::Wait(snap, q)),
+        },
+        _ => return Err("unexpected theme snapshot".into()),
+    };
+    Ok(ThemeAnswer::Install(op, phase))
+}
+
+type ThemeReply = (ToolResult, Option<Credential>, Option<ThemeToolEffect>);
 
 struct HeldAppCall {
     id: String,
@@ -724,27 +1125,34 @@ struct HeldAppCall {
     binding: Credential,
     line: Id,
     look_title: Option<String>,
+    phase: Option<ThemePhase>,
+    design: Option<DesignPhase>,
 }
 
 #[derive(Default)]
 pub struct AppTools {
     held: BTreeMap<(Id, RequestId, Id), HeldAppCall>,
+    waiting_mix: Vec<WaitingMix>,
+    ready: Vec<(HeldAppCall, String)>,
+    roll_seed: u64,
 }
 
 impl AppTools {
     /// Return the immediate reply, if any, and the binding whose trace changed.
-    pub fn start<L: Copy + Eq, T: Copy + Eq>(&mut self, call: &str, parsed: Result<AppToolCall<'_>, String>, model: &mut Model,
-        sessions: &mut [crate::tweak::Session<L, T>], waits: &mut AgentWaits) -> (Option<ToolResult>, Option<Credential>) {
+    pub(crate) fn start<L: Copy + Eq, T: Copy + Eq>(&mut self, call: &str, parsed: Result<AppToolCall<'_>, String>, model: &mut Model,
+        sessions: &mut [crate::tweak::Session<L, T>], waits: &mut AgentWaits, theme: ThemeToolContext<'_>)
+        -> (Option<ToolResult>, Option<Credential>, Option<ThemeToolEffect>) {
+        let mut effect = None;
         let tool = match parsed {
             Ok(tool) => tool,
-            Err(why) => return (Some(ToolResult::refused(call, why)), None),
+            Err(why) => return (Some(ToolResult::refused(call, why)), None, None),
         };
         let binding = tool.binding;
         let (agent, line) = match model.owner_turn(binding) {
             Ok(turn) => turn,
             Err(why) => {
                 let changed = waits.warn(binding, tool.name, &why);
-                return (Some(ToolResult::refused(call, why)), changed.then_some(binding))
+                return (Some(ToolResult::refused(call, why)), changed.then_some(binding), None)
             }
         };
         let run = (|| -> Result<_, String> {
@@ -761,6 +1169,54 @@ impl AppTools {
                     let title = town.state.entities[&item].text(field::TITLE);
                     Ok((Some(ToolResult::ok(call, json, "app edit history")), format!("read {title}'s edit history")))
                 }
+                AppTool::Delete(name) => {
+                    store::delete_in(theme.themes_dir, &name).map_err(|e| e.to_string())?;
+                    let body = json::obj(vec![("deleted", json::s(&name))]).to_json();
+                    let text = format!("deleted saved theme {name}");
+                    effect = Some(ThemeToolEffect::Deleted(name));
+                    Ok((Some(ToolResult::ok(call, body, "deleted theme")), text))
+                }
+                AppTool::Palettes(query) => {
+                    Ok((Some(ToolResult::ok(call, palettes_page(theme.themes_dir, query), "palette suggestions")), "browsed palettes".into()))
+                }
+                AppTool::Theme { item, op } => {
+                    let (session, app) = sessions.iter_mut().filter(|s| s.town == binding.town && s.item == item && s.me == me)
+                        .find_map(|s| shared_app(&town.state, s).map(|app| (s, app))).ok_or("no active share for this item")?;
+                    if session.is_ended() { return Err("share ended".into()) }
+                    let (op, phase) = match op {
+                        ThemeCall::Get(q) => (ThemeOp::Get, ThemePhase::Get(q)),
+                        ThemeCall::Set { name, value } => (ThemeOp::Set { name, value }, ThemePhase::Set),
+                        ThemeCall::Preset(id) if makepad_widgets::BaseTheme::parse(&id).is_some() =>
+                            ThemePhase::install(theme::resolve_preset(&ThemeSnapshot::default(), &id)?),
+                        ThemeCall::Preset(id) => (ThemeOp::Get, ThemePhase::Preset(id)),
+                        ThemeCall::Saved(name) => (ThemeOp::Get, ThemePhase::Saved(store::load_in(theme.themes_dir, &name).map_err(|e| e.to_string())?)),
+                        ThemeCall::Save { name, replace } => {
+                            if !replace && store::exists_in(theme.themes_dir, &name) { return Err(store::StoreError::Exists(name).to_string()) }
+                            (ThemeOp::Get, ThemePhase::Save { name, replace })
+                        }
+                        ThemeCall::Build(spec) => {
+                            if spec.roll && spec.seed.is_none() { self.roll_seed = lab::next_mix_seed(self.roll_seed); }
+                            let (install, fields) = build_reply(builder::build_from_spec(&spec, self.roll_seed)?);
+                            (ThemeOp::Install(install), ThemePhase::Install { fields, saved: None })
+                        }
+                        ThemeCall::Mix { appearance, mode, weights, seed } => {
+                            let spec = match weights {
+                                Some(w) => lab::MixSpec::Weights(w),
+                                None => lab::MixSpec::Surprise { seed: seed.unwrap_or_else(|| {
+                                    self.roll_seed = lab::next_mix_seed(self.roll_seed); self.roll_seed
+                                }) },
+                            };
+                            (ThemeOp::Get, ThemePhase::Mix(MixQuery { appearance, mode, spec }))
+                        }
+                    };
+                    let request = ShareRequest::Theme(op);
+                    let text = app_request_text(&request, app.text(field::TITLE));
+                    let req = session.request(Some(agent), request)?;
+                    if matches!(phase, ThemePhase::Mix(_)) { theme.mixer_cache.prepare(); }
+                    self.held.insert((item, req, agent), HeldAppCall { id: call.into(), tool: tool.name.into(), binding, line,
+                        look_title: None, phase: Some(phase), design: None });
+                    Ok((None, text))
+                }
                 AppTool::Live { item, request } => {
                     let (session, app) = sessions.iter_mut().filter(|s| s.town == binding.town && s.item == item && s.me == me)
                         .find_map(|s| shared_app(&town.state, s).map(|app| (s, app))).ok_or("no active share for this item")?;
@@ -770,9 +1226,13 @@ impl AppTools {
                         if session.is_ended() { return Err("share ended".into()) }
                         Some(title.replace(['\r', '\n'], " "))
                     } else { None };
+                    let design = match &request {
+                        ShareRequest::Design(req) => Some(DesignPhase::for_request(req)),
+                        _ => None,
+                    };
                     let text = app_request_text(&request, look_title.as_deref().unwrap_or(title));
                     let req = session.request(Some(agent), request)?;
-                    self.held.insert((item, req, agent), HeldAppCall { id: call.into(), tool: tool.name.into(), binding, line, look_title });
+                    self.held.insert((item, req, agent), HeldAppCall { id: call.into(), tool: tool.name.into(), binding, line, look_title, phase: None, design });
                     Ok((None, text))
                 }
             })
@@ -780,12 +1240,15 @@ impl AppTools {
         let (reply, ink, text) = match run {
             Ok((reply, text)) => (reply, Ink::Action, text),
             Err(why) => {
+                let why = if tool.name.starts_with("app_design_") && why.len() > MAX_RESULT_BYTES {
+                    "Design arguments exceed the tool result limit.".into()
+                } else { why };
                 let text = format!("{} refused: {why}", tool.name);
                 (Some(ToolResult::refused(call, why)), Ink::Warning, text)
             }
         };
         let changed = waits.traces.output_on(binding, line, text, ink, (waits.clock)());
-        (reply, changed.then_some(binding))
+        (reply, changed.then_some(binding), effect)
     }
 
     /// A Stop or End folded in this same batch supersedes an undelivered picture.
@@ -817,13 +1280,116 @@ impl AppTools {
         changed.then_some(held.binding)
     }
 
-    pub fn answer<L, T>(&mut self, session: &crate::tweak::Session<L, T>, seat: crate::tweak::Seat, req: crate::tweak::RequestId,
-        agent: Option<Id>, notice: &crate::tweak::Notice, waits: &mut AgentWaits) -> Option<(ToolResult, Option<Credential>)> {
-        use crate::tweak::Notice;
+    pub(crate) fn needs_mixer_cache(&self) -> bool {
+        !self.waiting_mix.is_empty() || self.held.values().any(|h| matches!(h.phase, Some(ThemePhase::Mix(_))))
+    }
+
+    pub(crate) fn flush_mixes<L: Copy + Eq, T: Copy + Eq>(&mut self, sessions: &mut [Session<L, T>], cache: &ThemeMixerCache) {
+        let Some(cache) = &cache.ready else { return };
+        for waiting in std::mem::take(&mut self.waiting_mix) {
+            let WaitingMix { mut held, share, item, agent, snap, query } = waiting;
+            let sent = (|| {
+                let session = sessions.iter_mut().find(|s| s.share == share && s.item == item && s.town == held.binding.town && !s.is_ended())
+                    .ok_or("share ended")?;
+                let (op, phase) = mix_install(cache, &snap, query)?;
+                let req = session.request(Some(agent), ShareRequest::Theme(op))?;
+                Ok::<_, String>((req, phase))
+            })();
+            match sent {
+                Ok((req, phase)) => { held.phase = Some(phase); self.held.insert((item, req, agent), held); }
+                Err(why) => self.ready.push((held, why)),
+            }
+        }
+    }
+
+    pub(crate) fn take_ready<L: Copy + Eq, T: Copy + Eq>(&mut self, sessions: &[Session<L, T>], waits: &mut AgentWaits,
+        reply: &mut impl FnMut(ToolResult)) -> Vec<Credential> {
+        let mut changed = vec![];
+        for w in self.waiting_mix.extract_if(.., |w| !sessions.iter().any(|s| s.share == w.share && s.town == w.held.binding.town && !s.is_ended())) {
+            self.ready.push((w.held, "share ended".into()));
+        }
+        for (held, why) in self.ready.drain(..) {
+            let (result, binding, _) = Self::finish_theme(held, Err(why), waits);
+            reply(result);
+            changed.extend(binding);
+        }
+        changed
+    }
+
+    fn finish_theme(held: HeldAppCall, answer: Result<ThemeAnswer, String>, waits: &mut AgentWaits) -> ThemeReply {
+        let (result, ink, text, effect) = match answer {
+            Ok(ThemeAnswer::Complete(body, text, effect)) => {
+                let json = body.to_json();
+                let result = if json.len() <= MAX_RESULT_BYTES { ToolResult::ok(held.id, json, &text) }
+                    else { ToolResult::failed(held.id, "Theme operation completed, but the result exceeds the tool result limit.") };
+                (result, Ink::Action, text, effect)
+            }
+            Ok(ThemeAnswer::Failed(why)) => (ToolResult::failed(held.id, &why), Ink::Warning, why, None),
+            Err(why) => { let text = format!("{} refused: {why}", held.tool); (ToolResult::refused(held.id, why), Ink::Warning, text, None) }
+            _ => unreachable!("only completed calls reach finish_theme"),
+        };
+        let changed = waits.traces.output_on(held.binding, held.line, text, ink, (waits.clock)());
+        (result, changed.then_some(held.binding), effect)
+    }
+
+    pub(crate) fn answer<L: Copy + Eq, T: Copy + Eq>(&mut self, session: &mut Session<L, T>, seat: Seat, req: RequestId,
+        agent: Option<Id>, notice: &Notice, waits: &mut AgentWaits, theme: ThemeToolContext<'_>) -> Option<ThemeReply> {
         if seat != session.me { return None }
-        let key = (session.item, req, agent?);
-        let held = self.held.get(&key)?;
+        let agent = agent?;
+        let key = (session.item, req, agent);
+        let held = self.held.get_mut(&key)?;
         if session.town != held.binding.town || held.look_title.is_some() && !matches!(notice, Notice::Refused(_)) { return None }
+        if let Some(phase) = &mut held.design {
+            let result = phase.answer(&held.id, notice, &session.view.design)?;
+            let (ink, outcome) = match result.outcome {
+                makepad_ai_services::wire::ToolOutcome::Ok => (Ink::Action, "completed"),
+                makepad_ai_services::wire::ToolOutcome::Refused => (Ink::Warning, "refused"),
+                _ => (Ink::Warning, "failed"),
+            };
+            let text = format!("design {} {outcome}", phase.label());
+            let changed = waits.traces.output_on(held.binding, held.line, text, ink, (waits.clock)()).then_some(held.binding);
+            self.held.remove(&key);
+            return Some((result, changed, None))
+        }
+        if held.phase.is_some() {
+            if !matches!(notice, Notice::Refused(_) | Notice::Theme { .. } | Notice::Applied { .. }) { return None }
+            let mut held = self.held.remove(&key)?;
+            let phase = held.phase.take()?;
+            let item = session.item;
+            let share = session.share;
+            let answer = match (notice, phase) {
+                (Notice::Refused(why), _) => Err(why.clone()),
+                (Notice::Theme { theme: raw }, phase) => ThemeSnapshot::parse(raw).ok_or_else(|| "invalid live theme snapshot".to_string())
+                    .and_then(|snap| snapshot_answer(phase, snap, theme, share, item)),
+                (Notice::Applied { path, prop, old, new, seq }, phase) if path == "theme" => {
+                    let body = match phase {
+                        ThemePhase::Set => Ok((json::obj(vec![("name", json::s(prop)), ("new", json::s(new))]), format!("set {prop} {new}"), None)),
+                        ThemePhase::Install { fields, saved } if prop == "install" => Ok((fields, format!("installed {new}"),
+                            saved.map(|saved| ThemeToolEffect::InstalledSaved { share, item, saved }))),
+                        _ => Err("unexpected theme acknowledgement".into()),
+                    };
+                    body.map(|(mut body, text, effect)| {
+                        if let Value::Obj(fields) = &mut body {
+                            fields.push(("old".into(), json::s(old)));
+                            fields.push(("seq".into(), json::s(seq.to_string())));
+                        }
+                        ThemeAnswer::Complete(body, text, effect)
+                    })
+                }
+                _ => Err("unexpected theme reply".into()),
+            };
+            match answer {
+                Ok(ThemeAnswer::Wait(snap, query)) => {
+                    self.waiting_mix.push(WaitingMix { held, share, item, agent, snap, query });
+                    return None
+                }
+                Ok(ThemeAnswer::Install(op, phase)) => match session.request(Some(agent), ShareRequest::Theme(op)) {
+                    Ok(req) => { held.phase = Some(phase); self.held.insert((item, req, agent), held); return None }
+                    Err(why) => return Some(Self::finish_theme(held, Err(why), waits)),
+                },
+                result => return Some(Self::finish_theme(held, result, waits)),
+            }
+        }
         let id = &held.id;
         let (result, output) = match notice {
             Notice::Refused(reason) => {
@@ -860,7 +1426,7 @@ impl AppTools {
             waits.traces.output_on(held.binding, held.line, text, ink, (waits.clock)()).then_some(held.binding)
         });
         self.held.remove(&key);
-        Some((result, changed))
+        Some((result, changed, None))
     }
 }
 
@@ -920,7 +1486,7 @@ impl Request {
     }
 }
 
-fn only_keys(object: &Value, keys: &[&str]) -> Result<(), String> {
+pub(crate) fn only_keys(object: &Value, keys: &[&str]) -> Result<(), String> {
     let Value::Obj(entries) = object else { return Err("expected an object".into()) };
     for (name, _) in entries {
         if !keys.contains(&name.as_str()) {
@@ -1033,7 +1599,9 @@ fn read_change(change: &Value) -> Result<Change, String> {
         ("null", Value::Bool(true)) => FieldValue::Null,
         _ => return Err(error.into()),
     };
+    if matches!(field, Key::Number(45..=48)) { return Err("Town reserves this field".into()) }
     if !field.accepts(&value) {
+        if matches!(field, Key::Number(40..=44)) { return Err("invalid value type for reserved field".into()) }
         if field == field::ORDER { return Err("Town writes the ORDER field itself".into()) }
         if field == field::Z { return Err("Town writes the Z field itself".into()) }
         return Err("a named field requires one balanced Splash literal; numeric fields take typed values".into())
@@ -1173,6 +1741,13 @@ fn read_workspace(tool: &str, args: &Value) -> Result<Request, String> {
                 Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
             } else { None };
             Request::BoardRead { binding, board, rect, after }
+        }
+        "board_pin" => {
+            only_keys(args, &["binding", "board", "from", "parent", "x", "y", "w", "h"])?;
+            let units = |key| args.get(key).map(|_| coordinate(args, key)).transpose();
+            action(Action::PinFrom { board: required_id(args.get("board"), "board")?, from: required_id(args.get("from"), "from")?,
+                parent: args.get("parent").map(|v| required_id(Some(v), "parent")).transpose()?,
+                x: units("x")?, y: units("y")?, w: units("w")?, h: units("h")? })
         }
         "item_add" => {
             only_keys(args, &["binding", "board", "kind", "x", "y", "w", "h", "text", "colour", "shape", "parent"])?;
@@ -1324,31 +1899,51 @@ fn read_workspace(tool: &str, args: &Value) -> Result<Request, String> {
 }
 
 /// Return the event ID and name any board items that stayed put.
-pub fn action_reply(town: &Town, id: &Id, tool: &str) -> String {
-    let mut fields = vec![("id", json::s(makepad_town_core::hex(id)))];
+pub fn action_reply(gate: &Gate<'_>, town: &Town, id: &Id, tool: &str) -> Result<AiOut, Withheld> {
+    if !gate.is_bound_to(&town.state) { return Err(Withheld::MissingSource) }
+    gate.town_readable()?;
+    let mut fields = vec![("id", AiJson::id(id))];
     if tool == "design_write" {
-        fields.push(("revision", json::s(format!("@{}", makepad_town_core::hex(id)))));
+        fields.push(("revision", AiJson::revision(id)));
     }
-    if let Some(report) = town.board_edit_report(id) {
+    if let Some(report) = town.board_edit_report(id).filter(|r| !r.locked.is_empty() || !r.deleted.is_empty()) {
         let (past, verb) = match tool {
             "item_move" => ("moved", "move"),
             "item_restack" => ("restacked", "restack"),
             _ => ("deleted", "delete"),
         };
         let noun = |count| if count == 1 { "item" } else { "items" };
-        let mut note = format!("{past} {} {}", report.changed, noun(report.changed));
+        let push_ids = |out: &mut AiTextBuilder, ids: &std::collections::BTreeSet<Id>| {
+            for (index, id) in ids.iter().enumerate() {
+                if index != 0 { out.push_static(", "); }
+                out.push_id(id);
+            }
+        };
+        let mut note = AiTextBuilder::new();
+        note.push_static(past);
+        note.push_static(" ");
+        note.push_usize(report.changed);
+        note.push_static(" ");
+        note.push_static(noun(report.changed));
         if !report.locked.is_empty() {
-            let ids = report.locked.iter().map(|id| makepad_town_core::hex(id)).collect::<Vec<_>>().join(", ");
             let count = report.locked.len();
-            note.push_str(&format!("; {count} locked {} stayed: {ids}. Use item_edit to unlock and {verb}.", noun(count)));
+            note.push_static("; ");
+            note.push_usize(count);
+            note.push_static(" locked ");
+            note.push_static(noun(count));
+            note.push_static(" stayed: ");
+            push_ids(&mut note, &report.locked);
+            note.push_static(". Use item_edit to unlock and ");
+            note.push_static(verb);
+            note.push_static(".");
         }
         if !report.deleted.is_empty() {
-            let ids = report.deleted.iter().map(|id| makepad_town_core::hex(id)).collect::<Vec<_>>().join(", ");
-            note.push_str(&format!("; already deleted or archived: {ids}"));
+            note.push_static("; already deleted or archived: ");
+            push_ids(&mut note, &report.deleted);
         }
-        if !report.locked.is_empty() || !report.deleted.is_empty() { fields.push(("note", json::s(note))); }
+        fields.push(("note", AiJson::built_str(note)));
     }
-    json::obj(fields).to_json()
+    gate.finish_json(AiJson::object(fields))
 }
 
 /// The tool of an action (AI parity).
@@ -1366,6 +1961,8 @@ pub fn tool_of(action: &Action) -> &'static str {
         Action::DismissProposed { .. } => return "dismiss_proposed",
         Action::Shared { .. } => return "shared",
         Action::PostClip { .. } => return "post_clip",
+        Action::PinMedia { .. } => return "pin_media",
+        Action::PinFrom { .. } => "pin_from",
         Action::AddProject { .. } => "add_project",
         Action::RemoveProject { .. } => "remove_project",
         Action::PostChat { .. } => "post_chat",
@@ -1416,6 +2013,7 @@ mod tests {
 
     use crate::model::{tests::ShareHomes, Origin};
     use crate::view::{LocalClock, Workspace};
+    use makepad_town_core::trust::LocalPolicy;
     use makepad_town_core::hex;
     use std::{cell::Cell, rc::Rc};
 
@@ -1458,8 +2056,8 @@ mod tests {
         for line in [plain, named] {
             assert_eq!(waits.traces.rows(&line)[0].phase(now.get()), Phase::GotIt, "both the seeded and named line have real receipts");
         }
-        let cursor = |page: &ToolResult| {
-            let json = json::parse(page.text.as_bytes()).unwrap();
+        let cursor = |page: &TownToolResult| {
+            let json = json::parse(page.text_for_test().as_bytes()).unwrap();
             parse_id(json.get("last").unwrap().as_str().unwrap()).unwrap()
         };
         let last = cursor(&page[0]);
@@ -1469,7 +2067,7 @@ mod tests {
         assert_eq!(waits.traces.rows(&named)[0].phase(now.get()), Phase::Done, "acknowledging the offered page completes its trace without a say");
         assert_eq!(waits.traces.rows(&next)[0].phase(now.get()), Phase::GotIt, "the same wait returns the new question and starts its own trace");
         let retry = waits.wait(&mut model, "retry old ack", binding, Some(last));
-        assert_eq!(retry[0].text, page[0].text, "retrying the previous ack returns the same offered page");
+        assert_eq!(retry[0].text_for_test(), page[0].text_for_test(), "retrying the previous ack returns the same offered page");
         assert!(waits.traces.working(binding), "an old ack cannot finish the new turn");
         assert!(waits.wait(&mut model, "ack and hold", binding, Some(cursor(&page[0]))).is_empty(), "acknowledging an empty inbox leaves the wait held");
         assert_eq!(waits.traces.next_change(model.open_id(), now.get()), None, "the final ack stops the trace timer while the wait is held");
@@ -1488,7 +2086,7 @@ mod tests {
         let start = model.state.message(&line).unwrap().wall_ms + 1_000;
         now.set(start);
         let page = waits.deliver(&mut model, None);
-        assert_eq!(page[0].call_id, "held", "the held call actually returns the page");
+        assert_eq!(page[0].call_id(), "held", "the held call actually returns the page");
         assert_eq!(waits.traces.rows(&line)[0].pickup, Some(start), "pickup has the return time");
         assert!(waits.traces.rows(&quote).is_empty(), "quoted data receives no independent receipt");
 
@@ -1499,12 +2097,14 @@ mod tests {
         let activity = Activity::of(&request, &model).unwrap();
         let Request::Do { action, .. } = request else { panic!("item_add must dispatch an action") };
         let id = model.act(action, Origin::Tool).unwrap();
-        activity.record(&mut waits, binding, &model, Some(id), "item_add", &ToolResult::ok("add", action_reply(&model, &id, "item_add"), "item_add"));
+        let gate = Gate::new(&model.state, LocalPolicy::Members);
+        let reply = action_reply(&gate, &model, &id, "item_add").unwrap();
+        activity.record(&mut waits, binding, &model, Some(id), "item_add", &TownToolResult::text("add", reply, "item_add"));
         let row = &waits.traces.rows(&line)[0];
         assert_eq!((row.phase(start), row.output[0].text.as_str()), (Phase::Working, "added sticky 'What is Town'"), "a committed action starts the working stream");
         let reader = read_bound("board_read", &json::obj(vec![("board", json::s(hex(&board)))]).to_json(), &bearer).unwrap();
         let board_page = model.board_read_json(board, None, None).unwrap();
-        Activity::of(&reader, &model).unwrap().record(&mut waits, binding, &model, None, "board_read", &ToolResult::ok("read", board_page, "the shared board"));
+        Activity::of(&reader, &model).unwrap().record(&mut waits, binding, &model, None, "board_read", &TownToolResult::text("read", board_page, "the shared board"));
         assert_eq!(waits.traces.rows(&line)[0].output[1].text, "read board 'Town tour'", "a successful read shows the board it read");
 
         now.set(start + 32_000);
@@ -1548,7 +2148,8 @@ mod tests {
         let request = Request::BoardRead { binding: second, board: two, rect: None, after: None };
         let binding = request.binding().unwrap();
         let why = model.board_read_json(two, None, None).unwrap_err();
-        Activity::of(&request, &model).unwrap().record(&mut waits, binding, &model, None, "board_read", &ToolResult::refused("read", &why));
+        let refused = TownToolResult::refused("read", SafeToolError::formatted_ids_only(why.clone()));
+        Activity::of(&request, &model).unwrap().record(&mut waits, binding, &model, None, "board_read", &refused);
         let warn = &waits.traces.rows(&two)[0].output[0];
         assert_eq!((warn.ink, &warn.text), (Ink::Warning, &format!("board_read: {why}")), "a refusal keeps the actual reason and warning ink");
         assert!(waits.traces.rows(&one)[0].output.is_empty(), "same-name agents do not share output");
@@ -1608,14 +2209,15 @@ mod tests {
             let Request::Do { binding, project, action } = read_bound(tool, &args.to_json(), &bearer)? else { panic!("expected action") };
             let caller = model.verify_binding(binding)?;
             let event = model.act_in(caller.town, project, action, Origin::Tool)?;
-            Ok(json::parse(action_reply(model, &event, tool).as_bytes()).unwrap())
+            let gate = Gate::new(&model.state, LocalPolicy::Members);
+            Ok(json::parse(action_reply(&gate, model, &event, tool).unwrap().as_str().as_bytes()).unwrap())
         };
         let inspect = |model: &mut Model, item: Id| {
             let args = json::obj(vec![("item", json::s(hex(&item)))]);
             let Request::Read { binding, read } = read_bound("design_read", &args.to_json(), &bearer).unwrap() else { panic!("expected design_read") };
             let caller = model.verify_binding(binding).unwrap();
             assert_eq!(read.what(), "the shared design");
-            json::parse(model.read_json_in(caller.town, &read).unwrap().as_bytes()).unwrap()
+            json::parse(model.read_json_in(caller.town, &read).unwrap().as_str().as_bytes()).unwrap()
         };
         let src = "\nView{prompt := Label{text: \"Café\"}}\n";
         let add = |model: &mut Model, preset| {
@@ -1668,6 +2270,82 @@ mod tests {
     }
 
     #[test]
+    fn call_tools_require_binding_and_never_open_mic_share_or_control() {
+        use crate::call::{ai::{tests::multiparty_shown, CallToolPlan}, CallAction, Phase, Press};
+        use CallTool::*;
+
+        for tool in &manifest(true).tools {
+            assert!(!matches!(tool.name.as_str(), "call_start" | "call_answer" | "call_join" | "call_unmute"
+                | "transcribe_on" | "share_start" | "share_watch" | "control_allow" | "control_allow_all"),
+                "{} would open a call capability", tool.name);
+        }
+
+        let (_homes, models, mut shown) = multiparty_shown("call-tool-actions");
+        let model = &models[0];
+        let town = model.open_id();
+        let foreign = [9; 32];
+        let own = shown.share.own_offers().next().unwrap().clone();
+        let watched = shown.share.watching.unwrap();
+        // Move just one resource across the town boundary at a time.
+        for (call_town, own_town, watch_town, rec_town, refused) in [
+            (foreign, town, town, town, &[HangUp, Decline, Mute, TranscribeOff][..]),
+            (town, foreign, town, town, &[ShareStop, ControlTakeBack][..]),
+            (town, town, foreign, town, &[ShareClose][..]),
+            (town, town, town, foreign, &[RecordingStop][..]),
+        ] {
+            let offer_town = |s| if s == own.session { Some(own_town) } else if s == watched { Some(watch_town) } else { None };
+            for (name, tool) in CallTool::ALL {
+                let result = check_call_tool_town(tool, &shown, Some(call_town), offer_town, Some(rec_town), town);
+                assert_eq!(result.is_err(), refused.contains(&tool), "{name} must check the town of its own resource");
+            }
+        }
+
+        let gate = Gate::new(&model.state, LocalPolicy::Members);
+        let me = model.me();
+        let closing = |action| matches!(action, None | Some(
+            CallAction::Press(Press::Cancel | Press::HangUp | Press::Decline | Press::Mute | Press::StopTranscribing
+                | Press::StopShare | Press::CloseWatch | Press::TakeBack | Press::StopRecording)
+            | CallAction::OnShare(_, Press::StopShare)
+        ));
+        let second_session = [3; 16];
+        for own_count in [1, 2] {
+            if own_count == 2 {
+                let mut second = own.clone();
+                Arc::make_mut(&mut second).session = second_session;
+                Arc::make_mut(&mut shown.share.offers).push(second);
+            }
+            for phase in [Phase::Idle, Phase::Calling, Phase::Ringing, Phase::Live] {
+                for (muted, transcribing) in [(false, true), (true, false)] {
+                    let view = Arc::make_mut(&mut shown.view);
+                    view.phase = phase;
+                    view.muted = muted;
+                    view.transcribing_me = transcribing;
+                    for (name, tool) in CallTool::ALL {
+                        let pressed = tool.press(&shown).map(CallAction::Press);
+                        assert!(closing(pressed), "{name}.press returned {pressed:?} while {phase:?}");
+                        for page in [None, Some(watched), Some(own.session), Some(second_session)] {
+                            let target = if own_count == 1 { Some(own.session) }
+                                else { page.filter(|s| *s == own.session || *s == second_session) };
+                            match tool.plan(&gate, &shown, page, &me).unwrap() {
+                                CallToolPlan::Action(action) => {
+                                    assert!(closing(action), "{name}.plan returned {action:?} while {phase:?}");
+                                    if tool == ShareStop {
+                                        let session = target.expect("two shares without a selected one must ask which to stop");
+                                        assert_eq!(action, Some(CallAction::OnShare(session, Press::StopShare)));
+                                    }
+                                }
+                                CallToolPlan::AmbiguousShareStop(_) => {
+                                    assert!(tool == ShareStop && target.is_none(), "{name} unexpectedly asked which share to stop");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_action_has_its_tool_and_calls_read_strictly() {
         let basic = manifest(false);
         let (token, bearer) = Credential::issue([1; 32]).unwrap();
@@ -1708,18 +2386,19 @@ mod tests {
             assert!(basic.tools.iter().any(|t| t.name == tool && t.risk == risk), "{tool} is advertised at {risk:?} risk");
             assert_eq!(read_with(tool, vec![("binding", json::s(&bearer))]), Ok(Request::Call { binding: token, tool: call }));
             assert!(read(tool, "{}").is_err(), "{tool} requires its binding");
+            assert!(read_with(tool, vec![("binding", json::s("Claude Code"))]).is_err(), "{tool} refuses a malformed binding");
             assert!(["video", "confirm"].into_iter().all(|key| read_with(tool, vec![("binding", json::s(&bearer)), (key, Value::Bool(true))]).is_err()), "{tool} refuses extra arguments");
         }
         for tool in basic.tools.iter().filter(|t| t.name.starts_with("call_") || t.name.starts_with("share_")
             || t.name.starts_with("control_") || t.name.starts_with("recording_") || t.name.starts_with("transcribe_")) {
             assert!(matches!(tool.risk, Risk::Read | Risk::Act), "{} cannot be Destructive", tool.name);
-            for opening in ["start", "answer", "unmute", "open", "watch", "record", "on", "camera", "allow"] {
+            for opening in ["start", "answer", "join", "unmute", "open", "watch", "record", "on", "camera", "allow"] {
                 assert!(!tool.name.split('_').skip(1).any(|word| word == opening),
                     "{} must not open anything ({opening})", tool.name);
             }
         }
-        assert!(basic.tools.iter().all(|t| !matches!(t.name.as_str(), "call_start" | "call_answer" | "call_unmute" | "call_camera_off"
-            | "share_start" | "watch_open" | "recording_start" | "transcribe_on")), "no tool starts a call, a share, Watch or a recording");
+        assert!(basic.tools.iter().all(|t| !matches!(t.name.as_str(), "call_start" | "call_answer" | "call_join" | "call_unmute" | "call_camera_off"
+            | "share_start" | "watch_open" | "recording_start" | "transcribe_on" | "control_allow" | "control_allow_all")), "no tool starts a call, a share, Watch or a recording");
         let id = "ab".repeat(16);
         let args = |id: &str| json::obj(vec![("ids", Value::Arr(vec![json::s(id)])), ("title",json::s("Demo")), ("text",json::s(""))]).to_json();
         assert!(matches!(read("publish", &args(&id)), Ok(Request::Publish { .. })));
@@ -1727,7 +2406,7 @@ mod tests {
         let manifest = manifest(true);
         assert_eq!(manifest.validate(), Ok(()), "the action tools register with valid schemas");
         let tools: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!((tools.len(), basic.tools.len()), (55, 53), "the publish setting controls exactly two of the 55 tools");
+        assert_eq!((tools.len(), basic.tools.len()), (75, 73), "the publish setting controls exactly two of the 75 tools");
         let unbound = ["join", "publish_media", "publish", "devices_retry", "devices_forget"];
         let parse_binding = |name: &str, args: &str| -> Result<Option<Credential>, String> {
             if let Some(app) = app_tool(name, args) {
@@ -1755,8 +2434,10 @@ mod tests {
             for key in required.iter().map(|v| v.as_str().unwrap()) {
                 let value = match key {
                     "binding" => continue,
+                    "name" => json::s("my_sunset"), "color" => json::s("#ff5c39"),
                     "code" => json::s(&bearer),
                     "ids" => Value::Arr(vec![json::s("ab".repeat(16))]),
+                    "from" if name == "board_pin" => id_arg(),
                     "items" | "from" => Value::Arr(vec![id_arg()]),
                     "moves" => Value::Arr(vec![json::obj(vec![("item", id_arg()), ("x", Value::Int(1)), ("y", Value::Int(1))])]),
                     "changes" => Value::Arr(vec![json::obj(vec![("entity", id_arg()), ("field", Value::Int(1)),
@@ -1766,6 +2447,9 @@ mod tests {
                     "to" => json::s("front"), "after" => json::s("end"), "status" => json::s("open"),
                     "revision" => json::s(format!("@{id_text}")), "section" => Value::Null,
                     "project" | "task" | "into" | "board" | "target" | "step" | "item" | "doc" | "of" => id_arg(),
+                    "ty" => json::s("View"), "place" => json::s("inside"), "scope" => json::s("all"),
+                    "op" if name == "app_design_history" => json::s("undo"),
+                    "op" if name == "app_design_patch" => json::s("diff"),
                     "src" => json::s("View{}"), "path" => json::s("root"), "prop" => json::s("text"),
                     "text" | "title" | "markdown" | "based_on" | "value" => json::s("Kit"),
                     _ => panic!("missing valid sample for {name}.{key}"),
@@ -1774,10 +2458,28 @@ mod tests {
             }
             // These tools require one of several alternative payload fields.
             match name {
+                "app_design_move" => fields.push(("direction", json::s("up"))),
+                "app_theme_install" => fields.push(("preset", json::s("dark"))),
+                "app_theme_mix" => fields.push(("surprise", Value::Bool(true))),
                 "app_pick" => fields.push(("path", json::s("root"))),
                 "item_edit" => fields.push(("locked", Value::Bool(true))),
                 "task_edit" => fields.push(("title", json::s("Kit"))),
                 _ => {}
+            }
+            if matches!(name, "app_theme_mix" | "app_theme_build") {
+                let maximum = schema.get("properties").and_then(|p| p.get("seed")).and_then(|s| s.get("maximum"));
+                assert_eq!(maximum, Some(&Value::Int(i64::MAX)), "{name} advertises the largest seed the router can carry");
+            }
+            if name.starts_with("app_design_") {
+                assert_eq!(schema.get("type"), Some(&json::s("object")), "{name} needs an object schema");
+                assert!(["oneOf", "anyOf", "allOf"].iter().all(|k| schema.get(k).is_none()), "{name} needs a flat schema");
+            }
+            if name.starts_with("app_theme_") || name.starts_with("app_design_") {
+                assert_eq!(definition.risk, if matches!(name, "app_theme_get" | "app_theme_palettes" | "app_design_state" | "app_design_palette") { Risk::Read } else { Risk::Act },
+                    "{name} advertises the risk of its operation");
+                let mut unknown = fields.clone();
+                unknown.extend([("binding", json::s(&bearer)), ("allow", Value::Bool(true))]);
+                assert!(parse_binding(name, &json::obj(unknown).to_json()).is_err(), "{name} refuses unknown arguments");
             }
             let without = parse_binding(name, &json::obj(fields.clone()).to_json());
             fields.push(("binding", json::s(&bearer)));
@@ -1791,7 +2493,7 @@ mod tests {
                 assert!(with.is_err(), "{name} rejects a supplied binding");
             }
         }
-        assert_eq!(bound_count, 50, "exactly 50 tools require a binding");
+        assert_eq!(bound_count, 70, "exactly 70 tools require a binding");
         for (entry, tool) in ACTIONS {
             assert!(tools.contains(&tool), "the action {entry} has no tool {tool}");
         }
@@ -1801,10 +2503,10 @@ mod tests {
         for action in [
             Action::Provide { on: true }, Action::RequestSummary { session: [1; 16] }, Action::RequestTaskUpdate { session: [1; 16] },
             Action::AcceptProposed { tasks: vec![[0; 32]] }, Action::DismissProposed { tasks: vec![[0; 32]] },
-            Action::SessionOpen { town: None, session: [1; 16], mode: makepad_town_core::event::SessionMode::Call { video: false }, to: vec![] },
-            Action::SessionJoin { town: None, session: [1; 16] },
+            Action::SessionOpen { town_wide: true, town: None, session: [1; 16], mode: makepad_town_core::event::SessionMode::Call { video: false }, to: vec![] },
+            Action::SessionJoin { peer: None, town: None, session: [1; 16] },
             Action::SessionLeave { session: [1; 16], secs: None, why: makepad_town_core::event::LeaveWhy::Ended },
-            Action::SessionDecline { town: None, session: [1; 16], why: makepad_town_core::event::DeclineWhy::Busy },
+            Action::SessionDecline { peer: None, town: None, session: [1; 16], why: makepad_town_core::event::DeclineWhy::Busy },
             Action::Said { session: [1; 16], lines: vec![] },
             Action::PostClip { project: Some([0; 32]), title: String::new(), media: (0, [0; 32]), poster: None, duration_ms: 0,
                 width: 0, height: 0, media_kind: String::new(), session: None },
@@ -1835,6 +2537,7 @@ mod tests {
             ("project_create", r#"{"title":"Design"}"#.to_owned()),
             ("project_remove", format!(r#"{{"project":"{id}"}}"#)),
             ("board_create", format!(r#"{{"title":"Plan","project":"{id}"}}"#)),
+            ("board_pin", format!(r#"{{"board":"{id}","from":"{id}"}}"#)),
             ("design_add", format!(r#"{{"board":"{id}","x":0,"y":1.25,"preset":"phone","src":"View{{}}","title":"Start"}}"#)),
             ("design_write", format!(r#"{{"item":"{id}","src":"Button{{}}","revision":"@{id}"}}"#)),
             ("item_add", format!(r#"{{"board":"{id}","kind":"text","x":1.25,"y":0,"w":4,"h":2}}"#)),
@@ -1915,6 +2618,22 @@ mod tests {
             assert!(bound("entity_set", &args(&key, r#"{"int":2}"#)).unwrap_err()
                 .contains(&format!("Town writes the {name} field itself")));
             assert!(bound("entity_set", &args(&key, r#"{"null":true}"#)).is_ok(), "{name} can be cleared");
+        }
+        let id_value = format!(r#"{{"id":"{id}"}}"#);
+        for field in 45..=48 {
+            for value in [r#"{"int":1}"#, r#"{"text":"note"}"#, r#"{"bool":true}"#, &id_value,
+                r#"{"null":true}"#, r#"{"literal":"1"}"#] {
+                assert!(bound("entity_set", &args(&field.to_string(), value)).unwrap_err().contains("Town reserves this field"),
+                    "field {field} must reject {value}");
+            }
+        }
+        for field in 40..=44 {
+            let integer = r#"{"int":2}"#;
+            let text = r#"{"text":"open"}"#;
+            let (valid, invalid) = if field == 41 { (integer, text) } else { (text, integer) };
+            let key = field.to_string();
+            assert!(bound("entity_set", &args(&key, invalid)).unwrap_err().contains("invalid value type for reserved field"));
+            assert!(bound("entity_set", &args(&key, valid)).is_ok() && bound("entity_set", &args(&key, r#"{"null":true}"#)).is_ok());
         }
         for bad in ["null", "5", "{}", r#"{"null":false}"#, r#"{"int":2.5}"#, r#"{"id":"no"}"#,
             r#"{"int":1,"bool":true}"#, r#"{"blob":"unknown"}"#, r#"{"bool":1}"#, r#"{"text":true}"#] {

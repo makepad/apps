@@ -16,6 +16,8 @@ struct Reading {
     demand: Option<View>,
     popped: usize,
     hold_picture: bool,
+    next_frame: bool,
+    parks: usize,
     ended_why: Option<Arc<str>>,
     keys: usize,
     drops: usize,
@@ -41,7 +43,9 @@ fn guest_files_visual_issue_from_watched_picture() {
     ben.start_store(cx.task_pool(), move || { let _ = signal.send(()); }).unwrap();
     let session = [7; 16];
     let mut call = CallController::default();
-    call.begin_offer(session, "Ana\nCanvas".into(), ShareRole::Viewer, (320., 240.));
+    // A sharer's device key is an uncompressed point (prefix 4), as the link delivers it.
+    let sharer = { let mut key = [1; 65]; key[0] = 4; key };
+    call.begin_offer(session, ben.open_id(), "Ana\nCanvas".into(), ShareRole::Viewer { sharer }, (320., 240.));
     call.watch(session);
     let clock = LocalClock::default();
     let mut data = ViewData { page: Page::Live(Live::Share(session)), call: call.shown(),
@@ -101,6 +105,8 @@ fn guest_files_visual_issue_from_watched_picture() {
     assert_eq!((issue.value(field::W), issue.value(field::H)), (Some(&Value::Int(4)), Some(&Value::Int(4))), "the issue has the received pixel size");
     assert_eq!(issue.value(field::SESSION), Some(&Value::Key(session.to_vec())), "the issue identifies the live share");
     assert_eq!(issue.text(field::LABEL), "Ana Canvas · 320 × 240 pt · as received", "the label carries the window's point size on one line");
+    assert_eq!(ben.state.copied_from(issue.id, issue.id, &field::LABEL), [makepad_town_core::event::CopySource::SharePeer { peer: sharer }],
+        "with no recorded session opener, the received picture names the watched sharer as its source");
     let Some(Value::Blob { size, root }) = issue.value(field::BLOB) else { panic!("the issue references its full PNG") };
     let path = blob::data_path(&ben.home.blobs_dir().join(makepad_town_core::hex(&ben.open_id())), &blob::id(*size, root));
     let png = makepad_ai_services::pictures::decode_png(&std::fs::read(path).unwrap()).unwrap();
@@ -132,7 +138,9 @@ impl EncodedSource for Held {
     fn set_wake(&mut self, _: Arc<dyn Fn() + Send + Sync>) {}
     fn set_kbps(&mut self, kbps: u32) { self.encoder.set_kbps(kbps); }
     fn want(&mut self, width: u32, height: u32, fps: u32) {
-        self.readings.lock().unwrap().demand = Some(View { width, height, fps });
+        let mut reading = self.readings.lock().unwrap();
+        if width == 0 { reading.parks += 1; }
+        reading.demand = Some(View { width, height, fps });
     }
     fn key_now(&mut self) { self.readings.lock().unwrap().keys += 1; self.encoder.request_key(); self.pending = true; }
     fn frame_counts(&self) -> Option<(u64, u64)> { Some((self.pts as u64 / 100_000, self.pts as u64 / 100_000)) }
@@ -140,6 +148,7 @@ impl EncodedSource for Held {
         {
             let mut reading = self.readings.lock().unwrap();
             reading.popped += 1;
+            self.pending |= std::mem::take(&mut reading.next_frame);
             if reading.hold_picture || reading.ended_why.is_some() { return None }
         }
         if !std::mem::take(&mut self.pending) { return None }
@@ -228,7 +237,7 @@ fn panel_drawer() -> impl FnMut(CallShown, bool) -> (usize, Option<crate::call::
         assert_eq!(popped.visible(), detached && data.call.share.watching.is_some());
         assert_eq!(center.visible(), data.call.share.shows_picture(&data.call.share.offers[0]),
             "the center shows the guest's watched picture or the sharer's own view, beside an open window too");
-        if let Some(offer) = data.call.share.offers.first().filter(|o| o.role == ShareRole::Viewer) {
+        if let Some(offer) = data.call.share.offers.first().filter(|o| matches!(o.role, ShareRole::Viewer { .. })) {
             for widget in [&center, &popped] {
                 let mut node = a11y_tree::Node::default();
                 widget.borrow::<crate::call::share_panel::SharePanel>().unwrap().semantics(&cx, &mut node);
@@ -305,7 +314,9 @@ fn linked_with(a: &crate::model::Model, b: &crate::model::Model, mut intercept: 
             devices_path: model.home.call_devices_path(), voice: VoiceSource::Feed });
         let mut host = Host::default();
         let port = ctl.link_up(&mut host, model.me(), peer, "Peer").unwrap();
-        intercept(ctl.active_link().unwrap(), &port);
+        ctl.set_open_town(Some((a.open_id(), vec![(peer, "Peer".into())])));
+        ctl.set_peer_caps(peer, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
+        intercept(&ctl.links[&peer], &port);
         assert!(worker.try_send(ToWorker::Call(port)).is_ok());
         Seat { ctl, host, worker }
     });
@@ -337,7 +348,7 @@ fn crossed_calls_and_plain_calls_each_spend_one_session() {
             pair.wait(|s| s.iter().all(|s| s.ctl.view().phase == Phase::Live && s.ctl.voice_attached));
             pair.seats[0].press(Press::HangUp);
             pair.wait(|s| s.iter().all(|s| s.ctl.view().phase == Phase::Idle && !s.ctl.has_call_workers()));
-            for s in &pair.seats { assert_eq!(s.ctl.active_link().unwrap().media.session_last, index as u32 + 1); }
+            for s in &pair.seats { assert_eq!(s.ctl.links.values().next().unwrap().media.session_last, index as u32 + 1); }
             assert_eq!(networks.load(Ordering::Acquire), 2 * (index + 1));
         }
     }
@@ -361,14 +372,14 @@ fn linked_share_joins_on_display_and_survives_the_call() {
     assert_eq!(readings.lock().unwrap().demand, Some(View::default()));
     assert_eq!(readings.lock().unwrap().popped, 0, "no source poll before Watch");
     for (i, seat) in pair.seats.iter_mut().enumerate() {
-        let role = if i == 0 { ShareRole::Sharer { link: LinkId::TEST, window: window.id } } else { ShareRole::Viewer };
-        assert_eq!(seat.ctl.take_share_events(), [ShareEvent::Started { session, title: "Drawing".into(), role }]);
+        let role = if i == 0 { ShareRole::Sharer { link: LinkId::TEST, window: window.id } } else { ShareRole::Viewer { sharer: a.me() } };
+        assert_eq!(seat.ctl.take_share_events(), [ShareEvent::Started { session, town: a.open_id(), title: "Drawing".into(), role }]);
         assert!(seat.ctl.take_share_events().is_empty());
     }
-    assert!(pair.seats[0].ctl.take_facts().iter().any(|f| matches!(f, Fact::ShareOpen { session: id, title, to }
-        if *id == session && title == "Drawing" && *to == b.me())));
+    assert!(pair.seats[0].ctl.take_facts().iter().any(|f| matches!(f, Fact::ShareOpen { session: id, title, town }
+        if *id == session && title == "Drawing" && *town == a.open_id())));
     assert!(!pair.seats[1].ctl.take_facts().iter().any(|f| matches!(f, Fact::ShareJoin { .. })));
-    a.act(Action::SessionOpen { town: None, session, mode: SessionMode::Share { title: "Drawing".into() },
+    a.act(Action::SessionOpen { town_wide: false, town: None, session, mode: SessionMode::Share { title: "Drawing".into() },
         to: vec![a.call_seat(&b.me()).unwrap()] }, Origin::Ui).unwrap();
     let viewer = &mut pair.seats[1];
     // Make the offer much older than the first draw without spending that time in the test.
@@ -410,9 +421,9 @@ fn linked_share_joins_on_display_and_survives_the_call() {
     assert!(viewer.shown().share.single_waiting_line().is_none());
     assert!(viewer.take_facts().is_empty(), "decoding a frame outside a draw cannot join the viewer");
     assert_eq!(draw_panel(viewer.shown(), false).0, 0, "the picture replaces the waiting line on its draw");
-    assert_eq!(viewer.take_facts(), [Fact::ShareJoin { session }]);
+    assert_eq!(viewer.take_facts(), [Fact::ShareJoin { session, town: a.open_id(), sharer: a.me() }]);
     let first_draw = *viewer.sharing.shown.offers.first().unwrap().first_draw.get().unwrap();
-    b.act(Action::SessionJoin { town: None, session }, Origin::Ui).unwrap();
+    b.act(Action::SessionJoin { peer: None, town: None, session }, Origin::Ui).unwrap();
 
     let resized = AppWindow { size: (480., 270.), ..window.clone() };
     let sharer = &mut pair.seats[0].ctl;
@@ -422,7 +433,7 @@ fn linked_share_joins_on_display_and_survives_the_call() {
     let viewer = &mut pair.seats[1].ctl;
     assert_eq!(viewer.sharing.shown.watching, Some(session), "resizing keeps the same watch");
     // Model the decoder losing its picture handle while the UI still has Watch open.
-    viewer.current.as_mut().unwrap().watch_share(PEER, View::default());
+    viewer.current.as_mut().unwrap().watch_share(viewer.links[&a.me()].peer_id, View::default());
     viewer.poll_share();
     assert!(matches!(viewer.take_share_picture_update(), Some(None)), "one redraw clears the old picture");
     viewer.poll_share();
@@ -469,7 +480,9 @@ fn linked_share_joins_on_display_and_survives_the_call() {
     let previous_problem = ShareProblem::new(session, "late report").encode();
     let before_stop = first_draw.elapsed().as_secs();
     pair.seats[0].press(Press::StopShare);
-    pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers()));
+    pair.wait(|s| s.iter().all(|s|
+        !s.ctl.has_call_workers() && s.ctl.sharing.shown.offer(session).is_none()
+    ));
     assert_eq!(readings.lock().unwrap().drops, 1, "Stop releases the watched source");
     assert!(pair.seats.iter().all(|s| s.ctl.sharing.shown.offers.is_empty() && s.ctl.sharing.shown.picture.is_none()));
     assert_eq!(networks.load(Ordering::Acquire), initial_workers);
@@ -496,9 +509,10 @@ fn linked_share_joins_on_display_and_survives_the_call() {
         let (source, _) = held_source();
         pair.seats[0].ctl.start_window(LinkId::TEST, &window, "Preview".into(), source).unwrap();
         let session = pair.seats[0].ctl.sharing.shown.offers.first().unwrap().session;
-        pair.wait(|s| s[1].ctl.viewer_session() == Some(session) && s[1].ctl.current.is_some());
+        pair.wait(|s| s[1].ctl.viewer_session() == Some(session));
         pair.seats[1].press(Press::Watch);
-        assert!(!pair.seats[1].ctl.share_message(&previous_problem), "a late failure cannot affect the next offer");
+        pair.wait(|s| s[1].ctl.current.is_some());
+        assert!(!pair.seats[1].ctl.share_message(a.me(), &previous_problem), "a late failure cannot affect the next offer");
         assert_eq!(pair.seats[1].ctl.shown().share.single_waiting_line(), Some("Waiting for Peer's picture…"),
             "a new share has its normal waiting line");
         assert!(pair.seats[0].ctl.shown().share.offers[0].sharer_line.as_deref().unwrap().contains("hasn't opened it yet"),
@@ -507,19 +521,23 @@ fn linked_share_joins_on_display_and_survives_the_call() {
             let viewer = &mut pair.seats[1].ctl;
             viewer.take_share_picture_update();
             let problem = ShareProblem::new(session, "encoder could not start").encode();
-            assert!(viewer.share_message(&problem), "the first report changes an empty waiting panel");
+            assert!(viewer.share_message(a.me(), &problem), "the first report changes an empty waiting panel");
             assert!(matches!(viewer.take_share_picture_update(), Some(None)), "a failure before the first frame redraws the panel");
             assert_eq!(viewer.shown().share.single_waiting_line(), Some("Peer's picture stopped: encoder could not start"));
-            assert!(!viewer.share_message(&problem), "a duplicate report does not redraw the panel again");
+            assert!(!viewer.share_message(a.me(), &problem), "a duplicate report does not redraw the panel again");
         }
         pair.seats[1].press(Press::CloseWatch);
         pair.seats[0].press(Press::Call);
         pair.wait(|s| s[1].ctl.view().ringing());
         pair.seats[side].press(ending);
-        pair.wait(|s| s.iter().all(|s| s.ctl.view().phase == Phase::Idle));
-        assert!(pair.seats.iter().all(|s| s.ctl.current.is_some() && s.ctl.sharing.shown.offers.first().unwrap().session == session));
-        pair.seats[0].press(Press::StopShare);
         pair.wait(|s| s.iter().all(|s| s.ctl.view().phase == Phase::Idle && !s.ctl.has_call_workers()));
+        assert!(pair.seats.iter().all(|s| s.ctl.sharing.shown.offers.first().unwrap().session == session));
+        pair.seats[0].press(Press::StopShare);
+        pair.wait(|s| s.iter().all(|s|
+            s.ctl.view().phase == Phase::Idle
+                && !s.ctl.has_call_workers()
+                && s.ctl.sharing.shown.offer(session).is_none()
+        ));
         for seat in &mut pair.seats {
             assert!(seat.ctl.sharing.shown.offers.is_empty());
             assert_eq!(seat.ctl.take_share_events().last(), Some(&ShareEvent::Ended { session, reason: ShareEndReason::Stopped }));
@@ -527,7 +545,7 @@ fn linked_share_joins_on_display_and_survives_the_call() {
         assert!(pair.seats[0].ctl.take_facts().iter().any(|f| matches!(f,
             Fact::Leave { session: id, why: LeaveWhy::Ended, .. } if *id == session)));
         assert!(!pair.seats[1].ctl.take_facts().iter().any(|f| matches!(f,
-            Fact::ShareJoin { session: id } | Fact::Leave { session: id, .. } if *id == session)),
+            Fact::ShareJoin { session: id, .. } | Fact::Leave { session: id, .. } if *id == session)),
             "an unseen share leaves no viewer participation at {ending:?}");
     }
 
@@ -539,7 +557,9 @@ fn linked_share_joins_on_display_and_survives_the_call() {
         pair.seats[0].ctl.start_window(LinkId::TEST, &window, "Second".into(), source).unwrap();
         let session = pair.seats[0].ctl.sharing.shown.offers.first().unwrap().session;
         // The follower starts its session when the keeper's Media arrives, which can be after the offer and the demand.
-        pair.wait(|s| s[1].ctl.viewer_session() == Some(session) && readings.lock().unwrap().demand == Some(View::default())
+        pair.wait(|s| s[1].ctl.viewer_session() == Some(session));
+        pair.seats[1].press(Press::Watch);
+        pair.wait(|s| readings.lock().unwrap().demand == Some(View::default())
             && s.iter().all(|s| s.ctl.current.is_some()) && s[0].number() == s[1].number());
         let shares_only = networks.load(Ordering::Acquire);
         assert_eq!(shares_only, previous_workers + 2, "a fresh share starts one media session on each seat");
@@ -549,7 +569,6 @@ fn linked_share_joins_on_display_and_survives_the_call() {
         pair.wait(|s| s[1].ctl.view().ringing());
         pair.seats[1].press(Press::Answer);
         pair.wait(|s| s.iter().all(|s| s.ctl.view().phase == Phase::Live));
-        pair.seats[1].press(Press::Watch);
         pair.seats[1].ctl.share_panel_size(session, crate::call::ShareSurface::Page, 320, 180);
         pair.wait(|s| s[1].ctl.sharing.shown.picture.is_some());
         draw_panel(pair.seats[1].ctl.shown(), false);
@@ -600,7 +619,9 @@ fn share_opening_controls_require_local_input_in_both_audio_modes() {
         ctl.configure(CallEnv { files: Default::default(), signal: Arc::new(|| {}), voice, devices_path: PathBuf::new(),
             spawn: makepad_call::driver::std_spawn(), jobs: makepad_call::driver::std_spawn() });
         let port = ctl.link_up(&mut host, [1; 65], [2; 65], "Peer").unwrap();
-        for press in [Press::Share(ShareChoice::Menu), Press::Share(ShareChoice::Row(8)), Press::Watch, Press::LetControl, Press::AllowAll(true)] {
+        ctl.set_open_town(Some(([9; 32], vec![([2; 65], "Peer".into())])));
+        ctl.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
+        for press in [Press::Share(ShareChoice::Menu), Press::Share(ShareChoice::Row(8)), Press::Watch, Press::LetControl([2; 65]), Press::AllowAll(true)] {
             let action = CallAction::Press(press);
             assert!(ctl.opening(action));
             assert!(!ctl.call_actions(&mut host, action), "queued or injected {press:?} is ignored");
@@ -611,7 +632,7 @@ fn share_opening_controls_require_local_input_in_both_audio_modes() {
         assert!(ctl.sharing.shown.choices.is_none());
         assert!(ctl.call_opening_presses(&mut host, CallAction::Press(Press::Share(ShareChoice::Menu))));
         assert!(ctl.sharing.shown.choices.is_some());
-        let offer = Message::Share { session: [4; 16], title: "Sheet".into(), w: 96., h: 64., ext: Default::default() };
+        let offer = Message::Share { session: [4; 16], title: "Sheet".into(), w: 96., h: 64., ext: super::super::super::ShareOfferExt { town: Some([9; 32]), ..Default::default() } };
         port.messages_in.try_send(offer.encode()).unwrap();
         ctl.poll(&mut host);
         assert!(!ctl.call_actions(&mut host, CallAction::Press(Press::Watch)));
@@ -625,10 +646,148 @@ fn share_opening_controls_require_local_input_in_both_audio_modes() {
         assert!(ctl.sharing.shown.offers.is_empty());
         assert!(ctl.take_facts().is_empty(), "a viewer who closed before any picture has no Join or Leave");
         let port = ctl.link_up(&mut host, [1; 65], [2; 65], "Peer").unwrap();
+        ctl.set_open_town(Some(([9; 32], vec![([2; 65], "Peer".into())])));
+        ctl.set_peer_caps([2; 65], MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
         port.messages_in.try_send(offer.encode()).unwrap();
         ctl.poll(&mut host);
         assert_eq!(ctl.viewer_session(), Some([4; 16]), "an idle link accepts a new share");
         assert!(ctl.current.is_none(), "the offer waits for keys before starting media");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn share_end_preserves_control_notice_across_split_polls_and_clears_earlier_notices() {
+    use crate::call::{signal, topic};
+    use makepad_call::driver::std_spawn;
+
+    const ANA: PublicKey = [1; 65];
+    const BEN: PublicKey = [2; 65];
+    const KIT: PublicKey = [3; 65];
+
+    struct DirectSeat<'a> {
+        ctl: CallController,
+        host: Host,
+        port: MediaPort,
+        apps: &'a mut AppLinks,
+    }
+
+    impl<'a> DirectSeat<'a> {
+        fn new(me: PublicKey, peer: PublicKey, name: &str, apps: &'a mut AppLinks) -> Self {
+            let mut ctl = CallController::default();
+            ctl.codecs = Arc::new(TestCodecs);
+            ctl.configure(CallEnv {
+                files: Default::default(), devices_path: Default::default(), voice: VoiceSource::Off,
+                spawn: std_spawn(), jobs: std_spawn(), signal: Arc::new(|| {}),
+            });
+            let mut host = Host::default();
+            let port = ctl.link_up(&mut host, me, peer, name).unwrap();
+            ctl.set_open_town(Some((MESH_TOWN, vec![(peer, name.into())])));
+            ctl.set_peer_caps(peer, SHARE_CAPS);
+            Self { ctl, host, port, apps }
+        }
+
+        fn poll(&mut self) {
+            self.ctl.poll(&mut self.host);
+            self.ctl.receive_control(self.apps);
+            self.ctl.revoke_ended_shares(self.apps);
+        }
+    }
+
+    fn deliver_one_by_one(from: &MediaPort, to: &mut DirectSeat<'_>) -> Vec<Vec<u8>> {
+        let mut delivered = Vec::new();
+        for frame in from.messages_out.try_iter() {
+            to.port.messages_in.try_send(frame.clone()).unwrap();
+            to.poll();
+            delivered.push(frame);
+        }
+        delivered
+    }
+
+    fn exchange(a: &mut DirectSeat<'_>, b: &mut DirectSeat<'_>) {
+        loop {
+            a.poll();
+            b.poll();
+            let outbound = deliver_one_by_one(&a.port, b);
+            let inbound = deliver_one_by_one(&b.port, a);
+            if outbound.is_empty() && inbound.is_empty() { break }
+        }
+    }
+
+    fn open_and_grant(a: &mut DirectSeat<'_>, b: &mut DirectSeat<'_>, link: LinkId, window: WindowId) -> SessionId {
+        a.ctl.open_share_window(a.apps, link, window).unwrap();
+        let session = a.ctl.only_local_offer().unwrap();
+        exchange(a, b);
+        assert!(b.ctl.call_opening_presses(&mut b.host, CallAction::OnShare(session, Press::Watch)),
+            "the viewer opens the new offer");
+        b.ctl.share_panel_size(session, ShareSurface::Page, 320, 180);
+        assert!(b.ctl.ask_control(session, true), "the viewer asks for control on this share");
+        exchange(a, b);
+        assert!(a.ctl.allow_control(a.apps, session, BEN, "Ben"), "the sharer grants the watching viewer control");
+        exchange(a, b);
+        let grant = a.ctl.shown().share.control.active.expect("the sharer holds a current grant");
+        assert_eq!(b.ctl.shown().share.control.active, Some(grant), "the viewer receives that grant before the end");
+        session
+    }
+
+    fn deliver_end(a: &mut DirectSeat<'_>, b: &mut DirectSeat<'_>, session: SessionId) {
+        a.poll();
+        let frames = deliver_one_by_one(&a.port, b);
+        let ends = frames.iter().filter(|f| matches!(signal::decode(f),
+            Ok(Some(Message::ShareOff { session: id, reason: ShareEndReason::Stopped })) if id == session)).count();
+        assert_eq!(ends, 1, "the viewer gets exactly one ShareOff for the ended offer");
+        assert!(!frames.iter().any(|f| signal::peer_payload(f).is_some_and(|(t, _, _)| t == topic::INPUT)),
+            "ending the share sends no redundant control message");
+        assert!(b.ctl.sharing.shown.offer(session).is_none(), "the viewer processes ShareOff");
+        assert_eq!(b.ctl.inputs_refused(), 0, "separate polls leave no stale input to refuse");
+        exchange(a, b);
+    }
+
+    let mut rig = crate::app_link::RecordingRig::new();
+    rig.app.scan();
+    rig.wait(|r| !r.app.apps().is_empty());
+    let link = rig.app.link(&rig.app.apps()[0].key.clone());
+    rig.live(link);
+    let window = rig.app.state(link).unwrap().windows[0].id;
+    let mut guest_apps = AppLinks::default();
+    let mut a = DirectSeat::new(ANA, BEN, "Ben", &mut rig.app);
+    let mut b = DirectSeat::new(BEN, ANA, "Ana", &mut guest_apps);
+
+    let session = open_and_grant(&mut a, &mut b, link, window);
+    assert!(a.ctl.press(&mut a.host, Press::StopShare), "StopShare ends the controlled share");
+    deliver_end(&mut a, &mut b, session);
+    for seat in [&a, &b] {
+        assert_eq!(seat.ctl.shown().share.control.notice.as_deref(), Some("Control ended with the share."),
+            "both seats keep the notice when stopping the share cuts control short");
+    }
+
+    let session = open_and_grant(&mut a, &mut b, link, window);
+    assert!(a.ctl.press(&mut a.host, Press::TakeBack), "the sharer takes back control before stopping");
+    exchange(&mut a, &mut b);
+    assert_eq!(b.ctl.shown().share.control.notice.as_deref(), Some("Ana took back control."),
+        "the viewer sees the earlier take-back before the share ends");
+    assert!(a.ctl.press(&mut a.host, Press::StopShare), "StopShare ends the previously controlled share");
+    deliver_end(&mut a, &mut b, session);
+    for seat in [&a, &b] {
+        let share = seat.ctl.shown().share;
+        assert!(share.control.notice.is_none() && share.control_session.is_none(),
+            "the earlier take-back notice and its session clear on both seats");
+    }
+
+    let _other_port = a.ctl.link_up(&mut a.host, ANA, KIT, "Kit").unwrap();
+    a.ctl.set_open_town(Some((MESH_TOWN, vec![(BEN, "Ben".into()), (KIT, "Kit".into())])));
+    a.ctl.set_peer_caps(KIT, SHARE_CAPS);
+    let session = open_and_grant(&mut a, &mut b, link, window);
+    a.ctl.set_town_peers(&mut a.host, BTreeMap::from([(MESH_TOWN, BTreeSet::from([KIT]))]));
+    deliver_end(&mut a, &mut b, session);
+    assert!(a.ctl.is_recipient(session, &KIT), "the share survives for the remaining recipient");
+    for seat in [&a, &b] {
+        assert_eq!(seat.ctl.shown().share.control.notice.as_deref(), Some("Control ended with the share."),
+            "revoking the holder's membership preserves the share-end notice on both seats");
+    }
+    for seat in [&mut a, &mut b] {
+        seat.ctl.shutdown(&mut seat.host);
+        while seat.ctl.has_call_workers() { seat.poll(); thread::yield_now(); }
     }
 }
 
@@ -654,8 +813,8 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     // A marker follows all earlier reliable input. Waiting for it and the local
     // app's reply barrier also completes when a deliberately bad input was refused.
     fn drain(pair: &mut Pair, app: &mut RecordingRig, link: LinkId) {
-        pair.seats[1].ctl.send_peer(topic::PROBE, Vec::new()).unwrap();
-        wait(pair, app, |s, _| !s[0].ctl.take_peer(topic::PROBE).is_empty());
+        pair.seats[1].ctl.send_peer_to(pair.seats[1].peer(), topic::PROBE, Vec::new()).unwrap();
+        wait(pair, app, |s, _| !s[0].ctl.take_peer_with_sender(topic::PROBE).is_empty());
         app.barrier(link);
     }
 
@@ -676,7 +835,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
         }
         pair.seats[1].press(Press::Watch);
         pair.seats[1].ctl.share_panel_size(session, crate::call::ShareSurface::Page, 24, 16);
-        wait(pair, app, |s, _| s[0].ctl.sharing.shown.control.peer_watching);
+        wait(pair, app, |s, _| s[0].ctl.sharing.shown.watchers.len() == 1);
         let line = pair.seats[0].ctl.shown().share.offers[0].sharer_line.clone().unwrap();
         assert!(!line.contains("hasn't opened"), "the viewer's subscription clears the not-opened line: {line}");
         session
@@ -684,7 +843,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
 
     fn grant(pair: &mut Pair, app: &mut RecordingRig, session: SessionId) -> GrantId {
         let name = pair.seats[0].ctl.view().peer_name.clone();
-        assert!(pair.seats[0].ctl.allow_control(&mut app.app, session, &name));
+        assert!(pair.seats[0].ctl.allow_control(&mut app.app, session, pair.seats[0].peer(), &name));
         let id = pair.seats[0].ctl.sharing.shown.control.active.unwrap();
         wait(pair, app, |s, _| s[1].ctl.sharing.shown.control.active == Some(id));
         id
@@ -704,10 +863,10 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     let up = |x| AppInput::PointerUp { x, y: 4., button: 0, mods };
     let key = || AppInput::KeyDown { key: KeyCode::KeyA, mods };
     let send = |pair: &mut Pair, session, grant, event| {
-        pair.seats[1].ctl.send_peer(topic::INPUT, ControlMessage::Input { session, grant, event }.encode()).unwrap();
+        pair.seats[1].ctl.send_peer_to(pair.seats[1].peer(), topic::INPUT, ControlMessage::Input { session, grant, event }.encode()).unwrap();
     };
     let seat = &mut pair.seats[0];
-    assert!(!seat.ctl.call_actions(&mut seat.host, CallAction::Press(Press::LetControl)),
+    assert!(!seat.ctl.call_actions(&mut seat.host, CallAction::Press(Press::LetControl(b.me()))),
         "an injected or queued Let control cannot grant access");
     assert!(!app.app.state(link).unwrap().input_allowed);
     for event in [moved(2.), key()] { send(&mut pair, session, [0; 16], event); }
@@ -716,12 +875,12 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     assert!(app.input_lines().is_empty(), "pointer and keys before Allow stay out of the app");
     for asking in [true, false, true] {
         assert!(pair.seats[1].ctl.ask_control(session, asking));
-        wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requested == asking.then_some(session));
+        wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requests.first().map(|r| r.0) == asking.then_some(session));
         assert_eq!(pair.seats[1].ctl.sharing.shown.control.asking, asking.then_some(session));
         assert!(!app.app.state(link).unwrap().input_allowed, "only Allow opens app input");
     }
     let sharer = &mut pair.seats[0];
-    for press in [Press::LetControl, Press::AllowAll(true)] {
+    for press in [Press::LetControl(b.me()), Press::AllowAll(true)] {
         assert!(!sharer.ctl.call_actions(&mut sharer.host, CallAction::OnShare(session, press)),
             "an injected {press:?} cannot open the watched share even with a pending request");
     }
@@ -729,10 +888,10 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     assert!(!offer.allow_all() && offer.allowed().is_empty() && !app.app.state(link).unwrap().input_allowed,
         "refused presses leave the switch, named rights and app input closed");
     let requested = grant(&mut pair, &mut app, session);
-    let peer = pair.seats[0].ctl.peer_epoch().unwrap().0;
+    let peer = pair.seats[0].peer();
     assert_eq!(pair.seats[0].ctl.sharing.shown.offer(session).unwrap().allowed().get(&peer),
         Some(&pair.seats[0].ctl.view().peer_name), "Allow records the authenticated peer's name for the chip");
-    assert!(pair.seats[0].ctl.sharing.shown.control.requested.is_none());
+    assert!(pair.seats[0].ctl.sharing.shown.control.requests.is_empty());
     assert!(pair.seats[1].ctl.sharing.shown.control.asking.is_none());
     assert_eq!(pair.seats[1].ctl.sharing.shown.control.active, Some(requested));
     pair.seats[1].press(Press::ReleaseControl);
@@ -745,7 +904,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     let first = pair.seats[1].ctl.sharing.shown.control.active.unwrap();
     assert_ne!(requested, first, "Take control starts a fresh spell without a sharer press");
     send(&mut pair, [0; 16], first, key());
-    pair.seats[1].ctl.send_peer(topic::INPUT, vec![1, 1, 0]).unwrap();
+    pair.seats[1].ctl.send_peer_to(pair.seats[1].peer(), topic::INPUT, vec![1, 1, 0]).unwrap();
     drain(&mut pair, &mut app, link);
     assert_eq!(pair.seats[0].ctl.inputs_refused(), 4);
     assert_eq!((pair.seats[0].ctl.inputs_refused_for(Refusal::NoAllow), pair.seats[0].ctl.inputs_refused_for(Refusal::Unreadable)), (3, 1),
@@ -790,7 +949,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     let second = grant(&mut pair, &mut app, session);
     assert_ne!(second, first, "regrant on the same share creates a fresh capability");
     send(&mut pair, session, first, key());
-    pair.seats[1].ctl.send_peer(topic::INPUT, ControlMessage::Release { session, grant: first }.encode()).unwrap();
+    pair.seats[1].ctl.send_peer_to(pair.seats[1].peer(), topic::INPUT, ControlMessage::Release { session, grant: first }.encode()).unwrap();
     drain(&mut pair, &mut app, link);
     assert_eq!(pair.seats[0].ctl.inputs_refused(), 7);
     assert!(app.app.state(link).unwrap().input_allowed, "a delayed Release cannot end the new grant");
@@ -832,7 +991,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     assert!(pair.seats[1].ctl.sharing.shown.control.notice.as_deref().unwrap().contains("took back"), "switch off ends the spell with TakenBack");
     assert_eq!(pair.seats[1].ctl.sharing.shown.control.allowed, None, "switch off withdraws a switch-only right");
     assert!(pair.seats[1].ctl.ask_control(next, true));
-    wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requested == Some(next));
+    wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requests.first().map(|r| r.0) == Some(next));
     let named = grant(&mut pair, &mut app, next);
     let sharer = &mut pair.seats[0];
     let revoke = {
@@ -875,7 +1034,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
     assert_eq!(pair.seats[1].ctl.sharing.shown.control.allowed, None, "removing the chip withdraws its right");
     assert!(pair.seats[1].ctl.sharing.shown.control.notice.as_deref().unwrap().contains("took back"), "removing the chip ends its spell with TakenBack");
     assert!(pair.seats[1].ctl.ask_control(next, true));
-    wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requested == Some(next));
+    wait(&mut pair, &mut app, |s, _| s[0].ctl.sharing.shown.control.requests.first().map(|r| r.0) == Some(next));
     assert!(pair.seats[0].ctl.allow_all_control(&mut app.app, next));
     wait(&mut pair, &mut app, |s, _| s[1].ctl.sharing.shown.control.active.is_some());
     for seat in &mut pair.seats {
@@ -892,6 +1051,27 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
 }
 
 
+fn run_call_tool(model: &crate::model::Model, seat: &mut Seat, tool: crate::call::ai::CallTool, page: Option<SessionId>)
+    -> (makepad_strict_json::Value, &'static str, bool) {
+    use crate::call::ai::{self, CallGateContext, CallTool, CallToolPlan};
+    use makepad_town_core::trust::{Gate, LocalPolicy};
+
+    let gate = Gate::new(&model.state, LocalPolicy::Members);
+    let peer = seat.peer();
+    let plan = tool.plan(&gate, &seat.ctl.shown(), page, &model.me()).unwrap();
+    let (msg, note, changed) = match plan {
+        CallToolPlan::AmbiguousShareStop(msg) => (Some(msg), "multiple shares running", false),
+        CallToolPlan::Action(None) if tool == CallTool::State => (None, "call state", false),
+        CallToolPlan::Action(action) => {
+            let changed = action.is_some_and(|a| seat.ctl.call_actions(&mut seat.host, a));
+            (None, if changed { "closed" } else { "nothing to close" }, changed)
+        }
+    };
+    let ctx = CallGateContext { call_peers: &[peer], peers: None, me: model.me(), person_name: model.person_name.as_deref() };
+    let out = ai::state(&gate, &seat.ctl.shown(), Instant::now(), &ctx, msg).unwrap();
+    (makepad_strict_json::parse(out.as_str().as_bytes()).unwrap(), note, changed)
+}
+
 /// The AI's call tools on a linked pair: `call_state` reports the share and its Allow from both
 /// seats, and each closing tool ends what its button ends, once.
 #[cfg(unix)]
@@ -899,7 +1079,7 @@ fn linked_takeover_binds_input_to_the_live_share_and_its_current_allow() {
 fn call_tools_read_and_close_a_linked_share() {
     use crate::app_link::RecordingRig;
     use crate::call::ai::CallTool;
-    use makepad_strict_json::{parse, Value};
+    use makepad_strict_json::Value;
 
     let (_homes, a, b) = crate::model::tests::shared_town("call-tools");
     let (mut pair, _) = linked_call(&a, &b);
@@ -922,27 +1102,23 @@ fn call_tools_read_and_close_a_linked_share() {
         seats[1].ctl.receive_control(&mut viewer_apps);
         ready(seats)
     });
-    wait(&mut pair, &mut app, Box::new(|s| s[0].ctl.sharing.shown.control.peer_watching));
-    assert!(pair.seats[0].ctl.allow_control(&mut app.app, session, "Peer"));
+    wait(&mut pair, &mut app, Box::new(|s| s[0].ctl.sharing.shown.watchers.len() == 1));
+    assert!(pair.seats[0].ctl.allow_control(&mut app.app, session, pair.seats[0].peer(), "Peer"));
     let grant = pair.seats[0].ctl.sharing.shown.control.active.unwrap();
     wait(&mut pair, &mut app, Box::new(move |s| s[1].ctl.sharing.shown.control.active == Some(grant)));
 
-    let run = |seat: &mut Seat, tool: CallTool| {
-        let (json, done, changed) = tool.run(&mut seat.ctl, &mut seat.host, None);
-        (parse(json.as_bytes()).unwrap(), done, changed)
-    };
     let share_field = |v: &Value, key| v.get("share").and_then(|s| s.get(key)).and_then(Value::as_str).map(str::to_owned);
-    let (sharer, done, changed) = run(&mut pair.seats[0], CallTool::State);
-    assert_eq!((done.as_str(), changed), ("call state", false), "call_state reads only");
+    let (sharer, done, changed) = run_call_tool(&a, &mut pair.seats[0], CallTool::State, None);
+    assert_eq!((done, changed), ("call state", false), "call_state reads only");
     assert_eq!(sharer.get("phase").and_then(Value::as_str), Some("live"));
     assert_eq!((share_field(&sharer, "state").as_deref(), share_field(&sharer, "controlled_by").as_deref()),
         (Some("sharing"), Some("Peer")), "the sharer sees its share and the peer holding the Allow");
-    let (viewer, ..) = run(&mut pair.seats[1], CallTool::State);
+    let (viewer, ..) = run_call_tool(&b, &mut pair.seats[1], CallTool::State, None);
     assert_eq!((share_field(&viewer, "state").as_deref(), share_field(&viewer, "controlled_by").as_deref()),
         (Some("viewing"), Some("you")), "the viewer holding the Allow is told it is in control");
 
-    let (after, done, changed) = run(&mut pair.seats[0], CallTool::ControlTakeBack);
-    assert_eq!((done.as_str(), changed), ("closed", true), "control_take_back ends the Allow");
+    let (after, done, changed) = run_call_tool(&a, &mut pair.seats[0], CallTool::ControlTakeBack, None);
+    assert_eq!((done, changed), ("closed", true), "control_take_back ends the Allow");
     assert!(after.get("share").and_then(|s| s.get("controlled_by")).is_some_and(|v| *v == Value::Null),
         "the answer is call_state after the take-back");
     pair.seats[0].ctl.revoke_ended_shares(&mut app.app);
@@ -950,9 +1126,9 @@ fn call_tools_read_and_close_a_linked_share() {
     wait(&mut pair, &mut app, Box::new(|s| s[1].ctl.sharing.shown.control.active.is_none()));
     assert!(pair.seats.iter().all(|s| s.ctl.shown().share.control.notice.unwrap().contains("took back")),
         "both seats read the button's own notice");
-    assert_eq!(run(&mut pair.seats[0], CallTool::ControlTakeBack).1, "nothing to close", "a second take-back has nothing to end");
+    assert_eq!(run_call_tool(&a, &mut pair.seats[0], CallTool::ControlTakeBack, None).1, "nothing to close", "a second take-back has nothing to end");
 
-    let (_, done, _) = run(&mut pair.seats[0], CallTool::ShareStop);
+    let (_, done, _) = run_call_tool(&a, &mut pair.seats[0], CallTool::ShareStop, None);
     assert_eq!(done, "closed", "share_stop stops the share");
     wait(&mut pair, &mut app, Box::new(|s| s[1].ctl.viewer_session().is_none()));
     for seat in &mut pair.seats {
@@ -961,13 +1137,13 @@ fn call_tools_read_and_close_a_linked_share() {
     }
     assert!(pair.seats.iter().all(|s| s.ctl.shown().share.control.notice.is_none()),
         "the take-back's line goes with the share it was about");
-    assert_eq!(run(&mut pair.seats[1], CallTool::ShareClose).1, "nothing to close", "no share left to close on the viewer");
+    assert_eq!(run_call_tool(&b, &mut pair.seats[1], CallTool::ShareClose, None).1, "nothing to close", "no share left to close on the viewer");
 
-    let (after, done, _) = run(&mut pair.seats[0], CallTool::HangUp);
+    let (after, done, _) = run_call_tool(&a, &mut pair.seats[0], CallTool::HangUp, None);
     assert_eq!(done, "closed", "call_hang_up ends the call");
     assert_eq!(after.get("phase").and_then(Value::as_str), Some("idle"), "the answer is the idle call");
     pair.wait(|s| s[1].ctl.view().phase == Phase::Idle);
-    assert_eq!(run(&mut pair.seats[1], CallTool::HangUp).1, "nothing to close", "the peer's call ended with it");
+    assert_eq!(run_call_tool(&b, &mut pair.seats[1], CallTool::HangUp, None).1, "nothing to close", "the peer's call ended with it");
 
     // Exercise the project entry on the idle link with the same discoverable window.
     use makepad_widgets::{makepad_draw::cx_draw::CxDraw, *};
@@ -1032,8 +1208,8 @@ fn call_tools_read_and_close_a_linked_share() {
     assert!(menu.visible() && menu.borrow::<Button>().unwrap().enabled() && !choices.visible(), "an outgoing offer keeps Share available and closes the picker");
     assert!(data.tree.lines.iter().any(|line| line.node == crate::lists::Node::Live(crate::lists::Live::Share(offer.session))
         && line.label == format!("You are sharing {}", offer.title)), "the project offer must appear in the sidebar by name");
-    pair.wait(|s| s[1].ctl.viewer_session() == Some(offer.session) && s.iter().all(|s| s.ctl.sharing.sending.is_some() || s.ctl.sharing.receiving));
-    assert!(pair.seats.iter().all(|s| s.ctl.view().phase == Phase::Idle && !s.ctl.voice_attached), "project sharing must leave voice idle on both seats");
+    pair.wait(|s| s[1].ctl.viewer_session() == Some(offer.session));
+    assert!(pair.seats.iter().all(|s| s.ctl.view().phase == Phase::Idle && !s.ctl.voice_attached && !s.ctl.has_call_workers()), "project sharing must leave voice idle on both seats");
     let sharer = &mut pair.seats[0];
     let menu_action = CallAction::Press(Press::Share(ShareChoice::Menu));
     assert!(sharer.ctl.call_opening_presses(&mut sharer.host, menu_action));
@@ -1042,7 +1218,9 @@ fn call_tools_read_and_close_a_linked_share() {
     assert!(!choices_now.iter().any(|r| r.selectable && r.label == offer.title), "the picker omits the shared window");
     assert!(sharer.ctl.call_opening_presses(&mut sharer.host, menu_action));
     pair.seats[0].press(Press::StopShare);
-    pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers()));
+    pair.wait(|s| s.iter().all(|s|
+        !s.ctl.has_call_workers() && s.ctl.sharing.shown.offer(offer.session).is_none()
+    ));
     show(cx, &mut data, &pair.seats[0].ctl);
     assert!(menu.visible() && !choices.visible(), "Stop must restore the project Share button with the picker closed");
     let sharer = &mut pair.seats[0];
@@ -1078,7 +1256,7 @@ fn restarting_the_shared_app_explains_the_end_on_both_seats() {
     };
     let check_ended = |pair: &Pair, offer: &ShareOffer| {
         let notice = format!("{} closed or restarted.", offer.title);
-        for (seat, role) in pair.seats.iter().zip([offer.role, ShareRole::Viewer]) {
+        for (seat, role) in pair.seats.iter().zip([offer.role, ShareRole::Viewer { sharer: a.me() }]) {
             let ended = seat.ctl.shown().share.ended.iter().find(|e| e.session == offer.session).cloned().expect("a restarted app leaves an ended share");
             assert_eq!((ended.session, ended.title.as_ref(), ended.role, ended.notice.as_ref()),
                 (offer.session, offer.title.as_str(), role, notice.as_str()));
@@ -1121,10 +1299,12 @@ impl Seat {
         (self.ctl.sharing.shown.offers.first().unwrap().session, readings)
     }
 
-    fn number(&self) -> u32 { self.ctl.active_link().unwrap().media.session_last }
+    fn peer(&self) -> PublicKey { self.ctl.links.values().next().unwrap().peer }
+
+    fn number(&self) -> u32 { self.ctl.links.values().next().unwrap().media.session_last }
 
     fn media_id(&self) -> CallId {
-        let link = self.ctl.active_link().unwrap();
+        let link = self.ctl.links.values().next().unwrap();
         MediaKey::media_id(self.number(), (&link.me, &link.local_media_key), (&link.peer, link.peer_media_key.as_ref().unwrap()))
     }
 
@@ -1136,25 +1316,25 @@ impl Seat {
 
 impl Pair {
     fn picture(&mut self, viewer: usize, session: SessionId) {
-        self.wait(|s| s[viewer].ctl.sharing.shown.offer(session).is_some_and(|o| o.role == ShareRole::Viewer));
+        self.wait(|s| s[viewer].ctl.sharing.shown.offer(session).is_some_and(|o| matches!(o.role, ShareRole::Viewer { .. })));
         self.seats[viewer].watch(session);
         self.wait(|s| s[viewer].ctl.sharing.shown.picture.is_some());
         let ctl = &mut self.seats[viewer].ctl;
         assert!(!ctl.take_facts().iter().any(|f| matches!(f, Fact::ShareJoin { .. })));
         ctl.sharing.shown.offer(session).unwrap().picture_drawn();
-        assert_eq!(ctl.take_facts().iter().filter(|f| matches!(f, Fact::ShareJoin { session: id } if *id == session)).count(), 1);
+        assert_eq!(ctl.take_facts().iter().filter(|f| matches!(f, Fact::ShareJoin { session: id, .. } if *id == session)).count(), 1);
         assert!(ctl.take_facts().is_empty());
-        assert!(self.seats.iter().all(|s| s.ctl.current.is_some() && (s.ctl.sharing.sending.is_some() || s.ctl.sharing.receiving)));
+        assert!(self.seats.iter().all(|s| s.ctl.current.is_some() && (s.ctl.sharing.sending.is_some() || !s.ctl.sharing.receiving_peers.is_empty())));
         assert_eq!(self.seats[0].number(), self.seats[1].number());
     }
 
     /// Messages queued before these markers have run through both Call-channel handlers.
     fn flush_signals(&mut self) {
-        for seat in &mut self.seats { seat.ctl.send_peer(crate::call::topic::PROBE, vec![1]).unwrap(); }
+        for seat in &mut self.seats { seat.ctl.send_peer_to(seat.peer(), crate::call::topic::PROBE, vec![1]).unwrap(); }
         let mut received = [false; 2];
         self.wait(|seats| {
             for (seen, s) in received.iter_mut().zip(seats) {
-                *seen |= !s.ctl.take_peer(crate::call::topic::PROBE).is_empty();
+                *seen |= !s.ctl.take_peer_with_sender(crate::call::topic::PROBE).is_empty();
             }
             received == [true; 2]
         });
@@ -1183,33 +1363,34 @@ fn media_share_crosses_hangup_and_can_replace_its_window_before_poll() {
         let n = n + 1;
         let id = pair.seats[0].media_id();
         pair.flush_signals();
-        let before = pair.seats.each_ref().map(|s| s.ctl.active_link().unwrap().media.clone());
+        let before = pair.seats.each_ref().map(|s| s.ctl.links.values().next().unwrap().media.clone());
         // Duplicate keys and out-of-role or stale signals cannot change this running session.
         for seat in &mut pair.seats {
             let ctl = &mut seat.ctl;
-            ctl.send_active(MediaKey::generate().unwrap().encode());
+            ctl.send_to(ctl.links.values().next().unwrap().peer, MediaKey::generate().unwrap().encode());
         }
         for msg in [MediaSignal::Media { n, on: true }, MediaSignal::Media { n: n-1, on: true },
             MediaSignal::Media { n: n-1, on: false }, MediaSignal::Want { on: false, last: n, running: false }] {
-            pair.seats[keeper].ctl.send_media(msg);
+            pair.seats[keeper].ctl.send_media_to(pair.seats[keeper].peer(), msg);
         }
         for msg in [MediaSignal::Want { on: false, last: n+1, running: false }, MediaSignal::Media { n: n+1, on: true }] {
-            pair.seats[follower].ctl.send_media(msg);
+            pair.seats[follower].ctl.send_media_to(pair.seats[follower].peer(), msg);
         }
         pair.flush_signals();
         for (seat, state) in pair.seats.iter().zip(before) {
-            assert!(seat.ctl.active_link().unwrap().media == state, "a refused signal changed the session state");
+            assert!(seat.ctl.links.values().next().unwrap().media == state, "a refused signal changed the session state");
             assert_eq!(seat.number(), n);
             assert!(seat.media_id() == id);
             assert!(seat.ctl.current.is_some() && seat.ctl.stopping.is_empty());
         }
         pair.seats[1].press(Press::CloseWatch);
+        pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers()));
         pair.seats[1].press(Press::Watch);
         pair.wait(|s| s[1].ctl.sharing.shown.picture.is_some());
-        assert_eq!(networks.load(Ordering::Acquire), starts);
+        assert_eq!(networks.load(Ordering::Acquire), starts + 2);
         pair.seats[0].press(Press::StopShare);
         pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers()));
-        assert!(pair.seats.iter().all(|s| s.number() == n));
+        assert!(pair.seats.iter().all(|s| s.number() == n + 1));
     }
 }
 
@@ -1233,19 +1414,21 @@ fn media_simultaneous_offers_switch_windows_and_call_glare_reuses_a_share() {
         pair.flush_signals();
         assert_eq!(pair.seats[follower].ctl.sharing.shown.picture.as_ref().unwrap().width, 320);
         assert_eq!(second_source.lock().unwrap().popped, 0, "offering another window does not switch the stream");
-        let (answer, reply, changed) = crate::call::ai::CallTool::ShareStop.run(
-            &mut pair.seats[keeper].ctl, &mut pair.seats[keeper].host, None);
-        assert_eq!(makepad_strict_json::parse(answer.as_bytes()).unwrap().get("message")
-            .and_then(makepad_strict_json::Value::as_str), Some(reply.as_str()), "the AI receives the same guidance as the person");
-        assert!(!changed && reply.contains(&window.title) && reply.contains(if keeper == 0 { "Left" } else { "Right" }));
+        let keeper_model = [first, second][keeper];
+        let stop = crate::call::ai::CallTool::ShareStop;
+        let (answer, note, changed) = run_call_tool(keeper_model, &mut pair.seats[keeper], stop, None);
+        assert_eq!((note, changed), ("multiple shares running", false), "an ambiguous stop returns a static note and stops nothing");
+        let first_title = if keeper == 0 { "Left" } else { "Right" };
+        let guidance = format!("Two shares are running ({first_title}, {}). Open the one to stop, or stop it on its page.", window.title);
+        assert_eq!(answer.get("message").and_then(makepad_strict_json::Value::as_str), Some(guidance.as_str()),
+            "the gated answer names both active shares and explains how to select one");
         pair.seats[follower].watch(other);
         assert!(pair.seats[follower].ctl.sharing.shown.picture.is_none(), "switching clears the previous picture immediately");
         pair.wait(|s| s[follower].ctl.sharing.shown.picture.as_ref().is_some_and(|p| p.width == rung.width));
-        assert_eq!(pair.seats[keeper].ctl.sharing.shown.peer_watching, Some(other));
+        assert_eq!(pair.seats[keeper].ctl.sharing.shown.own_offers().find(|o| !o.watchers.is_empty()).map(|o| o.session), Some(other));
         assert_eq!(offers[keeper].1.lock().unwrap().demand, Some(View::default()), "the first source is parked");
         assert_eq!(pair.seats[keeper].ctl.sharing.shown.watching, Some(offers[follower].0), "the reverse watch continues");
-        let (_, _, changed) = crate::call::ai::CallTool::ShareStop.run(
-            &mut pair.seats[keeper].ctl, &mut pair.seats[keeper].host, Some(offers[keeper].0));
+        let (_, _, changed) = run_call_tool(keeper_model, &mut pair.seats[keeper], stop, Some(offers[keeper].0));
         assert!(changed, "the open page selects just that offer");
         pair.flush_signals();
         assert!(pair.seats[follower].ctl.sharing.shown.offer(offers[keeper].0).is_none());
@@ -1296,17 +1479,17 @@ fn media_late_key_holds_the_number_and_watch_survives_attachment_before_layout()
         assert_eq!(networks.load(Ordering::Acquire), 0);
         assert!(pair.seats[follower].ctl.take_facts().is_empty());
         let ctl = &mut pair.seats[follower].ctl;
-        ctl.send_active(withheld.take().unwrap());
-        pair.wait(|s| s.iter().all(|s| s.number() == 1 && (s.ctl.sharing.sending.is_some() || s.ctl.sharing.receiving)));
+        ctl.send_to(ctl.links.values().next().unwrap().peer, withheld.take().unwrap());
+        pair.wait(|s| s.iter().all(|s| s.number() == 1 && (s.ctl.sharing.sending.is_some() || !s.ctl.sharing.receiving_peers.is_empty())));
         let ctl = &mut pair.seats[follower].ctl;
-        assert!(ctl.current.as_ref().unwrap().share_picture(PEER).is_some());
+        assert!(ctl.current.as_ref().unwrap().share_picture(ctl.links.values().next().unwrap().peer_id).is_some());
         assert_eq!(ctl.shown().share.single_waiting_line(), Some("Waiting for Peer's picture…"));
         ctl.share_panel_size(offer, crate::call::ShareSurface::Page, 320, 180);
         pair.wait(|s| s[follower].ctl.sharing.shown.picture.is_some());
         let ctl = &mut pair.seats[follower].ctl;
         assert!(ctl.take_facts().is_empty());
         ctl.sharing.shown.offers.first().unwrap().picture_drawn();
-        assert!(matches!(ctl.take_facts().as_slice(), [Fact::ShareJoin { session }] if *session == offer));
+        assert!(matches!(ctl.take_facts().as_slice(), [Fact::ShareJoin { session, .. }] if *session == offer));
         assert_eq!(networks.load(Ordering::Acquire), 2);
     }
 }
@@ -1361,7 +1544,7 @@ fn media_relink_rotates_both_keys_and_refuses_the_old_windows_datagram() {
     for (first, second) in [(&a, &b), (&b, &a)] {
         let (mut pair, _) = linked_controllers(first, second);
         let (capture, packets) = sync_channel(256);
-        let sender = &mut pair.seats[0].ctl.active_link_mut().unwrap().out;
+        let sender = &mut pair.seats[0].ctl.links.values_mut().next().unwrap().out;
         let forward = std::mem::replace(sender, capture);
         let (offer, _) = pair.seats[0].offer("First");
         pair.wait(|s| s[1].ctl.viewer_session() == Some(offer));
@@ -1376,11 +1559,11 @@ fn media_relink_rotates_both_keys_and_refuses_the_old_windows_datagram() {
             }
             saved.is_some() && s[1].ctl.sharing.shown.picture.is_some()
         });
-        pair.seats[0].ctl.active_link_mut().unwrap().out = forward;
+        pair.seats[0].ctl.links.values_mut().next().unwrap().out = forward;
         let datagram = saved.unwrap();
         let old_id = pair.seats[0].media_id();
         let key_fingerprints = |pair: &Pair| pair.seats.each_ref().map(|s| {
-            let link = s.ctl.active_link().unwrap();
+            let link = s.ctl.links.values().next().unwrap();
             makepad_network::digest::sha256_hash(&link.local_media_key.session_secret(&[0; 16], &link.me))
         });
         let first_keys = key_fingerprints(&pair);
@@ -1403,8 +1586,10 @@ fn media_relink_rotates_both_keys_and_refuses_the_old_windows_datagram() {
 
         let (workers, _) = linked_pair(first.device_key(), second.device_key());
         for (s, (worker, peer)) in pair.seats.iter_mut().zip(workers) {
-            let me = s.ctl.active_link().unwrap().me;
+            let me = s.ctl.links.values().next().unwrap().me;
             let port = s.ctl.link_up(&mut s.host, me, peer, "Peer").unwrap();
+            s.ctl.set_open_town(Some((a.open_id(), vec![(peer, "Peer".into())])));
+            s.ctl.set_peer_caps(peer, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1));
             assert_eq!(s.number(), 0);
             assert!(s.ctl.current.is_none() && s.ctl.sharing.shown.offers.is_empty());
             assert!(s.ctl.take_share_events().contains(&ShareEvent::Ended { session: second_offer, reason: ShareEndReason::LinkDropped }));
@@ -1412,7 +1597,7 @@ fn media_relink_rotates_both_keys_and_refuses_the_old_windows_datagram() {
             assert!(worker.try_send(ToWorker::Call(port)).is_ok());
             s.worker = worker;
         }
-        pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers() && s.ctl.active_link().unwrap().peer_media_key.is_some()));
+        pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers() && s.ctl.links.values().next().unwrap().peer_media_key.is_some()));
         assert!(key_fingerprints(&pair).iter().zip(first_keys).all(|(new, old)| *new != old));
         let (new_offer, _) = pair.seats[0].offer("Relinked");
         pair.picture(1, new_offer);
@@ -1445,4 +1630,477 @@ fn media_ring_crosses_share_and_answer_crosses_watch_or_stop() {
         pair.seats[0].press(Press::HangUp);
         pair.wait(|s| s.iter().all(|s| !s.ctl.has_call_workers()));
     }
+}
+
+// Keep the real reliable and datagram carriers for each pair. The voice-isolation
+// check observes the outgoing media headers before passing them to the link worker.
+const MESH_TOWN: TownId = [0x44; 32];
+const NAMES: [&str; 3] = ["Ana", "Ben", "Kit"];
+const SHARE_CAPS: MediaCaps = MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1);
+
+struct MeshLink {
+    worker: LinkWorker,
+    outgoing: std::sync::mpsc::Receiver<Vec<u8>>,
+    forward: std::sync::mpsc::SyncSender<Vec<u8>>,
+    voice_seq: Option<u64>,
+}
+
+struct ShareMesh {
+    keys: [Arc<makepad_town_core::key::DeviceKey>; 3],
+    ctl: [CallController; 3],
+    hosts: [Host; 3],
+    apps: [AppLinks; 3],
+    #[cfg(unix)]
+    rig: Option<crate::app_link::RecordingRig>,
+    carriers: BTreeMap<(usize, usize), MeshLink>,
+    networks: Arc<AtomicUsize>,
+}
+
+impl ShareMesh {
+    fn new(third: bool) -> Self {
+        let networks = Arc::new(AtomicUsize::new(0));
+        let count = networks.clone();
+        let run = makepad_call::driver::std_spawn();
+        let spawn: Spawn = Arc::new(move |name, work| {
+            if name == "call network" { count.fetch_add(1, Ordering::Release); }
+            run(name, work);
+        });
+        let mut mesh = Self {
+            keys: std::array::from_fn(|_| Arc::new(makepad_town_core::key::DeviceKey::generate().unwrap())),
+            ctl: Default::default(), hosts: Default::default(), apps: Default::default(),
+            carriers: Default::default(), networks,
+            #[cfg(unix)]
+            rig: None,
+        };
+        for (i, ctl) in mesh.ctl.iter_mut().enumerate() {
+            ctl.codecs = Arc::new(TestCodecs);
+            ctl.configure(CallEnv { spawn: spawn.clone(), jobs: spawn.clone(), signal: Arc::new(|| {}),
+                files: Default::default(), devices_path: Default::default(),
+                voice: VoiceSource::Synthetic { tone_hz: 440. + 110. * i as f32 } });
+        }
+        mesh.link(0, 1, true);
+        if third { mesh.add_third(); }
+        mesh
+    }
+
+    fn key(&self, i: usize) -> PublicKey { self.keys[i].public() }
+
+    fn link(&mut self, a: usize, b: usize, caps_first: bool) {
+        let (pair, _) = linked_pair(self.keys[a].clone(), self.keys[b].clone());
+        for ((worker, peer), (i,j)) in pair.into_iter().zip([(a,b),(b,a)]) {
+            let me = self.key(i);
+            let mut port = self.ctl[i].link_up(&mut self.hosts[i], me, peer, NAMES[j]).unwrap();
+            let (forward, rx) = std::sync::mpsc::sync_channel(2048);
+            let outgoing = std::mem::replace(&mut port.datagrams_out, rx);
+            assert!(worker.try_send(ToWorker::Call(port)).is_ok(), "seat {i} attaches its carrier to {j}");
+            self.carriers.insert((i,j), MeshLink { worker, outgoing, forward, voice_seq: None });
+            if caps_first { self.ctl[i].set_peer_caps(peer, SHARE_CAPS); }
+            let peers: Vec<_> = self.carriers.keys().filter(|(k,_)| *k == i).map(|(_,j)| (self.key(*j), NAMES[*j].into())).collect();
+            self.ctl[i].set_town_peers(&mut self.hosts[i], BTreeMap::from([(MESH_TOWN, peers.iter().map(|(p,_)| *p).collect())]));
+            self.ctl[i].set_open_town(Some((MESH_TOWN, peers)));
+            if !caps_first { self.ctl[i].set_peer_caps(peer, SHARE_CAPS); }
+        }
+    }
+
+    fn add_third(&mut self) { self.link(0, 2, false); self.link(1, 2, true); }
+
+    fn disconnect(&mut self, i: usize, j: usize) {
+        for (a,b) in [(i,j),(j,i)] {
+            let p = self.key(b);
+            self.ctl[a].link_down(&mut self.hosts[a], p);
+            self.carriers.remove(&(a,b));
+        }
+    }
+
+    fn pump(&mut self) {
+        for link in self.carriers.values_mut() {
+            for d in link.outgoing.try_iter() {
+                if let Some((header,_)) = makepad_call::wire::Header::parse(&d) {
+                    if header.stream == makepad_call::wire::stream::VOICE { link.voice_seq = Some(header.seq); }
+                }
+                link.forward.try_send(d).expect("the live carrier accepts the observed datagram");
+            }
+            while let Some(event) = link.worker.try_recv() {
+                assert!(!matches!(event, FromWorker::Failed(_) | FromWorker::Lost), "the share mesh carrier stays up: {event:?}");
+            }
+        }
+        for i in 0..3 {
+            self.ctl[i].poll(&mut self.hosts[i]);
+            #[cfg(unix)]
+            if i == 0 {
+                if let Some(rig) = &mut self.rig {
+                    let events = rig.app.poll();
+                    self.ctl[i].share_app_events(&mut rig.app, &events);
+                    self.ctl[i].receive_control(&mut rig.app);
+                    continue
+                }
+            }
+            self.ctl[i].receive_control(&mut self.apps[i]);
+        }
+    }
+
+    fn until(&mut self, what: &str, mut ready: impl FnMut(&mut Self) -> bool) {
+        let limit = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.pump();
+            if ready(self) { return }
+            assert!(Instant::now() < limit, "waiting for {what}");
+            thread::yield_now();
+        }
+    }
+
+    fn offer(&mut self) -> (SessionId, Arc<Mutex<Reading>>) {
+        let (source, readings) = held_source();
+        let w = AppWindow { id: WindowId(7), title: "Drawing".into(), visible: true, size: (320.,180.), dpi: 1. };
+        let session = self.ctl[0].start_window(LinkId::TEST, &w, w.title.clone(), source).unwrap();
+        let probe = readings.clone();
+        self.ctl[0].sharing.locals.get_mut(&session).unwrap().probe = Some(Box::new(move || (1, probe.lock().unwrap().ended_why.clone())));
+        (session, readings)
+    }
+
+    fn watch(&mut self, i: usize, s: SessionId) {
+        self.until("the town offer to reach the viewer", |m| m.ctl[i].sharing.shown.offer(s).is_some());
+        assert!(self.ctl[i].call_opening_presses(&mut self.hosts[i], CallAction::OnShare(s, Press::Watch)), "the viewer opens the selected offer");
+        self.ctl[i].share_panel_size(s, ShareSurface::Page, 320, 180);
+    }
+
+    fn pts(&self, i: usize) -> Option<i64> { self.ctl[i].sharing.shown.picture.as_ref().map(|p| p.pts_100ns) }
+
+    fn barrier(&mut self, from: usize, to: usize) {
+        let key = self.key(to);
+        self.ctl[from].send_peer_to(key, crate::call::topic::PROBE, vec![1]).unwrap();
+        self.until("the reliable marker following the test messages", |m|
+            m.ctl[to].take_peer_with_sender(crate::call::topic::PROBE).iter().any(|(p,_)| *p == m.key(from)));
+    }
+}
+
+impl Drop for ShareMesh {
+    fn drop(&mut self) {
+        for (ctl, host) in self.ctl.iter_mut().zip(&mut self.hosts) { ctl.shutdown(host); }
+        while self.ctl.iter().any(CallController::has_call_workers) {
+            for (ctl, host) in self.ctl.iter_mut().zip(&mut self.hosts) { ctl.poll(host); }
+            thread::yield_now();
+        }
+    }
+}
+
+#[test]
+fn multi_viewer_share_delivers_frames_to_two_viewers_and_survives_one_leaving() {
+    let mut m = ShareMesh::new(true);
+    let (s, reading) = m.offer();
+    m.until("both incoming offers", |m| [1,2].iter().all(|&i| m.ctl[i].sharing.shown.offer(s).is_some()));
+    assert_eq!(m.networks.load(Ordering::Acquire), 0, "offering to two recipients starts no media workers");
+    for i in [1,2] { m.watch(i,s); }
+    m.until("both viewers to decode a picture", |m| m.pts(1).is_some() && m.pts(2).is_some());
+    let mut expected = vec![(m.key(1), NAMES[1].to_owned()), (m.key(2), NAMES[2].to_owned())];
+    expected.sort();
+    assert_eq!(m.ctl[0].sharing.shown.offer(s).unwrap().watchers, expected, "the local offer names both viewers");
+    assert_eq!(m.ctl[0].sharing.shown.watchers, expected, "the share summary names both viewers");
+    let initial = [1,2].map(|i| m.pts(i).unwrap());
+    let parks = reading.lock().unwrap().parks;
+    m.ctl[0].settle_media();
+    m.ctl[0].poll(&mut m.hosts[0]);
+    for i in [1,2] {
+        let pid = m.ctl[0].links[&m.key(i)].peer_id;
+        assert_eq!(m.ctl[0].sharing.sent_views.get(&pid), Some(&(s, m.ctl[i].share_subscription())), "unchanged settling preserves viewer {i}");
+    }
+    reading.lock().unwrap().next_frame = true;
+    m.until("both viewers to decode the next frame without a new key request", |m| [1,2].iter().all(|&i| m.pts(i) > Some(initial[i-1])));
+    assert_eq!(reading.lock().unwrap().parks, parks, "unchanged settling keeps demand open");
+    let generations = [0,2].map(|i| m.ctl[i].call_generation());
+    assert!(m.ctl[1].call_actions(&mut m.hosts[1], CallAction::OnShare(s, Press::CloseWatch)), "Ben closes Watch");
+    m.until("Ben's subscription to close", |m| m.ctl[0].sharing.shown.watchers.len() == 1);
+    m.disconnect(0,1);
+    let previous = m.pts(2);
+    reading.lock().unwrap().next_frame = true;
+    m.until("Kit to receive a new picture after Ben disconnects", |m| m.pts(2) > previous);
+    assert_eq!([0,2].map(|i| m.ctl[i].call_generation()), generations, "both surviving calls keep their workers");
+    assert_eq!(m.ctl[0].sharing.shown.watchers, [(m.key(2), NAMES[2].into())], "Kit remains the only watcher");
+}
+
+#[test]
+fn late_linker_receives_active_share_offer_and_watches() {
+    let mut m = ShareMesh::new(false);
+    let (s, reading) = m.offer();
+    m.watch(1,s);
+    m.until("Ben's first picture", |m| m.pts(1).is_some());
+    let old = m.pts(1);
+    let generation = m.ctl[0].call_generation();
+    m.add_third();
+    m.watch(2,s);
+    m.until("Kit's first picture and Ben's next picture", |m| m.pts(2).is_some() && m.pts(1) > old);
+    let offer = m.ctl[2].sharing.shown.offer(s).unwrap();
+    assert_eq!((offer.town, offer.role), (MESH_TOWN, ShareRole::Viewer { sharer: m.key(0) }), "the late offer binds Ana and the original town");
+    let ben = m.key(1);
+    let kit = m.key(2);
+    m.ctl[0].set_town_peers(&mut m.hosts[0], BTreeMap::from([(MESH_TOWN,BTreeSet::from([ben]))]));
+    m.until("revocation to remove Kit's offer", |m| m.ctl[2].sharing.shown.offer(s).is_none());
+    let local = &m.ctl[0].sharing.locals[&s];
+    assert!(!local.recipients.contains(&kit) && !local.viewers.contains_key(&kit), "revocation removes both delivery and viewing rights");
+    let previous = m.pts(1);
+    reading.lock().unwrap().next_frame = true;
+    m.until("Ben to receive another picture after revocation", |m| m.pts(1) > previous);
+    assert_eq!(m.ctl[0].call_generation(), generation, "revocation keeps Ben's original network worker");
+    reading.lock().unwrap().ended_why = Some("capture failed".into());
+    m.ctl[0].poll_share();
+    m.until("Ben's terminal reason and retirement of standalone media", |m|
+        m.ctl[1].sharing.shown.offer(s).unwrap().stopped_line.is_some() && m.ctl.iter().all(|ctl| !ctl.has_call_workers()));
+    let starts = m.networks.load(Ordering::Acquire);
+    m.ctl[0].set_town_peers(&mut m.hosts[0], BTreeMap::from([(MESH_TOWN,BTreeSet::from([ben, kit]))]));
+    m.until("Kit's replayed terminal reason", |m| m.ctl[2].sharing.shown.offer(s).is_some_and(|o| o.stopped_line.is_some()));
+    m.watch(2,s);
+    m.barrier(2,0);
+    let shown = m.ctl[2].shown().share;
+    let line = shown.waiting_line(shown.offer(s).unwrap()).unwrap();
+    assert!(line.contains("capture failed"), "the reopened panel explains the stopped picture");
+    assert_eq!(Some(line), m.ctl[1].sharing.shown.offer(s).unwrap().stopped_line.as_deref(), "both viewers see the same terminal reason");
+    assert_eq!(m.ctl[2].share_subscription(), View::default(), "the stopped panel requests no pictures");
+    let view = Message::View { session: s, width: 320, height: 180, fps: 30, ext: Default::default() };
+    assert!(!m.ctl[0].share_message(kit, &view.encode()), "an open View in flight cannot restart a stopped offer");
+    m.ctl[0].settle_media();
+    assert!(m.ctl.iter().all(|ctl| !ctl.has_call_workers()), "the stopped offer needs no workers");
+    assert_eq!(m.networks.load(Ordering::Acquire), starts, "no new worker started for the stopped offer");
+    assert!(!m.ctl[0].is_viewer(s,&kit) && !m.ctl[0].sharing.shown.offer(s).unwrap().watchers.iter().any(|(p,_)| *p == kit),
+        "neither the in-flight View nor reopening a stopped offer registers Kit");
+}
+
+#[test]
+fn share_only_viewer_gets_video_without_voice_leak() {
+    let mut m = ShareMesh::new(false);
+    m.ctl[0].press(&mut m.hosts[0], Press::Call);
+    m.until("Ben's incoming call", |m| m.ctl[1].view().ringing());
+    m.ctl[1].press(&mut m.hosts[1], Press::Answer);
+    m.until("Ana and Ben exchanging voice", |m| [(0,1),(1,0)].iter().all(|p| m.carriers[p].voice_seq.is_some()));
+    m.add_third();
+    let (s, _) = m.offer();
+    m.watch(2,s);
+    m.until("Kit's first share picture", |m| m.pts(2).is_some());
+    let before = [(0,1),(1,0)].map(|p| m.carriers[&p].voice_seq);
+    m.until("both voice streams advancing while Kit watches", |m|
+        [(0,1),(1,0)].iter().enumerate().all(|(i,p)| m.carriers[p].voice_seq > before[i]));
+    assert!(!m.ctl[0].flow.is_voice_peer(&m.key(2)), "the watched link is joined with voice disabled for Kit");
+    assert_eq!(m.carriers[&(0,2)].voice_seq, None, "Ana has sent zero voice datagrams on Kit's video link");
+    assert_eq!(m.ctl[2].view().phase, Phase::Idle, "Kit's watch never opens a voice call");
+}
+
+#[cfg(unix)]
+#[test]
+fn decoder_open_failure_surfaces_in_preview_and_watched_share_ui() {
+    use makepad_call::{driver::codec::Decoder, guard::Rung};
+    const WHY: &str = "low-latency H.264 decode requires GStreamer's avdec_h264 element (install gstreamer1.0-libav)";
+    struct MissingDecoder;
+    impl Codecs for MissingDecoder {
+        fn encoder(&self, rung: Rung, kbps: u32) -> Result<Box<dyn Encoder>, String> { TestCodecs.encoder(rung, kbps) }
+        fn decoder(&self) -> Result<Box<dyn Decoder>, String> { Err(WHY.into()) }
+    }
+
+    let mut m = ShareMesh::new(false);
+    m.ctl[1].codecs = Arc::new(MissingDecoder);
+    let (session, _) = m.app_window();
+    let rig = m.rig.as_mut().unwrap();
+    rig.set_preview_codecs(Arc::new(MissingDecoder));
+    m.ctl[0].share_panel_size(session, ShareSurface::Page, 320, 180);
+    m.ctl[0].sync_share_preview(&mut rig.app, Some(session));
+    let probe = m.ctl[0].sharing.locals[&session].preview.as_ref().expect("the page opened a preview").0.probe();
+    rig.wait(|_| probe.ended_why().is_some());
+    m.ctl[0].poll_share();
+    let preview_note = format!("Preview couldn't decode: {WHY}");
+    let sharer = m.ctl[0].shown().share;
+    assert_eq!(sharer.single_waiting_line(), Some(preview_note.as_str()), "the preview panel shows the decoder-open error");
+    let offer = sharer.offer(session).unwrap();
+    assert!(offer.sharer_line.as_deref().unwrap().contains(&preview_note), "the sharer's status shows the same error");
+    assert!(offer.stopped_line.is_none(), "a local preview failure leaves the encoded share live");
+    m.ctl[0].sync_share_preview(&mut rig.app, None);
+    m.ctl[0].poll_share();
+    assert!(!m.ctl[0].shown().share.offer(session).unwrap().sharer_line.as_deref().unwrap().contains(&preview_note),
+        "closing the preview clears its error from the sharer's status");
+
+    while m.ctl[1].sharing.shown.offer(session).is_none() { m.pump(); thread::yield_now(); }
+    assert!(m.ctl[1].call_opening_presses(&mut m.hosts[1], CallAction::OnShare(session, Press::Watch)), "the viewer opens the share");
+    m.ctl[1].share_panel_size(session, ShareSurface::Page, 320, 180);
+    while m.ctl[1].sharing.shown.watched().unwrap().decode_problem.is_none() { m.pump(); thread::yield_now(); }
+    let viewer = m.ctl[1].shown().share;
+    let message = format!("this person's video couldn't be decoded: {WHY}");
+    assert_eq!(viewer.single_waiting_line(), Some(message.as_str()), "the watched panel shows the decoder's exact error");
+    assert!(viewer.watched().unwrap().stopped_line.is_none(), "the viewer can recover on a later key frame");
+    m.ctl[1].share_press(Press::CloseWatch);
+    let closed = m.ctl[1].shown().share;
+    assert!(closed.watched().is_none() && closed.offer(session).unwrap().decode_problem.is_none(),
+        "closing Watch clears the error on the surviving offer");
+}
+
+#[cfg(unix)]
+impl ShareMesh {
+    fn app_window(&mut self) -> (SessionId, LinkId) {
+        let mut rig = crate::app_link::RecordingRig::new();
+        rig.app.scan();
+        rig.wait(|r| !r.app.apps().is_empty());
+        let link = rig.app.link(&rig.app.apps()[0].key.clone());
+        rig.live(link);
+        let window = rig.app.state(link).unwrap().windows[0].id;
+        self.ctl[0].open_share_window(&mut rig.app, link, window).unwrap();
+        self.rig = Some(rig);
+        (self.ctl[0].only_local_offer().unwrap(), link)
+    }
+
+    fn grant_to(&mut self, s: SessionId, i: usize) -> crate::call::control::GrantId {
+        let peer = self.key(i);
+        assert!(self.ctl[0].allow_control(&mut self.rig.as_mut().unwrap().app, s, peer, NAMES[i]), "the sharer grants the selected viewer control");
+        assert_eq!(self.ctl[0].sharing.shown.control.holder, Some((peer, NAMES[i].into())), "the grant names the selected viewer");
+        let grant = self.ctl[0].sharing.shown.control.active.unwrap();
+        self.until("the selected viewer to receive its grant", |m| m.ctl[i].sharing.shown.control.active == Some(grant));
+        grant
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn step4_local_share_excludes_step3_peer_and_binds_let_control_on_live_share_page() {
+    use crate::{call::ShareOfferExt, lists::{Live, Page, ViewData}};
+    use makepad_widgets::*;
+
+    let mut m = ShareMesh::new(true);
+    let (ana, ben, kit) = (m.key(0), m.key(1), m.key(2));
+    for i in [0, 1] { m.ctl[i].set_peer_caps(kit, MediaCaps(MediaCaps::MULTIPARTY_V1)); }
+    let (session, link) = m.app_window();
+    let app = &m.rig.as_ref().unwrap().app;
+    let window = app.state(link).unwrap().windows[0].id;
+    let title = crate::record::capture::window_label(app, link, window).expect("the shared window has a title");
+    assert_eq!(m.ctl[0].take_facts(), [Fact::ShareOpen { session, title: title.clone(), town: MESH_TOWN }],
+        "starting a local share records its session, window title and town");
+
+    m.barrier(0, 1);
+    let offer = m.ctl[1].sharing.shown.offer(session).expect("Ben receives the window offer before the next reliable message");
+    assert_eq!((offer.town, offer.role, &offer.title), (MESH_TOWN, ShareRole::Viewer { sharer: ana }, &title),
+        "Ben sees Ana's window in the shared town");
+    m.barrier(0, 2);
+    assert!(m.ctl[2].sharing.shown.offers.is_empty(), "Kit receives no offer over the voice-only link");
+
+    for (id, town) in [([31; 16], None), ([32; 16], Some(MESH_TOWN))] {
+        m.ctl[2].send_to(ana, Message::Share { session: id, title: "Drawing".into(), w: 320., h: 180.,
+            ext: ShareOfferExt { town, ..Default::default() } }.encode());
+    }
+    m.barrier(2, 0);
+    assert_eq!(m.ctl[0].sharing.shown.offers.iter().map(|o| o.session).collect::<Vec<_>>(), [session],
+        "neither the townless nor the town-tagged offer from Kit reaches Ana");
+
+    m.watch(1, session);
+    assert!(m.ctl[1].ask_control(session, true), "Ben can request control after opening Watch");
+    m.until("Ben's watch and named control request to reach Ana", |m| {
+        let shown = &m.ctl[0].sharing.shown;
+        shown.offer(session).is_some_and(|o| o.watchers.iter().any(|(p, _)| *p == ben))
+            && shown.control.requests.iter().any(|(s, p, name)| *s == session && *p == ben && name == "Ben")
+    });
+
+    let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+    let ui = cx.with_vm(|vm| {
+        let root = script_eval!(vm, { use mod.prelude.widgets.* use mod.widgets.* View{live_share := LiveSharePage{}} });
+        WidgetRef::script_from_value(vm, root)
+    });
+    let mut data = ViewData { call: m.ctl[0].shown(), page: Page::Live(Live::Share(session)), ..Default::default() };
+    data.sync_live_share(&mut cx, &ui);
+    let allow = ui.button(&cx, ids!(live_share.let_control));
+    assert!(allow.visible(), "the sharer's page shows the pending control request");
+    assert_eq!(allow.text(), "Allow", "the pending request uses the Allow button");
+    let press = CallAction::OnShare(session, Press::LetControl(ben));
+    assert_eq!(allow.action_data().as_ref().and_then(|a| a.downcast_ref::<CallAction>()), Some(&press),
+        "Allow binds both the requested session and Ben's key");
+    assert!(!m.ctl[0].call_actions(&mut m.hosts[0], press), "ordinary actions cannot grant control");
+    m.grant_to(session, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn takeover_grant_is_mutually_exclusive_and_drops_non_holder_input() {
+    use crate::{app_link::{AppInput, Mods}, call::{control::{ControlMessage, PanelInput}, topic}};
+    use super::super::takeover::Refusal;
+    use makepad_widgets::KeyCode;
+    let mut m = ShareMesh::new(true);
+    let (s, link) = m.app_window();
+    let (ana,ben,kit) = (m.key(0),m.key(1),m.key(2));
+    for i in [1,2] {
+        m.watch(i,s);
+        assert!(m.ctl[i].ask_control(s,true), "viewer {i} requests control");
+        m.until("the request and measured view", |m| m.ctl[0].is_viewer(s,&m.key(i))
+            && m.ctl[0].sharing.shown.control.requests.iter().any(|(_,p,_)| *p == m.key(i)));
+    }
+    assert_eq!(m.ctl[0].sharing.shown.control.requests, [(s,ben,"Ben".into()),(s,kit,"Kit".into())], "requests preserve arrival order");
+    let first = m.grant_to(s,1);
+    let mods = Mods::default();
+    let key = AppInput::KeyDown { key: KeyCode::KeyA, mods };
+    let button = AppInput::PointerDown { x: 3., y: 4., button: 0, mods };
+    for event in [key.clone(), button] { m.ctl[1].panel_input(&PanelInput { session: s, grant: first, event }); }
+    m.until("the shared app to receive Ben's held key and button", |m| m.rig.as_ref().unwrap().input_lines().len() == 2);
+    for message in [ControlMessage::Input { session: s, grant: first, event: key.clone() },
+        ControlMessage::Release { session: s, grant: first }] {
+        m.ctl[2].send_peer_to(ana, topic::INPUT, message.encode()).unwrap();
+    }
+    m.barrier(2,0);
+    m.rig.as_mut().unwrap().barrier(link);
+    assert_eq!(m.ctl[0].inputs_refused_for(Refusal::NoAllow), 1, "the holder's grant ID cannot authorize another sender's input");
+    assert_eq!(m.ctl[0].inputs_refused_for(Refusal::Stale), 1, "another sender cannot release the holder's grant");
+    assert_eq!(m.rig.as_ref().unwrap().input_lines().len(), 2, "Kit's ungranted input never reaches the app");
+    let second = m.grant_to(s,2);
+    assert_ne!(first, second, "handoff creates a fresh grant ID");
+    m.until("Ben to receive TakenBack", |m| m.ctl[1].sharing.shown.control.notice.as_deref().is_some_and(|n| n.contains("took back")));
+    m.ctl[1].send_peer_to(ana, topic::INPUT, ControlMessage::Input {session:s, grant:first, event:key}.encode()).unwrap();
+    m.ctl[2].panel_input(&PanelInput {session:s, grant:second, event:AppInput::Text("new holder".into())});
+    m.barrier(1,0);
+    m.barrier(2,0);
+    let rig = m.rig.as_mut().unwrap();
+    rig.barrier(link);
+    let lines: Vec<_> = rig.input_lines().iter().map(|line| makepad_remote::Req::parse(line)).collect();
+    assert_eq!(lines.len(), 5, "only Ben's two inputs, two releases and Kit's text reach the app");
+    assert!(lines[2..4].iter().all(|r| r.get("k") == Some("up"))
+        && lines[2..4].iter().any(|r| r.cmd == "mouse") && lines[2..4].iter().any(|r| r.cmd == "key"),
+        "the old holder's key and button are released before the new holder's input");
+    assert_eq!(lines[4].get("t"), Some("new holder"), "Kit's input arrives after the old holder's releases");
+    m.disconnect(0,2);
+    let rig = m.rig.as_mut().unwrap();
+    m.ctl[0].revoke_ended_shares(&mut rig.app);
+    assert!(!rig.app.state(link).unwrap().input_allowed, "disconnect withdraws app input permission");
+    assert_eq!(m.ctl[0].sharing.shown.control.notice.as_deref(), Some("Control ended when the link disconnected."), "the sharer sees why control ended");
+    assert_eq!(m.ctl[0].sharing.shown.offer(s).unwrap().watchers, [(ben,"Ben".into())], "Ben's watch survives Kit's disconnect");
+}
+
+#[cfg(unix)]
+#[test]
+fn allow_all_second_watcher_does_not_steal_active_grant() {
+    let mut m = ShareMesh::new(true);
+    let (s, _) = m.app_window();
+    assert!(m.ctl[0].allow_all_control(&mut m.rig.as_mut().unwrap().app, s), "local input enables all viewers' rights");
+    m.watch(1,s);
+    m.until("Ben's automatic grant", |m| m.ctl[1].sharing.shown.control.active.is_some());
+    let grant = m.ctl[1].sharing.shown.control.active;
+    m.watch(2,s);
+    m.until("Kit to receive her right", |m| m.ctl[2].sharing.shown.control.allowed == Some(s));
+    assert!(m.ctl[2].ask_control(s,true), "Kit can request the occupied control");
+    m.until("Kit's pending request", |m| !m.ctl[0].sharing.shown.control.requests.is_empty());
+    assert_eq!(m.ctl[0].sharing.shown.control.holder, Some((m.key(1),"Ben".into())), "the second watcher cannot take Ben's grant");
+    assert_eq!(m.ctl[1].sharing.shown.control.active, grant, "Ben retains his uninterrupted grant");
+    assert!(m.ctl[2].sharing.shown.control.active.is_none(), "Kit's right alone does not open input");
+    assert_eq!(m.ctl[0].sharing.shown.control.requests, [(s,m.key(2),"Kit".into())], "Kit's request waits for explicit handoff");
+}
+
+#[test]
+fn spoofed_control_from_non_sharer_is_ignored() {
+    use crate::call::{control::{ControlMessage, EndReason}, topic};
+    let mut m = ShareMesh::new(true);
+    let (s, _) = m.offer();
+    m.watch(1,s);
+    m.until("Ben's first picture from Ana", |m| m.pts(1).is_some());
+    let ben = m.key(1);
+    let grant = [7;16];
+    for msg in [ControlMessage::Control {session:s, grant, ended:None},
+        ControlMessage::Control {session:s, grant, ended:Some(EndReason::TakenBack)},
+        ControlMessage::Rights {session:s, allowed:true}] {
+        m.ctl[2].send_peer_to(ben,topic::INPUT,msg.encode()).unwrap();
+    }
+    m.ctl[2].send_to(ben, ShareProblem::new(s,"capture stopped").encode());
+    m.ctl[2].send_share_to(ben,Message::ShareOff { session:s, reason:ShareEndReason::Stopped });
+    m.barrier(2,1);
+    let shown = &m.ctl[1].sharing.shown;
+    assert!(shown.control.active.is_none() && shown.control.allowed.is_none(), "only the authenticated sharer can set control or rights");
+    assert!(shown.offer(s).is_some_and(|o| o.stopped_line.is_none()), "only the authenticated sharer can stop the offer or its picture");
+    assert_eq!(shown.watching_sharer, Some(m.key(0)), "Ben is still watching Ana");
 }

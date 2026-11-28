@@ -625,7 +625,7 @@ pub struct ExplorerView {
     #[rust]
     laid_mode: SheetMode,
     #[rust]
-    arch_draft: Option<ReqDraft>,
+    strip_draft: Option<ReqDraft>,
     #[rust]
     sheet_probes: probe_flags::SheetProbes,
     /// A probe carried over the sheet: the flag its drop would make, drawn before the drop.
@@ -1226,24 +1226,35 @@ impl ExplorerView {
     }
 
     fn toggle_blocks(&mut self, cx: &mut Cx) {
-        self.sheet_mode = if self.sheet_mode == SheetMode::Blocks { SheetMode::Schematic } else { SheetMode::Blocks };
+        self.set_blocks_mode(cx, self.sheet_mode != SheetMode::Blocks);
+    }
+
+    pub fn set_blocks_mode(&mut self, cx: &mut Cx, on: bool) {
+        let mode = if on { SheetMode::Blocks } else { SheetMode::Schematic };
+        if self.sheet_mode == mode { return; }
+        self.sheet_mode = mode;
         self.tools.radio_button(cx, ids!(a_blocks)).set_active(cx, self.sheet_mode == SheetMode::Blocks, Animate::No);
         if self.reveal.is_some() { self.leave_reveal(cx, false); }
         self.relayout_sheet(cx);
         self.draw_bg.redraw(cx);
     }
 
-    fn sync_arch_button(&mut self, cx: &mut Cx) {
+    fn sync_draft_buttons(&mut self, cx: &mut Cx) {
         let new = cx.get_global_ref::<ReqDraft>();
-        if self.arch_draft.is_some() && self.arch_draft.as_ref() == new { return; }
+        if self.strip_draft.is_some() && self.strip_draft.as_ref() == new { return; }
         let draft = new.cloned().unwrap_or_default();
-        if self.arch_draft.as_ref() == Some(&draft) { return; }
+        if self.strip_draft.as_ref() == Some(&draft) { return; }
         let working = draft.view.as_ref().is_some_and(|v| !v.done);
-        let note = if draft.slot == Some("architecture") { draft.view.as_ref().map(|v| v.text.as_str()) }
-            else if working { Some("Another stage is being drafted") } else { None };
-        self.tools.button(cx, ids!(a_arch)).set_enabled(cx, !working && draft.admit.is_ok());
-        self.tools.tip(cx, ids!(a_arch_tip)).set_text(note.or(draft.admit.err()).unwrap_or("Draft architecture"));
-        self.arch_draft = Some(draft);
+        for (slot, label, button, tip) in [
+            ("architecture", "Draft architecture", ids!(a_arch).as_slice(), ids!(a_arch_tip).as_slice()),
+            ("schematic", "Draft schematic", ids!(a_schematic), ids!(a_schematic_tip)),
+        ] {
+            let note = if draft.slot == Some(slot) { draft.view.as_ref().map(|v| v.text.as_str()) }
+                else if working { Some("Another stage is being drafted") } else { None };
+            self.tools.button(cx, button).set_enabled(cx, !working && draft.admit.is_ok());
+            self.tools.tip(cx, tip).set_text(note.or(draft.admit.err()).unwrap_or(label));
+        }
+        self.strip_draft = Some(draft);
     }
 
     fn layout_result(&mut self, cx: &mut Cx, result: LayoutResult) {
@@ -2420,7 +2431,7 @@ impl ExplorerView {
                         StripAction::Rail(name) => self.rail(name),
                         StripAction::PowerFlag => power_flag_entry(cx)
                             .map(|entry| Carried::Part(Arc::new(template_of(entry)), "Power flag".into(), EntryKey { name: entry.name.clone(), lib: entry.lib.clone() })),
-                        StripAction::PowerMenu { .. } | StripAction::DraftArchitecture => None,
+                        StripAction::PowerMenu { .. } | StripAction::DraftArchitecture | StripAction::DraftSchematic => None,
                     })
                 });
                 if let Some(carried) = carried {
@@ -3723,6 +3734,7 @@ impl Widget for ExplorerView {
         let actions = cx.capture_actions(|cx| self.tools.handle_event(cx, event, scope));
         if self.tools.radio_button(cx, ids!(a_blocks)).clicked(&actions) { self.toggle_blocks(cx); }
         if self.tools.button(cx, ids!(a_arch)).clicked(&actions) { cx.action(StripAction::DraftArchitecture); }
+        if self.tools.button(cx, ids!(a_schematic)).clicked(&actions) { cx.action(StripAction::DraftSchematic); }
         for tool in strip_presses(cx, &self.tools, &actions) {
             if self.name_edit.is_some() { self.close_value_edit(cx); }
             let double = self.tool_clicks.click(tool, cx.seconds_since_app_start());
@@ -4137,7 +4149,7 @@ impl Widget for ExplorerView {
             return DrawStep::done();
         }
         self.return_picture = None;
-        self.sync_arch_button(cx);
+        self.sync_draft_buttons(cx);
         if self.design.is_none() || self.applied_gen < self.design_gen {
             self.draw_bg.draw_grid(cx, rect, None, tokens);
             self.strip_at = draw_strip(cx, scope, self.uid, &self.tools, rect);

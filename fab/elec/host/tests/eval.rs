@@ -296,6 +296,9 @@ fn held_proposal_declined_replaced_or_stale_applies_nothing() {
     let probe = design.unit_by_name("probe").unwrap();
     let shared = fill.task.unit;
     assert_eq!(view.boards.len(), 2, "both candidate boards publish fills");
+    let pending = &view.checks.as_ref().unwrap().pending_labels;
+    assert!(pending.iter().any(|s| s == "DRC (probe)") && pending.iter().any(|s| s == "DRC (shared)"),
+        "both units awaiting whole-board checks must be named in Review");
     for unit in &design.units {
         let zone = unit.board.as_ref().unwrap().zones[0].id;
         let board = view.boards.iter().find(|b| b.unit == unit.id).unwrap();
@@ -349,6 +352,111 @@ fn held_proposal_declined_replaced_or_stale_applies_nothing() {
     assert_eq!(docs.text(circuit.doc).unwrap().as_ref(), other, "stale accept keeps the person's circuit");
     assert!(docs.sources().find("brief.req.splash").is_none(), "stale accept does not create the other document");
     assert_eq!(engine.log().entries.len(), 1, "only the person's edit entered history");
+}
+
+#[test]
+fn draft_schematic_rejects_a_part_only_in_the_import_library() {
+    let (mut engine, mail) = proposal_fixture();
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "load.blocks.splash").unwrap();
+    let text = doc.text.replace(r#"e.r(o.r, p.top, p.gnd, {package: "0402"})"#, r#"e.part("cached_regulator", {pins: {VIN: p.top GND: p.gnd}})"#);
+    mail.push(Cmd::Propose { slot: "schematic".into(), label: "Schematic".into(),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: text.into() }],
+        by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), ticket: Ticket(1) });
+    let sent = step(&mut engine, &mail);
+    let [job] = sent.evals.as_slice() else { panic!("the proposed build must reach verification") };
+    mail.result(job.run());
+    let result = step(&mut engine, &mail);
+    let [(_, Outcome::Refused(r))] = result.outcomes.as_slice() else { panic!("a build using an undefined part must be refused") };
+    assert!(r.text.contains("no part named cached_regulator is defined in this project")
+        && r.text.contains("only in the local import library is not in this project yet"),
+        "the schematic refusal must identify the part and explain its availability: {}", r.text);
+}
+
+#[test]
+fn schematic_proposal_exposes_erc_findings_and_allows_accept_with_findings() {
+    use fab_elec_circuit::CheckKind::{PowerNotDriven, SinglePinNet};
+    let (mut engine, mail) = planned_regulator();
+    let before = texts(&engine);
+    let row = propose_regulator(&mut engine, &mail, false);
+    let checks = row.checks.as_ref().unwrap();
+    for kind in [PowerNotDriven, SinglePinNet] {
+        assert!(checks.findings.iter().any(|f| f.kind == kind && f.family == "erc" && f.unit == "device"
+            && f.items == "GND" && f.message.contains("GND") && f.fix.is_some()),
+            "{kind:?} must name the candidate rail and carry its explanation and fix");
+    }
+    assert!(checks.findings.windows(2).all(|pair| pair[0].severity >= pair[1].severity), "the most severe findings must come first");
+    assert!(checks.pending_labels.is_empty(), "a mirrored board with settled checks must not report outstanding DRC");
+    assert!(row.requirements.as_ref().unwrap().failures.iter().any(|(n, _)| n == "ERC clean"), "the undriven regulator must fail ERC clean");
+    mail.push(decision(row.id, row.shown, true));
+    let accepted = step(&mut engine, &mail);
+    assert!(accepted.rejected.is_empty() && engine.log().entries.len() == 1 && Arc::ptr_eq(engine.design(), row.design.as_ref().unwrap()),
+        "Accept with findings must install exactly the shown candidate as one undo step");
+    mail.push(Cmd::Undo);
+    let undo = step(&mut engine, &mail);
+    run(&mut engine, &mail, undo);
+    assert_eq!(texts(&engine), before, "one undo must restore the planned architecture");
+}
+
+fn planned_regulator() -> (Engine, Mailbox) {
+    let mut src = fab_elec_lang::Sources::new();
+    src.add("device.req.splash", r#"require("ERC clean", checks(@erc).errors, {max: 0})"#).unwrap();
+    src.add("device.blocks.splash", r#"let e = mod.elec
+let supply = e.block({name: "Supply" planned: true ports: {vin: e.port(@power_in) gnd: e.port(@ground)}})"#).unwrap();
+    src.add("device.ckt.splash", r#"use mod.project.*
+let e = mod.elec
+let va = e.net({name: "VA" kind: @power})
+let gnd = e.net({name: "GND" kind: @ground})
+let reg = supply({vin: va gnd: gnd})"#).unwrap();
+    let (design, docs) = Docs::load(src, fab_elec_lang::std_libs());
+    (Engine::new_held(design, Arc::default(), Arc::default(), Arc::default(), "device".into()).with_docs(docs), Mailbox::default())
+}
+
+fn propose_regulator(engine: &mut Engine, mail: &Mailbox, supplied: bool) -> Arc<fab_elec_host::ProposalView> {
+    let doc = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "device.blocks.splash").unwrap();
+    let flags = if supplied { "let vin = e.part(mod.std.power_flag(), {pins: [p.vin]}); let g = e.part(mod.std.power_flag(), {pins: [p.gnd]});" } else { "" };
+    let text = format!(r#"let e = mod.elec
+let supply = e.block({{name: "Supply" ports: {{vin: e.port(@power_in) gnd: e.port(@ground)}} build: fn(p, o) {{
+    {flags}
+    let u = e.part(mod.std.ldo_3v3(), {{pins: {{VIN: p.vin EN: p.vin GND: p.gnd}} nc: [@VOUT @NC]}})
+}}}})"#);
+    mail.push(Cmd::Propose { slot: "schematic".into(), label: "Schematic".into(),
+        set: vec![DocSet::Replace { name: doc.name.clone(), base_rev: doc.rev, text: text.into() }],
+        by: fab_elec_host::ProposalAuthor::Local(By::Ai { turn: 1, call: 1 }), ticket: Ticket(1) });
+    let sent = step(engine, mail);
+    let verified = run(engine, mail, sent);
+    let row = engine.snapshot().proposals[0].clone();
+    assert!(matches!(&verified.outcomes[..], [(_, Outcome::Proposed { id, .. })] if *id == row.id)
+        && row.state == fab_elec_host::ProposalState::Ready, "the filled block must be Ready for the person's decision");
+    row
+}
+
+#[test]
+fn schematic_proposal_repropose_in_same_slot_clears_erc_and_passes_req() {
+    let (mut engine, mail) = planned_regulator();
+    let first = propose_regulator(&mut engine, &mail, false);
+    let circuit = engine.docs().unwrap().view().texts.iter().find(|d| d.name == "device.ckt.splash").unwrap();
+    mail.push(change_doc(&engine, &circuit.name, circuit.text.replace("\"VA\"", "\"VBAT\"")));
+    let rename = step(&mut engine, &mail);
+    run(&mut engine, &mail, rename);
+    let rechecked = engine.snapshot().proposals[0].clone();
+    let checks = rechecked.checks.as_ref().unwrap();
+    assert!(rechecked.id == first.id && checks.counts == first.checks.as_ref().unwrap().counts && rechecked.requirements == first.requirements,
+        "renaming only the undriven rail must preserve identity, counts and requirement verdicts");
+    assert!(checks.findings.iter().any(|f| f.items == "VBAT") && rechecked.shown == first.shown + 1,
+        "changed finding details alone must advance the shown revision");
+    let before = texts(&engine);
+    let history = engine.log().entries.len();
+    let fixed = propose_regulator(&mut engine, &mail, true);
+    assert_ne!(fixed.id, first.id, "replacing the schematic slot must give it a fresh proposal identity");
+    assert!(!fixed.checks.as_ref().unwrap().findings.iter().any(|f| f.family == "erc" && f.severity == fab_elec_core::Severity::Error),
+        "both flagged supplies must clear the candidate's ERC errors");
+    assert_eq!(fixed.requirements.as_ref().unwrap().pass, 1, "the repaired schematic must pass ERC clean");
+    mail.push(decision(rechecked.id, rechecked.shown, true));
+    let stale = step(&mut engine, &mail);
+    assert!(matches!(&stale.outcomes[..], [(_, Outcome::Refused(r))] if r.text.contains("ended")),
+        "Accept bound to the earlier proposal identity and revision must be refused as ended");
+    assert!(engine.log().entries.len() == history && texts(&engine) == before && engine.snapshot().proposals[0].id == fixed.id,
+        "the stale press must leave the documents, history and replacement untouched");
 }
 
 #[test]
@@ -3109,4 +3217,142 @@ fn body_set_switches_a_parts_body_as_its_card_does_in_one_undo_step() {
         run(&mut engine, &mailbox, undone);
     }
     assert_eq!((models_text(&engine), boot(&engine)), (None, original), "two undos take the document and the overrides back");
+}
+
+#[test]
+fn brief_ledctl_flows_through_proposals_place_and_route_to_met_requirements() {
+    use fab_elec_bom::shortlist::{sourcing_of_part, ShortlistContext};
+    use fab_elec_core::{Contour, Severity};
+    use fab_elec_fixtures::brief_ledctl as fixture;
+    use fab_elec_host::{edit_actions, req_actions, sheet_actions, ProposalAuthor, ProposalState};
+    use fab_elec_route::{route_channel, RouteEvent, RouteRequest, RouteWorker, Spawn};
+    use fab_elec_view::flow::{initial_outline_mm, next_step, FlowStage};
+
+    // One router for both commands, with its pool jobs run synchronously. Only final offers
+    // advance the engine, as on the Board tab; partials and wall-clock cadence are immaterial.
+    struct Inline;
+    impl Spawn for Inline {
+        fn spawn(&self, work: Box<dyn FnOnce() + Send>) { work(); }
+    }
+    let began = std::time::Instant::now();
+    let mut sources = fab_elec_lang::Sources::new();
+    let req_name = fixture::REQUIREMENTS[0].0;
+    let req_id = sources.add(req_name, fixture::BRIEF).unwrap();
+    let (design, docs) = Docs::load(sources, fab_elec_lang::std_libs());
+    edit_actions::register_actions();
+    let mut engine = Engine::new(design, Arc::default(), Arc::default(), Arc::default(), "brief".into())
+        .with_docs(docs).with_app_tools();
+    let mail = Mailbox::default();
+    let book = fab_elec_bom::prices::Library::from_text(fixture::PRICES).expect("the offline fixture price book must read");
+    for (slot, files) in [("requirements", fixture::REQUIREMENTS), ("architecture", fixture::ARCHITECTURE),
+        ("parts", fixture::PARTS), ("schematic", fixture::SCHEMATIC)] {
+        let snap = engine.snapshot();
+        if slot == "parts" {
+            let ctx = ShortlistContext { pinned: &[], used_parts: &Default::default(), imported_ids: &Default::default() };
+            let lists = sheet_actions::parts_shortlist(&snap.design, snap.catalog.as_ref().unwrap(), &[], &ctx, &book.prices, &[]).unwrap();
+            for block in ["usb", "reg", "control", "indicators", "mode"] {
+                assert!(lists.contains(&format!("block: \"{block}\"")), "the offline shortlist must cover planned block {block}");
+            }
+        }
+        let set = files.iter().map(|&(name, text)| {
+            match snap.docs.as_ref().unwrap().texts.iter().find(|d| d.name == name) {
+                Some(d) => DocSet::Replace { name: name.into(), base_rev: d.rev, text: text.into() },
+                None => DocSet::Add { name: name.into(), text: text.into() },
+            }
+        }).collect();
+        let by = if slot == "parts" { By::Person } else { By::Ai { turn: 1, call: 1 } };
+        let history = engine.log().entries.len();
+        mail.push(Cmd::Propose { slot: slot.into(), label: slot.into(), set, by: ProposalAuthor::Local(by), ticket: Ticket(1) });
+        let start = step(&mut engine, &mail);
+        run(&mut engine, &mail, start);
+        let view = engine.snapshot().proposals[0].clone();
+        assert_eq!(view.state, ProposalState::Ready, "{slot} proposal must be ready");
+        assert_eq!(engine.log().entries.len(), history, "{slot} must wait for a person's decision");
+        if slot == "architecture" || slot == "schematic" {
+            let erc: Vec<_> = view.checks.as_ref().unwrap().findings.iter().filter(|f| f.family == "erc").collect();
+            assert!(erc.iter().all(|v| v.severity != Severity::Error) && (slot != "architecture" || erc.is_empty()),
+                "{slot} candidate ERC: {erc:#?}");
+        }
+        mail.push(decision(view.id, view.shown, true));
+        let accepted = step(&mut engine, &mail);
+        assert!(accepted.rejected.is_empty() && engine.log().entries.len() == history + 1, "accepting {slot} must make one undo step: {:?}", accepted.rejected);
+    }
+
+    let snap = engine.snapshot();
+    let docs = snap.docs.as_ref().unwrap();
+    let unit = &snap.design.units[0];
+    let (report, _) = req_actions::report(docs, &req_actions::design_facts(&snap));
+    assert_eq!(report.row("ERC clean").unwrap().status, fab_elec_req::Status::Pass, "the filled schematic must meet ERC clean");
+    assert_eq!(next_step(&snap, Some(&report), Some("schematic")).unwrap().stage, FlowStage::Place, "accepting the filled schematic must offer placement");
+    for comp in &unit.circuit.comps {
+        let (primary, alternates) = sourcing_of_part(&comp.part);
+        assert!(comp.part.approved && comp.part.lifecycle == Some(fab_elec_parts::Lifecycle::Active) && comp.part.footprint.is_some()
+            && book.prices.resolve(&primary).is_some() && !alternates.is_empty(), "{} needs a priced approved active pick with an alternate and a footprint", comp.path);
+    }
+    let pcb = format!("{}.pcb.splash", unit.name);
+    assert!(!docs.texts.iter().any(|d| d.name == pcb), "the schematic must reach Place without a layout document");
+    let (req, diags) = fab_elec_req::read(req_id, fixture::REQUIREMENTS[0].1);
+    assert!(diags.is_empty(), "the accepted targets must read: {diags:?}");
+    let (w,h) = initial_outline_mm(unit, &[req], true);
+    assert_eq!((w,h), (50.0,30.0), "the brief's size bound must determine the initial outline");
+    let mut layout = unit.clone();
+    Arc::make_mut(layout.board.as_mut().unwrap()).apply(&BoardOp::SetOutline(vec![Contour::rect(P::ZERO, P::mm(w,h), 0)])).unwrap();
+    let history = engine.log().entries.len();
+    mail.push(Cmd::Docs { set: vec![DocSet::Add { name: pcb.clone(), text: board_doc::write_unit(&layout).into() }],
+        label: format!("Add {pcb}"), by: By::Person, ticket: Some(Ticket(2)) });
+    let sent = step(&mut engine, &mail);
+    assert!(matches!(&sent.outcomes[..], [(_, Outcome::Done { by: By::Person, .. })]) && engine.log().entries.len() == history + 1,
+        "creating the outlined board must be one person's commit: {:?}", sent.rejected);
+    run(&mut engine, &mail, sent);
+
+    std::thread::scope(|scope| {
+        let (wake, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || { let _ = wake.send(()); });
+        scope.spawn(move || RouteWorker::new(inbox, Arc::new(Inline)).run());
+        for (seq, tool) in [(1, "elec.place"), (2, "elec.route")] {
+            let args = if tool == "elec.place" { tool_args([("mode", "place")]) } else { vec![] };
+            mail.push(Cmd::Invoke { tool: tool.into(), args, by: By::Person, preview: false, ticket: Ticket(3) });
+            let sent = step(&mut engine, &mail);
+            let [start] = sent.routes.as_slice() else { panic!("{tool} must start on the current board: {:?}", sent.rejected) };
+            handle.request(RouteRequest::Base(start.base.clone())).unwrap();
+            handle.request(start.job.request()).unwrap();
+            let answer = 'offers: loop {
+                wakes.recv().expect("the router must publish its completion");
+                while let Some(event) = handle.try_recv() {
+                    match event {
+                        RouteEvent::Proposal(p) if p.last => break 'offers p,
+                        RouteEvent::Refused(r) => panic!("{tool} refused: {r:?}"),
+                        _ => {}
+                    }
+                }
+            };
+            let unit = &engine.design().units[0];
+            if let Some(place) = &answer.metrics.place {
+                let outside: Vec<_> = place.no_room.iter().map(|id| &unit.circuit.comps[id.ix()].path).collect();
+                assert!(outside.is_empty(), "Place left parts outside the board: {outside:?}");
+            }
+            let sample = fab_elec_host::job_sample(Arc::new(answer), By::Person, seq).unwrap();
+            let tag = sample.tag;
+            mail.preview(sample);
+            mail.push(Cmd::CommitPreview { seq, tag });
+            let done = step(&mut engine, &mail);
+            assert!(done.rejected.is_empty(), "{tool} must commit its final offer: {:?}", done.rejected);
+        }
+    });
+
+    let snap = engine.snapshot();
+    let unit = &snap.design.units[0];
+    let board = unit.board.as_ref().unwrap();
+    let facts = req_actions::design_facts(&snap);
+    let (report, _) = req_actions::report(snap.docs.as_ref().unwrap(), &facts);
+    let measured = facts.units[0].board.as_ref().unwrap();
+    let open: Vec<_> = snap.of(&snap.conn, unit.id).unwrap().value.unrouted.iter().map(|net| &board.nets[net.ix()].name).collect();
+    let errors: Vec<_> = snap.violations.value.iter().filter(|v| v.severity == Severity::Error).collect();
+    eprintln!("brief_ledctl: {w} x {h} mm, {} placed components, {} nets, {} unplaced, {} unrouted, {} errors, {:?}",
+        board.placed.len(), board.nets.len(), measured.unplaced, open.len(), errors.len(), began.elapsed());
+    assert_eq!(report.row("fully routed").unwrap().value.as_deref(), Some(open.len().to_string().as_str()), "the Board pane and board.unrouted must agree");
+    assert!(open.is_empty() && errors.is_empty(), "unrouted nets: {open:?}; board and circuit findings: {errors:#?}");
+    let outline = board.outline_bbox();
+    assert_eq!((measured.unplaced, outline.width(), outline.height(), measured.layers), (0, i64::from(mm(50.0)), i64::from(mm(30.0)), 2), "all components must fit the derived two-layer board");
+    assert!(report.met(), "every measured target must pass: {:?}", report.rows);
 }

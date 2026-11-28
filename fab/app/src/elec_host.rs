@@ -55,8 +55,10 @@ use fab_elec_view::board::BoardDraws;
 use fab_elec_view::board::tools::Tidying;
 use fab_elec_view::board::view::{BoardEditDone, BoardEditPress, FillWaitNotice, StitchPress};
 use fab_elec_view::req_list::{AddRefused, ReqAction, ReqDraft, ReqForm};
-use crate::req_draft::{Draft, StageSpec, ARCH_STAGE, REQ_STAGE};
+use crate::req_draft::{Draft, StageSpec, ARCH_STAGE, PARTS_STAGE, REQ_STAGE, SCHEMATIC_STAGE};
 use fab_elec_view::snapshot::ReqSummary;
+use fab_elec_view::flow::{initial_outline_mm, next_step, FlowStage, NextStep};
+use fab::ui::review_strip::{ReviewAction, ReviewNext};
 use fab_model::eval::Evaluated;
 use fab_model::program::ScriptEnv;
 use makepad_widgets::makepad_platform::thread::{to_ui_oneshot, Class, Strand, Ticket as TaskTicket, TaskHandle, ToUIOneshotReceiver, ToUIReceiver};
@@ -407,9 +409,44 @@ enum FromEngine {
     Loaded { boards: Vec<Arc<Board>>, doc_load_rev: u64 },
     Case(CaseUpdate),
     FillWait(FillWaitNotice),
+    Accepted(String, String),
     /// The plate scene of the live design asked for as `seq` (the loaded design's is 0).
     /// `committed`: built from a design with no preview in it.
     Scene { seq: u64, scene: Arc<ElecScene>, committed: bool },
+}
+
+/// The engine calls decision only for an accepted candidate. Forward the ordinary journal
+/// unchanged and publish the stage only when the very same ticket commits.
+struct StageJournal {
+    journal: Option<crate::journal::Electronics>,
+    tx: fab_elec_host::HostTx<FromEngine>,
+}
+
+type DecisionReply = Box<dyn FnOnce(Result<u64, String>) + Send + Sync>;
+
+impl fab_elec_host::JournalSink for StageJournal {
+    fn receive(&self, event: fab_elec_host::JournalEvent<'_>) {
+        if let Some(journal) = &self.journal { journal.receive(event); }
+    }
+
+    fn gesture(&self, ticket: fab_elec_host::Ticket, name: &str, args: &[(String, String)]) -> Option<DecisionReply> {
+        self.journal.as_ref()?.gesture(ticket, name, args)
+    }
+
+    fn decision(&self, ticket: fab_elec_host::Ticket, name: &str, args: &[(String, String)]) -> Option<DecisionReply> {
+        let journal = self.journal.as_ref().and_then(|j| j.decision(ticket, name, args));
+        if name != "elec.step.accept" { return journal; }
+        let value = |key| args.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        let (Some(slot), Some(label)) = (value("slot"), value("label")) else { return journal };
+        if !matches!(slot.as_str(), "requirements" | "architecture" | "parts" | "schematic") && !slot.starts_with("schematic:") {
+            return journal;
+        }
+        let tx = self.tx.clone();
+        Some(Box::new(move |result| {
+            if result.is_ok() { tx.send(FromEngine::Accepted(slot, label)); }
+            if let Some(reply) = journal { reply(result); }
+        }))
+    }
 }
 
 /// Per board unit of `design`: whether the board has case parts in `ev` (the requirements'
@@ -759,6 +796,13 @@ pub struct ElecHost {
     pub(super) draft: Option<Draft>,
     draft_say: Option<&'static StageSpec>,
     draft_revealed: bool,
+    next: Option<NextStep>,
+    flow_design: Weak<Design>,
+    flow_snapshot: Weak<DesignSnapshot>,
+    placed_step: Option<u64>,
+    place_offer: bool,
+    outline_for_place: Option<(BoardId, std::sync::mpsc::Receiver<Outcome>)>,
+    place_after: Option<(BoardId, u64)>,
     journal: Option<crate::journal::Electronics>,
     journal_calls: HashMap<u64, Arc<crate::journal::Binding>>,
     next_journal_call: u64,
@@ -803,6 +847,10 @@ pub struct ElecHost {
     bom_group: bool,
     bom_quantity: i64,
     price_book: Option<Result<Arc<PriceBook>, String>>,
+    library_pinned: Vec<(String, String)>,
+    imported_catalog: Arc<Vec<fab_elec_lang::CatalogEntry>>,
+    import_scan: Option<TaskHandle<Arc<Vec<fab_elec_lang::CatalogEntry>>>>,
+    imports_dirty: bool,
     price_jobs: VecDeque<(Delivery, LibraryJob)>,
     price_running: Option<(Delivery, TaskHandle<()>)>,
     price_rx: ToUIReceiver<Result<LibraryOutput, String>>,
@@ -1199,7 +1247,7 @@ fn step_set(args: &[(String, String)], docs: Option<&fab_elec_view::DocsView>) -
 }
 
 /// The Review strip's bounded line diff, counted per document on the read pool.
-fn proposal_fields(id: u64, shown: u64, state: &str, docs: &[ProposalDoc], checks: Option<&ProposalChecks>, requirements: Option<&ReqSummary>)
+fn proposal_fields(id: u64, shown: u64, state: &str, docs: &[ProposalDoc], checks: Option<&ProposalChecks>, requirements: Option<&ReqSummary>, findings_from: usize)
     -> Vec<(&'static str, fab_ai::out::S)> {
     use fab_ai::out;
     use makepad_git::diff::{diff_lines_bounded, DiffOp};
@@ -1222,16 +1270,30 @@ fn proposal_fields(id: u64, shown: u64, state: &str, docs: &[ProposalDoc], check
         out::obj(vec![("doc", out::s(&doc.name)), ("added", out::int(added)), ("removed", out::int(removed))])
     }));
     let checks = out::opt(checks.map(|checks| {
-        let counts = out::arr(checks.counts.iter().map(|((kind, severity), count)| {
-            let kind = match kind { fab_elec_circuit::CheckKind::Custom(name) => name.clone(), k => format!("{k:?}") };
-            let severity = match severity {
-                fab_elec_core::Severity::Error => "error",
-                fab_elec_core::Severity::Warning => "warning",
-                fab_elec_core::Severity::Info => "info",
-            };
-            out::obj(vec![("kind", out::s(kind)), ("severity", out::s(severity)), ("count", out::int(*count))])
+        let severity = |level| match level {
+            fab_elec_core::Severity::Error => "error",
+            fab_elec_core::Severity::Warning => "warning",
+            fab_elec_core::Severity::Info => "info",
+        };
+        let kind_name = |kind: &fab_elec_circuit::CheckKind| match kind {
+            fab_elec_circuit::CheckKind::Custom(name) => name.clone(), k => format!("{k:?}"),
+        };
+        let counts = out::arr(checks.counts.iter().map(|((kind, level), count)| {
+            out::obj(vec![("kind", out::s(kind_name(kind))), ("severity", out::s(severity(*level))), ("count", out::int(*count))])
         }));
-        out::obj(vec![("counts", counts), ("pending", out::flag(checks.pending))])
+        let total = checks.findings.len();
+        let start = findings_from.min(total);
+        let end = start.saturating_add(EDIT_FINDINGS).min(total);
+        let findings = out::arr(checks.findings[start..end].iter().map(|f| {
+            let mut fields = vec![("unit", out::s(&f.unit)), ("family", out::s(f.family)), ("severity", out::s(severity(f.severity))),
+                ("kind", out::s(kind_name(&f.kind))), ("message", out::s(&f.message)), ("items", out::s(&f.items))];
+            if let Some(fix) = &f.fix { fields.push(("fix", out::s(fix))); }
+            out::line(out::obj(fields))
+        }));
+        let mut fields = vec![("counts", counts), ("pending", out::flag(checks.pending)), ("findings", findings), ("total", out::int(total))];
+        if end < total { fields.push(("next", out::int(end))); }
+        if !checks.pending_labels.is_empty() { fields.push(("pending_labels", out::arr(checks.pending_labels.iter().map(out::s)))); }
+        out::obj(fields)
     }));
     let mut fields = vec![("id", out::int(id)), ("shown", out::int(shown)), ("state", out::s(state)), ("docs", docs), ("checks", checks)];
     if let Some(req) = requirements {
@@ -1245,7 +1307,7 @@ fn proposal_fields(id: u64, shown: u64, state: &str, docs: &[ProposalDoc], check
     fields
 }
 
-fn listed_proposal(p: &ProposalView) -> fab_ai::out::S {
+fn listed_proposal(p: &ProposalView, findings_from: usize) -> fab_ai::out::S {
     use fab_ai::out;
     let state = match &p.state {
         ProposalState::Unchecked => "unchecked".into(),
@@ -1262,7 +1324,7 @@ fn listed_proposal(p: &ProposalView) -> fab_ai::out::S {
         ProposalAuthor::Local(By::Disk) => out::obj(vec![("kind", out::s("disk"))]),
         ProposalAuthor::Peer { label } => out::obj(vec![("kind", out::s("peer")), ("label", out::s(label.as_ref()))]),
     };
-    let mut fields = proposal_fields(p.id.0, p.shown, &state, &p.docs, p.checks.as_deref(), p.requirements.as_deref());
+    let mut fields = proposal_fields(p.id.0, p.shown, &state, &p.docs, p.checks.as_deref(), p.requirements.as_deref(), findings_from);
     fields.extend([("slot", out::s(p.slot.as_ref())), ("label", out::s(p.label.as_ref())), ("author", author)]);
     out::obj(fields)
 }
@@ -1349,6 +1411,7 @@ struct CheckWait {
 /// it judged, and what it found (None: the project has no requirements).
 #[derive(Clone)]
 struct ReqJudged {
+    snapshot: Weak<DesignSnapshot>,
     seq: u64,
     checks: bool,
     shown: Option<Arc<fab_elec_view::ReqShown>>,
@@ -1488,15 +1551,6 @@ fn line_col(text: &str, at: usize) -> (usize, usize) {
 const EXPORT: &str = "elec.export";
 const EXPORT_VALIDATE: &str = "elec.export.validate";
 
-/// The reads `run_action` answers from the committed design, by action name.
-fn read_of(name: &str) -> Option<fn(&Design, &[(String, String)]) -> Result<String, fab_elec_core::Diag>> {
-    match name {
-        "elec.bom.read" => Some(fab_elec_host::bom_actions::bom_read),
-        "elec.design.read" => Some(fab_elec_host::edit_actions::design_read),
-        _ => None,
-    }
-}
-
 /// The editors that show `sites`, each once, in the order the sites name them.
 fn site_editors(sites: &[Sel]) -> Vec<ElecEditor> {
     let mut editors = Vec::new();
@@ -1533,6 +1587,7 @@ impl ElecHost {
         cx.global::<Tidying>().boards.clear();
         let mut host = ElecHost {
             draft: None, draft_say: None, draft_revealed: false,
+            next: None, flow_design: Weak::new(), flow_snapshot: Weak::new(), placed_step: None, place_offer: false, outline_for_place: None, place_after: None,
             journal: journal.map(crate::journal::Electronics::new), journal_calls: HashMap::new(), next_journal_call: 0,
             started: Cx::monotonic_now(),
             scene_timed: false,
@@ -1556,6 +1611,8 @@ impl ElecHost {
             case_seen: 0,
             case_task: None,
             bom_task: None, bom_rx: Default::default(), bom_design: None, bom_group: true, bom_quantity: 10,
+            library_pinned: fab::view_prefs::load_library().0,
+            imported_catalog: Arc::default(), import_scan: None, imports_dirty: true,
             price_book: None, price_jobs: [(None, LibraryJob::Load)].into(), price_running: None,
             price_rx: Default::default(), price_proposals: Default::default(), price_review_changed: false,
             rates: None, rates_task: None, rates_rx: Default::default(),
@@ -1621,6 +1678,8 @@ impl ElecHost {
     /// and preview, and `old` (the commands the old engine did not take and the snapshots retired
     /// for it) are dropped there, off the UI thread.
     fn load(&mut self, cx: &mut Cx, docs: Arc<fab_model::Docs>, assets: Arc<fab_model::ElecAssets>, old: Option<Inbox>) {
+        self.imports_dirty = true;
+        self.pump_imports(cx);
         self.versions = VecDeque::from([Version { docs: Arc::new(electronics(&docs)), assets: assets.keys().cloned().collect() }]);
         self.written_away.clear();
         self.outside = None;
@@ -1658,7 +1717,7 @@ impl ElecHost {
                 .with_mesh_keys(keys)
                 .with_library_keys(library)
                 .with_docs(docs);
-            engine.with_journal(journal.map(|journal| Arc::new(journal) as Arc<dyn fab_elec_host::JournalSink>))
+            engine.with_journal(Some(Arc::new(StageJournal { journal, tx: tx.clone() })))
         });
     }
 
@@ -1678,7 +1737,7 @@ impl ElecHost {
             if let Some(journal) = &journal { journal.attach(&cx.thread_spawner()); }
             self.journal = journal.map(crate::journal::Electronics::new);
             if bed == self.bed {
-                if let Some(journal) = &self.journal { self.driver.attach_journal(Arc::new(journal.clone())); }
+                if self.journal.is_some() { self.driver.attach_journal(Arc::new(StageJournal { journal: self.journal.clone(), tx: self.driver.sender() })); }
             }
         }
         self.reload(cx, bed, plate, docs, assets);
@@ -1839,6 +1898,14 @@ impl ElecHost {
     /// and drawn boards, then load `docs`. Old results reach receivers that are gone. Cost:
     /// O(units) releases and a copy of the ended proposal labels on the UI. The strand drops the old engine and inbox.
     fn restart(&mut self, cx: &mut Cx, docs: Arc<fab_model::Docs>, same_plate: bool) {
+        self.next = None;
+        self.flow_design = Weak::new();
+        self.flow_snapshot = Weak::new();
+        self.placed_step = None;
+        self.place_offer = false;
+        self.outline_for_place = None;
+        self.place_after = None;
+        cx.global::<ReviewNext>().0 = None;
         self.draft = None;
         self.draft_say = None;
         self.draft_revealed = false;
@@ -2247,8 +2314,21 @@ impl ElecHost {
         }
     }
 
-    /// Once per event, before widgets. True when the shown snapshot or item states changed.
+    #[cfg(test)]
     pub fn event(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        self.event_with_flow(cx, event, &mut None)
+    }
+
+    /// Once per event, before widgets. True when the shown snapshot or item states changed.
+    pub fn event_with_flow(&mut self, cx: &mut Cx, event: &Event, accepted: &mut Option<(String, String)>) -> bool {
+        let mut flow_changed = false;
+        if let Event::Actions(actions) = event {
+            if actions.iter().any(|a| a.downcast_ref::<ReviewAction>() == Some(&ReviewAction::DismissNext)) {
+                *accepted = None;
+                self.place_offer = false;
+                flow_changed = true;
+            }
+        }
         if let Some(journal) = &self.journal { journal.plate().retry_worker(); }
         self.firmware.flash_event(cx, event);
         self.firmware.radio_event(cx, event);
@@ -2319,9 +2399,23 @@ impl ElecHost {
                     _ => {}
                 }
             }
-            if actions.iter().any(|a| matches!(a.downcast_ref::<fab_elec_view::explorer::tools::StripAction>(),
-                Some(fab_elec_view::explorer::tools::StripAction::DraftArchitecture))) {
-                self.request_draft(&ARCH_STAGE);
+            use fab_elec_view::explorer::tools::StripAction;
+            for action in actions.iter().filter_map(|a| a.downcast_ref::<StripAction>()) {
+                match action {
+                    StripAction::DraftArchitecture => self.request_draft(&ARCH_STAGE),
+                    StripAction::DraftSchematic => self.request_draft(&SCHEMATIC_STAGE),
+                    _ => {}
+                }
+            }
+            use fab_elec_view::library::LibraryAction;
+            for action in actions.iter().filter_map(|a| a.downcast_ref::<LibraryAction>()) {
+                match action {
+                    LibraryAction::ChooseParts => self.request_draft(&PARTS_STAGE),
+                    LibraryAction::Remember { pinned, .. } => {
+                        self.library_pinned = pinned.iter().map(|key| (key.lib.clone(), key.name.clone())).collect();
+                    }
+                    LibraryAction::Arm(_) | LibraryAction::Place { .. } => {}
+                }
             }
             for action in actions.iter().filter_map(|a| a.as_widget_action()?.action.downcast_ref::<ReqAction>()) {
                 match action {
@@ -2409,6 +2503,7 @@ impl ElecHost {
                 self.firmware.radio_cancel();
             }
         }
+        self.pump_imports(cx);
         if !self.typing.is_empty() && self.settled && self.outside.is_none() {
             for text in std::mem::take(&mut self.typing) {
                 let _ = self.driver.act(text);
@@ -2494,6 +2589,11 @@ impl ElecHost {
                     });
                 }
                 Drained::Host { msg, shown } => match msg {
+                    FromEngine::Accepted(slot, label) => {
+                        self.place_offer = false;
+                        *accepted = Some((slot, label));
+                        flow_changed = true;
+                    }
                     FromEngine::FillWait(wait) => cx.action(wait),
                     FromEngine::Loaded { boards, doc_load_rev } => {
                         self.doc_load_rev = doc_load_rev;
@@ -2635,6 +2735,32 @@ impl ElecHost {
                 self.judge_requirements(cx, &snap);
                 #[cfg(debug_assertions)]
                 self.check_row_owners(cx);
+            }
+        }
+        if changed || judged || flow_changed {
+            if let Some(snap) = self.driver.snap() {
+                if let (Some(job), Some(commit)) = (&snap.job, &snap.last_commit) {
+                    if job.end == Some(fab_elec_view::snapshot::JobEnd::Finished)
+                        && commit.tag == Some(job.status.job.tag()) && self.placed_step != Some(commit.seq)
+                        && self.driver.job_metrics().is_some_and(|m| m.place.is_some()) {
+                        self.placed_step = Some(commit.seq);
+                        self.place_offer = true;
+                    }
+                }
+            }
+            self.sync_flow(cx, accepted.as_ref(), judged || flow_changed);
+            if !self.held_calls.is_empty() { self.release_calls(cx); }
+        }
+        self.finish_outline(cx);
+        if cx.has_global::<ElecLive>() {
+            let live = cx.get_global::<ElecLive>();
+            let book = self.price_book.as_ref().and_then(|result| result.as_ref().ok());
+            if !Arc::ptr_eq(&live.imported_catalog, &self.imported_catalog)
+                || live.price_book.as_ref().map(Arc::as_ptr) != book.map(Arc::as_ptr)
+            {
+                live.imported_catalog = self.imported_catalog.clone();
+                live.price_book = book.cloned();
+                cx.redraw_all();
             }
         }
         // The committed design, as elec.bom.read reads: a drag's previews would rebuild the sheet
@@ -3052,7 +3178,7 @@ impl ElecHost {
                 cx.get_global::<ElecLive>().requirements = None;
                 makepad_widgets::SignalToUI::set_ui_signal();
             }
-            self.req_judged = Some(ReqJudged { seq, checks, shown: None });
+            self.req_judged = Some(ReqJudged { snapshot: Arc::downgrade(snap), seq, checks, shown: None });
             self.finish_reqs();
             return;
         }
@@ -3068,7 +3194,7 @@ impl ElecHost {
                 judged.get_or_insert_with(Default::default).mistakes.extend(profile_mistakes(&snap));
             }
             if makepad_widgets::makepad_platform::thread::checkpoint().is_ok() {
-                let _ = tx.send(ReqJudged { seq, checks, shown: judged.map(Arc::new) });
+                let _ = tx.send(ReqJudged { snapshot: Arc::downgrade(&snap), seq, checks, shown: judged.map(Arc::new) });
             }
         }) {
             Ok(task) => {
@@ -3228,6 +3354,115 @@ impl ElecHost {
         }
         // Hover stays in pane uniforms; the time cursor reaches the bench through `event`
         // (SimHost::handle_actions), which sees every action.
+    }
+
+    fn sync_flow(&mut self, cx: &mut Cx, accepted: Option<&(String, String)>, refreshed: bool) {
+        let Some(snap) = self.driver.snap() else { return };
+        if snap.preview.is_none() && (refreshed || self.flow_snapshot.as_ptr() != Arc::as_ptr(snap)) {
+            let judged = self.req_judged.as_ref().filter(|j| j.snapshot.as_ptr() == Arc::as_ptr(snap));
+            self.flow_snapshot = if judged.is_some() { Arc::downgrade(snap) } else { Weak::new() };
+            self.flow_design = Arc::downgrade(&snap.design);
+            self.next = judged
+                .and_then(|j| next_step(snap, j.shown.as_ref().map(|r| &r.report), accepted.map(|a| a.0.as_str())));
+        } else if self.flow_design.as_ptr() != Arc::as_ptr(&snap.design) {
+            self.next = None;
+        }
+        let bar = cx.global::<ReviewNext>();
+        let next = self.next.as_ref().filter(|_| self.place_offer || accepted.is_some());
+        let label = accepted.map_or("", |(_, label)| label.as_str());
+        if let (Some((caption, shown)), Some(step)) = (bar.0.as_deref(), next) {
+            let same_label = if self.place_offer { caption == "Placement completed" } else { caption.strip_prefix("Accepted: ") == Some(label) };
+            if same_label && shown == step { return; }
+        } else if next.is_none() && bar.0.is_none() { return; }
+        bar.0 = next.map(|step| {
+            let caption = if self.place_offer { "Placement completed".into() } else { format!("Accepted: {label}") };
+            Arc::new((caption, step.clone()))
+        });
+        cx.redraw_all();
+    }
+
+    pub fn awaiting_flow(&self) -> bool {
+        self.driver.snap().is_some_and(|snap| snap.preview.is_none() && self.flow_snapshot.as_ptr() != Arc::as_ptr(snap))
+    }
+
+    pub fn offered(&self, stage: FlowStage) -> bool {
+        self.settled && self.outside.is_none() && self.next.as_ref().is_some_and(|s| s.stage == stage)
+            && self.driver.snap().is_some_and(|s| s.proposals.is_empty() && s.preview.is_none()
+                && self.flow_design.as_ptr() == Arc::as_ptr(&s.design))
+    }
+
+    pub fn start_next(&mut self, cx: &mut Cx, stage: FlowStage) {
+        if !self.offered(stage) { return; }
+        let draft = match stage {
+            FlowStage::Requirements => &REQ_STAGE,
+            FlowStage::Architecture => &ARCH_STAGE,
+            FlowStage::Parts => &PARTS_STAGE,
+            FlowStage::Schematic | FlowStage::FixErc => &SCHEMATIC_STAGE,
+            FlowStage::Place => return self.place_from_brief(cx),
+            FlowStage::Route | FlowStage::Done => return,
+        };
+        if cx.global::<ReqDraft>().admit.is_ok() { self.request_draft(draft); }
+    }
+
+    pub fn flow_unit(&self) -> Option<BoardId> {
+        let name = self.next.as_ref()?.unit.as_deref()?;
+        self.design()?.units.iter().find(|u| u.name == name).map(|u| u.id)
+    }
+
+    fn place_from_brief(&mut self, cx: &mut Cx) {
+        if self.outline_for_place.is_some() || self.place_after.is_some() { return; }
+        let Some(id) = self.flow_unit() else { return };
+        let snap = self.driver.snap().unwrap();
+        let unit = snap.design.unit(id).unwrap();
+        let (Some(board), Some(docs)) = (&unit.board, &snap.docs) else { return };
+        let name = format!("{}.pcb.splash", unit.name);
+        let has_board_doc = docs.texts.iter().any(|d| d.name == name);
+        if has_board_doc && !board.outline.is_empty() { return self.place_all(cx, id); }
+
+        let requirements = docs.texts.iter().filter(|d| fab_elec_lang::DocKind::of_name(&d.name) == Some(fab_elec_lang::DocKind::Requirements))
+            .map(|d| fab_elec_req::read(d.doc, &d.text).0).collect::<Vec<_>>();
+        let single = snap.design.units.iter().filter(|u| u.board.is_some()).count() == 1;
+        let (w, h) = initial_outline_mm(unit, &requirements, single);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if has_board_doc {
+            self.driver.invoke("elec.board.outline".into(), vec![("unit".into(), unit.name.clone()), ("rect".into(), format!("0 0 {w} {h}"))], false, By::Person, tx);
+        } else {
+            let outline = fab_elec_core::Contour::rect(P::ZERO, P::mm(w, h), 0);
+            let mut layout = unit.clone();
+            if let Err(error) = Arc::make_mut(layout.board.as_mut().unwrap()).apply(&BoardOp::SetOutline(vec![outline])) {
+                self.notices.push((NoticeView::Board, Some(format!("Could not set the initial outline: {error:?}"))));
+                return;
+            }
+            let text = fab_elec_lang::board_doc::write_unit(&layout).into();
+            self.driver.docs(vec![DocSet::Add { name: name.clone(), text }], format!("Add {name}"), By::Person, tx);
+        }
+        self.outline_for_place = Some((id, rx));
+    }
+
+    fn finish_outline(&mut self, cx: &mut Cx) {
+        if let Some((id, rx)) = &self.outline_for_place {
+            match rx.try_recv() {
+                Ok(Outcome::Done { seq, .. }) => self.place_after = Some((*id, seq)),
+                Ok(Outcome::Refused(r)) => self.notices.push((NoticeView::Board, Some(r.text.clone()))),
+                Err(TryRecvError::Empty) => return,
+                _ => self.notices.push((NoticeView::Board, Some("The board closed before its outline was committed".into()))),
+            }
+            self.outline_for_place = None;
+        }
+        let Some((id, seq)) = self.place_after else { return };
+        let Some(snap) = self.driver.snap() else { return };
+        if commit_seq(snap) < seq || snap.stale.has(fab_elec_view::StageFlags::EVAL) { return; }
+        if snap.design.unit(id).and_then(|u| u.board.as_ref()).is_some_and(|board| !board.outline.is_empty()) {
+            self.place_after = None;
+            if self.settled && self.outside.is_none() { self.place_all(cx, id); }
+        } else if self.driver.idle() {
+            self.place_after = None;
+            self.notices.push((NoticeView::Board, Some("The committed board has no outline for placement".into())));
+        }
+    }
+
+    fn place_all(&mut self, cx: &mut Cx, unit: BoardId) {
+        self.act(cx, ViewAction::Place { unit, parts: Vec::new(), all: false, free_panel: false });
     }
 
     fn queue_board_job(&mut self, cx: &mut Cx, job: Option<(&str, Vec<(String, String)>)>) {
@@ -3497,10 +3732,18 @@ impl ElecHost {
                 self.answer(held.call, answer.map_err(|diag| diag.message));
                 continue;
             }
-            if let Some(read) = read_of(next.name) {
+            if next.name == "elec.design.read" {
+                if self.awaiting_flow() { return; }
+                let held = self.held_calls.pop_front().unwrap();
+                let design = snap.design.clone();
+                let stage = self.next.as_ref().filter(|_| self.flow_design.as_ptr() == Arc::as_ptr(&design)).map(|s| s.stage);
+                self.pool_read(cx, held.call, move || fab_elec_host::edit_actions::design_read_with_stage(&design, &held.args, stage).map_err(|diag| diag.message));
+                continue;
+            }
+            if next.name == "elec.bom.read" {
                 let held = self.held_calls.pop_front().expect("a front call");
                 let design = snap.design.clone();
-                self.pool_read(cx, held.call, move || read(&design, &held.args).map_err(|diag| diag.message));
+                self.pool_read(cx, held.call, move || fab_elec_host::bom_actions::bom_read(&design, &held.args).map_err(|diag| diag.message));
                 continue;
             }
             // The board's files, from the committed board once its fills are exact; and their check.
@@ -3566,6 +3809,26 @@ impl ElecHost {
                 });
                 continue;
             }
+            if next.name == fab_elec_host::sheet_actions::PARTS_SHORTLIST.name {
+                if self.imports_dirty || self.import_scan.is_some() || self.price_book.is_none() { return; }
+                let held = self.held_calls.pop_front().expect("a front call");
+                let design = snap.design.clone();
+                let catalog = snap.catalog.clone();
+                let imported = self.imported_catalog.clone();
+                let pinned = self.library_pinned.clone();
+                let book = self.price_book.as_ref().and_then(|result| result.as_ref().ok()).cloned();
+                self.pool_read(cx, held.call, move || {
+                    let used_parts = design.units.iter().flat_map(|u| &u.circuit.comps).map(|c| c.part.name.clone()).collect();
+                    let imported_ids = imported.iter().map(|entry| entry.name.clone()).collect();
+                    let ctx = fab_elec_bom::shortlist::ShortlistContext { pinned: &pinned, used_parts: &used_parts, imported_ids: &imported_ids };
+                    let empty_prices = Default::default();
+                    let prices = book.as_ref().map_or(&empty_prices, |book| &book.prices);
+                    let empty_catalog = fab_elec_lang::Catalog { entries: Vec::new() };
+                    fab_elec_host::sheet_actions::parts_shortlist(&design, catalog.as_deref().unwrap_or(&empty_catalog),
+                        &imported, &ctx, prices, &held.args).map_err(|diag| diag.message)
+                });
+                continue;
+            }
             // The Library panel's entries.
             if next.name == fab_elec_host::sheet_actions::LIBRARY_LIST.name {
                 let held = self.held_calls.pop_front().expect("a front call");
@@ -3587,7 +3850,9 @@ impl ElecHost {
                 let proposals = snap.proposals.clone();
                 self.pool_read(cx, held.call, move || {
                     use fab_ai::out;
-                    Ok(out::text(&out::obj(vec![("proposals", out::arr(proposals.iter().map(|p| listed_proposal(p))))])))
+                    let from = held.args.iter().find(|(k, _)| k == "findings_from").map_or(0, |(_, v)|
+                        v.trim().replace('_', "").parse::<usize>().unwrap_or(usize::MAX));
+                    Ok(out::text(&out::obj(vec![("proposals", out::arr(proposals.iter().map(|p| listed_proposal(p, from))))])))
                 });
                 continue;
             }
@@ -4099,7 +4364,7 @@ impl ElecHost {
                 Ok(Outcome::Proposed { id, shown, checks, requirements }) => {
                     self.pool_read(cx, call, move || {
                         let docs = proposed_docs.ok_or("the proposal's documents were not published")?;
-                        Ok(fab_ai::out::text(&fab_ai::out::obj(proposal_fields(id.0, shown, "ready", &docs, checks.as_deref(), requirements.as_deref()))))
+                        Ok(fab_ai::out::text(&fab_ai::out::obj(proposal_fields(id.0, shown, "ready", &docs, checks.as_deref(), requirements.as_deref(), 0))))
                     });
                 }
                 Ok(Outcome::Declined { id }) => self.answer(call, Ok(format!("{{state: @declined id: {}}}", id.0))),
@@ -4216,7 +4481,7 @@ impl ElecHost {
     /// (`req_actions::req_delta`). O(requirements) per answer; nothing while none is ready.
     fn finish_reqs(&mut self) {
         use fab_ai::out;
-        let Some(ReqJudged { seq, checks, shown }) = self.req_judged.clone() else { return };
+        let Some(ReqJudged { seq, checks, shown, .. }) = self.req_judged.clone() else { return };
         let ready = |wait: &CheckWait| wait.before.is_none() && wait.reqs.is_some() && wait.seq <= seq && (checks || !wait.checks);
         if !self.check_waits.iter().any(ready) {
             return;
@@ -4829,8 +5094,40 @@ impl ElecHost {
         self.sim.as_mut().filter(|_| self.resume_after_failure.is_none())
     }
 
+    /// Keep one scan in flight. An import that lands during the scan requests another pass.
+    fn pump_imports(&mut self, cx: &mut Cx) {
+        if let Some(result) = self.import_scan.as_mut().and_then(TaskHandle::try_take) {
+            self.import_scan = None;
+            match result {
+                Ok(entries) => self.imported_catalog = entries,
+                Err(e) => log!("electronics: could not scan the local parts library: {e:?}"),
+            }
+        }
+        if !self.imports_dirty || self.import_scan.is_some() { return; }
+        self.imports_dirty = false;
+        let Some(root) = crate::part_models::library() else { return };
+        match cx.task_pool().submit_named(Class::Background, "local parts catalog", move || {
+            let paths = fab_elec_import::library::Library::new(root).parts(&fab_elec_import::easyeda::Lcsc);
+            let mut docs = Vec::with_capacity(paths.len());
+            for (number, path) in paths {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => docs.push((format!("{number}.part.splash"), Arc::from(text))),
+                    Err(e) => log!("electronics: could not read cached part {number}: {e}"),
+                }
+            }
+            Arc::new(fab_elec_lang::from_part_docs("imported", &docs))
+        }) {
+            Ok(task) => self.import_scan = Some(task),
+            Err(e) => {
+                self.imports_dirty = true;
+                log!("electronics: could not start local parts scan: {e}");
+            }
+        }
+    }
+
     /// Make newly available library models visible to the open design.
     pub fn library_models(&mut self, models: Vec<(String, String)>) {
+        self.imports_dirty = true;
         if !models.is_empty() {
             self.driver.push(Cmd::LibraryModels(models));
             self.driver.kick();
@@ -5982,6 +6279,8 @@ bench("press", {circuit: "ledavr"}, fn(b, c) {
         let empty_design = |host: &mut ElecHost, cx: &mut Cx, id| {
             let design = call(host, cx, "elec.design.read", vec![], id);
             assert!(design.field("units").unwrap().value.items().unwrap().is_empty(), "a design without a circuit must list zero units");
+            assert_eq!(design.field("stage").and_then(|f| f.value.ident()), Some("requirements"),
+                "an empty or brief-only plate must offer requirements to the AI as well as the strip");
         };
         empty_design(&mut fresh, &mut cx, 12);
         let requirements = call(&mut fresh, &mut cx, "elec.req.list", vec![], 1);
@@ -6074,8 +6373,21 @@ bench("press", {circuit: "ledavr"}, fn(b, c) {
                 "the first document verifies, with ERC unknown until there is a circuit");
             assert!(unpublished(&fresh) && fresh.take_docs().is_none(), "a held first document sends no files to the plate");
             fresh.act(&mut cx, ViewAction::ProposalDecision { id: proposal.id, shown: proposal.shown, accept });
-            idle(&mut fresh, &mut cx, "decide the requirements proposal");
-            if !accept {
+            let mut accepted = None;
+            idle_with_flow(&mut fresh, &mut cx, "decide the requirements proposal", &mut accepted);
+            if accept {
+                fresh.run_action(&mut cx, "elec.design.read", vec![], By::Person, Some(19));
+                idle_with_flow(&mut fresh, &mut cx, "read the accepted stage", &mut accepted);
+                let bar = cx.get_global_ref::<ReviewNext>().and_then(|b| b.0.as_deref()).expect("accept must offer a next stage");
+                assert!(bar.0 == "Accepted: First requirement" && bar.1.stage == FlowStage::Architecture,
+                    "only the accepted row supplies the label and the next step");
+                assert!(fresh.take_answers().iter().any(|(id, ok, answer)| *id == 19 && *ok && answer.contains("stage: architecture")),
+                    "the committed design read must agree with the banner");
+                let dismiss = cx.capture_actions(|cx| cx.action(ReviewAction::DismissNext));
+                fresh.event_with_flow(&mut cx, &Event::Actions(dismiss), &mut accepted);
+                assert!(accepted.is_none() && cx.get_global::<ReviewNext>().0.is_none(), "Dismiss must clear the offer for this plate");
+            } else {
+                assert!(accepted.is_none() && cx.global::<ReviewNext>().0.is_none(), "declining must never offer the next stage");
                 assert!(fresh.driver.snap().unwrap().proposals.is_empty() && fresh.undo_step().is_none() && fresh.take_docs().is_none() && !plate.modified(),
                     "declining the proposal leaves the empty plate clean");
             }
@@ -6276,9 +6588,13 @@ bench("press", {circuit: "ledavr"}, fn(b, c) {
     }
 
     fn idle(host: &mut ElecHost, cx: &mut Cx, what: &str) {
+        idle_with_flow(host, cx, what, &mut None);
+    }
+
+    fn idle_with_flow(host: &mut ElecHost, cx: &mut Cx, what: &str, accepted: &mut Option<(String, String)>) {
         let deadline = Instant::now() + HANG_GUARD;
         loop {
-            host.event(cx, &Event::Signal);
+            host.event_with_flow(cx, &Event::Signal, accepted);
             if !host.busy() && host.driver.snap().is_some() && host.engine_calls.is_empty() && host.read_calls.is_empty() && host.held_calls.is_empty()
                 && host.export_calls.is_empty() && host.check_waits.is_empty() && host.text_check.is_none() {
                 return;
@@ -7360,8 +7676,10 @@ bench("board", {circuit: "handheld"}, fn(b, c) {
         let root = journal::test_dir();
         let dir = root.join("journal");
         let circuit = "probe.ckt.splash";
-        let before = "use mod.elec.*\nlet e = mod.elec\nlet gnd = e.net({name: \"GND\" kind: @ground})\n";
-        let docs = Arc::new([(circuit.into(), Arc::from(before))].into_iter().collect());
+        let ports = (0..=EDIT_FINDINGS).map(|i| format!("io{i}: e.port(@in)")).collect::<Vec<_>>().join(" ");
+        let before = format!("use mod.elec.*\nlet e = mod.elec\nlet gnd = e.net({{name: \"GND\" kind: @ground}})\n\
+            let header = e.block({{name: \"Header\" planned: true ports: {{{ports}}}}})\nlet connector = header({{}})\n");
+        let docs = Arc::new([(circuit.into(), Arc::from(before.as_str()))].into_iter().collect());
         let plate = Plate::testing(&dir, "probe.fab.splash", &docs);
         let mut host = ElecHost::open(&mut cx, Some(plate.clone()), 1, None, docs, Arc::default(), Arc::default(), Arc::default());
         idle(&mut host, &mut cx, "load the circuit");
@@ -7413,9 +7731,19 @@ bench("board", {circuit: "handheld"}, fn(b, c) {
             "the two-layer board meets the layer limit while print time remains unjudged");
         assert_verdict(&ready, &verdict);
 
-        host.run_action(&mut cx, step_actions::LIST.name, vec![], ai(2), Some(2));
+        let first_page = field(reported, "findings").items().unwrap();
+        let next = field(reported, "next").number().unwrap() as usize;
+        let expected_messages: Vec<_> = checks.findings.iter().map(|f| f.message.clone()).collect();
+        assert_eq!((first_page.len(), next, field(reported, "total").number()), (EDIT_FINDINGS, EDIT_FINDINGS, Some((EDIT_FINDINGS + 1) as f64)),
+            "propose must return the first 40 findings, the true total and the next offset");
+        host.run_action(&mut cx, step_actions::LIST.name, vec![("findings_from".into(), next.to_string())], ai(2), Some(2));
         let list = answer(&mut host, &mut cx, 2, true);
         let [row] = field(&list, "proposals").items().unwrap() else { panic!("the list has the one pending proposal") };
+        let last = field(row, "checks");
+        let tail = field(last, "findings").items().unwrap();
+        assert!(last.field("next").is_none() && field(last, "total").number() == field(reported, "total").number()
+            && first_page.iter().chain(tail).map(|f| field(f, "message").string().unwrap()).eq(expected_messages.iter().map(String::as_str)),
+            "following next must deliver every strip finding exactly once and end pagination");
         assert!(field(row, "id").number() == Some(id.0 as f64) && field(row, "state").string() == Some("ready")
             && field(row, "slot").string() == Some("schematic") && field(row, "label").string() == Some("Probe stage")
             && field(field(row, "author"), "kind").string() == Some("ai")

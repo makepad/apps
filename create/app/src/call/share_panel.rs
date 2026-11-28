@@ -1,10 +1,12 @@
 use super::ShareRole;
 use super::control::{valid_point, FrameMotion, GrantId, PanelInput};
 use crate::app_link::{AppInput, Mods, WindowId};
+use crate::board::canvas::AppZoom;
+use crate::tweak::{overlay, design::drag::{design_pointer, picture_drop, LiftPress}};
 use crate::record::capture::{ThumbnailPicture, WindowThumbnail};
 use makepad_call::driver::codec::Picture;
-use makepad_town_core::event::SessionId;
-use makepad_widgets::{event::{DigitId, TouchState}, makepad_draw::shader::draw_nv12::DrawNv12, *};
+use makepad_town_core::event::{Id, SessionId};
+use makepad_widgets::{event::{DigitId, ScrollPhase, TouchState}, makepad_draw::shader::draw_nv12::DrawNv12, *};
 use std::sync::{Arc, Weak};
 
 script_mod! {
@@ -12,6 +14,8 @@ script_mod! {
     use mod.widgets.*
     mod.widgets.SharePanel = #(SharePanel::register_widget(vm)){
         width: Fill height: Fill draw_nv12: mod.draw.DrawNv12{} draw_bg.color: #000
+        drag_chip: DragChip{}
+        ghost_ink: #(overlay::ghost_shader(vm))
         label: BodyNote.draw_text
         draw_waiting: BodyNote.draw_text
         scroll_bars: ScrollBars{
@@ -57,6 +61,9 @@ pub fn opening_uids(cx: &Cx, root: &WidgetRef) -> Vec<WidgetUid> {
     let mut uids = super::widgets::opening_uids(cx, root);
     let switch = root.widget(cx, ids!(live_share.allow_all));
     if !switch.is_empty() { uids.push(switch.widget_uid()); }
+    if let Some(page) = root.widget(cx, ids!(live_share)).borrow::<crate::ui::live::LiveSharePage>() {
+        uids.extend_from_slice(page.let_control_buttons());
+    }
     uids
 }
 
@@ -97,6 +104,12 @@ pub fn window_point(rect: Rect, size: DVec2, abs: DVec2, captured: bool) -> Opti
     valid_point((size.x, size.y), p.x, p.y, captured).then_some(p)
 }
 
+fn picture_overlay(session: Option<SessionId>, share: &super::ShareShown) -> Option<&(Id, overlay::Selections)> {
+    let session = session?;
+    share.overlay.as_ref().filter(|(_, s)| s.share.or(share.watching) == Some(session)
+        && s.window_size.iter().all(|n| n.is_finite() && *n > 0.))
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct SharePanel {
     #[uid] uid: WidgetUid,
@@ -113,6 +126,11 @@ pub struct SharePanel {
     #[redraw] #[live] draw_bg: DrawColor,
     #[live] draw_nv12: DrawNv12,
     #[live] ink: DrawColor,
+    #[live] ghost_ink: overlay::DrawDesignGhost,
+    #[live] drag_chip: ScriptObjectRef,
+    #[rust] lift: Option<LiftPress>,
+    #[rust] resize: Option<overlay::ResizePress>,
+    #[rust] design_over: Option<Id>,
     #[live] label: DrawText,
     #[live] draw_waiting: DrawText,
     #[live] scroll_bars: ScrollBars,
@@ -181,6 +199,9 @@ impl super::CallController {
 }
 
 impl SharePanel {
+    #[cfg(test)]
+    pub(crate) fn ghost_ink(&self) -> &overlay::DrawDesignGhost { &self.ghost_ink }
+
     fn release_held(&mut self, session: SessionId, grant: GrantId, mut send: impl FnMut(PanelInput)) {
         self.motion.flush(&mut send);
         let mut release = |event| send(PanelInput { session, grant, event });
@@ -275,45 +296,123 @@ impl SharePanel {
     }
 
     fn watch_picture_input(&mut self, cx: &mut Cx, event: &Event, share: &super::ShareShown, pannable: bool) {
-        if !pannable && share.overlay.is_none() { return }
+        let overlay = picture_overlay(self.session, share);
+        if self.resize.is_some() && (overlay.is_none_or(|(_, s)| !s.build_mode || !s.can_edit)
+            || matches!(event, Event::WindowLostFocus(_) | Event::DragEnd)) {
+            self.resize.take().unwrap().cancel(cx, self.uid);
+        }
+        if !pannable && overlay.is_none() { return }
+        if matches!(event, Event::WindowLostFocus(_) | Event::DragEnd) {
+            self.lift = None;
+            self.design_over = None;
+        }
+        if let Some(abs) = design_pointer(event) {
+            let target = overlay.and_then(|(item, s)| {
+                if !s.can_edit || !self.picture_ready(share) { return None }
+                Some((*item, s.window, self.picture_pointer(cx, share, abs, false)?))
+            });
+            picture_drop(cx, self.uid, self.draw_bg.area(), event, target, &mut self.design_over);
+            return
+        }
+        let tf = overlay.map(|(_, s)| s.transform(self.picture_bounds(self.draw_bg.area().rect(cx), share)));
+        let can_hit_handle = |cx: &Cx, abs| self.picture_ready(share)
+            && self.draw_bg.area().clipped_rect(cx).contains(abs)
+            && !self.over_controls(cx, abs) && !self.over_window_buttons(cx, abs);
         match event.hits(cx, self.draw_bg.area()) {
             Hit::FingerDown(e) if e.is_primary_hit() => {
-                let Some(point) = self.picture_pointer(cx, e.abs, false) else { return };
-                if share.overlay.is_some() {
-                    self.tweak_pick(cx, share, point);
+                if let Some((item, s)) = overlay.filter(|_| can_hit_handle(cx, e.abs)) {
+                    self.resize = overlay::ResizePress::begin(*item, tf.unwrap(), s, e.digit_id, e.abs);
+                    if self.resize.is_some() { cx.claim_finger_drag(e.digit_id); return }
+                }
+                let Some(point) = self.picture_pointer(cx, share, e.abs, false) else { return };
+                if let Some((item, s)) = overlay {
+                    if let Some(path) = s.selected_at(tf.as_ref().unwrap(), e.abs).filter(|_| self.picture_ready(share)) {
+                        self.lift = Some(LiftPress { item: *item, digit: e.digit_id, start: e.abs, path: path.into() });
+                        cx.claim_finger_drag(e.digit_id);
+                    } else { self.tweak_pick(cx, share, point); }
                 } else {
                     cx.claim_finger_drag(e.digit_id);
                     self.pan_drag = Some((e.digit_id, self.scroll_bars.get_scroll_pos()));
                 }
             }
+            Hit::FingerMove(e) if self.resize.as_ref().is_some_and(|r| r.digit == e.digit_id) => {
+                self.resize.as_mut().unwrap().update(cx, self.uid, e.abs, overlay::ResizePhase::Drag);
+            }
+            Hit::FingerUp(e) if self.resize.as_ref().is_some_and(|r| r.digit == e.digit_id) => {
+                let mut resize = self.resize.take().unwrap();
+                if e.cancelled || e.is_sweep { resize.cancel(cx, self.uid); }
+                else { resize.update(cx, self.uid, e.abs, overlay::ResizePhase::Release); }
+            }
             Hit::FingerMove(e) => {
+                if let Some(p) = &self.lift {
+                    if p.digit == e.digit_id && p.lift(cx, e.abs, &self.drag_chip) { self.lift = None; }
+                }
                 if let Some((digit, start)) = self.pan_drag {
                     if digit == e.digit_id { self.pan_to(cx, start + (e.abs_start - e.abs)); }
                 }
             }
+            Hit::FingerUp(e) if self.lift.as_ref().is_some_and(|p| p.digit == e.digit_id) => {
+                self.lift = None;
+                if !e.cancelled && !e.is_sweep {
+                    if let Some(point) = self.picture_pointer(cx, share, e.abs, false) { self.tweak_pick(cx, share, point); }
+                }
+            }
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) if overlay.is_some() => {
+                let s = &overlay.unwrap().1;
+                let tf = tf.as_ref().unwrap();
+                if can_hit_handle(cx, e.abs) {
+                    if let Some(handle) = overlay::hit_size_handle(tf, s, e.abs) {
+                        cx.set_cursor(handle.cursor());
+                        return;
+                    }
+                }
+                if self.picture_pointer(cx, share, e.abs, false).is_some() && s.selected_at(tf, e.abs).is_some() {
+                    cx.set_cursor(MouseCursor::Hand);
+                }
+            }
             Hit::FingerUp(e) if self.pan_drag.is_some_and(|(digit, _)| digit == e.digit_id) => self.pan_drag = None,
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) if pannable && share.overlay.is_none() => {
-                if self.picture_pointer(cx, e.abs, false).is_some() { cx.set_cursor(MouseCursor::Hand); }
+                if self.picture_pointer(cx, share, e.abs, false).is_some() { cx.set_cursor(MouseCursor::Hand); }
             }
             _ => {}
         }
     }
 
-    fn picture_pointer(&self, cx: &Cx, abs: DVec2, captured: bool) -> Option<DVec2> {
+    fn picture_bounds(&self, panel: Rect, share: &super::ShareShown) -> Rect {
+        let native = self.popout || self.one_to_one.is_some();
+        let mut rect = picture_rect(panel, self.picture_points, native, self.scroll_bars.get_scroll_pos(), self.dpi);
+        if native && picture_overlay(self.session, share).is_some_and(|(_, s)|
+            s.focus.isolated_rect.is_some_and(|r| r.window == s.window) && (s.focus.center || s.focus.zoom > 1.)) {
+            // A native-size picture can be larger than its pane. Anchor the focused view to
+            // the visible pane's center while keeping its native scale and saved scroll position.
+            rect.pos = panel.center() - rect.size * 0.5;
+        }
+        rect
+    }
+
+    fn picture_pointer(&self, cx: &Cx, share: &super::ShareShown, abs: DVec2, captured: bool) -> Option<DVec2> {
         self.window?;
         let area = self.draw_bg.area();
         if !captured && (!area.clipped_rect(cx).contains(abs) || self.over_controls(cx, abs)
             || self.over_window_buttons(cx, abs)) { return None }
-        let rect = picture_rect(area.rect(cx), self.picture_points, self.popout || self.one_to_one.is_some(), self.scroll_bars.get_scroll_pos(), self.dpi);
+        let rect = self.picture_bounds(area.rect(cx), share);
+        if let Some((_, selections)) = picture_overlay(self.session, share) {
+            let tf = selections.transform(rect);
+            let p = if captured { tf.inverse(abs) } else { tf.screen_to_app(abs)? };
+            return valid_point((self.window_size.x, self.window_size.y), p.x, p.y, captured).then_some(p)
+        }
         window_point(rect, self.window_size, abs, captured)
     }
 
-    /// Outside control, a primary press on the live picture picks the widget under it for app tweaks.
+    fn picture_ready(&self, share: &super::ShareShown) -> bool {
+        self.session.and_then(|id| share.offer(id)).is_some_and(|offer| share.picture_for(offer.session).is_some()
+            && self.texture.is_some() && self.reported.map(|t| t.0) == Some(offer.session)
+            && self.window_size == dvec2(offer.window_size.0, offer.window_size.1))
+    }
+
     fn tweak_pick(&self, cx: &mut Cx, share: &super::ShareShown, point: DVec2) {
-        let Some(offer) = share.watched() else { return };
-        if share.picture.is_none() || self.texture.is_none() || self.reported.map(|(session, _, _)| session) != Some(offer.session)
-            || self.window_size != dvec2(offer.window_size.0, offer.window_size.1) { return }
-        let Some((item, rings)) = &share.overlay else { return };
+        if !self.picture_ready(share) { return }
+        let Some((item, rings)) = picture_overlay(self.session, share) else { return };
         if let Some(at) = crate::tweak::overlay::pick_at(rings.window, point, rings.window_size) {
             cx.widget_action(self.uid, crate::board::canvas::AppPick { item: *item, at });
         }
@@ -345,12 +444,21 @@ impl SharePanel {
         }
         if let Some((texture, w, h)) = &self.texture {
             self.draw_nv12.set_nv12(texture, *w, *h, Default::default(), None);
-            self.draw_nv12.draw_abs(cx, self.view_rect);
-            if let Some((_, rings)) = share.overlay.as_ref().filter(|_| share.watching == Some(offer.session)) {
-                crate::tweak::overlay::draw_selections(cx, self.view_rect, rings, &mut self.ink, &mut self.label);
-            }
+            if let Some((_, rings)) = picture_overlay(Some(offer.session), share) {
+                let tf = rings.transform(self.view_rect);
+                let (uv, dest) = tf.texture_crop();
+                let pixels = dvec2(*w as f64, *h as f64);
+                let origin = uv.pos * pixels;
+                let extent = uv.size * pixels;
+                self.draw_nv12.src = vec4(origin.x as f32, origin.y as f32, extent.x as f32, extent.y as f32);
+                cx.push_clip_rect(self.view_rect);
+                if dest.size.x > 0. && dest.size.y > 0. { self.draw_nv12.draw_abs(cx, dest); }
+                overlay::draw_isolate_scrim(cx, &tf, rings, &mut self.ink);
+                overlay::draw_selections(cx, &tf, rings, &mut self.ink, &mut self.label, &mut self.ghost_ink);
+                cx.pop_clip_rect();
+            } else { self.draw_nv12.draw_abs(cx, self.view_rect); }
             // Only a guest's first picture joins the share; the sharer's own view is not a join.
-            if offer.role == ShareRole::Viewer { offer.picture_drawn(); }
+            if matches!(offer.role, ShareRole::Viewer { .. }) { offer.picture_drawn(); }
         }
     }
 
@@ -370,6 +478,9 @@ impl SharePanel {
         let area = self.draw_bg.area();
         if !area.is_empty() && cx.has_key_focus(area) { cx.revert_key_focus(); }
         self.release_texture();
+        self.lift = None;
+        if let Some(mut resize) = self.resize.take() { resize.cancel(cx, self.uid); }
+        self.design_over = None;
         self.reported = None;
         self.window = None;
         self.pan_drag = None;
@@ -398,7 +509,7 @@ impl Widget for SharePanel {
         };
         self.window = Some(match offer.role {
             ShareRole::Sharer { window, .. } => PanelWindow::Local(window),
-            ShareRole::Viewer => PanelWindow::Remote(offer.session),
+            ShareRole::Viewer { .. } => PanelWindow::Remote(offer.session),
         });
         self.window_size = dvec2(offer.window_size.0, offer.window_size.1);
         let grant = share.control.active.filter(|_| share.control_session == Some(offer.session));
@@ -421,7 +532,7 @@ impl Widget for SharePanel {
         self.picture_points = if one_to_one {
             share.picture_for(offer.session).map_or(shape, |p| dvec2(p.width as f64, p.height as f64) / self.dpi)
         } else { shape };
-        self.view_rect = picture_rect(rect, self.picture_points, one_to_one, self.scroll_bars.get_scroll_pos(), self.dpi);
+        self.view_rect = self.picture_bounds(rect, share);
         self.draw_nv12.sharp = if one_to_one { 2.0 } else { 0.0 };
         self.draw_bg.draw_abs(cx, rect);
         let pixels = if self.popout {
@@ -443,7 +554,7 @@ impl Widget for SharePanel {
             self.scroll_bars.draw_scroll_bars(cx);
             cx.end_turtle();
         }
-        if offer.role == ShareRole::Viewer {
+        if matches!(offer.role, ShareRole::Viewer { .. }) {
             let picture = self.view_rect.clip((visible.pos, visible.pos + visible.size));
             // Let a small picture's chip extend into the surrounding letterbox.
             let width = 2. * (picture.center().x - visible.pos.x).min(visible.pos.x + visible.size.x - picture.center().x);
@@ -474,6 +585,12 @@ impl Widget for SharePanel {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if !self.visible { return }
+        if matches!(self.window, Some(PanelWindow::Local(_))) {
+            if let Some(share) = scope.data.get::<crate::lists::ViewData>().map(|d| &d.call.share) {
+                self.watch_picture_input(cx, event, share, false);
+            }
+            return
+        }
         let Some(PanelWindow::Remote(session)) = self.window else { return };
         if scope.data.get::<crate::lists::ViewData>().and_then(|d| d.call.share.watching) != Some(session) { return }
         let uid = self.uid;
@@ -490,6 +607,21 @@ impl Widget for SharePanel {
             }
         });
         let Some(share) = scope.data.get::<crate::lists::ViewData>().map(|d| &d.call.share) else { return };
+        if let Event::Scroll(e) = event {
+            let wheel = e.is_mouse || e.phase == ScrollPhase::None;
+            let zoom = picture_overlay(self.session, share).filter(|(_, s)| s.focus.isolated_path.is_some())
+                .and_then(|(item, _)| AppZoom::wheel(*item, e.scroll, wheel, &e.modifiers));
+            if let Some(zoom) = zoom {
+                // While a seat drives the app, its wheel scrolls the app, as before isolation.
+                if share.control.active.is_none() && self.picture_pointer(cx, share, e.abs, false).is_some()
+                    && matches!(event.hits(cx, self.draw_bg.area()), Hit::FingerScroll(_)) {
+                    cx.widget_action(self.uid, zoom);
+                    e.handled_x.set(true);
+                    e.handled_y.set(true);
+                    return
+                }
+            }
+        }
         let one_to_one = self.popout || self.one_to_one == Some(session);
         let mut pannable = false;
         if one_to_one {
@@ -505,7 +637,7 @@ impl Widget for SharePanel {
                 let over = |bar: Area| bar.is_valid(cx) && bar.clipped_rect(cx).contains(wheel.abs);
                 let on_x = extent.x > 0. && over(bars[0]);
                 let on_y = extent.y > 0. && over(bars[1]);
-                if on_x || on_y || (pannable && share.control.active.is_none() && self.picture_pointer(cx, wheel.abs, false).is_some()) {
+                if on_x || on_y || (pannable && share.control.active.is_none() && self.picture_pointer(cx, share, wheel.abs, false).is_some()) {
                     let d = wheel.scroll;
                     let delta = if on_x || (!on_y && wheel.modifiers.shift) { dvec2(d.x + d.y, 0.) }
                         else if on_y { dvec2(0., d.y) } else { d };
@@ -534,9 +666,9 @@ impl Widget for SharePanel {
         if area.is_empty() { return }
         if cx.has_key_focus(area) {
             let outside = match event {
-                Event::MouseDown(e) => self.picture_pointer(cx, e.abs, false).is_none(),
+                Event::MouseDown(e) => self.picture_pointer(cx, share, e.abs, false).is_none(),
                 Event::TouchUpdate(e) => e.touches.iter().any(|t| t.state == TouchState::Start
-                    && self.picture_pointer(cx, t.abs, false).is_none()),
+                    && self.picture_pointer(cx, share, t.abs, false).is_none()),
                 _ => false,
             };
             if outside { cx.revert_key_focus(); return }
@@ -548,7 +680,7 @@ impl Widget for SharePanel {
         };
         let input = match event.hits(cx, area) {
             Hit::FingerDown(e) => {
-                let Some(p) = self.picture_pointer(cx, e.abs, false) else { return };
+                let Some(p) = self.picture_pointer(cx, share, e.abs, false) else { return };
                 let Some(button) = button(&e.device) else { return };
                 self.buttons |= 1 << button;
                 self.last_pointer = p;
@@ -559,24 +691,24 @@ impl Widget for SharePanel {
             Hit::FingerUp(e) => {
                 let Some(button) = button(&e.device) else { return };
                 if self.buttons & (1 << button) == 0 { return }
-                let Some(p) = self.picture_pointer(cx, e.abs, true) else { return };
+                let Some(p) = self.picture_pointer(cx, share, e.abs, true) else { return };
                 self.buttons &= !(1 << button);
                 AppInput::PointerUp { x: p.x, y: p.y, button, mods: mods(e.modifiers) }
             }
             Hit::FingerMove(e) => {
-                let Some(p) = self.picture_pointer(cx, e.abs, self.buttons != 0) else { return };
+                let Some(p) = self.picture_pointer(cx, share, e.abs, self.buttons != 0) else { return };
                 self.last_pointer = p;
                 self.pointer_mods = mods(e.modifiers);
                 AppInput::PointerMove { x: p.x, y: p.y }
             }
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
-                let Some(p) = self.picture_pointer(cx, e.abs, false) else { return };
+                let Some(p) = self.picture_pointer(cx, share, e.abs, false) else { return };
                 // The pop-out holds nothing else: keys follow the pointer there. Docked, a press takes them.
                 if self.popout && !cx.has_key_focus(area) { cx.set_key_focus_from_user(area); }
                 AppInput::PointerMove { x: p.x, y: p.y }
             }
             Hit::FingerScroll(e) => {
-                let Some(p) = self.picture_pointer(cx, e.abs, false) else { return };
+                let Some(p) = self.picture_pointer(cx, share, e.abs, false) else { return };
                 if let Event::Scroll(s) = event { s.handled_x.set(true); s.handled_y.set(true); }
                 AppInput::Scroll { x: p.x, y: p.y, dx: e.scroll.x, dy: e.scroll.y, mods: mods(e.modifiers) }
             }
@@ -690,7 +822,84 @@ impl Widget for ShareChoices {
 mod tests {
     use super::*;
     #[test]
+    fn opening_uids_includes_all_dynamic_let_control_buttons_and_join_call() {
+        use crate::call::{CallAction, CallController, CallEnv, Message, Press, ShareOfferExt};
+        use crate::lists::{Live, Page, ViewData};
+        use makepad_call::driver::{std_spawn, VoiceSource};
+        use makepad_town_core::share::hello::MediaCaps;
+        let mut pool = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
+        let cx = &mut *pool;
+        let ui = cx.with_vm(|vm| {
+            let root = script_eval!(vm, { use mod.widgets.* View{flow: Down
+                project_call := CallButton{} home_join_call := JoinCallButton{} live_share := LiveSharePage{}
+            } });
+            WidgetRef::script_from_value(vm, root)
+        });
+        let (session, town, ben, kit) = ([1; 16], [2; 32], [3; 65], [4; 65]);
+        let mut ctl = CallController::default();
+        ctl.configure(CallEnv { devices_path: Default::default(), files: Default::default(), spawn: std_spawn(), jobs: std_spawn(),
+            signal: Arc::new(|| {}), voice: VoiceSource::Off });
+        let port = ctl.link_up(cx, ben, kit, "Kit").unwrap();
+        ctl.set_open_town(Some((town, vec![(kit, "Kit".into())])));
+        ctl.set_peer_caps(kit, MediaCaps(MediaCaps::MULTIPARTY_SHARE_V1));
+        port.messages_in.try_send(Message::Share { session, title: "Fab".into(), w: 320., h: 180.,
+            ext: ShareOfferExt { town: Some(town), ..Default::default() } }.encode()).unwrap();
+        ctl.poll(cx);
+        let mut data = ViewData { page: Page::Live(Live::Share(session)), call: ctl.shown(), ..Default::default() };
+        let offer = Arc::make_mut(&mut Arc::make_mut(&mut data.call.share.offers)[0]);
+        offer.role = ShareRole::Sharer { link: crate::app_link::LinkId::TEST, window: WindowId(1) };
+        offer.watchers = vec![(ben, "Ben".into()), (kit, "Kit".into())];
+        data.call.share.control.requests = vec![(session, kit, "Kit".into()), (session, ben, "Ben".into())];
+        data.sync_live_share(cx, &ui);
+        let page = ui.widget(cx, ids!(live_share));
+        let mut target = ui_checks::UiCheckTarget::new(cx);
+        target.draw(cx, &ui, dvec2(400., 320.));
+        assert_eq!(page.label(cx, ids!(share_watchers)).text(), "Watching: Ben, Kit");
+        assert_eq!(page.label(cx, ids!(sharer_status)).text(), "Kit asks to control Fab");
+        let primary = page.button(cx, ids!(let_control));
+        let requests = page.flat_list(cx, ids!(control_requests));
+        let row = requests.borrow().unwrap().items.values().next().expect("Ben's request row").widget.clone();
+        assert_eq!(row.label(cx, ids!(prompt)).text(), "Ben asks to control Fab");
+        let allow = row.button(cx, ids!(allow));
+        let mut a11y = a11y_tree::Node::default();
+        allow.borrow().unwrap().semantics(cx, &mut a11y);
+        assert_eq!(a11y.name, "Allow Ben to control Fab");
+        for (button, peer) in [(&primary, kit), (&allow, ben)] {
+            assert_eq!(button.text(), "Allow");
+            assert!(button.area().rect(cx).size.x > 0., "the Allow control was drawn");
+            assert_eq!(button.action_data().as_ref().and_then(|a| a.downcast_ref::<CallAction>()),
+                Some(&CallAction::OnShare(session, Press::LetControl(peer))));
+        }
+        let opening = opening_uids(cx, &ui);
+        for uid in [ui.widget(cx, ids!(project_call.call_join)).widget_uid(), ui.widget(cx, ids!(home_join_call.call_join)).widget_uid(),
+            primary.widget_uid(), page.widget(cx, ids!(allow_all)).widget_uid(), allow.widget_uid()] {
+            assert!(opening.contains(&uid), "opening control {uid:?}");
+        }
+        data.call.share.control.requests.pop();
+        data.call.share.control_session = Some(session);
+        data.call.share.control.active = Some([5; 16]);
+        data.call.share.control.holder = Some((ben, "Ben".into()));
+        data.sync_live_share(cx, &ui);
+        assert_eq!(page.label(cx, ids!(sharer_status)).text(), "Ben is controlling Fab · Kit asks to control Fab");
+        assert!(!page.widget(cx, ids!(pending_requests)).visible() && requests.borrow().unwrap().items.is_empty());
+        assert!(page.borrow::<crate::ui::live::LiveSharePage>().unwrap().let_control_buttons().is_empty());
+        assert!(!opening_uids(cx, &ui).contains(&allow.widget_uid()));
+        ctl.shutdown(cx);
+    }
+
+    #[test]
     fn pointer_maps_the_displayed_window_and_excludes_both_kinds_of_bars() {
+        let watched = Some([1; 16]);
+        let selections = overlay::Selections::new(0, [800., 400.], &Default::default(), &Default::default());
+        let mut share = crate::call::ShareShown::default();
+        share.watching = watched;
+        share.overlay = Some(([0; 32], selections));
+        assert!(picture_overlay(watched, &share).is_some());
+        assert!(picture_overlay(Some([2; 16]), &share).is_none(), "a different pop-out uses its own picture coordinates");
+        for size in [[0., 400.], [800., -1.], [f64::NAN, 400.], [800., f64::INFINITY]] {
+            share.overlay.as_mut().unwrap().1.window_size = size;
+            assert!(picture_overlay(watched, &share).is_none(), "invalid window size {size:?}");
+        }
         let panel = Rect { pos: dvec2(10., 20.), size: dvec2(400., 300.) };
         for (size, origin, end, bar) in [
             (dvec2(800., 400.), dvec2(10., 70.), dvec2(410., 270.), dvec2(210., 69.)),

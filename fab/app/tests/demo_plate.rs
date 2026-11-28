@@ -17,6 +17,8 @@
 
 #[path = "common/picture.rs"]
 mod picture;
+#[path = "common/view_menu.rs"]
+mod view_menu;
 use makepad_script::syntax;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, KeyCode, KeyModifiers, Role, Selector, TestApp, TestConfig};
@@ -139,6 +141,9 @@ fn named_views(app: TestApp, mode: &Path) {
     // The grab waits for a recording that drew all three, and for the view's finished picture.
     wait_until(&app, "a recording of the three parts", || parts_drawn(&app) == 3);
     settled_camera(&app);
+    if app.locator(Selector::id("code")).count() == 0 {
+        view_menu::pick(&app, "Code");
+    }
     let rect = viewport_rect(&app);
     let shot = picture::finished_screenshot(&app);
     // The bracket and the lattice are a strong orange, the vase a teal. (The view gizmo alone has
@@ -152,7 +157,7 @@ fn named_views(app: TestApp, mode: &Path) {
     // finished view is exported: the mode file is read at each sample of the still view.
     std::fs::write(mode, "vgrab").unwrap();
     let narrow = rect.2 - rect.0;
-    app.locator(Selector::role(Role::ToggleButton).name("Code")).wait_visible().check(false);
+    view_menu::pick(&app, "Code");
     wait_until(&app, "the view at its full width", || {
         let rect = viewport_rect(&app);
         rect.2 - rect.0 > narrow

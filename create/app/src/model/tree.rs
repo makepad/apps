@@ -126,7 +126,7 @@ impl Model {
             }
             None => {
                 if !self.state.active_member(&self.me()) { return Err("This town is read-only now.".into()) }
-                self.append(Content::Entity { kind: Key::Number(kind::TOWN), derive: None, project: None,
+                self.append(Content::Entity { copied_from: vec![], kind: Key::Number(kind::TOWN), derive: None, project: None,
                     fields: vec![(field::TITLE, Value::Text(title.into()))] }, Origin::Ui).map(|_| ())
             }
         }

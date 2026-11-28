@@ -1,5 +1,5 @@
 //! Each spell of control is bound to a share, an authenticated connection and a fresh grant.
-use super::{CallController, Phase, ShareRole};
+use super::{CallController, ShareRole};
 use crate::app_link::{AppInput, AppLinks, LinkPhase};
 use crate::call::{control::{ControlMessage, EndReason, GrantId, PanelInput}, topic};
 use makepad_town_core::{event::SessionId, key::PublicKey};
@@ -112,8 +112,8 @@ fn press_point(event: &AppInput) -> Option<(f64, f64)> {
 pub(super) struct Takeover {
     grant: Option<Grant>,
     /// A new subscription to check once the app links are available in receive_control.
-    new_watcher: Option<SessionId>,
-    released: Option<(SessionId, GrantId)>,
+    pub(super) new_watchers: Vec<(SessionId, PublicKey)>,
+    released: Option<(SessionId, GrantId, PublicKey)>,
     pub(super) input: InputCounts,
 }
 
@@ -130,28 +130,28 @@ impl CallController {
         self.sharing.shown.control_session.and_then(|s| self.sharing.shown.offer(s)).is_some_and(|o| matches!(o.role, ShareRole::Sharer { .. }))
     }
 
-    fn matches_grant(&self, session: SessionId, id: GrantId) -> bool {
+    fn matches_grant(&self, sender: PublicKey, session: SessionId, id: GrantId) -> bool {
         self.takeover.grant.as_ref().is_some_and(|g| g.id == id && g.session == session
-            && self.peer_epoch() == Some(g.peer))
+            && sender == g.peer.0 && self.peer_epoch_of(&sender) == Some(g.peer))
     }
 
     fn begin_control(&mut self, session: SessionId, id: GrantId, peer: (PublicKey, u64)) {
-        self.takeover.new_watcher = None;
         self.takeover.grant = Some(Grant { session, id, peer, buttons: 0 });
         self.takeover.input.logged = 0;
         self.takeover.released = None;
         if self.sharing.shown.watching == Some(session) {
             self.sharing.shown.control.asking = None;
         } else {
-            self.sharing.shown.control.requested = None;
+            self.sharing.shown.control.requests.retain(|(s, p, _)| (*s, *p) != (session, peer.0));
+            self.sharing.shown.control.holder = Some((peer.0, self.peer_display_name(&peer.0)));
         }
         self.sharing.shown.control_session = Some(session);
         self.sharing.shown.control.active = Some(id);
         self.sharing.shown.control.notice = None;
     }
 
-    pub(super) fn control_send(&mut self, message: ControlMessage) -> bool {
-        if self.send_peer(topic::INPUT, message.encode()).is_err() {
+    pub(super) fn control_send(&mut self, peer: PublicKey, message: ControlMessage) -> bool {
+        if self.send_peer_to(peer, topic::INPUT, message.encode()).is_err() {
             self.takeover.input.undelivered += 1;
             self.input_undelivered(1);
             return false
@@ -163,7 +163,8 @@ impl CallController {
     pub fn ask_control(&mut self, session: SessionId, asking: bool) -> bool {
         if self.sharing.shown.watching != Some(session) || self.sharing.shown.control.asking.is_some() == asking
             || (asking && self.matches_session_grant(session)) { return false }
-        if !self.control_send(ControlMessage::Ask { session, asking }) { return false }
+        let Some(peer) = self.sharing.shown.watching_sharer else { return false };
+        if !self.control_send(peer, ControlMessage::Ask { session, asking }) { return false }
         self.sharing.shown.control.asking = asking.then_some(session);
         true
     }
@@ -172,20 +173,23 @@ impl CallController {
         self.takeover.grant.as_ref().is_some_and(|grant| grant.session == session)
     }
 
-    pub(super) fn watcher_started(&mut self, session: SessionId) {
-        let allowed = self.peer_can_control(session);
-        self.control_send(ControlMessage::Rights { session, allowed });
-        self.takeover.new_watcher = allowed.then_some(session);
+    pub(super) fn watcher_started(&mut self, session: SessionId, peer: PublicKey) {
+        let allowed = self.peer_can_control(session, &peer);
+        self.control_send(peer, ControlMessage::Rights { session, allowed });
+        if allowed && self.takeover.grant.is_none() { self.takeover.new_watchers.push((session, peer)); }
     }
 
-    pub(super) fn grant_control(&mut self, apps: &mut AppLinks, session: SessionId) -> bool {
+    pub(super) fn grant_control(&mut self, apps: &mut AppLinks, session: SessionId, next_peer: PublicKey) -> bool {
         let Some(offer) = self.sharing.shown.offer(session) else { return false };
         let ShareRole::Sharer { link, window } = offer.role else { return false };
-        let Some(peer) = self.peer_epoch() else { return false };
-        if self.sharing.shown.peer_watching != Some(session)
-            || !self.peer_can_control(session)
-            || self.takeover.grant.is_some() || !apps.state(link).is_some_and(|s| s.phase == LinkPhase::Live
+        let Some(peer) = self.peer_epoch_of(&next_peer) else { return false };
+        if !self.is_viewer(session, &next_peer) || !self.peer_can_control(session, &next_peer)
+            || !apps.state(link).is_some_and(|s| s.phase == LinkPhase::Live
                 && s.windows.iter().any(|w| w.id == window)) { return false }
+        if let Some(old) = &self.takeover.grant {
+            if old.session == session && old.peer == peer { return false }
+            self.end_control(EndReason::TakenBack, true);
+        }
         let mut grant = [0; 16];
         if let Err(e) = makepad_network::tls::os_random(&mut grant) {
             log!("Could not grant control: {e}");
@@ -195,17 +199,18 @@ impl CallController {
         apps.allow_input(link);
         if !apps.state(link).is_some_and(|s| s.input_allowed) { return false }
         self.begin_control(session, grant, peer);
-        self.control_send(ControlMessage::Control { session, grant, ended: None });
+        self.control_send(next_peer, ControlMessage::Control { session, grant, ended: None });
         true
     }
 
     pub fn panel_input(&mut self, input: &PanelInput) {
         let refusal = if self.local_control() || self.sharing.shown.watching.is_none() { Some(Refusal::NotWatching) }
-            else if !self.matches_grant(input.session, input.grant) { Some(Refusal::NoAllow) }
+            else if !self.sharing.shown.watching_sharer.is_some_and(|p| self.matches_grant(p, input.session, input.grant)) { Some(Refusal::NoAllow) }
             else if !self.takeover.grant.as_mut().is_some_and(|g| g.observe(&input.event)) { Some(Refusal::Unpaired) }
             else { None };
         if let Some(why) = refusal { return self.takeover.input.refuse(why) }
-        if self.control_send(ControlMessage::Input { session: input.session, grant: input.grant, event: input.event.clone() }) {
+        let peer = self.sharing.shown.watching_sharer.unwrap();
+        if self.control_send(peer, ControlMessage::Input { session: input.session, grant: input.grant, event: input.event.clone() }) {
             let counts = &mut self.takeover.input;
             counts.sent += 1;
             if let Some((x, y)) = press_point(&input.event) {
@@ -218,22 +223,23 @@ impl CallController {
     pub(super) fn end_control(&mut self, reason: EndReason, notify: bool) -> bool {
         let Some(active) = self.takeover.grant.take() else { return false };
         self.sharing.shown.control.active = None;
+        self.sharing.shown.control.holder = None;
         let Some(offer) = self.sharing.shown.offer(active.session).cloned() else { return true };
         let (session, grant) = (active.session, active.id);
-        let connected = self.peer_epoch() == Some(active.peer);
+        let connected = self.peer_epoch_of(&active.peer.0) == Some(active.peer);
         let local = self.local_control();
         if let ShareRole::Sharer { link, .. } = offer.role {
             self.sharing.revokes.push(link);
             if connected && notify {
-                self.control_send(ControlMessage::Control { session, grant, ended: Some(reason) });
+                self.control_send(active.peer.0, ControlMessage::Control { session, grant, ended: Some(reason) });
                 if let Some(link) = self.links.get_mut(&active.peer.0) { link.flush_peer(&mut self.sent); }
             }
         } else if connected && notify {
-            if self.control_send(ControlMessage::Release { session, grant }) {
-                self.takeover.released = Some((session, grant));
+            if self.control_send(active.peer.0, ControlMessage::Release { session, grant }) {
+                self.takeover.released = Some((session, grant, active.peer.0));
             }
         }
-        let peer = &self.view().peer_name;
+        let peer = self.peer_display_name(&active.peer.0);
         let title = &offer.title;
         let line = match reason {
             EndReason::TakenBack if local => "You took back control.".into(),
@@ -251,8 +257,11 @@ impl CallController {
 
     /// Drain only the input topic. The peer-event dispatcher separately accounts for undelivered messages.
     pub fn receive_control(&mut self, apps: &mut AppLinks) -> bool {
-        let mut changed = self.takeover.new_watcher.take().is_some_and(|s| self.grant_control(apps, s));
-        for body in self.take_peer(topic::INPUT) {
+        let mut changed = false;
+        for (s, p) in std::mem::take(&mut self.takeover.new_watchers) {
+            if self.takeover.grant.is_none() { changed |= self.grant_control(apps, s, p); }
+        }
+        for (sender, body) in self.take_peer_with_sender(topic::INPUT) {
             if self.sharing.shown.offers.is_empty() {
                 self.takeover.input.refuse(Refusal::NoShare);
                 continue
@@ -263,7 +272,7 @@ impl CallController {
             let offer = session.and_then(|s| self.sharing.shown.offer(s));
             let size = offer.or_else(|| self.sharing.shown.control_session.and_then(|s| self.sharing.shown.offer(s)))
                 .map_or((0., 0.), |o| o.window_size);
-            let buttons = self.takeover.grant.as_ref().map_or(0, |g| g.buttons);
+            let buttons = self.takeover.grant.as_ref().filter(|g| g.peer.0 == sender && Some(g.session) == session).map_or(0, |g| g.buttons);
             let msg = match ControlMessage::decode_captured(&body, size, buttons) {
                 Ok(Some(msg)) => msg,
                 Ok(None) => continue,
@@ -281,16 +290,23 @@ impl CallController {
             };
             match (offer.role, msg) {
                 (ShareRole::Sharer { .. }, ControlMessage::Ask { session, asking }) => {
-                    if self.matches_session_grant(session) { continue }
-                    if asking && self.grant_control(apps, session) { changed = true; continue }
-                    // The request may arrive before the first View measurement. Allow still requires a subscriber.
-                    if !asking && self.sharing.shown.control.requested != Some(session) { continue }
-                    let request = asking.then_some(session);
-                    changed |= self.sharing.shown.control.requested != request;
-                    self.sharing.shown.control.requested = request;
+                    if !self.is_recipient(session, &sender) { self.takeover.input.refuse(Refusal::Stale); continue }
+                    if self.takeover.grant.as_ref().is_some_and(|g| g.session == session && g.peer.0 == sender) { continue }
+                    if asking && self.takeover.grant.is_none() && self.peer_can_control(session, &sender)
+                        && self.grant_control(apps, session, sender) { changed = true; continue }
+                    let pos = self.sharing.shown.control.requests.iter().position(|(s, p, _)| (*s, *p) == (session, sender));
+                    match (asking, pos) {
+                        (true, None) => {
+                            let name = self.peer_display_name(&sender);
+                            self.sharing.shown.control.requests.push((session, sender, name));
+                        }
+                        (false, Some(i)) => { self.sharing.shown.control.requests.remove(i); }
+                        _ => continue,
+                    }
+                    changed = true;
                 }
                 (ShareRole::Sharer { link, window }, ControlMessage::Input { session, grant, event })
-                    if offer.session == session && self.matches_grant(session, grant)
+                    if offer.session == session && self.matches_grant(sender, session, grant)
                         && apps.state(link).is_some_and(|s| s.input_allowed) => {
                     if self.takeover.grant.as_mut().is_some_and(|g| g.observe(&event)) {
                         let press = press_point(&event);
@@ -304,33 +320,33 @@ impl CallController {
                     } else { self.takeover.input.refuse(Refusal::Unpaired); }
                 }
                 (ShareRole::Sharer { .. }, ControlMessage::Release { session, grant })
-                    if offer.session == session && self.matches_grant(session, grant) => {
+                    if offer.session == session && self.matches_grant(sender, session, grant) => {
                     changed |= self.end_control(EndReason::Released, true);
                     self.revoke_ended_shares(apps);
                 }
-                (ShareRole::Viewer, ControlMessage::Control { session, grant, ended: None })
-                    if offer.session == session => {
-                    if self.matches_grant(session, grant) { continue }
+                (ShareRole::Viewer { sharer }, ControlMessage::Control { session, grant, ended: None })
+                    if sharer == sender && offer.session == session => {
+                    if self.matches_grant(sender, session, grant) { continue }
                     if self.sharing.shown.watching != Some(session) || self.takeover.grant.is_some()
-                        || (self.view().phase != Phase::Live && self.sharing.shown.control.asking != Some(session)
+                        || (!self.flow.is_voice_peer(&sender) && self.sharing.shown.control.asking != Some(session)
                             && self.sharing.shown.control.allowed != Some(session)) {
-                        self.control_send(ControlMessage::Release { session, grant });
-                    } else if let Some(peer) = self.peer_epoch() {
+                        self.control_send(sender, ControlMessage::Release { session, grant });
+                    } else if let Some(peer) = self.peer_epoch_of(&sender) {
                         self.begin_control(session, grant, peer);
                         changed = true;
                     }
                 }
-                (ShareRole::Viewer, ControlMessage::Rights { session, allowed }) => {
+                (ShareRole::Viewer { sharer }, ControlMessage::Rights { session, allowed }) if sharer == sender => {
                     if self.sharing.shown.watching == Some(session) {
                         let right = allowed.then_some(session);
                         changed |= self.sharing.shown.control.allowed != right;
                         self.sharing.shown.control.allowed = right;
                     }
                 }
-                (ShareRole::Viewer, ControlMessage::Control { session, grant, ended: Some(EndReason::Released) })
-                    if self.takeover.released == Some((session, grant)) => self.takeover.released = None,
-                (ShareRole::Viewer, ControlMessage::Control { session, grant, ended: Some(reason) })
-                    if self.matches_grant(session, grant) => changed |= self.end_control(reason, false),
+                (ShareRole::Viewer { sharer }, ControlMessage::Control { session, grant, ended: Some(EndReason::Released) })
+                    if sharer == sender && self.takeover.released == Some((session, grant, sender)) => self.takeover.released = None,
+                (ShareRole::Viewer { sharer }, ControlMessage::Control { session, grant, ended: Some(reason) })
+                    if sharer == sender && self.matches_grant(sender, session, grant) => changed |= self.end_control(reason, false),
                 (_, ControlMessage::Input { .. }) => self.takeover.input.refuse(Refusal::NoAllow),
                 _ => self.takeover.input.refuse(Refusal::Stale),
             }

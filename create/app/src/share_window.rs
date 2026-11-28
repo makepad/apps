@@ -173,6 +173,17 @@ impl App {
             && TranscriptInput::from_event(event, false) == Some(TranscriptInput::Choose)
     }
 
+    pub(crate) fn allow_consented_call_press(&self, press: CallAction, uid: WidgetUid, opening: &[WidgetUid],
+        grant: impl FnOnce(bool) -> bool) -> bool {
+        if matches!(press, CallAction::Press(Press::Watch | Press::LetControl(_) | Press::AllowAll(true))) { return false }
+        if matches!(press, CallAction::Press(Press::Answer)) && self.view.page != Page::Live(Live::Call) { return false }
+        if matches!(press, CallAction::OnShare(_, Press::Watch | Press::LetControl(_) | Press::AllowAll(true))
+            | CallAction::Press(Press::Share(_) | Press::Answer | Press::Call | Press::CallSeat(_) | Press::JoinCall(..))) && !opening.contains(&uid) { return false }
+        let opens_right = matches!(press, CallAction::OnShare(_, Press::LetControl(_) | Press::AllowAll(true)));
+        if !self.call.opening_from_ui(press) || !grant(!opens_right) { return false }
+        !matches!(press, CallAction::OnShare(session, _) if self.view.share_page() != Some(session))
+    }
+
     /// Check provenance only for an opening control in this release's captured actions.
     pub(crate) fn consented_call_presses(&mut self, cx: &mut Cx, event: &Event, actions: &mut ActionsBuf, opening: &[WidgetUid]) {
         if TranscriptInput::from_event(event, false) != Some(TranscriptInput::Choose) { return }
@@ -186,7 +197,7 @@ impl App {
             if !opening.contains(&w.widget_uid) { return true }
             self.shell_actions(cx, std::slice::from_ref(action));
             if self.view.page == Page::Live(Live::Share(session)) && self.view.call.share.offer(session)
-                .is_some_and(|o| o.role == ShareRole::Viewer) {
+                .is_some_and(|o| matches!(o.role, ShareRole::Viewer { .. })) {
                 self.call_opening_presses(cx, CallAction::OnShare(session, Press::Watch));
             }
             false
@@ -197,16 +208,19 @@ impl App {
             if let CallAction::Press(p @ Press::Share(ShareChoice::Row(_))) = *press {
                 if self.call.shown().share.capture.picking { self.capture_input(cx, p); continue; }
             }
-            if matches!(press, CallAction::Press(Press::Watch | Press::LetControl | Press::AllowAll(true))) { continue }
-            if matches!(press, CallAction::Press(Press::Answer)) && self.view.page != Page::Live(Live::Call) { continue }
-            if matches!(press, CallAction::OnShare(_, Press::Watch | Press::LetControl | Press::AllowAll(true)) |
-                CallAction::Press(Press::Share(_) | Press::Answer)) && !opening.contains(&w.widget_uid) { continue }
-            let opens_right = matches!(press, CallAction::OnShare(_, Press::LetControl | Press::AllowAll(true)));
-            if !self.call.opening_from_ui(*press) || !consent::granted(cx, !opens_right && self.call.consent_home.verified()) { continue }
+            if !self.allow_consented_call_press(*press, w.widget_uid, opening, |allow_test_home| {
+                consent::granted(cx, allow_test_home && self.call.consent_home.verified())
+            }) { continue }
             match *press {
-                CallAction::OnShare(session, _) if self.view.share_page() != Some(session) => continue,
-                CallAction::OnShare(session, Press::LetControl) => {
-                    if self.call.allow_control(&mut self.app_links, session, &self.view.call.view.peer_name) { self.show_call(cx); }
+                CallAction::Press(Press::JoinCall(session, town, scope)) => {
+                    if self.model.as_ref().is_some_and(|m| m.open_id() == town && m.call_join_scope(town, session) == Some(scope)) {
+                        self.call_opening_presses(cx, *press);
+                    }
+                }
+                CallAction::OnShare(session, Press::LetControl(peer)) => {
+                    let Some(model) = &self.model else { continue };
+                    let name = model.author_label(&peer, makepad_town_core::event::Actor::Human);
+                    if self.call.allow_control(&mut self.app_links, session, peer, &name) { self.show_call(cx); }
                 }
                 CallAction::OnShare(session, Press::AllowAll(true)) => {
                     if self.call.allow_all_control(&mut self.app_links, session) { self.show_call(cx); }

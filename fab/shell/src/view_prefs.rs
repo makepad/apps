@@ -52,13 +52,90 @@ fn parse_look(s: &str) -> Option<PartLook> {
     }
 }
 
-fn load(key: &str) -> Option<String> {
+fn parse_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn parse_code(text: &str) -> (bool, Option<f64>) {
+    (
+        parse_value(text, "code") != Some("0"),
+        parse_value(text, "code_width").and_then(|w| w.parse().ok()).filter(|w: &f64| *w > 0.0),
+    )
+}
+
+/// Every machine view and workspace preference loaded at startup.
+#[derive(Clone, Debug)]
+pub struct ViewPrefs {
+    pub look: Option<PartLook>,
+    pub drag_detail: DragDetail,
+    pub sliced_detail: SlicedDetail,
+    pub traced_detail: TracedDetail,
+    pub soldered: bool,
+    pub lighting: Option<Lighting>,
+    pub board_lighting: Option<Lighting>,
+    pub colours: Option<fab_plate::ColourMode>,
+    pub shading: Option<Shading>,
+    pub overlays: Option<Overlays>,
+    pub slice: bool,
+    pub surface: bool,
+    pub nav: crate::api::NavScheme,
+    pub invert_wheel: bool,
+    pub part_side_w: Option<f64>,
+    pub arm: bool,
+    pub scan: bool,
+    pub workspaces: crate::workspaces::Workspaces,
+    pub scan_colour: bool,
+    pub scan_cameras: bool,
+    pub ortho: bool,
+}
+
+impl ViewPrefs {
+    /// Parses every startup view preference from `view.prefs` text with pre-built `workspaces`.
+    pub fn from_text(text: &str, workspaces: crate::workspaces::Workspaces) -> Self {
+        let v = |k: &str| parse_value(text, k);
+        Self {
+            look: v("look").and_then(parse_look),
+            drag_detail: parse_drag_detail(v("drag_detail")),
+            sliced_detail: parse_sliced_detail(v("sliced_detail")),
+            traced_detail: parse_traced_detail(v("traced_detail")),
+            soldered: parse_soldered(v("soldered")),
+            lighting: v("lighting").and_then(Lighting::from_key),
+            board_lighting: v("board_lighting").and_then(Lighting::from_key),
+            colours: v("colours").and_then(fab_plate::ColourMode::from_key),
+            shading: v("shading").and_then(Shading::from_key),
+            overlays: v("overlays").map(parse_overlays),
+            slice: v("slice") == Some("1"),
+            surface: v("surface") == Some("1"),
+            nav: v("nav").and_then(crate::api::NavScheme::from_key).unwrap_or_default(),
+            invert_wheel: v("invert_wheel") == Some("1"),
+            part_side_w: v("part_side_w").and_then(parse_part_side_w),
+            arm: v("arm") == Some("1"),
+            scan: v("scan") == Some("1"),
+            workspaces,
+            scan_colour: v("scan_colour") != Some("0"),
+            scan_cameras: v("scan_cameras") != Some("0"),
+            ortho: v("ortho") == Some("1"),
+        }
+    }
+
+    /// Reads `view.prefs` (at most once) and `view.workspaces.ron` (at most once).
+    pub fn load() -> Self {
+        let text = read_prefs().unwrap_or_default();
+        let code = parse_code(&text);
+        let workspaces = crate::workspaces::Workspaces::load_with_code(code);
+        Self::from_text(&text, workspaces)
+    }
+}
+
+fn read_prefs() -> Option<String> {
     if cfg!(target_arch = "wasm32") {
         return None;
     }
-    let text = std::fs::read_to_string(path()?).ok()?;
-    let start = format!("{key}=");
-    text.lines().find_map(|l| l.strip_prefix(start.as_str()).map(str::to_string))
+    std::fs::read_to_string(path()?).ok()
+}
+
+fn load(key: &str) -> Option<String> {
+    parse_value(&read_prefs()?, key).map(str::to_owned)
 }
 
 fn save(key: &str, value: &str) {
@@ -93,7 +170,7 @@ pub fn load_slice() -> bool {
 
 /// Design's code split: shown, and its width (None: the starting one).
 pub fn load_code() -> (bool, Option<f64>) {
-    (load("code").as_deref() != Some("0"), load("code_width").and_then(|w| w.parse().ok()).filter(|w: &f64| *w > 0.0))
+    parse_code(&read_prefs().unwrap_or_default())
 }
 
 /// Keeps the code split's state and width for the next start.
@@ -129,7 +206,11 @@ pub fn save_nav(scheme: crate::api::NavScheme) {
 
 /// The Part sidebar's width, as the person dragged it.
 pub fn load_part_side_w() -> Option<f64> {
-    load("part_side_w").and_then(|w| w.trim().parse::<f64>().ok()).filter(|w| w.is_finite())
+    load("part_side_w").as_deref().and_then(parse_part_side_w)
+}
+
+fn parse_part_side_w(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|w| w.is_finite())
 }
 
 pub fn save_part_side_w(width: f64) {
@@ -241,7 +322,11 @@ pub fn save_scan_cameras(on: bool) {
 
 /// How fine each version under the hand is, as chosen on this machine.
 pub fn load_drag_detail() -> DragDetail {
-    match load("drag_detail").as_deref().map(str::trim) {
+    parse_drag_detail(load("drag_detail").as_deref())
+}
+
+fn parse_drag_detail(value: Option<&str>) -> DragDetail {
+    match value.map(str::trim) {
         Some("halfway") => DragDetail::Halfway,
         Some("full") => DragDetail::Full,
         _ => DragDetail::Realtime,
@@ -262,7 +347,11 @@ pub fn save_drag_detail(detail: DragDetail) {
 
 /// How the Sliced view draws its far beads on the desktop, as chosen on this machine.
 pub fn load_sliced_detail() -> SlicedDetail {
-    match load("sliced_detail").as_deref().map(str::trim) {
+    parse_sliced_detail(load("sliced_detail").as_deref())
+}
+
+fn parse_sliced_detail(value: Option<&str>) -> SlicedDetail {
+    match value.map(str::trim) {
         Some("exact") => SlicedDetail::Exact,
         _ => SlicedDetail::Fast,
     }
@@ -281,7 +370,11 @@ pub fn save_sliced_detail(detail: SlicedDetail) {
 
 /// Traced sample detail, Fast until Exact is chosen.
 pub fn load_traced_detail() -> TracedDetail {
-    match load("traced_detail").as_deref().map(str::trim) {
+    parse_traced_detail(load("traced_detail").as_deref())
+}
+
+fn parse_traced_detail(value: Option<&str>) -> TracedDetail {
+    match value.map(str::trim) {
         Some("exact") => TracedDetail::Exact,
         _ => TracedDetail::Fast,
     }
@@ -300,7 +393,11 @@ pub fn save_traced_detail(detail: TracedDetail) {
 
 /// Solder joints show unless the person turned Soldered off (View menu).
 pub fn load_soldered() -> bool {
-    !matches!(load("soldered").as_deref().map(str::trim), Some("off"))
+    parse_soldered(load("soldered").as_deref())
+}
+
+fn parse_soldered(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("off"))
 }
 
 pub fn save_soldered(on: bool) {
@@ -361,6 +458,58 @@ mod tests {
         assert_eq!(load_library(), (pinned, Vec::new()), "Recent can be empty while Pinned survives");
         save("elec_library", r#"[[["","R"]],["incomplete pair"]]"#);
         assert_eq!(load_library(), (Vec::new(), Vec::new()), "a malformed list discards the whole preference");
+    }
+
+    #[test]
+    fn app_state_default_reads_no_prefs_and_apply_loaded_view_prefs_restores_all() {
+        use crate::api::NavScheme;
+        use crate::ui::stage::PART_SIDE_W;
+
+        let _prefs = FreshPrefs::new();
+        save_drag_detail(DragDetail::Full);
+        save_sliced_detail(SlicedDetail::Exact);
+        save_traced_detail(TracedDetail::Exact);
+        save_soldered(false);
+        save_nav(NavScheme::Blender);
+        save_invert_wheel(true);
+        save_part_side_w(420.0);
+        save_code(false, Some(520.0));
+        save_look(PartLook::Mesh);
+        save_ortho(true);
+
+        let mut state = AppState::default();
+        let pane = state.view.lead_plate();
+        assert_eq!(state.view.drag_detail, DragDetail::Realtime);
+        assert_eq!(state.view.sliced_detail, SlicedDetail::Fast);
+        assert_eq!(state.view.traced_detail, TracedDetail::Fast);
+        assert!(state.view.soldered);
+        assert_eq!(state.ui.nav, NavScheme::Fab);
+        assert!(!state.ui.invert_wheel);
+        assert_eq!(state.ui.part_side_w, PART_SIDE_W);
+        assert!(state.ui.code_shown(), "workspace construction ignores the saved code split");
+        assert_eq!(state.view.look, default_look());
+        assert!(!state.view.camera(pane).ortho);
+        assert_eq!(state.model_sources, Default::default());
+        assert_eq!(state.firmware_net, Default::default());
+        assert_eq!(state.firmware_tokens, Ok(Vec::new()));
+
+        let prefs = ViewPrefs::load();
+        state.apply_loaded_view_prefs(prefs.clone(), false);
+        assert_eq!(state.view.drag_detail, DragDetail::Full);
+        assert_eq!(state.view.sliced_detail, SlicedDetail::Exact);
+        assert_eq!(state.view.traced_detail, TracedDetail::Exact);
+        assert!(!state.view.soldered);
+        assert_eq!(state.ui.nav, NavScheme::Blender);
+        assert!(state.ui.invert_wheel);
+        assert_eq!(state.ui.part_side_w, 420.0);
+        assert!(!state.ui.code_shown(), "Design restores the saved code split");
+        assert_eq!(state.view.look, PartLook::Mesh);
+        assert_eq!(state.ui.workspaces.rev, 1);
+        assert_eq!(state.ui.workspaces.instance_rev, 1);
+        assert!(state.ui.workspaces.list.iter().all(|def| def.shape == 1));
+        assert!(!state.view.camera(pane).ortho, "a restored camera keeps its projection");
+        state.apply_loaded_view_prefs(prefs, true);
+        assert!(state.view.camera(pane).ortho, "a fresh camera takes the saved projection");
     }
 
     #[test]
@@ -437,17 +586,25 @@ mod tests {
         // (the far tier's beads as quads or every bead whole, as the person left them).
         assert_eq!(last.view.sliced_detail, SlicedDetail::Fast, "the far beads start fast");
         last.apply_core(&ShellAction::SetSlicedDetail(SlicedDetail::Exact));
-        assert_eq!(AppState::default().view.sliced_detail, SlicedDetail::Exact, "a restart keeps Exact");
+        let mut restarted = AppState::default();
+        assert_eq!(restarted.view.sliced_detail, SlicedDetail::Fast, "construction uses the default detail");
+        restarted.apply_view_prefs();
+        assert_eq!(restarted.view.sliced_detail, SlicedDetail::Exact, "a restart keeps Exact");
         assert_eq!(load_look(), Some(PartLook::Field), "the sliced detail keeps the look");
         last.apply_core(&ShellAction::SetSlicedDetail(SlicedDetail::Fast));
-        assert_eq!(AppState::default().view.sliced_detail, SlicedDetail::Fast, "Fast picked back comes back");
+        restarted.apply_view_prefs();
+        assert_eq!(restarted.view.sliced_detail, SlicedDetail::Fast, "Fast picked back comes back");
         // View › Traced Detail keeps the same default and restart behaviour.
         assert_eq!(last.view.traced_detail, TracedDetail::Fast, "traced samples start fast");
         last.apply_core(&ShellAction::SetTracedDetail(TracedDetail::Exact));
-        assert_eq!(AppState::default().view.traced_detail, TracedDetail::Exact, "a restart keeps Exact");
+        let mut restarted = AppState::default();
+        assert_eq!(restarted.view.traced_detail, TracedDetail::Fast, "construction uses the default detail");
+        restarted.apply_view_prefs();
+        assert_eq!(restarted.view.traced_detail, TracedDetail::Exact, "a restart keeps Exact");
         assert_eq!(load_look(), Some(PartLook::Field), "the traced detail keeps the look");
         last.apply_core(&ShellAction::SetTracedDetail(TracedDetail::Fast));
-        assert_eq!(AppState::default().view.traced_detail, TracedDetail::Fast, "Fast picked back comes back");
+        restarted.apply_view_prefs();
+        assert_eq!(restarted.view.traced_detail, TracedDetail::Fast, "Fast picked back comes back");
     }
 }
 
@@ -531,14 +688,17 @@ fn overlay_flags(overlays: &mut Overlays) -> [(&'static str, &mut bool); 7] {
 /// The overlays as chosen on this machine, if they were; one the file does not name starts as it
 /// always does.
 pub fn load_overlays() -> Option<Overlays> {
-    let text = load("overlays")?;
+    load("overlays").as_deref().map(parse_overlays)
+}
+
+fn parse_overlays(text: &str) -> Overlays {
     let mut overlays = Overlays::default();
     for (name, on) in overlay_flags(&mut overlays) {
         if let Some(value) = text.split(',').find_map(|kv| kv.strip_prefix(name)?.strip_prefix(':')) {
             *on = value.trim() == "1";
         }
     }
-    Some(overlays)
+    overlays
 }
 
 /// Keeps the person's choice of overlays for the next start.

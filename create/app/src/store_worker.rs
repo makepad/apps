@@ -28,6 +28,13 @@ pub struct StoredFile {
     pub id: Id,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoardMediaTarget {
+    pub board: Id,
+    /// Explicit top-left in 1/64 canvas units, or the next free spot at publication.
+    pub pos: Option<(i64, i64)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FileResult {
     pub town: TownId,
@@ -91,6 +98,7 @@ pub(crate) struct ClipImport {
 #[derive(Clone, Debug)]
 pub(crate) struct ClipResult {
     pub file: FileResult,
+    pub board: Option<BoardMediaTarget>,
     pub path: PathBuf,
     pub info: ClipImport,
     pub stored_poster: Option<StoredFile>,
@@ -195,7 +203,7 @@ enum Command {
     Add { town: TownId, project: Id, path: PathBuf, title: String, clip: Option<ClipImport> },
     Issue { draft: u64, town: TownId, png: Arc<Vec<u8>>, poster: Arc<Vec<u8>> },
     IssueVideo { draft: u64, town: TownId, recording: crate::app_link::report::Recording },
-    AddOwn { sequence: usize, town: TownId, path: PathBuf, title: String },
+    AddOwn { sequence: usize, town: TownId, path: PathBuf, title: String, board: Option<BoardMediaTarget> },
     StorePoster(Box<Poster>),
     RemoveRecording { path: PathBuf, title: String, extension: &'static str },
     Attach(Link),
@@ -229,6 +237,17 @@ impl StoreWorker {
 
     pub(crate) fn spawn(home: Arc<Home>, pool: TaskPool, wake_ui: impl Fn() + Send + Sync + 'static,
         before_start: impl FnOnce() + Send + 'static) -> io::Result<Self> {
+        Self::spawn_with(home, pool, wake_ui, default_poster_decoder(), before_start)
+    }
+
+    #[doc(hidden)]
+    pub fn start_with_poster_decoder(home: Arc<Home>, pool: TaskPool, wake_ui: impl Fn() + Send + Sync + 'static,
+        poster_decoder: PosterDecoder) -> io::Result<Self> {
+        Self::spawn_with(home, pool, wake_ui, poster_decoder, || {})
+    }
+
+    fn spawn_with(home: Arc<Home>, pool: TaskPool, wake_ui: impl Fn() + Send + Sync + 'static,
+        poster_decoder: PosterDecoder, before_start: impl FnOnce() + Send + 'static) -> io::Result<Self> {
         let (to, commands) = mpsc::sync_channel(1);
         let (snapshots, from) = mpsc::sync_channel(1);
         let flushed = Arc::new(AtomicBool::new(false));
@@ -243,7 +262,7 @@ impl StoreWorker {
             folder.get_or_init(|| std::fs::create_dir_all(&dir).map(|()| dir)
                 .map_err(|e| format!("Could not open the recordings folder: {e}")));
             signal();
-            Stores::new(home, pool).run(commands, snapshots, &*signal);
+            Stores::with_poster_decoder(home, pool, poster_decoder).run(commands, snapshots, &*signal);
             done.store(true, Ordering::Release);
             signal();
         })?;
@@ -276,7 +295,15 @@ impl StoreWorker {
 
     /// A person's own picture or video, posted to the town. The worker sniffs it.
     pub(crate) fn add_own(&mut self, town: TownId, path: PathBuf, title: String) {
-        self.pending.commands.push(Command::AddOwn { sequence: self.next_own, town, path, title });
+        self.queue_own(town, path, title, None);
+    }
+
+    pub(crate) fn add_board_file(&mut self, town: TownId, target: BoardMediaTarget, path: PathBuf, title: String) {
+        self.queue_own(town, path, title, Some(target));
+    }
+
+    fn queue_own(&mut self, town: TownId, path: PathBuf, title: String, board: Option<BoardMediaTarget>) {
+        self.pending.commands.push(Command::AddOwn { sequence: self.next_own, town, path, title, board });
         self.next_own += 1;
     }
 
@@ -328,8 +355,24 @@ struct Poster {
     jpeg: Result<Arc<Vec<u8>>, String>,
 }
 
+/// Geometry and duration read beside a video poster JPEG.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PosterMeta {
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+}
+
+/// Decodes a poster JPEG and fills video metadata for a dropped video file.
+pub type PosterDecoder = Arc<dyn Fn(&Path, &mut PosterMeta) -> Result<Vec<u8>, String> + Send + Sync>;
+
+fn default_poster_decoder() -> PosterDecoder {
+    Arc::new(decode_poster)
+}
+
 /// Dropping the closure also returns the clip if the pool refuses or cancels it.
 struct PosterJob {
+    decode: PosterDecoder,
     poster: Option<Poster>,
     results: mpsc::Sender<Poster>,
     worker: Thread,
@@ -338,7 +381,11 @@ struct PosterJob {
 impl PosterJob {
     fn run(mut self) {
         let poster = self.poster.as_mut().unwrap();
-        poster.jpeg = decode_poster(&poster.clip.path, &mut poster.clip.info).map(Arc::new);
+        let info = &mut poster.clip.info;
+        let mut meta = PosterMeta { width: info.width, height: info.height, duration_ms: info.duration_ms };
+        poster.jpeg = (self.decode)(&poster.clip.path, &mut meta).map(Arc::new);
+        // The container can report its geometry and duration even if reading its first frame fails.
+        (info.width, info.height, info.duration_ms) = (meta.width, meta.height, meta.duration_ms);
     }
 }
 
@@ -349,12 +396,12 @@ impl Drop for PosterJob {
     }
 }
 
-fn decode_poster(path: &Path, info: &mut ClipImport) -> Result<Vec<u8>, String> {
+fn decode_poster(path: &Path, meta: &mut PosterMeta) -> Result<Vec<u8>, String> {
     let name = path.to_str().ok_or("The file name is not text.")?;
     let mut decoder = makepad_video::VideoFileDecoder::open(name).map_err(|e| e.to_string())?;
     let found = decoder.info();
-    (info.width, info.height) = (found.width, found.height);
-    info.duration_ms = u64::try_from(found.duration_100ns / 10_000).unwrap_or(0);
+    (meta.width, meta.height) = (found.width, found.height);
+    meta.duration_ms = u64::try_from(found.duration_100ns / 10_000).unwrap_or(0);
 
     let frame = decoder.next_frame().map_err(|e| e.to_string())?.ok_or("the video has no frame")?;
     let w = u16::try_from(frame.width).map_err(|_| "frame too wide")?;
@@ -362,12 +409,13 @@ fn decode_poster(path: &Path, info: &mut ClipImport) -> Result<Vec<u8>, String> 
     let mut jpeg = Vec::new();
     jpeg_encoder::Encoder::new(&mut jpeg, 80).encode(&frame.to_rgb8(), w, h, jpeg_encoder::ColorType::Rgb)
         .map_err(|e| e.to_string())?;
-    if info.width == 0 { (info.width, info.height) = (frame.width, frame.height); }
+    if meta.width == 0 { (meta.width, meta.height) = (frame.width, frame.height); }
     Ok(jpeg)
 }
 
 struct Stores {
     pool: TaskPool,
+    poster_decoder: PosterDecoder,
     posters: mpsc::Sender<Poster>,
     poster_results: Receiver<Poster>,
     // The front is the first unposted drop. A storage retry keeps its original slot.
@@ -388,9 +436,14 @@ struct Stores {
 }
 
 impl Stores {
+    #[cfg(test)]
     fn new(home: Arc<Home>, pool: TaskPool) -> Self {
+        Self::with_poster_decoder(home, pool, default_poster_decoder())
+    }
+
+    fn with_poster_decoder(home: Arc<Home>, pool: TaskPool, poster_decoder: PosterDecoder) -> Self {
         let (posters, poster_results) = mpsc::channel();
-        Self { pool, posters, poster_results, first_own: 0, own_clips: VecDeque::new(),
+        Self { pool, poster_decoder, posters, poster_results, first_own: 0, own_clips: VecDeque::new(),
             home, chunk: CHUNK, #[cfg(test)] checked_slots: 0, announce: BTreeMap::new(), repairs: HashSet::new(), towns: HashMap::new(), changes: Snapshot::default(), retry: Vec::new(), recovery: Vec::new() }
     }
 
@@ -467,12 +520,12 @@ impl Stores {
     /// A person's file: sniff its kind from its first bytes, store it as it lies (no folder
     /// check, never removed), read a picture's size from its header, and for a video take its
     /// size and length and a first-frame poster. A refusal comes back as a result, not a retry.
-    fn add_own(&mut self, sequence: usize, town: TownId, path: &Path, title: &str) -> io::Result<()> {
+    fn add_own(&mut self, sequence: usize, town: TownId, path: &Path, title: &str, board: Option<BoardMediaTarget>) -> io::Result<()> {
         let refuse = |me: &mut Self, why: &'static str| {
             let info = ClipImport { source: ClipSource::Own, format: CaptureFormat::Png, session: None,
                 duration_ms: 0, poster: None, width: 0, height: 0 };
             let file = FileResult { town, project: None, title: title.to_owned(), result: Err(why) };
-            me.finish_own(sequence, ClipResult { file, path: path.to_owned(), info, stored_poster: None });
+            me.finish_own(sequence, ClipResult { file, board, path: path.to_owned(), info, stored_poster: None });
             Ok(())
         };
         let mut head = Vec::new();
@@ -483,16 +536,19 @@ impl Stores {
             eprintln!("town: could not read {}: {err}", path.display());
             return refuse(self, "This file could not be read.");
         }
-        let Some(format) = CaptureFormat::sniff(&head) else { return refuse(self, NOT_MEDIA) };
+        let Some(format) = CaptureFormat::sniff(&head) else {
+            return refuse(self, if board.is_some() { "Only pictures and videos can be dropped on a board." } else { NOT_MEDIA })
+        };
         let file = match self.import(town, path)? {
             Ok(file) => file,
             Err(why) => return refuse(self, why),
         };
         let info = ClipImport { source: ClipSource::Own, format, session: None, duration_ms: 0, poster: None, width: 0, height: 0 };
         let file_result = FileResult { town, project: None, title: title.to_owned(), result: Ok(file) };
-        let mut clip = ClipResult { file: file_result, path: path.to_owned(), info, stored_poster: None };
+        let mut clip = ClipResult { file: file_result, board, path: path.to_owned(), info, stored_poster: None };
         if format.is_video() {
             let job = PosterJob {
+                decode: self.poster_decoder.clone(),
                 poster: Some(Poster { sequence, clip, jpeg: Err("The poster job did not finish.".into()) }),
                 results: self.posters.clone(),
                 worker: thread::current(),
@@ -580,9 +636,9 @@ impl Stores {
                 }
                 return;
             }
-            Command::AddOwn { sequence, town, ref path, ref title } => {
+            Command::AddOwn { sequence, town, ref path, ref title, board } => {
                 if !retrying { self.own_clips.push_back(None); }
-                self.add_own(sequence, town, path, title)
+                self.add_own(sequence, town, path, title, board)
             }
             Command::StorePoster(poster) => {
                 self.store_poster(*poster, retrying);
@@ -614,7 +670,7 @@ impl Stores {
                             self.changes.recording_problems.push(why);
                         }
                     }
-                    self.changes.clips.push(ClipResult { file, path: path.clone(), info: info.clone(), stored_poster });
+                    self.changes.clips.push(ClipResult { file, board: None, path: path.clone(), info: info.clone(), stored_poster });
                 } else {
                     self.changes.files.push(file);
                 }
@@ -894,14 +950,23 @@ mod tests {
         std::fs::write(&video, b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2").unwrap();
         std::fs::write(&picture, b"GIF89a\x01\0\x01\0").unwrap();
 
-        // One batch makes the picture ready before the worker can drain the video result.
-        let mut worker = StoreWorker::start(home, test_pool(), || {}).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut worker = StoreWorker::start_with_poster_decoder(home, test_pool(), || {}, Arc::new(move |_, _| {
+            release_rx.lock().unwrap().recv().unwrap();
+            Err("synthetic broken video".into())
+        })).unwrap();
         worker.add_own([1; 32], video.clone(), "broken.mp4".into());
         worker.add_own([1; 32], picture.clone(), "picture.gif".into());
         worker.stop();
         worker.dispatch();
+        let snapshot = worker.from.recv().unwrap();
+        assert!(snapshot.clips.is_empty(), "the ready picture waits for the earlier video");
+        worker.acknowledge();
+        worker.dispatch();
+        release_tx.send(()).unwrap();
         let mut clips = Vec::new();
-        let mut problems = Vec::new();
+        let mut problems = snapshot.recording_problems.clone();
         while let Ok(snapshot) = worker.from.recv() {
             clips.extend_from_slice(&snapshot.clips);
             problems.extend_from_slice(&snapshot.recording_problems);
@@ -916,6 +981,40 @@ mod tests {
         assert_eq!(problems.len(), 1);
         assert_eq!(problems, ["broken.mp4: posted without a preview, since no picture could be read from it."],
             "the shown line is plain; the decoder's detail goes only to the log");
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn decode_poster_reads_a_real_clip_and_refuses_a_header_only_mp4() {
+        use makepad_video::{VideoFileCodec, VideoFileEncoder, VideoFileEncoderOptions};
+
+        let dir = ShareHomes::new("poster-decode");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let real = dir.0.join("real.mp4");
+        let mut encoder = VideoFileEncoder::new(real.to_str().unwrap(), VideoFileEncoderOptions {
+            codec: VideoFileCodec::H264, width: 64, height: 48, ..Default::default()
+        }).expect("create video encoder");
+        for grey in [96, 160] {
+            encoder.push_frame_rgb8(&[grey; 64 * 48 * 3], None).expect("encode frame");
+        }
+        encoder.finish().expect("finish the clip");
+
+        let mut meta = PosterMeta::default();
+        let jpeg = decode_poster(&real, &mut meta).expect("decode the poster");
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]), "the poster has a JPEG header");
+        assert_eq!((meta.width, meta.height), (64, 48), "poster dimensions match the clip");
+
+        let mp4 = b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2".as_slice();
+        let mov = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
+        for (name, bytes) in [
+            ("broken.mp4", mp4.to_vec()),
+            ("lying.png", [mp4, &[0; 8]].concat()),
+            ("screen.mov", [mov, &[0; 8]].concat()),
+        ] {
+            let path = dir.0.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(decode_poster(&path, &mut PosterMeta::default()).is_err(), "{name} has no poster frame");
+        }
     }
 
     #[test]

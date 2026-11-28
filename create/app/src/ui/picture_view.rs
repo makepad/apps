@@ -131,7 +131,9 @@ impl PictureView {
         // Completion wakes the UI. Only the current file's task can install a texture.
         match cx.task_pool().submit_named(Class::Visible, "load chat picture", move || {
             let bytes = std::fs::read(path).ok()?;
-            decode_image_from_data(&bytes).ok()
+            let mut image = decode_image_from_data(&bytes).ok()?;
+            image.prepare_for_texture();
+            Some(image)
         }) {
             Ok(task) => self.loading = Some(task),
             Err(_) => self.failed = true,

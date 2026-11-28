@@ -150,3 +150,20 @@ fn utc_formats_civil_time() {
     assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z", "a leap day");
     assert_eq!(at(1_794_745_296), "2026-11-15T12:21:36Z");
 }
+
+#[test]
+fn library_parts_lists_local_splash_files_deterministically_without_network() {
+    let root = std::env::temp_dir().join(format!("fab-library-local-parts-{}", std::process::id()));
+    let folder = root.join("example");
+    let src = Example { version: Cell::new(1) };
+    for (name, file) in [("E7", "E7.part.splash"), ("E2", "E2.part.splash"), ("E3", "E3.part.splash"),
+        ("E4.partial", "E4.partial.part.splash"), ("e5", "e5.part.splash"), ("E6", "E6.glb")] {
+        let dir = folder.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), "").unwrap();
+    }
+    std::fs::write(folder.join("E3/refused.txt"), "conversion refused").unwrap();
+    assert_eq!(Library::new(&root).parts(&src), ["E2", "E7"].map(|n| (n.into(), folder.join(n).join(format!("{n}.part.splash")))),
+        "only canonical, non-refused part documents should be listed, in part-number order");
+    std::fs::remove_dir_all(root).unwrap();
+}

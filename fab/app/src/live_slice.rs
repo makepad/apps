@@ -89,6 +89,7 @@ impl std::fmt::Debug for LiveResult {
 
 /// What a settle for the Print editor needs to turn the slice into its result.
 pub struct PrintJob {
+    pub head_envelope: std::path::PathBuf,
     pub gen: u64,
     pub settings: fab::print::PrintSettings,
     /// Print-side spool colours, independent of the viewport.
@@ -742,11 +743,15 @@ impl LiveOwner {
     /// Whether `msg` has the owner run: it asks for it now, or a publication is due. A message
     /// that waits holds a publication for the view's next take.
     fn due(&self, msg: &Msg, paced: bool) -> bool {
-        let due = msg.now() || !paced || self.taken.load(Ordering::Acquire);
-        if !due {
-            self.held.store(true, Ordering::Release);
+        if msg.now() || !paced || self.taken.load(Ordering::Acquire) {
+            return true;
         }
-        due
+        #[cfg(test)]
+        gates::reach("producer holds");
+        // Hold, then look again ([`LiveOwner::took`] takes, then looks): a take that came after
+        // the look above found nothing held and asked for nothing, so this message is due itself.
+        self.held.store(true, Ordering::SeqCst);
+        self.taken.load(Ordering::SeqCst)
     }
 
     /// The owner's loop: `msgs` handled in order, then what they applied published when a
@@ -779,7 +784,15 @@ impl LiveOwner {
                 continue;
             }
             if !inbox.msgs.is_empty() {
-                self.held.store(true, Ordering::Release);
+                #[cfg(test)]
+                gates::reach("owner parks");
+                // Hold, then look again, as [`LiveOwner::due`] does: a take since the look above
+                // asked for nothing, so what came meanwhile is due now.
+                self.held.store(true, Ordering::SeqCst);
+                if self.taken.load(Ordering::SeqCst) {
+                    msgs = std::mem::take(&mut inbox.msgs);
+                    continue;
+                }
             }
             inbox.state = Some(state);
             return;
@@ -1677,7 +1690,7 @@ pub fn input_for(plate_id: u64, setup: &CheckSetup, plate: Arc<Plate>, machine: 
     });
     // Non-planar tops plan with the installed head, else the placeholder: they slice and
     // preview either way, and the print check refuses them until a measured head is installed.
-    let np_head = Some(Arc::new(crate::head::boxes(&crate::head::for_slicing())));
+    let np_head = Some(Arc::new(crate::head::boxes(&crate::head::for_slicing_from(setup.head_envelope()))));
     LiveInput { plate_id, settings_id: setup.id_for(&plate), setup: Arc::new(move |kept| resolve.job_setup_of(&p, &m, kept)), plate, overlaps: None, paint: Arc::new(Vec::new()), frames, machine, np_head, pieces: None }
 }
 
@@ -1813,6 +1826,7 @@ pub fn settle(job: PrintJob, input: SliceInput) {
     let key = if job.check.is_some() { tag | 1 << 63 } else { tag };
     let print = job.check.is_none();
     if print {
+        drop(SLICED.take());
         h.owner.post(Msg::PrintJob { gen: job.gen, machine: job.machine.clone(), colours: job.palettes() });
     }
     let new = h.jobs.lock().insert(key, job).is_none();
@@ -3792,6 +3806,59 @@ mod tests {
         assert!(inbox.state.is_some_and(|l| l.unpublished == Unpublished::default()), "nothing waits for a next event");
     }
 
+    /// A view's take that lands between a waiting message's look at `taken` and its `held` finds
+    /// nothing held and asks for nothing; the message must not stay in the inbox with no owner
+    /// coming. Both places that hold a message for the next take: a producer's post, and an owner
+    /// parking with what came while it published.
+    #[test]
+    fn a_take_between_a_waiting_messages_look_and_its_hold_still_gets_it_out() {
+        let mut stranded = Vec::new();
+        for at in ["producer holds", "owner parks"] {
+            let owner = LiveOwner::new();
+            let handled = std::sync::atomic::AtomicUsize::new(0);
+            let handle = |l: &mut LiveState, m: Msg| if let Msg::Part(e) = m {
+                handled.fetch_add(1, Ordering::Relaxed);
+                apply_queued(l, e);
+            };
+            let publish = |l: &mut LiveState| {
+                l.unpublished = Unpublished::default();
+                owner.taken.store(false, Ordering::Release);
+            };
+            let work = Work { handle: &handle, publish: &publish, lost: &|why: String| panic!("the state was lost: {why}") };
+            // The view has not taken the newest publication yet.
+            owner.taken.store(false, Ordering::Release);
+            let part = || Msg::Part(event_of((2, 11, 1, 0, 0, 0)));
+            let (arrived, go) = gates::arm(at);
+            std::thread::scope(|scope| {
+                struct Disarm(&'static str);
+                impl Drop for Disarm {
+                    fn drop(&mut self) { gates::disarm(self.0); }
+                }
+                std::thread::Builder::new().name(format!("live {at} under test")).spawn_scoped(scope, || {
+                    let _disarm = Disarm(at);
+                    gates::mark();
+                    if at == "producer holds" {
+                        // An engine worker posts a part while the state is parked.
+                        owner.post_run(part(), true, &work);
+                    } else {
+                        // An owner finishing a publication finds a part that came meanwhile.
+                        let state = owner.inbox.lock().unwrap().state.take().expect("the state is parked");
+                        owner.inbox.lock().unwrap().msgs.push(part());
+                        owner.run(state, Vec::new(), true, &work);
+                    }
+                }).expect("the thread under test");
+                arrived.recv().unwrap_or_else(|_| panic!("{at}: the thread looked at taken and stopped before its hold"));
+                assert!(!owner.took(), "{at}: the view takes the newest with nothing held yet: it asks for nothing");
+                drop(go);
+            });
+            let inbox = owner.inbox.into_inner().unwrap();
+            if handled.load(Ordering::Relaxed) != 1 || !inbox.msgs.is_empty() || inbox.state.is_none() {
+                stranded.push(format!("{at}: {} part(s) handled, {} left in the inbox with no owner coming", handled.load(Ordering::Relaxed), inbox.msgs.len()));
+            }
+        }
+        assert!(stranded.is_empty(), "a part waiting for a take that came between its look and its hold must still go out: {stranded:?}");
+    }
+
     /// A queued event's identity, as the test made it: (kind, content key, revision, layer, region,
     /// which plan of the layer).
     type EventId = (u8, u64, u64, u32, u32, u32);
@@ -3960,7 +4027,7 @@ mod tests {
         let machine = fab_plate::machine::Machine::dual_nozzle_350();
         let job_of = {
             let machine = machine.clone();
-            move |gen: u64| PrintJob { gen, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: machine.clone(), name: "block".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() }
+            move |gen: u64| PrintJob { gen, head_envelope: crate::dirs::FabDirs::system().head_envelope, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: machine.clone(), name: "block".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() }
         };
         let job = Arc::new(job_of(0));
         // The edit's plate (an empty one), and the Print editor's (another).
@@ -4166,7 +4233,7 @@ mod tests {
                 })
             };
             let input = SliceInput { plate_id: plate_id(&ev), settings_id: setup.id_for(&ev.plate), parts: ev.plate.parts.len(), make };
-            let job = PrintJob { gen: 0, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: ev.machine.clone(), name: "lost".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+            let job = PrintJob { gen: 0, head_envelope: crate::dirs::FabDirs::system().head_envelope, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: ev.machine.clone(), name: "lost".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
             (input, job)
         };
         let (input, job) = block(2);

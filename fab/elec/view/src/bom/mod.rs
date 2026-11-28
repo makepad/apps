@@ -216,8 +216,8 @@ script_mod! {
             show_bg: true draw_bg +: {color: theme.color_inset}
             bar := View{
                 width: Fill height: Fit flow: Right{wrap: true} spacing: 5 align: Align{y: 0.5}
-                Title{width: Fit height: 22 text: "Estimate, not a quote"}
-                Cell{width: Fit height: 22 text: "Boards"}
+                heading := Title{width: Fit height: 22 text: "Estimate, not a quote"}
+                boards := Cell{width: Fit height: 22 text: "Boards"}
                 qty := TextInput{width: 55 height: 23 text: "10"}
                 compare := ButtonFlatter{text: "Quantities and charges"}
                 reload := ButtonFlatter{text: "Reload prices and rates"}

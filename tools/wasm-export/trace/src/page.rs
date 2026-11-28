@@ -262,7 +262,7 @@ from_wasm_names!(
     FromWasmAllocIndexBuffer, FromWasmAllocVao, FromWasmFreeWebGLResources, FromWasmPollGpuCompletion,
     FromWasmAllocTextureImage2D_BGRAu8_32, FromWasmAllocTextureImage2D_Ru8, FromWasmAllocTextureImage2D_RGBAf32,
     FromWasmAllocTextureCube_BGRAu8_32, FromWasmBeginRenderTexture, FromWasmRequestRenderTextureCapture,
-    FromWasmBeginRenderCanvas, FromWasmSetDefaultDepthAndBlendMode, FromWasmDrawCall, FromWasmXrStartPresenting,
+    FromWasmBeginRenderCanvas, FromWasmSetDefaultDepthAndBlendMode, FromWasmUploadUniformStream, FromWasmDrawCall, FromWasmXrStartPresenting,
     FromWasmXrStopPresenting, FromWasmQueryMidiPorts, FromWasmUseMidiInputs, FromWasmSendMidiOutput,
     FromWasmQueryAudioDevices, FromWasmStartAudioOutput, FromWasmStopAudioOutput, FromWasmTestClock, FromWasmPrepareVideoPlayback,
     FromWasmBeginVideoPlayback, FromWasmPauseVideoPlayback, FromWasmResumeVideoPlayback, FromWasmMuteVideoPlayback,
@@ -391,7 +391,9 @@ impl Page {
         let gpu = crate::environment::gpu(&self.environment.gpu).expect("validated GPU profile");
         let init = ToWasmInit {
             // The GPU profiles carry no texture limit: 8192 is GpuInfo's default.
-            gpu_info: WGpuInfo { min_uniform_vectors: gpu.uniforms, float_color_targets: gpu.float_targets, max_texture_size: 8192, vendor: gpu.vendor.into(), renderer: gpu.renderer.into() },
+            gpu_info: WGpuInfo { min_uniform_vectors: gpu.uniforms, float_color_targets: gpu.float_targets, max_texture_size: 8192,
+                // WebGL2's usual UNIFORM_BUFFER_OFFSET_ALIGNMENT and MAX_UNIFORM_BLOCK_SIZE (the page's defaults)
+                uniform_buffer_offset_alignment: 256, max_uniform_block_size: 65_536, vendor: gpu.vendor.into(), renderer: gpu.renderer.into() },
             cpu_cores: self.environment.cores,
             // This tracing page has no accessibility consumer.
             a11y_enabled: false,
@@ -559,6 +561,7 @@ impl Page {
             "FromWasmBeginRenderTexture" => self.gl.begin_texture(read!(FromWasmBeginRenderTexture)),
             "FromWasmBeginRenderCanvas" => self.gl.begin_canvas(read!(FromWasmBeginRenderCanvas)),
             "FromWasmSetDefaultDepthAndBlendMode" => {}
+            "FromWasmUploadUniformStream" => self.gl.uniform_stream(read!(FromWasmUploadUniformStream)),
             "FromWasmDrawCall" => self.gl.draw(read!(FromWasmDrawCall), replies),
             "FromWasmPollGpuCompletion" => {
                 let m = read!(FromWasmPollGpuCompletion);

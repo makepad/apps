@@ -45,13 +45,13 @@ script_mod! {
                 return sdf.result
             }
         }
-        phase := mod.widgets.FabTitleLabel{ width: Fill text: "" }
-        times := mod.widgets.FabTitleLabel{ width: Fill text: "" }
+        phase := mod.widgets.FabTitleLabel{ width: Fill text: "" draw_text +: { color: fab.color_text_well } }
+        times := mod.widgets.FabTitleLabel{ width: Fill text: "" draw_text +: { color: fab.color_text_well } }
         bar := mod.widgets.FabProgress{ width: Fill height: 8 }
-        detail := mod.widgets.FabLabelDim{ width: Fill text: "" }
-        accepted := mod.widgets.FabLabelDim{ width: Fill text: "" visible: false }
-        steps := mod.widgets.FabLabel{ width: Fill text: "" visible: false }
-        heat := mod.widgets.FabLabelDim{ width: Fill text: "" }
+        detail := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
+        accepted := mod.widgets.FabLabelDim{ width: Fill text: "" visible: false draw_text +: { color: fab.color_text_well_dim } }
+        steps := mod.widgets.FabLabel{ width: Fill text: "" visible: false draw_text +: { color: fab.color_text_well } }
+        heat := mod.widgets.FabLabelDim{ width: Fill text: "" draw_text +: { color: fab.color_text_well_dim } }
         note := mod.widgets.FabLabel{ width: Fill text: "" draw_text +: { color: fab.color_error } }
         actions := View{
             width: Fill height: Fit flow: Right spacing: 6
@@ -70,10 +70,10 @@ script_mod! {
                 remove := mod.widgets.FabButton{ text: "Remove" }
             }
         }
-        virtual_row := mod.widgets.FabVirtualSpeed{}
+        virtual_row := mod.widgets.FabVirtualSpeed{ virtual_note +: { draw_text +: { color: fab.color_text_well_dim } } }
         start_confirm := View{
             width: Fill height: Fit flow: Down spacing: 6 visible: false
-            question := mod.widgets.FabLabel{ width: Fill text: "Is the plate clear? The job starts at once." }
+            question := mod.widgets.FabLabel{ width: Fill text: "Is the plate clear? The job starts at once." draw_text +: { color: fab.color_text_well } }
             buttons := View{
                 width: Fill height: Fit flow: Right spacing: 6
                 go := mod.widgets.FabButtonAccent{ text: "Start print" }
@@ -82,7 +82,7 @@ script_mod! {
         }
         stop_confirm := View{
             width: Fill height: Fit flow: Down spacing: 6 visible: false
-            question := mod.widgets.FabLabel{ width: Fill text: "Stop the print? A stopped print cannot be resumed." }
+            question := mod.widgets.FabLabel{ width: Fill text: "Stop the print? A stopped print cannot be resumed." draw_text +: { color: fab.color_text_well } }
             buttons := View{
                 width: Fill height: Fit flow: Right spacing: 6
                 go := mod.widgets.FabButtonAccent{ text: "Stop print" }

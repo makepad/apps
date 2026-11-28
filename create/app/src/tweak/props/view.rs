@@ -394,9 +394,6 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                 width: 22
                 height: 16
             }
-            tname_wrap := View { width: Fit height: Fit visible: false
-                tname := PanelButton { width: Fit height: 16 padding: Inset{left: 4 right: 4 top: 1 bottom: 1} text: "" draw_text +: { text_style +: { font_size: 7.0 } } }
-            }
             origin := PanelLabelSmall { width: 8 margin: Inset{left: 0 top: 2 right: 0 bottom: 0} text: "" }
         }
 
@@ -577,7 +574,6 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                 }
             }
         }
-        // The shared selection's name and type are read-only in Town.
         let IdentityRowT = View {
             width: Fill
             height: Fit
@@ -586,7 +582,7 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
             align: Align{x: 0.0 y: 0.5}
             padding: Inset{left: 8 right: 8 top: 3 bottom: 5}
             name_field := PanelInput {
-                is_read_only: true
+                is_read_only: true submit_on_enter: true
                 // 70 / 30 against the type beside it: a name is
                 // usually short, and a type that gets ellipsised is
                 // no use at all.
@@ -607,6 +603,11 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                 text_overflow: TextOverflow.Ellipsis
             }
         }
+        let BoxLeg = FabValueInput {
+            width: Fill{weight: 100.0 max: 64}
+            height: 16
+            padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+        }
         let BoxRowT = FabPropRow {
             height: Fit
             margin: Inset{left: 0 right: 0 top: 3 bottom: 9}
@@ -619,7 +620,7 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                     width: Fill
                     height: Fit
                     align: Align{x: 0.5 y: 0.5}
-                    leg_top := FabValueInput { width: 64 height: 16 }
+                    leg_top := BoxLeg {}
                 }
                 mid_row := View {
                     width: Fill
@@ -627,9 +628,9 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                     flow: Right
                     spacing: 4
                     align: Align{x: 0.5 y: 0.5}
-                    leg_left := FabValueInput { width: 64 height: 16 }
+                    leg_left := BoxLeg {}
                     frame := View {
-                        width: Fill
+                        width: Fill{weight: 40.0}
                         height: 20
                         show_bg: true
                         draw_bg +: {
@@ -642,13 +643,13 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
                             }
                         }
                     }
-                    leg_right := FabValueInput { width: 64 height: 16 }
+                    leg_right := BoxLeg {}
                 }
                 bot_row := View {
                     width: Fill
                     height: Fit
                     align: Align{x: 0.5 y: 0.5}
-                    leg_bottom := FabValueInput { width: 64 height: 16 }
+                    leg_bottom := BoxLeg {}
                 }
             }
             link := PanelCheckBox {
@@ -875,7 +876,22 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
             drag_scrolling: false
             InfoRow := TweakRow{width: Fill height: Fit InfoRowT{}}
             SectionRow := TweakRow{width: Fill height: Fit header := SectionRowT{}}
-            ColorRow := PropRow{editor := ColorRowT{} refusal := Refusal{}}
+            ColorRow := PropRow{
+                editor := ColorRowT{}
+                tname_wrap := View {
+                    width: Fill height: Fit visible: false flow: Right
+                    align: Align{x: 1.0 y: 0.5}
+                    padding: Inset{left: 8 right: 14 top: 0 bottom: 3}
+                    tname := PanelButton {
+                        width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
+                        height: 16 margin: Inset{left: 0 right: 0 top: 0 bottom: 0}
+                        padding: Inset{left: 4 right: 4 top: 1 bottom: 1}
+                        text: ""
+                        draw_text +: {max_lines: 1 text_overflow: TextOverflow.Ellipsis text_style +: {font_size: 7.0}}
+                    }
+                }
+                refusal := Refusal{}
+            }
             TextRow := PropRow{editor := TextRowT{} refusal := Refusal{}}
             NumRow := PropRow{editor := NumRowT{} refusal := Refusal{}}
             BoolRow := PropRow{editor := BoolRowT{} refusal := Refusal{}}
@@ -883,7 +899,12 @@ pub(in crate::tweak) fn sidebar_value(vm: &mut ScriptVm, row: ScriptValue) -> Sc
             InsetRow := PropRow{editor := InsetRowT{} refusal := Refusal{}}
             MetricsRow := PropRow{editor := MetricsRowT{} refusal := Refusal{}}
             NoEditorRow := PropRow{editor := NoEditorRowT{} refusal := Refusal{}}
-            IdentityRow := PropRow{editor := IdentityRowT{} refusal := Refusal{}}
+            IdentityRow := PropRow{editor := IdentityRowT{} refusal := Refusal{}
+                rename_confirm := View{visible: false width: Fill height: Fit flow: Right{wrap: true} spacing: 3
+                    rename_anyway := PanelButton{text: "Rename anyway"}
+                    rename_cancel := PanelButton{text: "Cancel"}
+                }
+            }
             SizeRow := PropRow{editor := SizeRowT{} refusal := Refusal{}}
             BoxRow := PropRow{editor := BoxRowT{} refusal := Refusal{}}
             FlowRow := PropRow{editor := FlowRowT{} refusal := Refusal{}}
@@ -932,14 +953,18 @@ fn fmt_measure(v: f64) -> String {
 }
 
 
+#[derive(Clone, Copy, PartialEq)]
+pub(in crate::tweak) enum HeaderId { ShaderConstants, Theme(u8) }
+
 #[derive(Clone, PartialEq)]
 pub(in crate::tweak) enum PropLine {
     Section(SectionKind, usize, bool),
     More(SectionKind, usize),
-    Header { title: String, count: String, open: Option<bool> },
+    Header { title: String, count: String, open: Option<(HeaderId, bool)> },
     Info { name: String, value: String, loc: String },
+    Identity { path: Rc<str>, ty: Rc<str>, field: RenameField },
     Measured(String),
-    Layout { kind: LayoutKind, path: Rc<str>, ty: Rc<str>, values: Rc<LayoutValues>, refusal: String },
+    Layout { kind: LayoutKind, path: Rc<str>, values: Rc<LayoutValues>, refusal: String },
     Prop { path: Rc<str>, row: RowBinding, theme_match: Option<Rc<str>>, tag: Option<&'static str>, refusal: Option<String> },
     CascadeLevel { level: usize, loc: String, icon: usize, color: Vec4f },
 }
@@ -947,6 +972,7 @@ pub(in crate::tweak) enum PropLine {
 impl PropLine {
     pub(in crate::tweak) fn same_binding(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Identity { path, .. }, Self::Identity { path: other, .. }) => path == other,
             (Self::Layout { path, kind, values, .. }, Self::Layout { path: p, kind: k, values: v, .. }) =>
                 path == p && kind == k && values.is_grid == v.is_grid,
             (Self::Prop { path, row, .. }, Self::Prop { path: other_path, row: other_row, .. }) =>
@@ -961,6 +987,7 @@ impl PropLine {
             Self::Section(..) | Self::More(..) | Self::Header { .. } => id!(SectionRow),
             Self::Info { .. } => id!(InfoRow),
             Self::Measured(_) => id!(MeasuredRow),
+            Self::Identity { .. } => id!(IdentityRow),
             Self::Layout { kind, .. } => kind.template(),
             Self::Prop { row, .. } => row.template(),
             Self::CascadeLevel { .. } => id!(CascadeRow),
@@ -975,7 +1002,7 @@ impl PropLine {
             }
             Self::Header { title, count, open } => {
                 item.label(cx, ids!(title)).set_text(cx, title);
-                item.label(cx, ids!(count)).set_text(cx, &format!("{count}{}", if *open == Some(false) { "  +" } else { "" }));
+                item.label(cx, ids!(count)).set_text(cx, &format!("{count}{}", if matches!(open, Some((_, false))) { "  +" } else { "" }));
             }
             Self::Info { name, value, loc } => {
                 item.label(cx, ids!(name)).set_text(cx, name);
@@ -986,10 +1013,13 @@ impl PropLine {
                 item.label(cx, ids!(title)).set_text(cx, &format!("+ show all ({count})"));
                 item.label(cx, ids!(count)).set_text(cx, "");
             }
-            Self::Layout { kind, path, ty, values, refusal } => {
+            Self::Identity { path, ty, field } => {
+                field.bind(cx, item, path, ty, previous.is_some_and(|p| !self.same_binding(p)));
+            }
+            Self::Layout { kind, values, refusal, .. } => {
                 let editor = item.widget(cx, ids!(editor));
                 let new_binding = previous.is_some_and(|p| !self.same_binding(p));
-                values.draw_sidebar(cx, &editor, *kind, path, ty, new_binding, controls);
+                values.draw_sidebar(cx, &editor, *kind, new_binding, controls);
                 let error = item.label(cx, ids!(refusal));
                 error.set_visible(cx, !refusal.is_empty());
                 error.set_text(cx, refusal);
@@ -1089,8 +1119,32 @@ impl PropLine {
     }
 }
 
+#[derive(Clone, Default, PartialEq)]
+pub(in crate::tweak) struct RenameField {
+    pub(in crate::tweak) editable: bool,
+    pub(in crate::tweak) draft: Option<String>,
+    pub(in crate::tweak) message: String,
+    pub(in crate::tweak) confirm: bool,
+    pub(in crate::tweak) busy: bool,
+}
+
+impl RenameField {
+    fn edit(&mut self, text: &str) {
+        if self.draft.as_deref() == Some(text) { return }
+        self.draft = Some(text.into());
+        self.confirm = false;
+        self.message = if text.len() <= crate::tweak::wire::MAX_DESIGN_NAME_LEN
+            && makepad_widgets::makepad_script::syntax::write::key(text).is_ok_and(|key| key == text) {
+            String::new()
+        } else { "Enter a valid Splash identifier.".into() };
+    }
+}
+
 #[derive(Default)]
 pub(in crate::tweak) struct Sidebar {
+    pub(in crate::tweak) rename: RenameField,
+    pub(in crate::tweak) located: bool,
+    pub(in crate::tweak) location_checked: bool,
     pub(in crate::tweak) props: Props,
     pub(in crate::tweak) path: Rc<str>,
     pub(in crate::tweak) ty: String,
@@ -1105,7 +1159,9 @@ pub(in crate::tweak) struct Sidebar {
 }
 
 pub(in crate::tweak) enum SidebarAction<'a> {
+    Rename { name: String, force: bool },
     Redraw,
+    ClearRefusal(Rc<str>, String),
     PaletteOpened(WidgetUid),
     Sets { path: Rc<str>, edits: PropertySets<'a>, phase: Phase },
 }
@@ -1154,6 +1210,28 @@ impl Sidebar {
                     *folded = !*folded;
                 }
                 Some(SidebarAction::Redraw)
+            }
+            PropLine::Identity { path, .. } if self.rename.editable && !self.rename.busy && self.path == *path => {
+                let input = item.text_input(cx, ids!(name_field));
+                if item.button(cx, ids!(rename_cancel)).clicked(actions) || input.escaped(actions) {
+                    self.rename = RenameField { editable: true, ..Default::default() };
+                    input.set_text(cx, crate::tweak::widget_name(path));
+                    return Some(SidebarAction::Redraw);
+                }
+                if let Some(text) = input.changed(actions) {
+                    self.rename.edit(&text);
+                    return Some(SidebarAction::Redraw);
+                }
+                let force = self.rename.confirm && item.button(cx, ids!(rename_anyway)).clicked(actions);
+                if force {
+                    return Some(SidebarAction::Rename { name: self.rename.draft.clone()?, force });
+                }
+                let text = input.returned(actions).map(|(text, _)| text)
+                    .or_else(|| input.key_focus_lost(actions).then(|| input.text()))?;
+                if self.rename.confirm || text == crate::tweak::widget_name(path) { return None }
+                self.rename.edit(&text);
+                if self.rename.message.is_empty() { Some(SidebarAction::Rename { name: text, force }) }
+                else { Some(SidebarAction::Redraw) }
             }
             PropLine::Layout { kind, path, values, .. } => {
                 let action = actions.first()?.as_widget_action()?;
@@ -1233,12 +1311,15 @@ impl Sidebar {
                 match action.action.downcast_ref::<TextInputAction>()? {
                     TextInputAction::Escaped => {
                         item.text_input(cx, ids!(value)).set_text(cx, &row.value);
-                        self.refusals.remove(&row.prop);
-                        Some(SidebarAction::Redraw)
+                        Some(SidebarAction::ClearRefusal(path.clone(), row.prop.clone()))
                     }
                     TextInputAction::Returned(text, _) => {
                         let set = commit(row, EditorEvent::Text(text), Phase::Off);
                         if set.is_none() && row.kind == RowKind::Color {
+                            if path.as_ref() == "theme" && !text.trim().is_empty() {
+                                return Some(SidebarAction::Sets { path: path.clone(),
+                                    edits: PropertySets::one(row.prop.as_str(), text.trim().into()), phase: Phase::Off })
+                            }
                             item.text_input(cx, ids!(value)).set_text(cx, &row.value);
                         }
                         set
@@ -1288,11 +1369,12 @@ impl Sidebar {
         let values = Rc::new(values);
         let ty: Rc<str> = Rc::from(self.ty.as_str());
         entries.into_iter().map(|entry| match entry {
+            VisKind::Layout(LayoutKind::Identity) => PropLine::Identity { path: self.path.clone(), ty: ty.clone(), field: self.rename.clone() },
             VisKind::Layout(kind) => {
                 let mut failures: Vec<_> = self.refusals.iter().filter(|(prop, _)| kind.owns(prop))
                     .map(|(prop, why)| format!("{prop}: {why}")).collect();
                 failures.sort();
-                PropLine::Layout { kind, path: self.path.clone(), ty: ty.clone(), values: values.clone(), refusal: failures.join("\n") }
+                PropLine::Layout { kind, path: self.path.clone(), values: values.clone(), refusal: failures.join("\n") }
             }
             VisKind::Section(section, count, open) => PropLine::Section(section, count, open),
             VisKind::More(section, count) => PropLine::More(section, count),

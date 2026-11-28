@@ -91,7 +91,11 @@ script_mod! {
     }
 }
 
-use crate::link_worker::{ConnectView, BAD_WORDS, BLOCKED_NETWORKS, PAIR_PEER_OLDER, PAIR_UPDATING, VERSION_TEXT};
+use crate::link_worker::{
+    ConnectView, Status, BAD_WORDS, BLOCKED_NETWORKS, NOT_REACHED_SECS, PAIR_PEER_OLDER, PAIR_UPDATING,
+    SAME_NETWORK_LAN_OFF_HERE, SAME_NETWORK_NO_LOCAL_ADDRESS, SAME_NETWORK_PEER_LAN_OFF, START_WAIT_SECS,
+    VERSION_TEXT, WORDS_OUT_OF_DATE,
+};
 use crate::model::PairSide;
 
 const FINDING: &str = "Finding this computer's address…";
@@ -108,8 +112,13 @@ pub fn pair_failure(why: &str) -> &'static str {
         PAIR_UPDATING => PAIR_UPDATING,
         PAIR_PEER_OLDER => PAIR_PEER_OLDER,
         BLOCKED_NETWORKS => BLOCKED_NETWORKS,
+        SAME_NETWORK_LAN_OFF_HERE => SAME_NETWORK_LAN_OFF_HERE,
+        SAME_NETWORK_PEER_LAN_OFF => SAME_NETWORK_PEER_LAN_OFF,
+        SAME_NETWORK_NO_LOCAL_ADDRESS => SAME_NETWORK_NO_LOCAL_ADDRESS,
+        WORDS_OUT_OF_DATE => WORDS_OUT_OF_DATE,
         crate::model::THAT_CANNOT_REJOIN => crate::model::THAT_CANNOT_REJOIN,
         crate::model::DIFFERENT_INVITATION => crate::model::DIFFERENT_INVITATION,
+        crate::model::ALREADY_IN_TOWN => crate::model::ALREADY_IN_TOWN,
         ADDRESS_FAILED => ADDRESS_FAILED,
         DECLINED => DECLINED,
         _ => PAIR_FAILED,
@@ -141,8 +150,18 @@ impl ConnectView {
         self.side == Some(side) && (!self.first_contact || self.linked.is_none() || self.failed.is_some())
     }
 
-    pub fn wait_line(since: u64, now: u64) -> String {
-        format!("Waiting for the other computer… {} s", now.saturating_sub(since))
+    pub fn wait_status(&self, now: u64) -> String {
+        if let Some(why) = self.blocked { return why.into() }
+        match self.status {
+            Some(Status::Reaching { secs }) if secs >= NOT_REACHED_SECS => format!(
+                "Haven't reached the other computer yet · {secs} s\nStill trying. Check the words on both sides."
+            ),
+            Some(Status::Reaching { secs }) => format!("Waiting for the other computer… {secs} s"),
+            Some(Status::Securing | Status::Proving) => "Connecting to the other computer…".into(),
+            _ if now.saturating_sub(self.waiting_since.unwrap_or(now)) >= START_WAIT_SECS =>
+                "Connection hasn't started yet.\nClose pairing and try again.".into(),
+            _ => "Starting connection…".into(),
+        }
     }
 
     pub fn show_form(&self, cx: &mut Cx, form: &WidgetRef, town: Option<&str>, unavailable: Option<&str>, now: u64) {
@@ -161,9 +180,8 @@ impl ConnectView {
         form.text_input(cx, ids!(connect_peer_words)).set_is_read_only(cx, self.waiting_since.is_some() || self.failed.is_some() || unavailable.is_some());
         let line = if let Some(why) = unavailable { why.into() }
             else if let Some(why) = &self.failed { pair_failure(why).into() }
-            else if let Some(since) = self.waiting_since {
-                self.blocked.map(str::to_owned).unwrap_or_else(|| Self::wait_line(since, now))
-            } else if let Some(why) = &self.bad_words { pair_failure(why).into() }
+            else if self.waiting_since.is_some() { self.wait_status(now) }
+            else if let Some(why) = &self.bad_words { pair_failure(why).into() }
             else if self.renewed && words.is_some() { RENEWED.into() }
             else { String::new() };
         let status = form.label(cx, ids!(pair_status));
@@ -186,6 +204,7 @@ mod tests {
         let text = widget.text();
         for line in text.lines() {
             if id != id!(pair_words) { assert!(line.chars().count() <= 60, "long line: {line}"); }
+            assert!(!line.contains("MAKEPAD_"), "environment variable in main flow: {line}");
             assert!(!line.contains(['/', '\\']), "path in main flow: {line}");
         }
         if widget.borrow::<Button>().is_some() {
@@ -273,6 +292,7 @@ mod tests {
         assert!(view.waiting_since.is_none(), "a wrong checksum never starts a wait");
         view.bad_words = None;
         view.waiting_since = Some(3);
+        view.apply(&FromWorker::Phase(Status::Reaching { secs: 12 }));
         assert_eq!(show(cx, &view, None), "Waiting for the other computer… 12 s");
         assert!(form.text_input(cx, ids!(connect_peer_words)).is_read_only(), "the submitted words stay fixed during pairing");
         view.blocked = Some(LOCAL_NETWORK_OFF);
@@ -287,7 +307,8 @@ mod tests {
                 "an unavailable town hides the words and retry");
         }
         for why in [BLOCKED_NETWORKS, VERSION_TEXT, PAIR_PEER_OLDER, PAIR_UPDATING, crate::model::THAT_CANNOT_REJOIN, crate::model::DIFFERENT_INVITATION,
-            DECLINED, ADDRESS_FAILED, PAIR_FAILED] {
+            crate::model::ALREADY_IN_TOWN, DECLINED, ADDRESS_FAILED, PAIR_FAILED] {
+            assert_eq!(pair_failure(why), why);
             view.failed = Some(why.into());
             let shown = show(cx, &view, None);
             if matches!(why, PAIR_PEER_OLDER | PAIR_UPDATING) {
@@ -302,6 +323,62 @@ mod tests {
         check_copy(id!(share_incoming), &prompt);
         prompt.label(cx, ids!(offer_line)).set_text(cx, &offer_line(&long_name, Some(&long_name)));
         assert_eq!(prompt.label(cx, ids!(offer_line)).text(), format!("{long_name} wants to add \"{long_name}\" to this computer."));
+    }
+
+    #[test]
+    fn pairing_form_copy_covers_starting_dialing_not_reached_and_lan_off_states() {
+        use crate::link_worker::{FromWorker, WordsRejected, LOCAL_NETWORK_OFF};
+        let mut pool = test_cx::checkout_test_cx(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::script_mod(vm);
+        });
+        let cx = &mut *pool;
+        let form = cx.with_vm(|vm| {
+            let value = script_eval!(vm, { use mod.widgets.* PairStep{} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut view = ConnectView { side: Some(PairSide::Join), first_contact: true, ..Default::default() };
+        let mut check = |v: &ConnectView, now, text: &str, retry| {
+            v.show_form(cx, &form, None, None, now);
+            check_copy(id!(connect_form), &form);
+            assert_eq!(form.label(cx, ids!(pair_status)).text(), text);
+            assert!(form.widget(cx, ids!(pair_status)).visible());
+            assert_eq!(form.widget(cx, ids!(pair_retry)).visible(), retry);
+            assert_ne!(form.widget(cx, ids!(pair_steps)).visible(), retry);
+        };
+        view.apply(&FromWorker::Phase(Status::WaitingForWords));
+        view.waiting_since = Some(11);
+        check(&view, 15, "Starting connection…", false);
+        view.waiting_since = Some(10);
+        check(&view, 15, "Connection hasn't started yet.\nClose pairing and try again.", false);
+        for (secs, text) in [
+            (0, "Waiting for the other computer… 0 s"),
+            (14, "Waiting for the other computer… 14 s"),
+            (15, "Haven't reached the other computer yet · 15 s\nStill trying. Check the words on both sides."),
+            (42, "Haven't reached the other computer yet · 42 s\nStill trying. Check the words on both sides."),
+        ] {
+            view.apply(&FromWorker::Phase(Status::Reaching { secs }));
+            view.apply(&FromWorker::WordsRejected(WordsRejected::AlreadyPairing));
+            check(&view, 109, text, false);
+        }
+        for why in [LOCAL_NETWORK_OFF, SAME_NETWORK_LAN_OFF_HERE, SAME_NETWORK_PEER_LAN_OFF, SAME_NETWORK_NO_LOCAL_ADDRESS] {
+            view.apply(&FromWorker::Blocked(why));
+            check(&view, 109, why, false);
+        }
+        for status in [Status::Securing, Status::Proving] {
+            view.apply(&FromWorker::Blocked(SAME_NETWORK_PEER_LAN_OFF));
+            view.apply(&FromWorker::Phase(status));
+            assert!(view.blocked.is_none());
+            check(&view, 109, "Connecting to the other computer…", false);
+        }
+        for reason in [WordsRejected::StaleAttempt, WordsRejected::OlderInvite, WordsRejected::NotReady] {
+            view.waiting_since = Some(10);
+            view.apply(&FromWorker::Phase(Status::Reaching { secs: 0 }));
+            view.apply(&FromWorker::Blocked(SAME_NETWORK_LAN_OFF_HERE));
+            view.apply(&FromWorker::WordsRejected(reason));
+            assert!(view.waiting_since.is_none() && view.blocked.is_none());
+            check(&view, 109, WORDS_OUT_OF_DATE, true);
+        }
     }
 
     #[test]

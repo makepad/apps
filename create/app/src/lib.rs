@@ -1,6 +1,7 @@
 //! Makepad Town's app crate: the model the window and the AI tools share ([`model`]), the AI
 //! service manifest and its action table ([`tools`]), and the window's lists ([`lists`]).
 
+pub mod ai_out;
 pub mod ai_trace;
 pub mod app_link;
 pub mod board;
@@ -13,7 +14,7 @@ pub mod model;
 pub mod publish;
 pub mod record;
 pub mod store_worker;
-mod theme;
+pub mod theme;
 pub mod tools;
 pub mod transcript;
 pub mod tweak;

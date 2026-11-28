@@ -74,9 +74,54 @@ pub enum DesignVerb {
     Apply,
     Typed,
     Locate,
+    Preview,
+    PreviewChunk,
+    Revert,
+    Drop,
     Theme,
     States,
     Pose,
+}
+
+impl DesignVerb {
+    pub(crate) fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::State => "state",
+            Self::Palette => "palette",
+            Self::Insert => "insert",
+            Self::Move => "move",
+            Self::Delete => "delete",
+            Self::Duplicate => "duplicate",
+            Self::Wrap => "wrap",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Out => "out",
+            Self::Rename => "rename",
+            Self::Set => "set",
+            Self::Bake => "bake",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::Reset => "reset",
+            Self::Patch => "patch",
+            Self::Commit => "commit",
+            Self::Verify => "verify",
+            Self::Close => "close",
+            Self::Pick => "pick",
+            Self::Tree => "tree",
+            Self::Props => "props",
+            Self::Apply => "apply",
+            Self::Typed => "typed",
+            Self::Locate => "locate",
+            Self::Preview => "preview",
+            Self::PreviewChunk => "preview_chunk",
+            Self::Revert => "revert",
+            Self::Drop => "drop",
+            Self::Theme => "theme",
+            Self::States => "states",
+            Self::Pose => "pose",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -233,8 +278,9 @@ impl DesignOp {
         if window.is_none() { return Ok(()) }
         let name = match self {
             Self::Design { verb: DesignVerb::Pick | DesignVerb::Tree | DesignVerb::Props | DesignVerb::Apply | DesignVerb::Typed |
-                DesignVerb::Locate | DesignVerb::Theme | DesignVerb::States | DesignVerb::Pose, .. } => return Ok(()),
-            Self::Design { verb, .. } => return Err(format!("design {} takes no window", format!("{verb:?}").to_ascii_lowercase())),
+                DesignVerb::Locate | DesignVerb::Theme | DesignVerb::States | DesignVerb::Pose |
+                DesignVerb::Drop | DesignVerb::Verify, .. } => return Ok(()),
+            Self::Design { verb, .. } => return Err(format!("design {} takes no window", verb.wire_name())),
             Self::Overlay(_) | Self::Annotate(_) => "tweak",
             Self::State => "tweak state",
             Self::Diff => "tweak diff",
@@ -269,7 +315,7 @@ impl DesignOp {
                 vec![field("path", path), field("splash", splash)],
             ),
             Self::Design { verb, args } => {
-                let op = format!("{verb:?}").to_ascii_lowercase();
+                let op = verb.wire_name();
                 let mut seen = std::collections::HashSet::new();
                 for (key, _) in &args {
                     if key.is_empty()
@@ -282,7 +328,7 @@ impl DesignOp {
                         return Err(format!("invalid or repeated design argument {key:?}"));
                     }
                 }
-                if let Some(schema) = makepad_remote::params::design(&op) {
+                if let Some(schema) = makepad_remote::params::design(op) {
                     makepad_remote::params::validate(args.iter().map(|p| p.0.as_str()), schema)?;
                 }
                 (format!("design {op}"), args)

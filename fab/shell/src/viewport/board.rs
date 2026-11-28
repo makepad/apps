@@ -28,7 +28,7 @@ script_mod! {
     mod.draw.FabBoardSurface = {
         alpha_blend: false
         depth_write: true
-        backface_culling: false
+        cull_mode: @None
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)

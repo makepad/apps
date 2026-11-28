@@ -64,8 +64,9 @@ impl Order {
 /// How a picture's paint ended ([`crate::model_host::HostAction::Painted`]).
 #[derive(Clone, Debug)]
 pub enum Painted {
-    /// Written (true), or found as it is or not painted (false: its line in the log says why).
-    Done(bool),
+    /// Written (`written == true`), or found current / not painted (`written == false`),
+    /// carrying the order's seen key ([`Order::seen`]).
+    Done { seen: String, written: bool },
     /// Its build stopped at the process's memory budget while other pictures built beside it: it
     /// is painted again once none does (its key among those looked at, [`Order::seen`]).
     Again(String),
@@ -89,21 +90,22 @@ impl From<String> for Unpainted {
 /// False when the pool takes no work (the app is closing).
 pub fn start(pool: &TaskPool, order: Order) -> bool {
     let key = order.key.clone();
+    let seen = order.seen();
     let task = pool.submit_named(Class::Background, "fab plate picture", move || {
         let started = std::time::Instant::now();
         let painted = match paint(&order) {
             Ok(true) => {
                 log!("fab: painted the picture of {} in {:.0} ms", order.key, started.elapsed().as_secs_f64() * 1e3);
-                Painted::Done(true)
+                Painted::Done { seen, written: true }
             }
-            Ok(false) => Painted::Done(false),
+            Ok(false) => Painted::Done { seen, written: false },
             Err(Unpainted { why, memory: true }) if !order.alone => {
                 log!("fab: the picture of {} waits until no other picture builds: {why}", order.key);
-                Painted::Again(order.seen())
+                Painted::Again(seen)
             }
             Err(Unpainted { why, .. }) => {
                 log!("fab: no picture of {}: {why}", order.key);
-                Painted::Done(false)
+                Painted::Done { seen, written: false }
             }
         };
         Cx::post_action(crate::model_host::HostAction::Painted(painted));
@@ -222,14 +224,13 @@ fn paint_model(model: fab_model::FabModel, out: &Path, machine: &Machine, shared
     let key = key_text(&content, machine, &calibrated, session.model.env(), &reads);
     let rgba = render(&ev, session.compiled.as_deref(), &name);
     let png = fab_ai::plates::thumbnail_png(WIDTH, HEIGHT, &rgba)?;
+    // Mark as painter-owned (empty/stale) before replacing `out`, so a crash after writing `out`
+    // never leaves `out` mistaken for a viewport-taken thumbnail (`!painted(&out)`), and `key == None`
+    // repaints on the next session as promised.
+    fab_model::project::write_unflushed(&named, b"")?;
     fab_model::project::write_unflushed(out, &png)?;
-    match key {
-        Some(key) => fab_model::project::write_unflushed(&named, key.as_bytes())?,
-        None => match std::fs::remove_file(&named) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", named.display()).into()),
-        },
+    if let Some(key) = key {
+        fab_model::project::write_unflushed(&named, key.as_bytes())?;
     }
     Ok(true)
 }

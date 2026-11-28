@@ -1,0 +1,14 @@
+use mod.project.*
+let e = mod.elec
+let gnd = e.net({name: "GND" kind: @ground})
+let vbus = e.net({name: "VBUS_5V" kind: @power volts: 5V})
+let rail = e.net({name: "V3V3" kind: @power volts: 3.3V})
+let leds = e.bus("LED", 8)
+let key = e.net({name: "MODE"})
+let usb = usb_power({vbus: vbus gnd: gnd})
+let reg = reg_3v3({vin: vbus vout: rail gnd: gnd})
+let control = mcu({vdd: rail gnd: gnd led: leds key: key})
+let indicators = led_bank({vdd: rail ctl: leds})
+let mode = button({vdd: rail out: key gnd: gnd})
+e.fixed(usb, {edge: @left})
+e.near(reg, usb, 6mm)

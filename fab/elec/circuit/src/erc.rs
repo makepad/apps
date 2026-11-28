@@ -7,7 +7,7 @@ use crate::check::{CheckKind, Measure, Violation};
 use crate::{Block, Circuit, NetKind, PortDef, PortKind, QtyUnit, Quantity};
 use fab_elec_core::{BlockId, BoardId, CompId, CompRef, NetId, NetRef, PinIx, PinRef, Sel, Severity};
 use fab_elec_parts::{PartKind, PinKind, VRange};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The outermost block declaring an output on this rail, or an independent component pin.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -47,7 +47,16 @@ fn planned_blocks(c: &Circuit) -> Vec<bool> {
 
 fn ports(c: &Circuit) -> impl Iterator<Item = (&Block, &PortDef, &[NetId])> {
     c.tree.iter().filter_map(|b| b.def.map(|d| (b, &c.block_defs[d.0 as usize]))).flat_map(|(b, d)| {
-        d.ports.iter().zip(&b.ports).map(move |(port, (_, nets))| (b, port, nets.as_slice()))
+        let mut by_name: Option<HashMap<&str, &[NetId]>> = None;
+        d.ports.iter().enumerate().map(move |(i, port)| {
+            let nets = match b.ports.get(i).filter(|(name, _)| name == &port.name) {
+                Some((_, nets)) => nets.as_slice(),
+                None => by_name.get_or_insert_with(|| {
+                    b.ports.iter().map(|(name, nets)| (name.as_str(), nets.as_slice())).collect()
+                }).get(port.name.as_str()).copied().unwrap_or_default(),
+            };
+            (b, port, nets)
+        })
     })
 }
 
@@ -208,7 +217,7 @@ pub fn erc_supplied(c: &Circuit, supplied: &[NetId]) -> Vec<Violation> {
         endpoints[i] += pins.len();
         direct_power[i] |= pins.iter().any(|&(id, p)| c.pin_kind(id, p) == Some(PinKind::PowerOut));
     }
-    let driven = power_driven(c, direct_power.clone(), &planned);
+    let driven = power_driven(c, direct_power, &planned);
     for (ni, pins) in net_pins.0.iter().enumerate() {
         let net = &c.nets[ni];
         let kinds: Vec<PinKind> = pins.iter().filter_map(|(comp, pin)| c.pin_kind(*comp, *pin)).collect();
@@ -266,7 +275,7 @@ pub fn erc_supplied(c: &Circuit, supplied: &[NetId]) -> Vec<Violation> {
                             .measures(Measure::VRange(v), Measure::VRange(req)));
                     }
                 }
-                if planned[block.id.ix()] && !direct_power[n.ix()] {
+                if planned[block.id.ix()] && !driven[n.ix()] {
                     out.push(Violation::new(CheckKind::PowerNotDriven, Severity::Error, unit, items(), &port.name,
                         format!("{}.{} has no power source on {}", block.path, port.name, c.nets[n.ix()].name)));
                 }
@@ -322,10 +331,11 @@ mod tests {
 
     #[test]
     fn bench_supply_drives_both_sides_of_a_series_resistor() {
-        let mut circuit = Circuit::default();
+        let mut circuit = circuit();
         let rails = [NetId(0), NetId(1)];
-        for (id, name) in rails.into_iter().zip(["VIN", "VA"]) {
-            circuit.nets.push(Net { id, name: name.into(), class: Default::default(), volts: None, kind: NetKind::Power, scope: None });
+        for (net, name) in circuit.nets.iter_mut().zip(["VIN", "VA"]) {
+            net.name = name.into();
+            net.kind = NetKind::Power;
         }
         for (refdes, kind, pin_kind) in [("R1", PartKind::Resistor, PinKind::Passive), ("U1", PartKind::Ic, PinKind::PowerIn)] {
             let pins = ["1", "2"].map(|name| PinDef {
@@ -347,6 +357,10 @@ mod tests {
         assert_eq!(before - findings.len(), 2, "both power inputs lack a driver with the bench disconnected");
         assert_eq!(erc_supplied(&circuit, &rails[..1]), findings,
             "supplying VIN clears the missing drivers on VIN and VA and preserves the other findings");
+        let load = block(&mut circuit, BlockId(0), "load", true, PortKind::PowerIn, None);
+        circuit.tree[load.ix()].ports[0].1 = vec![rails[1]];
+        assert!(!erc_supplied(&circuit, &rails[..1]).iter().any(|v| v.kind == CheckKind::PowerNotDriven),
+            "the planned load on VA must receive the bench supply through the realized resistor");
     }
 
     fn circuit() -> Circuit {
@@ -390,7 +404,7 @@ mod tests {
     fn block_checks_flag_voltage_domain_mismatch_and_rail_overbudget() {
         let mut c = circuit();
         block(&mut c, BlockId(0), "supply", true, PortKind::PowerOut, Some(0.3));
-        block(&mut c, BlockId(0), "load", true, PortKind::PowerIn, Some(0.2));
+        let load = block(&mut c, BlockId(0), "load", true, PortKind::PowerIn, Some(0.2));
         block(&mut c, BlockId(0), "other", true, PortKind::PowerIn, Some(0.3));
         let req = VRange { min: 3.0, max: 3.6 };
         c.block_defs[1].ports[0].volts = Some(req);
@@ -405,6 +419,17 @@ mod tests {
         c.nets[0].volts = Some(VRange::fixed(3.3));
         c.block_defs[0].ports[0].current = Some(0.5);
         assert!(erc(&c).is_empty(), "a compatible rail at its current budget must pass");
+
+        // A hand-built instance can bind its ports in a different order or omit one.
+        let ground = PortDef { name: "gnd".into(), kind: PortKind::Ground, current: None, volts: None, default: None };
+        c.block_defs[1].ports.push(ground);
+        c.tree[load.ix()].ports.insert(0, ("gnd".into(), vec![NetId(1)]));
+        c.nets[0].volts = Some(VRange::fixed(5.0));
+        c.block_defs[0].ports[0].current = Some(0.3);
+        assert_eq!(erc(&c), findings, "voltage and current findings must follow the named supply port after reordering bindings");
+        c.tree[load.ix()].ports.remove(0);
+        assert!(erc(&c).iter().any(|v| v.kind == CheckKind::OpenPort && v.items == [Sel::Block(c.unit, load)] && v.rule == "gnd"),
+            "a declared port absent from the instance must still produce its own OpenPort finding");
     }
 
     #[test]

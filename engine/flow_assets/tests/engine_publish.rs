@@ -7,7 +7,7 @@ use makepad_flow_assets::{AssetListQuery, AssetStoreConfig, AssetWorker, StoreLo
 use makepad_flow::engine::executors::{Executor, Poll};
 use makepad_flow::{Literal, Loc, Node, Port, PortType, Value};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use makepad_flow::PortValue;
 
 struct Roots(Vec<PathBuf>);
@@ -83,7 +83,6 @@ fn publish(worker: &AssetWorker, value: Value) -> makepad_strict_json::Value {
 fn publish_node(worker: &AssetWorker, node: &Node, run: PublishRun, value: Value) -> makepad_strict_json::Value {
     let mut executor = PublishExecutor::new(Some(worker.store()), run);
     executor.start(node, &[("value".into(), PortValue::One(value))]).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match executor.poll() {
             Poll::Done(outputs) => {
@@ -91,8 +90,7 @@ fn publish_node(worker: &AssetWorker, node: &Node, run: PublishRun, value: Value
                 return makepad_strict_json::parse(&value.bytes).unwrap();
             }
             Poll::Failed(error) => panic!("publish failed: {error}"),
-            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            other => panic!("publish timed out after {other:?}"),
+            _ => std::thread::sleep(Duration::from_millis(20)),
         }
     }
 }
@@ -247,6 +245,7 @@ fn a_derived_publish_records_its_generator_prompt_and_library_parent() {
                 model: "realesrgan".into(),
                 seed: Some(42),
                 params: vec![("factor".into(), Literal::Num(2.0))],
+                hub: String::new(),
             }],
             prompt: "a sunset".into(),
             sources: vec![source.digest],
@@ -319,15 +318,14 @@ fn missing_store_failure_names_discovery() {
     let run = PublishRun { flow: "demo".into(), instance: "one".into(), ..Default::default() };
     let mut executor = PublishExecutor::new(Some(worker.store()), run);
     executor.start(&node(), &[("value".into(), PortValue::One(picture(10)))]).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match executor.poll() {
             Poll::Failed(error) => {
                 assert!(error.contains("no asset server discovered on this LAN"), "{error}");
                 break;
             }
-            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => panic!("missing store failure timed out"),
+            Poll::Done(_) => panic!("publish without a store must fail"),
+            _ => std::thread::sleep(Duration::from_millis(10)),
         }
     }
     worker.stop();

@@ -1,8 +1,14 @@
 //! The fixed greeting and its optional, length-delimited source snapshot.
 use crate::sync::SyncError;
 
+/// Multi-party voice calls (`RingExt.town/roster`, `CallJoin`/`CallJoinAck`).
+pub const MULTIPARTY_CALL_LEVEL: u16 = 4;
+/// Structural design requests and notices on the Tweak topic.
+pub const DESIGN_LEVEL: u16 = MULTIPARTY_CALL_LEVEL + 1;
+/// Multi-viewer town-tagged shares and single-holder takeover.
+pub const MULTIPARTY_SHARE_LEVEL: u16 = DESIGN_LEVEL + 1;
 /// Raise when a landing introduces behaviour that requires a level gate.
-pub const LEVEL: u16 = 3;
+pub const LEVEL: u16 = MULTIPARTY_SHARE_LEVEL;
 /// Raise behind the fleet as support for older levels is retired.
 pub const MIN_PEER: u16 = 0;
 const SOURCES: u8 = 1;
@@ -20,6 +26,7 @@ impl MediaCaps {
     pub const HEVC_444_DECODE: u32 = 1 << 3;
     pub const GPU_DECODE: u32 = 1 << 4;
     pub const MULTIPARTY_V1: u32 = 1 << 5;
+    pub const MULTIPARTY_SHARE_V1: u32 = 1 << 6;
 
     pub fn supports(self, bit: u32) -> bool { self.0 & bit != 0 }
 }
@@ -54,7 +61,7 @@ impl Hello {
             let upstream = if oid.len() == 40 { makepad_network::tls::from_hex(oid).unwrap_or_default() } else { [0; 20] };
             Some(Source { key: key.into(), branch: branch.into(), upstream })
         }).collect();
-        Self { level: LEVEL, min_peer: MIN_PEER, sources, media_caps: MediaCaps::default() }
+        Self { level: LEVEL, min_peer: MIN_PEER, sources, media_caps: MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1) }
     }
 
     pub fn compatible(&self, peer: &Self) -> bool {
@@ -146,8 +153,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_encodes_multiparty_share_level_and_caps() {
+        let hello = Hello::local(std::iter::empty());
+        assert_eq!(hello.level, LEVEL, "the local greeting advertises the current level");
+        assert!(hello.level >= MULTIPARTY_SHARE_LEVEL, "the advertised level includes multi-viewer shares");
+        assert!(MULTIPARTY_SHARE_LEVEL > MULTIPARTY_CALL_LEVEL, "voice-only copies recognize a newer greeting");
+        assert!(MULTIPARTY_SHARE_LEVEL > DESIGN_LEVEL, "copies with design requests but no multi-viewer shares recognize a newer greeting");
+        assert_eq!(hello.min_peer, MIN_PEER, "the greeting keeps the minimum peer level");
+        assert_eq!(hello.media_caps, MediaCaps(MediaCaps::MULTIPARTY_V1 | MediaCaps::MULTIPARTY_SHARE_V1),
+            "the greeting advertises both multi-party voice and multi-viewer shares");
+        let mut wire = Vec::new();
+        hello.encode(&mut wire);
+        assert!(wire.ends_with(&[TAG_MEDIA_CAPS, 4, 0, 96, 0, 0, 0]), "both capabilities fit in the trailing seven-byte entry");
+        assert_eq!(Hello::decode(&wire).unwrap(), hello, "the greeting round-trips with its capability");
+    }
+
+    #[test]
     fn hello_roundtrips_media_caps_and_old_decoder_skips_tag_4() {
         let mut hello = Hello::local([("github.com/makepad/apps", "main", "")].into_iter());
+        hello.media_caps = MediaCaps::NONE;
         let mut legacy = Vec::new();
         hello.encode(&mut legacy);
         let mut tail = &legacy[4..];

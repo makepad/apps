@@ -1,11 +1,10 @@
-use super::{string, Board};
+use super::{check_state, withheld, Board};
 use makepad_ai_services::wire::MAX_RESULT_BYTES;
 use makepad_town_core::entity::field;
 use makepad_town_core::event::Id;
 use makepad_town_core::fold::State;
-use makepad_town_core::{hex, parse_id};
-use makepad_network::digest::sha256_hash;
-use makepad_strict_json as json;
+use makepad_town_core::parse_id;
+use makepad_town_core::trust::{AiJson, AiOut, AiTextBuilder, Gate, Withheld};
 
 const BUDGET: usize = MAX_RESULT_BYTES - 512;
 const STALE: &str = "the board changed since that page; read it again from the start";
@@ -31,62 +30,55 @@ impl Cursor {
     }
 }
 
-// Stored literals can contain raw whitespace and control characters. Match the wire JSON writer.
-fn encoded_char_len(c: char) -> usize {
-    match c {
-        '"' | '\\' | '\n' | '\r' | '\t' | '\x08' | '\x0c' => 2,
-        c if c < ' ' => 6,
-        c => c.len_utf8(),
-    }
-}
-
-fn encoded_len(s: &str) -> usize { s.chars().map(encoded_char_len).sum() }
-
 struct Envelope {
-    head: String,
+    board: Id,
+    revision: Id,
+    total: usize,
+    parent: Id,
 }
 
 impl Envelope {
-    fn new(board: &Board, parent: Id) -> Self {
-        Self { head: format!(r#"{{"board":"{}","revision":"{}","total":{},"parent":"{}","splash":"#,
-            hex(&board.root.id), board.revision, board.nodes.len(), hex(&parent)) }
+    fn new(board: &Board<'_, '_>, parent: Id) -> Self {
+        Self { board: board.root.id, revision: board.revision, total: board.nodes.len(), parent }
     }
 
-    fn reply(&self, source: &str, next: Option<&str>, extra: &str) -> String {
-        let mut reply = self.head.clone();
-        json::s(source).write_into(&mut reply);
-        reply.push_str(extra);
-        reply.push_str(r#","next":"#);
-        if let Some(cursor) = next { json::s(cursor).write_into(&mut reply); }
-        else { reply.push_str("null"); }
-        reply.push('}');
-        reply
+    fn reply(&self, source: AiJson, next: Option<AiJson>, fragment: Option<AiJson>, title: Option<AiJson>) -> AiJson {
+        let mut fields = vec![("board", AiJson::id(&self.board)), ("revision", AiJson::id(&self.revision)),
+            ("total", AiJson::int(self.total as i64)), ("parent", AiJson::id(&self.parent)), ("splash", source)];
+        if let Some(fragment) = fragment { fields.push(("fragment", fragment)); }
+        if let Some(title) = title { fields.push(("title", title)); }
+        fields.push(("next", next.unwrap_or_else(AiJson::null)));
+        AiJson::object(fields)
     }
 }
 
-enum Part { Title, Node { at: usize, source: String } }
+enum Part { Title, Node { at: usize, source: AiTextBuilder } }
 
-impl Board<'_> {
+impl Board<'_, '_> {
     fn envelope(&self, at: usize) -> Envelope {
         let parent = self.nodes.get(at).and_then(|n| n.parent).map_or(self.root.id, |i| self.nodes[i].entity.id);
         Envelope::new(self, parent)
     }
 
-    fn title_page(&self) -> String {
+    fn title_page(&self) -> AiJson {
         let mut title = self.header(true);
-        title.push_str(&self.footer(true));
-        self.envelope(0).reply(&title, Some(&hex(&self.root.id)), "")
+        title.push_builder(&self.footer(true));
+        self.envelope(0).reply(AiJson::built_str(title), Some(AiJson::id(&self.root.id)), None, None)
     }
 
-    fn fragment(&self, part: Part, cursor: Option<(Id, usize)>, with_title: bool) -> Result<String, String> {
+    fn fragment(&self, part: Part, cursor: Option<(Id, usize)>, with_title: bool) -> Result<AiJson, String> {
         let (id, source, last, end, kind, env) = match part {
             Part::Title if self.root_extras() => {
-                let source = self.header(true) + &self.footer(true);
+                let mut source = self.header(true);
+                source.push_builder(&self.footer(true));
                 (self.root.id, source, self.root.id, 0, "root", Envelope::new(self, self.root.id))
             }
             Part::Title => {
-                let mut source = String::new();
-                string(&mut source, self.root.text(field::TITLE));
+                let mut source = AiTextBuilder::new();
+                match self.gate.entity_field_text(&self.root.id, &field::TITLE) {
+                    Ok(t) => source.push_splash_quoted(t.as_for_ai_str()),
+                    Err(_) => source.push_static("\"\""),
+                }
                 (self.root.id, source, self.root.id, 0, "title", Envelope::new(self, self.root.id))
             }
             Part::Node { at, source } => {
@@ -94,48 +86,42 @@ impl Board<'_> {
                 (node.entity.id, source, node.entity.id, node.end, "node", self.envelope(at))
             }
         };
-        let digest = sha256_hash(source.as_bytes());
+        let digest = source.sha256();
         let index = match cursor {
             Some((hash, index)) if hash == digest => index,
             Some(_) => return Err(STALE_FRAGMENT.into()),
             None => 1,
         };
-        let id = hex(&id);
-        let hash = hex(&digest);
-        let continuation = |i| format!("{id}~{hash}~{i}");
-        let metadata = |i, count| format!(r#","fragment":{{"kind":"{kind}","id":"{id}","hash":"{hash}","index":{i},"total":{count}}}"#);
+        let continuation = |i| {
+            let mut out = AiTextBuilder::new();
+            out.push_id(&id); out.push_static("~"); out.push_id(&digest); out.push_static("~"); out.push_u64(i);
+            AiJson::built_str(out)
+        };
+        let metadata = |i, count| AiJson::object(vec![("kind", AiJson::static_str(kind)), ("id", AiJson::id(&id)),
+            ("hash", AiJson::id(&digest)), ("index", AiJson::int(i)), ("total", AiJson::int(count))]);
 
-        // The split must survive changes to board total, revision, title and parent. All ids
-        // have fixed width. Reserve the maximum decimal widths of the counters in the envelope.
-        let worst = u64::MAX; // The wire split is identical on 32- and 64-bit peers.
-        let overhead = env.reply("", Some(&continuation(worst)), &metadata(worst, worst)).len()
-            + (worst.to_string().len() - self.nodes.len().to_string().len());
-        let town = BUDGET - overhead;
-        let mut bounds = vec![0];
-        let mut bytes = 0;
-        for (offset, c) in source.char_indices() {
-            let width = encoded_char_len(c);
-            if bytes + width > town { bounds.push(offset); bytes = 0; }
-            bytes += width;
-        }
-        bounds.push(source.len());
+        // Fragment widths must survive changes in total, revision, title and parent.
+        let overhead = env.reply(AiJson::static_str(""), Some(continuation(u64::MAX)), Some(metadata(i64::MIN, i64::MIN)), None)
+            .encoded_len() + 20 - AiJson::int(self.nodes.len() as i64).encoded_len();
+        let bounds = source.json_fragment_bounds(BUDGET - overhead);
         let count = bounds.len() - 1;
         if index == 0 || index > count { return Err(STALE_FRAGMENT.into()) }
-        let piece = &source[bounds[index - 1]..bounds[index]];
+        let piece = source.slice_to_json(bounds[index - 1], bounds[index]).ok_or(STALE_FRAGMENT)?;
         let next = if index < count { Some(continuation(index as u64 + 1)) }
-            else if end < self.nodes.len() { Some(hex(&last)) } else { None };
-        let mut extra = metadata(index as u64, count as u64);
-        if with_title {
-            extra.push_str(r#","title":"#);
-            json::s(self.root.text(field::TITLE)).write_into(&mut extra);
-        }
-        let reply = env.reply(piece, next.as_deref(), &extra);
-        if with_title && reply.len() > BUDGET { return Ok(self.title_page()) }
-        debug_assert!(reply.len() <= BUDGET);
+            else if end < self.nodes.len() { Some(AiJson::id(&last)) } else { None };
+        let title = if with_title {
+            match self.gate.entity_field_text(&self.root.id, &field::TITLE) {
+                Ok(t) => Some(AiJson::text(t)),
+                Err(Withheld::MissingSource) => Some(AiJson::static_str("")),
+                Err(_) => None,
+            }
+        } else { None };
+        let reply = env.reply(piece, next, Some(metadata(index as i64, count as i64)), title);
+        if with_title && reply.encoded_len() > BUDGET { return Ok(self.title_page()) }
         Ok(reply)
     }
 
-    fn page(&self, after: Option<Cursor>) -> Result<String, String> {
+    fn page(&self, after: Option<Cursor>) -> Result<AiJson, String> {
         let first = after.is_none();
         let start = match after {
             None => 0,
@@ -157,12 +143,11 @@ impl Board<'_> {
             }
         };
         let env = self.envelope(start);
-        let board_id = hex(&self.root.id);
-        let more = env.reply("", Some(&board_id), "").len();
-        let done = env.reply("", None, "").len();
+        let more = env.reply(AiJson::static_str(""), Some(AiJson::id(&self.root.id)), None, None).encoded_len();
+        let done = env.reply(AiJson::static_str(""), None, None, None).encoded_len();
         let mut source = self.header(first);
         let footer = self.footer(first);
-        let mut bytes = encoded_len(&source) + encoded_len(&footer);
+        let mut bytes = source.json_encoded_len() + footer.json_encoded_len();
         let total = self.nodes.len();
         if first && bytes + if total > 0 { more } else { done } > BUDGET {
             return self.fragment(Part::Title, None, false)
@@ -176,34 +161,35 @@ impl Board<'_> {
             while at < limit {
                 let node = &self.nodes[at];
                 let subtree = self.subtree(at);
-                let size = encoded_len(&subtree);
+                let size = subtree.json_encoded_len();
                 let overhead = if node.end < total { more } else { done };
                 let separator = usize::from(last.is_some());
                 if overhead + bytes + separator + size > BUDGET {
                     if last.is_some() { break }
-                    if first && (self.root_extras() || overhead + encoded_len(&self.header(false)) + size + 2 <= BUDGET) {
+                    if first && (self.root_extras() || overhead + self.header(false).json_encoded_len() + size + 2 <= BUDGET) {
                         return Ok(self.title_page())
                     }
                     return self.fragment(Part::Node { at, source: subtree }, None, first)
                 }
-                if last.is_some() { source.push(' '); }
-                source.push_str(&subtree);
+                if last.is_some() { source.push_static(" "); }
+                source.push_builder(&subtree);
                 bytes += separator + size;
                 last = Some(node.entity.id);
                 at = node.end;
             }
         }
-        source.push_str(&footer);
-        let next = last.filter(|_| at < total).map(|id| hex(&id));
-        Ok(env.reply(&source, next.as_deref(), ""))
+        source.push_builder(&footer);
+        let next = last.filter(|_| at < total).map(|id| AiJson::id(&id));
+        Ok(env.reply(AiJson::built_str(source), next, None, None))
     }
 }
 
-pub fn read(state: &State, board: Id, rect: Option<[f64; 4]>, after: Option<Cursor>) -> Result<String, String> {
-    let board = Board::new(state, board, rect).map_err(|e| match after {
+pub fn read<'a>(state: &'a State, gate: &Gate<'a>, board: Id, rect: Option<[f64; 4]>, after: Option<Cursor>) -> Result<AiOut, String> {
+    check_state(state, gate)?;
+    let board = Board::new(state, gate, board, rect).map_err(|e| match after {
         Some(Cursor::Fragment { .. }) => STALE_FRAGMENT.to_owned(),
         Some(Cursor::After(_)) => STALE.to_owned(),
         None => e,
     })?;
-    board.page(after)
+    gate.finish_json(board.page(after)?).map_err(withheld)
 }

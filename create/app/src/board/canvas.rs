@@ -1,19 +1,22 @@
 //! The board and its local interaction overlay. Fold events materialize text and shape handles alongside
 //! the spatial view. Drawing only borrows this projection and the camera.
-use super::gesture::{scroll_nav, AlignTo, BoardTool, Gesture, Handle, NewItem, Placement, Preview, ScrollNav, Transform, DRAG_SLOP};
+use super::gesture::{scroll_nav, snap_rect, ticks, AlignTo, BoardTool, Gesture, Guide, Handle, NewItem, Placement, Preview, ScrollNav, Transform, DRAG_SLOP};
 use super::live::{Incoming, Outbox};
 use super::look::{self, Body, Lift, Look, Place, Surface, STEPS};
+use super::media::{BoardMediaCache, MediaSlotState};
 use super::tree::step_kind;
 use super::view::{Present, Step, Target};
 use super::{BoardItem, BoardView, Rect as Bounds, RectIndex};
+use crate::tweak::focus::{wheel_zoom, FocusState};
 use crate::tweak::overlay::{self, Selections};
+use crate::tweak::design::drag::{design_pointer, picture_drop, LiftPress};
 use crate::model::{Action as ModelAction, ItemStyle, RestackTo};
 use makepad_canvas::{
     remap_event, sync_handled, Camera, CameraState, CanvasLayer, DrawCanvasCard, DrawCanvasGrid,
     DrawCanvasShadow, MAX_ZOOM, MIN_ZOOM,
 };
 use makepad_town_core::entity::{field, kind};
-use makepad_town_core::event::{Id, Key, Value};
+use makepad_town_core::event::{Id, Key, TownId, Value};
 use makepad_town_core::fold::State;
 use makepad_widgets::{
     drag_visual::CxDragVisualExt,
@@ -21,7 +24,8 @@ use makepad_widgets::{
     text::{font_family::FontFamilyId, layouter::LaidoutText},
     *,
 };
-use std::{collections::{BTreeSet, HashMap}, ops::Range, rc::Rc};
+use makepad_widgets::image::DrawImage;
+use std::{collections::{BTreeSet, HashMap, HashSet}, ops::Range, path::{Path, PathBuf}, rc::Rc};
 
 script_mod! {
     use mod.prelude.workspace.*
@@ -59,6 +63,7 @@ script_mod! {
         }
         outline +: {color: palette.accent}
         tool_chip: DragChip{}
+        design_ghost: #(overlay::ghost_shader(vm))
         editor: TextInputFlat{
             visible: false is_multiline: true submit_on_enter: false
             empty_text: "" padding: 0 margin: 0 align: Align{x: 0 y: 0}
@@ -193,12 +198,63 @@ struct Face {
     open_writers: HashMap<String, Id>,
     layout: Option<(MetricsKey, Rc<LaidoutText>)>,
     detail: Detail,
+    media: Option<Box<MediaFace>>,
     /// The font size, in points, the text fits its item at, and what it was fitted to.
     fit: Option<(FitKey, f32)>,
 }
 
+#[derive(Default)]
+struct MediaFace {
+    local: Option<(Id, PathBuf)>,
+    get: bool,
+    get_rect: Option<Rect>,
+    placeholder: Badge,
+    duration: Badge,
+}
+
+#[derive(Default)]
+struct Badge {
+    text: String,
+    layout: Option<(MetricsKey, Rc<LaidoutText>)>,
+}
+
+struct DropGhost {
+    rect: Bounds,
+    guides: [Option<Guide>; 2],
+    count: usize,
+    label: String,
+    badge: Badge,
+}
+
+impl Badge {
+    fn draw(&mut self, cx: &mut Cx2d, label: &mut DrawText, surface: &mut DrawCanvasCard, look: &Look,
+        r: Rect, text: &str, corner: bool) -> Rect {
+        let style = &label.text_style;
+        let key = MetricsKey { width: 0., font: style.font_family_id(), size: style.font_size, spacing: style.line_spacing,
+            centre: false, family_generation: cx.fonts.borrow().font_family_generation() };
+        if self.text != text || self.layout.as_ref().is_none_or(|(old, _)| *old != key) {
+            text.clone_into(&mut self.text);
+            self.layout = Some((key, label.layout(cx, 0., 0., None, false, Align::default(), text)));
+        }
+        let layout = &self.layout.as_ref().unwrap().1;
+        let size = dvec2(layout.size_in_lpxs.width as f64, layout.size_in_lpxs.height as f64);
+        let padded = dvec2((size.x + 14.).min(r.size.x), (size.y + 6.).min(r.size.y));
+        let pos = if corner { r.pos + dvec2((r.size.x - padded.x - 4.).max(0.), (r.size.y - padded.y - 4.).max(0.)) }
+            else { r.center() - padded * 0.5 };
+        let pill = Rect { pos, size: padded };
+        let edge = Surface { radius: (padded.y * 0.5) as f32, border: 1., border_color: look.frame_line, ..Surface::FLAT };
+        card(surface, cx, pill, look.frame, &edge);
+        label.color = look.caption;
+        cx.push_clip_rect(pill);
+        label.draw_walk_laidout(cx, Walk::abs_rect(Rect { pos: pill.center() - size * 0.5, size }), layout);
+        cx.pop_clip_rect();
+        pill
+    }
+}
+
 impl Face {
     fn update(&mut self, item: &BoardItem, state: &State) -> bool {
+        if item.image.is_some() { self.media.get_or_insert_with(Default::default); } else { self.media = None; }
         let e = &state.entities[&item.text_handle()];
         self.open_writers.retain(|name, _| e.fields.contains_key(&Key::Name(name.clone())));
         for (name, register) in e.open_fields() {
@@ -451,6 +507,8 @@ impl Scene {
 
 #[derive(Clone, Debug)]
 pub enum BoardCanvasAction {
+    OpenMedia { item: Id, blob: Id, media: String },
+    FetchBlob { blob: Id },
     Act(ModelAction),
     Place(NewItem),
     CommitText { board: Id, action: ModelAction },
@@ -469,6 +527,15 @@ struct TextEdit {
 #[derive(Clone, Debug)]
 pub struct AppPick { pub item: Id, pub at: crate::tweak::At }
 
+#[derive(Clone, Debug)]
+pub struct AppZoom { pub item: Id, pub factor: f64 }
+
+impl AppZoom {
+    pub(crate) fn wheel(item: Id, scroll: DVec2, wheel: bool, mods: &KeyModifiers) -> Option<Self> {
+        wheel_zoom(scroll, wheel, mods).map(|factor| Self { item, factor })
+    }
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct BoardCanvas {
     #[uid]
@@ -479,6 +546,10 @@ pub struct BoardCanvas {
     grid: DrawCanvasGrid,
     #[live]
     card: DrawCanvasCard,
+    #[live] image: DrawImage,
+    #[rust] media: BoardMediaCache,
+    #[rust] media_town: Option<TownId>,
+    #[rust] media_keep: HashSet<(TownId, Id)>,
     #[live]
     shadow: DrawCanvasShadow,
     #[live]
@@ -543,6 +614,7 @@ pub struct BoardCanvas {
     fit_pending: bool,
     #[rust]
     gesture: Gesture,
+    #[rust] reported_selection: BTreeSet<Id>,
     #[rust]
     pub tool: BoardTool,
     #[rust]
@@ -553,8 +625,14 @@ pub struct BoardCanvas {
     placement_dragged: bool,
     #[rust]
     ghost: Option<Placement>,
+    #[rust]
+    drop_ghost: Option<DropGhost>,
     #[live]
     tool_chip: ScriptObjectRef,
+    #[live] design_ghost: overlay::DrawDesignGhost,
+    #[rust] design_lift: Option<LiftPress>,
+    #[rust] design_resize: Option<overlay::ResizePress>,
+    #[rust] design_over: Option<Id>,
     #[find]
     #[live]
     editor: WidgetRef,
@@ -594,6 +672,9 @@ pub struct BoardCanvas {
 }
 
 impl BoardCanvas {
+    #[cfg(test)]
+    pub(crate) fn design_ghost(&self) -> &overlay::DrawDesignGhost { &self.design_ghost }
+
     pub fn is_empty(&self) -> bool {
         self.scene.as_ref().is_none_or(|s| s.faces.is_empty())
     }
@@ -607,8 +688,11 @@ impl BoardCanvas {
 
     pub fn select_board(&mut self, cx: &mut Cx, state: &State, selected: Option<Id>, shown: bool) {
         if self.scene.as_ref().map(|s| s.id) == selected {
+            if !shown { self.clear_file_hover(cx); }
             return;
         }
+        self.clear_file_hover(cx);
+        self.clear_media(cx);
         self.end_live(cx, false);
         self.finish_text(cx, true);
         self.last_click = None;
@@ -620,6 +704,7 @@ impl BoardCanvas {
         self.toolbar_drag = None;
         self.tool = BoardTool::Select;
         self.gesture = Gesture::default();
+        self.report_selection(cx);
         self.pressure = 1.;
         self.last_load = 0.;
         if shown {
@@ -627,6 +712,48 @@ impl BoardCanvas {
         } else {
             self.repaint_pending = true;
         }
+    }
+
+    pub fn clear_media(&mut self, cx: &mut Cx) {
+        self.image.draw_vars.empty_texture(0);
+        self.media.clear(cx);
+        self.media_keep.clear();
+        self.media_town = None;
+    }
+
+    pub fn media_placeholder_text(&self, item: Id) -> Option<&str> {
+        self.scene.as_ref()?.faces.get(&item)?.media.as_ref().map(|m| m.placeholder.text.as_str())
+    }
+
+    /// Snapshot local availability when the board or the store changes. Paint only looks up
+    /// a ready handle or passes the path to a worker on the first request.
+    pub fn sync_media<'a>(&mut self, cx: &mut Cx, town: TownId, blobs_dir: &Path,
+        status: impl Fn(Id) -> (bool, bool, Option<&'a makepad_town_core::blob::lane::Status>)) {
+        if self.media_town != Some(town) {
+            self.clear_media(cx);
+            self.media_town = Some(town);
+        }
+        let Some(scene) = &mut self.scene else { return };
+        let mut changed = false;
+        for (id, face) in &mut scene.faces {
+            let Some(face) = &mut face.media else { continue };
+            let Some(image) = scene.view.get(id).and_then(|i| i.image.as_ref()) else { continue };
+            let display = image.poster.or(image.blob);
+            let (mut here, mut get) = (None, false);
+            if let Some((blob, size)) = display {
+                let (complete, wanted, transfer) = status(blob);
+                if complete { here = Some(blob); }
+                else { get = matches!(transfer, Some(makepad_town_core::blob::lane::Status::Bad { .. }))
+                    || (size > 1024 * 1024 && !wanted && transfer.is_none()); }
+            }
+            if face.local.as_ref().map(|(id, _)| *id) != here {
+                face.local = here.map(|id| (id, makepad_town_core::blob::data_path(&blobs_dir.join(makepad_town_core::hex(&town)), &id)));
+                changed = true;
+            }
+            changed |= face.get != get;
+            face.get = get;
+        }
+        if changed { self.request(cx); }
     }
 
     pub fn applied(&mut self, cx: &mut Cx, state: &State, ids: &[Id], shown: bool) {
@@ -653,6 +780,7 @@ impl BoardCanvas {
                 self.repaint_pending = true;
             }
         }
+        self.report_selection(cx);
         self.update_live(cx, false);
     }
 
@@ -697,6 +825,7 @@ impl BoardCanvas {
         } else {
             self.repaint_pending = true;
         }
+        self.report_selection(cx);
         self.update_live(cx, false);
     }
 
@@ -761,7 +890,7 @@ fn body_of(kind: &Key, shape: &str) -> Body {
 }
 
 fn item_colour(item: &BoardItem, look: &Look) -> Vec4f {
-    if item.kind == kind::DESIGN {
+    if item.kind == kind::DESIGN || item.kind == kind::IMAGE {
         return look.frame;
     }
     match item.colour {
@@ -817,7 +946,7 @@ fn local_rect(camera: &Camera, b: Bounds) -> Rect {
 }
 
 fn supported(kind: &Key) -> bool {
-    matches!(kind, Key::Name(_) | Key::Number(kind::STICKY | kind::SHAPE | kind::SECTION | kind::TEXT_BLOCK | kind::DESIGN | kind::APP))
+    matches!(kind, Key::Name(_) | Key::Number(kind::STICKY | kind::SHAPE | kind::SECTION | kind::TEXT_BLOCK | kind::DESIGN | kind::APP | kind::IMAGE))
 }
 
 #[derive(Default)]
@@ -895,6 +1024,7 @@ impl BoardCanvas {
         let Some(scene) = &mut self.scene else { return false };
         let preview = self.gesture.preview.as_ref();
         if !lifted {
+            self.media_keep.clear();
             scene.cull(bounds, preview);
         }
         let geometry = |item: &BoardItem| {
@@ -1070,6 +1200,55 @@ impl BoardCanvas {
             for corner in locks.drain(..) {
                 draw_lock(cx, &mut self.outline, self.grid.color_a, corner, Some(&camera));
             }
+            // Keep each layer's pictures and badges above its cards and below the next
+            // layer's shadow. Separate parents keep the badge quad out of the surface batch.
+            if let Some(town) = self.media_town {
+                for id in &ids[layer.clone()] {
+                    let item = scene.view.get(id).unwrap();
+                    let Some(image) = item.image.as_deref() else { continue };
+                    let face = scene.faces.get_mut(id).unwrap();
+                    let media = face.media.as_mut().unwrap();
+                    media.get_rect = None;
+                    if !face.detail.body || !geometry(item).intersects(bounds) { continue }
+                    let r = local_rect(&camera, geometry(item));
+                    let mut message = "Picture unavailable";
+                    if let Some((blob, _)) = image.poster.or(image.blob) {
+                        self.media_keep.insert((town, blob));
+                        let state = self.media.state(town, blob);
+                        let path = if state == MediaSlotState::Missing {
+                            media.local.as_ref().filter(|(id, _)| *id == blob).map(|(_, path)| path.clone())
+                        } else { None };
+                        let texture = self.media.request(cx, town, blob, path);
+                        if let (Some(tex), MediaSlotState::Ready { w, h }) = (texture, state) {
+                            if w > 0 && h > 0 && r.size.x > 0. && r.size.y > 0. {
+                                let pixels = dvec2(w as f64, h as f64);
+                                let size = pixels * (r.size.x / pixels.x).min(r.size.y / pixels.y);
+                                let fit_rect = Rect { pos: r.center() - size * 0.5, size };
+                                self.image.border_radius = look::surface(Body::Media, look.frame, size, "", &look).radius;
+                                self.image.draw_vars.set_texture(0, tex);
+                                self.image.draw_abs(cx, fit_rect);
+                                self.image.draw_vars.empty_texture(0);
+                            }
+                            message = "";
+                        } else if state != MediaSlotState::Failed {
+                            message = if media.get { "Get" } else { "Loading…" };
+                        }
+                    }
+                    if !message.is_empty() || image.duration_ms > 0 {
+                        cx.push_draw_call_parent();
+                        cx.push_draw_call_parent();
+                        if !message.is_empty() {
+                            let pill = media.placeholder.draw(cx, &mut self.share_label, &mut self.card, &look, r, message, false);
+                            if media.get { media.get_rect = Some(pill); }
+                        }
+                        if image.duration_ms > 0 {
+                            media.duration.draw(cx, &mut self.share_label, &mut self.card, &look, r, &image.duration_label, true);
+                        }
+                        cx.pop_draw_call_parent();
+                        cx.pop_draw_call_parent();
+                    }
+                }
+            }
             self.label.begin_deferred_slug_flush();
             self.title.begin_deferred_slug_flush();
             for id in &ids[layer.clone()] {
@@ -1149,7 +1328,7 @@ impl BoardCanvas {
             self.open_text(cx, id, item.kind == kind::TEXT_BLOCK);
         }
         self.request_overlay(cx);
-        cx.widget_action(self.widget_uid(), BoardCanvasAction::SelectionChanged);
+        self.report_selection(cx);
     }
 
     pub fn edit_context(&mut self, cx: &mut Cx, shown: bool, writable: bool) {
@@ -1170,7 +1349,7 @@ impl BoardCanvas {
         let place = look::place(body_of(&item.kind, &face.shape), rect(item.rect));
         let (ax, ay) = (if place.centre_x { 0.5 } else { 0. }, if place.centre_y { 0.5 } else { 0. });
         let mut editor = self.editor.clone();
-        script_apply_eval!(cx, editor, {label_align: Align{x: #(ax) y: 0.0} align: Align{x: 0.0 y: #(ay)}});
+        script_apply_eval!(cx, editor, {use mod.prelude.widgets.* label_align: Align{x: #(ax) y: 0.0} align: Align{x: 0.0 y: #(ay)}});
         self.last_click = None;
         self.editor.set_visible(cx, true);
         self.editor.set_text(cx, &face.text);
@@ -1316,8 +1495,10 @@ impl BoardCanvas {
         !matches!(event, Event::Scroll(_) | Event::Pinch(_))
     }
 
+    /// The empty board's invitation. It steps aside while a file's ghost shows the drop, as the
+    /// board will look once the file lands.
     pub fn show_invitation(&self) -> bool {
-        self.is_empty() && !self.tool.places() && self.toolbar_drag.is_none()
+        self.is_empty() && !self.tool.places() && self.toolbar_drag.is_none() && self.drop_ghost.is_none()
     }
 
     pub fn drag_tool(&mut self, cx: &mut Cx, tool: BoardTool, toolbar: WidgetRef) {
@@ -1331,6 +1512,19 @@ impl BoardCanvas {
     }
 
     fn drag_event(&mut self, cx: &mut Cx, event: &Event) {
+        if let Some(point) = design_pointer(event) {
+            let target = self.scene.as_ref().and_then(|scene| scene.pick(self.camera.world_at(point))).and_then(|id| {
+                let s = self.app_presence.get(&id).filter(|s| s.can_edit)?;
+                let tf = s.board_transform(self.app_view_rect(id)?)?;
+                Some((id, s.window, tf.screen_to_app(point)?))
+            });
+            picture_drop(cx, self.widget_uid(), self.area, event, target, &mut self.design_over);
+            return
+        }
+        if matches!(event, Event::DragEnd | Event::WindowLostFocus(_)) {
+            self.design_lift = None; self.design_over = None;
+            if let Some(mut resize) = self.design_resize.take() { resize.cancel(cx, self.widget_uid()); }
+        }
         let Some((tool, toolbar)) = &self.toolbar_drag else { return };
         let tool = *tool;
         let over_toolbar = toolbar.area().clipped_rect(cx);
@@ -1397,6 +1591,17 @@ impl BoardCanvas {
         }
     }
 
+    pub fn selected_item(&self) -> Option<Id> {
+        if self.gesture.selection.ids.len() == 1 { self.gesture.selection.ids.first().copied() } else { None }
+    }
+
+    fn report_selection(&mut self, cx: &mut Cx) {
+        if self.reported_selection != self.gesture.selection.ids {
+            self.reported_selection.clone_from(&self.gesture.selection.ids);
+            cx.widget_action(self.widget_uid(), BoardCanvasAction::SelectionChanged);
+        }
+    }
+
     pub fn can_align(&self) -> bool { self.gesture.selection.ids.len() >= 2 }
 
     pub fn alignment(&self, choice: AlignTo) -> Option<ModelAction> {
@@ -1405,6 +1610,50 @@ impl BoardCanvas {
 
     pub fn board_id(&self) -> Option<Id> {
         self.scene.as_ref().map(|s| s.id)
+    }
+
+    pub fn next_free_spot(&self, board: Id, size: (f64, f64)) -> Option<(i64, i64)> {
+        let scene = self.scene.as_ref().filter(|s| s.id == board)?;
+        Some(scene.view.next_free_spot((self.camera.scale > 0.).then(|| camera_bounds(self.camera)), size))
+    }
+
+    pub fn file_hover(&mut self, cx: &mut Cx, point: DVec2, alt: bool, count: usize, name: Option<&str>) {
+        if self.camera.scale <= 0. || count == 0 {
+            self.clear_file_hover(cx);
+            return
+        }
+        let p = self.camera.world_at(point);
+        let (rect, guides) = snap_rect(self.scene.as_ref().map(|s| &s.view),
+            Bounds::new(p.x, p.y, p.x + 320., p.y + 240.), self.camera.scale, alt);
+        let name = name.filter(|s| !s.is_empty());
+        if let Some(ghost) = &mut self.drop_ghost {
+            if ghost.count == count && (count > 1 || ghost.label.strip_prefix("Drop on board: ") == name) {
+                if ghost.rect != rect || ghost.guides != guides {
+                    ghost.rect = rect;
+                    ghost.guides = guides;
+                    self.request_overlay(cx);
+                }
+                return
+            }
+        }
+        let label = if count > 1 { format!("Drop {count} files on board") }
+            else if let Some(name) = name { format!("Drop on board: {name}") }
+            else { "Drop on board".into() };
+        self.drop_ghost = Some(DropGhost { rect, guides, count, label, badge: Badge::default() });
+        self.request_overlay(cx);
+    }
+
+    /// Whether a ghost was showing.
+    pub fn clear_file_hover(&mut self, cx: &mut Cx) -> bool {
+        let shown = self.drop_ghost.take().is_some();
+        if shown { self.request_overlay(cx); }
+        shown
+    }
+
+    pub fn take_file_drop(&mut self, cx: &mut Cx) -> Option<(i64, i64)> {
+        let ghost = self.drop_ghost.take()?;
+        self.request_overlay(cx);
+        Some((ticks(ghost.rect.x0)?, ticks(ghost.rect.y0)?))
     }
 
     fn request_overlay(&mut self, cx: &mut Cx) {
@@ -1497,12 +1746,22 @@ impl BoardCanvas {
     }
 
     /// Refresh on a presence/window change. The overlay can repaint without rebuilding the board recording.
-    pub fn set_app_presence(&mut self, cx: &mut Cx, item: Id, window: usize, size: [f64; 2], view: &crate::tweak::SeatView, state: &State) {
-        let next = Selections::new(window, size, view, state);
+    pub(crate) fn set_app_presence(&mut self, cx: &mut Cx, item: Id, next: Selections) {
         if self.app_presence.get(&item) != Some(&next) {
             self.app_presence.insert(item, next);
             self.request_overlay(cx);
         }
+    }
+
+    pub(crate) fn app_presence(&self, item: &Id) -> Option<&Selections> { self.app_presence.get(item) }
+
+    fn design_view(&self, id: Id) -> Option<(&Selections, crate::tweak::focus::ViewportTransform)> {
+        let s = self.app_presence.get(&id)?;
+        Some((s, s.board_transform(self.app_view_rect(id)?)?))
+    }
+
+    pub(crate) fn app_focus(&self, item: &Id) -> Option<&FocusState> {
+        self.app_presence.get(item).map(|p| &p.focus)
     }
 
     pub fn clear_app_presence(&mut self, cx: &mut Cx, item: Id) {
@@ -1512,7 +1771,7 @@ impl BoardCanvas {
     /// A click on the displayed share uses the same letterbox transform as the selection overlay.
     pub fn app_pick_at(&self, item: Id, screen: DVec2) -> Option<crate::tweak::At> {
         let presence = self.app_presence.get(&item)?;
-        let point = overlay::board_window_point(self.app_view_rect(item)?, presence.window_size, screen)?;
+        let point = presence.board_transform(self.app_view_rect(item)?)?.screen_to_app(screen)?;
         overlay::pick_at(presence.window, point, presence.window_size)
     }
 
@@ -1526,7 +1785,9 @@ impl BoardCanvas {
         cx.push_clip_rect(clip);
         for (id, presence) in &self.app_presence {
             if let Some(view) = self.app_view_rect(*id).filter(|r| r.intersects(clip)) {
-                overlay::draw_selections(cx, view, presence, &mut self.outline, &mut self.share_label);
+                let Some(tf) = presence.board_transform(view) else { continue };
+                overlay::draw_isolate_scrim(cx, &tf, presence, &mut self.outline);
+                overlay::draw_selections(cx, &tf, presence, &mut self.outline, &mut self.share_label, &mut self.design_ghost);
             }
         }
         cx.pop_clip_rect();
@@ -1622,6 +1883,18 @@ impl BoardCanvas {
             outline(ghost.rect, 1., false, true);
         }
         let screen = |p| snap_to_pixel(camera.local_to_screen(camera.world_to_local(p)), dpi);
+        if let Some(drop) = &mut self.drop_ghost {
+            let r = rect(drop.rect);
+            let size = r.size * camera.scale;
+            let frame = Surface { radius: 4., border: 1., border_color: accent, ..Surface::FLAT };
+            let tint = vec4(accent.x, accent.y, accent.z, accent.w * 0.12);
+            for i in (0..drop.count.min(4)).rev() {
+                let offset = 32. * i as f64;
+                card(&mut self.card, cx, Rect { pos: screen(r.pos + dvec2(offset, offset)), size }, tint, &frame);
+            }
+            drop.badge.draw(cx, &mut self.share_label, &mut self.card, &look,
+                Rect { pos: screen(r.pos), size }, &drop.label, false);
+        }
         let mut draw_segment = |(a, b)| {
             let pos = screen(a);
             let size = screen(b) - pos;
@@ -1629,6 +1902,10 @@ impl BoardCanvas {
         };
         if let Some(ghost) = &self.ghost {
             for (axis, guide) in ghost.guides.iter().enumerate() {
+                if let Some(g) = guide { draw_segment(g.segment(axis)); }
+            }
+        } else if let Some(drop) = &self.drop_ghost {
+            for (axis, guide) in drop.guides.iter().enumerate() {
                 if let Some(g) = guide { draw_segment(g.segment(axis)); }
             }
         } else {
@@ -1666,8 +1943,10 @@ impl BoardCanvas {
         self.finish_text(cx, true);
         self.placement_start = None;
         self.ghost = None;
+        self.clear_file_hover(cx);
         self.toolbar_drag = None;
         self.gesture.cancel();
+        self.report_selection(cx);
         self.end_live(cx, false);
         self.present = Some(present);
         self.overlay_pending = true;
@@ -1733,7 +2012,7 @@ impl BoardCanvas {
         if camera.scale <= 0. {
             return;
         }
-        let could_align = self.can_align();
+        let active_pointer = self.gesture.pointer_active();
         let had_preview = self.gesture.preview.is_some();
         let mut action = None;
         let mut redraw = false;
@@ -1778,6 +2057,20 @@ impl BoardCanvas {
                             || d.mouse_button().is_some_and(|b| b.is_middle() || b.is_secondary());
                         let screen = camera.local_to_screen(d.abs);
                         let handle = self.gesture.hit_handle(&scene.view, p, camera.scale);
+                        if !pan && d.is_primary_hit() {
+                            if let Some((item, (s, tf))) = id.and_then(|i| Some((i, self.design_view(i)?))) {
+                                if let Some(resize) = overlay::ResizePress::begin(item, tf, s, d.digit_id, screen) {
+                                    self.design_resize = Some(resize);
+                                    cx.claim_finger_drag(d.digit_id);
+                                    return
+                                }
+                                if let Some(path) = s.selected_at(&tf, screen) {
+                                    self.design_lift = Some(LiftPress { item, digit: d.digit_id, start: screen, path: path.into() });
+                                    cx.claim_finger_drag(d.digit_id);
+                                    return
+                                }
+                            }
+                        }
                         if let Some(handle) = handle.filter(|_| !pan) {
                             self.gesture.press_handle(&scene.view, handle, p);
                             self.drag_pointer = Some((screen, d.modifiers));
@@ -1787,6 +2080,28 @@ impl BoardCanvas {
                         }
                         redraw = true;
                         cursor = true;
+                    }
+                }
+                Hit::FingerMove(m) if self.design_resize.as_ref().is_some_and(|r| r.digit == m.digit_id) => {
+                    let uid = self.widget_uid();
+                    self.design_resize.as_mut().unwrap().update(cx, uid, camera.local_to_screen(m.abs), overlay::ResizePhase::Drag);
+                }
+                Hit::FingerUp(u) if self.design_resize.as_ref().is_some_and(|r| r.digit == u.digit_id) => {
+                    let mut resize = self.design_resize.take().unwrap();
+                    if u.is_sweep || u.cancelled { resize.cancel(cx, self.widget_uid()); }
+                    else { resize.update(cx, self.widget_uid(), camera.local_to_screen(u.abs), overlay::ResizePhase::Release); }
+                }
+                Hit::FingerMove(m) if self.design_lift.as_ref().is_some_and(|p| p.digit == m.digit_id) => {
+                    if self.design_lift.as_ref().unwrap().lift(cx, camera.local_to_screen(m.abs), &self.tool_chip) {
+                        self.design_lift = None;
+                    }
+                }
+                Hit::FingerUp(u) if self.design_lift.as_ref().is_some_and(|p| p.digit == u.digit_id) => {
+                    let item = self.design_lift.take().unwrap().item;
+                    if !u.is_sweep && !u.cancelled {
+                        if let Some(at) = self.app_pick_at(item, camera.local_to_screen(u.abs)) {
+                            cx.widget_action(self.widget_uid(), AppPick { item, at });
+                        }
                     }
                 }
                 Hit::FingerMove(m) if self.placement_start.is_some() => {
@@ -1839,7 +2154,14 @@ impl BoardCanvas {
                         } else { None };
                         self.gesture.hover = if u.is_over { scene.pick(world(u.abs)) } else { None };
                         if let Some(id) = clicked.filter(|id| self.gesture.hover == Some(*id)) {
-                            if let Some(at) = self.app_pick_at(id, camera.local_to_screen(u.abs)) {
+                            if let Some(image) = scene.view.get(&id).and_then(|i| i.image.as_deref()) {
+                                let fetch = scene.faces[&id].media.as_ref().is_some_and(|m| m.get && m.get_rect.is_some_and(|r| r.contains(u.abs)));
+                                if fetch {
+                                    action = image.poster.or(image.blob).map(|(blob, _)| BoardCanvasAction::FetchBlob { blob });
+                                } else if u.tap_count >= 2 && previous_click == Some(id) {
+                                    action = image.blob.map(|(blob, _)| BoardCanvasAction::OpenMedia { item: id, blob, media: image.media.clone() });
+                                } else { self.last_click = Some(id); }
+                            } else if let Some(at) = self.app_pick_at(id, camera.local_to_screen(u.abs)) {
                                 cx.widget_action(self.widget_uid(), AppPick { item: id, at });
                             } else if u.tap_count >= 2 && previous_click == Some(id) {
                                 self.open_text(cx, id, false);
@@ -1861,7 +2183,12 @@ impl BoardCanvas {
                     self.gesture.handle = handle;
                     self.gesture.hover = id;
                     self.gesture.space = cx.keyboard.is_key_down(KeyCode::Space);
-                    cursor = true;
+                    let screen = camera.local_to_screen(h.abs);
+                    let design_cursor = id.filter(|_| self.tool == BoardTool::Select && !self.gesture.space)
+                        .and_then(|i| self.design_view(i)).and_then(|(s, tf)|
+                            overlay::hit_size_handle(&tf, s, screen).map(|h| h.cursor())
+                                .or_else(|| s.selected_at(&tf, screen).map(|_| MouseCursor::Hand)));
+                    if let Some(c) = design_cursor { cx.set_cursor(c); } else { cursor = true; }
                 }
                 Hit::FingerHoverOut(_) => {
                     self.gesture.handle = None;
@@ -1874,9 +2201,16 @@ impl BoardCanvas {
                         Event::Scroll(e) => e.is_mouse || e.phase == ScrollPhase::None,
                         _ => true,
                     };
-                    match scroll_nav(s.scroll * camera.scale, wheel, &s.modifiers) {
-                        ScrollNav::Zoom(by) => self.zoom(cx, camera.local_to_screen(s.abs), camera.scale * by),
-                        ScrollNav::Pan(by) => self.pan(cx, camera.pan + by),
+                    let isolated = scene.and_then(|scene| scene.pick(world(s.abs)))
+                        .filter(|id| self.app_focus(id).is_some_and(|f| f.isolated_path.is_some()));
+                    let scroll = s.scroll * camera.scale;
+                    if let Some(zoom) = isolated.and_then(|item| AppZoom::wheel(item, scroll, wheel, &s.modifiers)) {
+                        cx.widget_action(self.widget_uid(), zoom);
+                    } else {
+                        match scroll_nav(scroll, wheel, &s.modifiers) {
+                            ScrollNav::Zoom(by) => self.zoom(cx, camera.local_to_screen(s.abs), camera.scale * by),
+                            ScrollNav::Pan(by) => self.pan(cx, camera.pan + by),
+                        }
                     }
                     if let Event::Scroll(e) = &mapped {
                         e.handled_x.set(true);
@@ -2033,8 +2367,8 @@ impl BoardCanvas {
         } else if redraw {
             self.request_overlay(cx);
         }
-        if could_align != self.can_align() {
-            cx.widget_action(self.widget_uid(), BoardCanvasAction::SelectionChanged);
+        if active_pointer || matches!(event, Event::MouseDown(_) | Event::TouchUpdate(_) | Event::KeyDown(_)) {
+            self.report_selection(cx);
         }
         if let Some(action) = action {
             cx.widget_action(self.widget_uid(), action);
@@ -2054,7 +2388,8 @@ impl Widget for BoardCanvas {
         if clip.size.x <= 0. || clip.size.y <= 0. {
             return DrawStep::done();
         }
-        if !recording.begin_maybe(cx, changed).is_not_redrawing() {
+        let board_redrew = !recording.begin_maybe(cx, changed).is_not_redrawing();
+        if board_redrew {
             self.repaint_pending = false;
             let previous = self.camera;
             self.camera.view = view;
@@ -2128,11 +2463,18 @@ impl Widget for BoardCanvas {
             self.overlay.as_mut().unwrap().end(cx);
         }
         self.draw_editor(cx, scope, clip);
+        if board_redrew {
+            self.media.evict_to_budget(cx, &self.media_keep);
+        }
         self.draw_nav(cx, scope, clip);
         DrawStep::done()
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::Signal) && self.media.poll(cx) {
+            self.media.evict_to_budget(cx, &self.media_keep);
+            self.request(cx);
+        }
         if self.next_frame.is_event(event).is_some() {
             self.glide_frame(cx, makepad_platform::monotonic_seconds());
         }
